@@ -669,6 +669,50 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn persisted_admitted_consumers_are_normalised_on_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "nono-oauth-capture-normalise-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("providers.json");
+
+        let phantom = format!("nono_{}", "a".repeat(64));
+        let mut tokens = serde_json::Map::new();
+        tokens.insert(
+            phantom.clone(),
+            serde_json::json!({
+                "real": "real-access",
+                "admitted_consumers": ["proxy./svc/"],
+                "created_at_secs": now_secs(),
+            }),
+        );
+        fs::write(
+            &path,
+            serde_json::json!({ "version": 1, "tokens": Value::Object(tokens) }).to_string(),
+        )
+        .unwrap();
+
+        let store = store_with_persistence(path);
+        assert_eq!(
+            std::str::from_utf8(
+                &store
+                    .resolve(&phantom, &route_consumer("svc"))
+                    .expect("a persisted phantom must resolve under the normalised consumer")
+            )
+            .unwrap(),
+            "real-access"
+        );
+        assert!(
+            store.resolve(&phantom, "proxy.other").is_none(),
+            "normalisation must not widen the persisted consumer set"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn opaque_fields<const N: usize>(paths: [&str; N]) -> Vec<OAuthTokenResponseFieldConfig> {
         paths
             .into_iter()

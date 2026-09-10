@@ -650,52 +650,65 @@ Groups use a structured allow/deny taxonomy:
 
 ### Built-in Groups
 
-nono ships with 32 built-in groups:
-
 **Deny groups** (block sensitive content):
-- `deny_credentials` - SSH keys, cloud credentials, GPG keys, container and package manager tokens
-- `deny_keychains_macos` - macOS Keychain databases, 1Password, password-store
-- `deny_keychains_linux` - Linux keyring, 1Password, password-store
-- `deny_browser_data_macos` - Browser data on macOS (Chrome, Firefox, Safari, Edge, Arc, Brave)
-- `deny_browser_data_linux` - Browser data on Linux (Chrome, Firefox, Edge, Brave)
-- `deny_macos_private` - macOS Messages, Mail, Cookies, MobileSync
-- `deny_shell_history` - Shell history files (.bash_history, .zsh_history, .python_history)
-- `deny_shell_configs` - Shell config files that may contain API keys (.bashrc, .zshrc, .profile, .env)
+- `deny_credentials` — SSH keys, cloud credentials, GPG keys, container and package manager tokens
+- `deny_keychains_macos` — macOS Keychain databases, 1Password, password-store
+- `deny_keychains_linux` — Linux keyring, 1Password, password-store
+- `deny_browser_data_macos` — Browser data on macOS (Chrome, Firefox, Safari, Edge, Arc, Brave)
+- `deny_browser_data_linux` — Browser data on Linux (Chrome, Firefox, Edge, Brave)
+- `deny_macos_private` — macOS Messages, Mail, Cookies, MobileSync
+- `deny_shell_history` — Shell history files (.bash_history, .zsh_history, .python_history)
+- `deny_shell_configs` — Shell config files that may contain API keys (.bashrc, .zshrc, .profile, .env)
 
 **Protection groups**:
-- `unlink_protection` - Prevents file deletion, with override for user-writable paths
-- `dangerous_commands` - Blocks `rm`, `dd`, `chmod`, `sudo`, `mkfs`, `pip`, `npm`, `kill`, etc.
-- `dangerous_commands_macos` - macOS-specific: `srm`, `brew`, `launchctl`
-- `dangerous_commands_linux` - Linux-specific: `shred`, `mkfs.*`, `fdisk`, `systemctl`, `apt`, `yum`, `dnf`, `pacman`
+- `unlink_protection` — Prevents file deletion, with override for user-writable paths
+- `dangerous_commands` — Blocks `rm`, `dd`, `chmod`, `sudo`, `mkfs`, `pip`, `npm`, `kill`, etc.
+- `dangerous_commands_macos` — macOS-specific: `srm`, `brew`, `launchctl`
+- `dangerous_commands_linux` — Linux-specific: `shred`, `mkfs.*`, `fdisk`, `systemctl`, `apt`, `yum`, `dnf`, `pacman`
 
 **System path groups** (grant necessary system access):
-- `system_read_macos` - macOS system libraries, frameworks, dyld cache
-- `system_read_linux` - Linux system libraries, locale data
-- `system_write_macos` - macOS temp directories, cache paths
-- `system_write_linux` - Linux temp directories
+- `system_read_macos` — macOS system libraries, frameworks, dyld cache
+- `system_read_linux_core` — Linux core system libraries, locale data, /dev/, /proc/self
+- `system_write_macos` — macOS temp directories, cache paths
+- `system_write_linux` — Linux temp directories
+- `linux_runtime_state` — Linux runtime state paths (/run, /var/run)
+- `linux_sysfs_read` — Linux sysfs paths for kernel and device state (/sys)
+- `linux_temp_read` — Linux shared temporary directory read access (/tmp)
 
 **Cache groups** (user-level caches and state):
-- `user_caches_macos` - ~/Library/Caches, ~/Library/Logs, ~/Library/Preferences
-- `user_caches_linux` - ~/.cache, ~/.local/state
+- `user_caches_macos` — ~/Library/Caches, ~/Library/Logs, ~/Library/Preferences
+- `user_caches_linux` — ~/.cache
+- `claude_cache_linux` — ~/.cache/claude-cli-nodejs
 
 **Runtime groups** (language toolchain paths):
-- `node_runtime` - nvm, fnm, npm, pnpm, volta
-- `rust_runtime` - rustup, cargo
-- `python_runtime` - pyenv, conda, pip, uv
-- `go_runtime` - ~/go, /usr/local/go
-- `java_runtime` - SDKMAN (~/.sdkman), Maven (~/.m2/repository, ~/.m2/wrapper), Gradle (~/.gradle/caches, ~/.gradle/wrapper)
-- `nix_runtime` - Nix profile paths, /nix/store, /nix/var (Linux only)
-- `user_tools` - Local bins, .desktop files, man pages, shell completions
-- `homebrew` - /opt/homebrew, /usr/local/Cellar, /usr/local/opt (macOS only)
+- `node_runtime` — nvm, fnm, npm, pnpm
+- `rust_runtime` — rustup, cargo
+- `python_runtime` — pyenv, conda, pip, uv
+- `go_runtime` — ~/go, /usr/local/go
+- `go_runtime_linux` — Go build cache on Linux (~/.cache/go-build)
+- `go_runtime_macos` — Go build cache on macOS (~/Library/Caches/go-build)
+- `java_runtime` — SDKMAN (~/.sdkman), Maven (~/.m2), Gradle (~/.gradle)
+- `nix_runtime` — Nix profile paths, /nix/store, /nix/var
+- `user_tools` — ~/.local/bin, .desktop files, man pages, shell completions
+- `homebrew_macos` — /opt/homebrew, /usr/local/Cellar, /usr/local/opt (macOS only)
+- `homebrew_linux` — /home/linuxbrew/.linuxbrew (Linux only)
+- `mise_manager` — Mise dev tools, env vars, task runner
+- `bun_runtime` — Bun runtime (~/.bun)
 
 **Tool-specific groups** (paths for specific applications):
-- `claude_code_macos` - macOS Keychain for Claude Code credential storage
-- `claude_code_linux` - ~/.local/share/claude
-- `claude_cache_linux` - ~/.cache/claude-cli-nodejs
-- `codex_macos` - macOS Keychain for Codex credential storage
-- `opencode_linux` - ~/.opencode/bin (Linux only, needed for Landlock exec)
-- `vscode_macos` - ~/.vscode, ~/Library/Application Support/Code
-- `vscode_linux` - ~/.vscode, ~/.config/Code
+- `claude_code_macos` — macOS Keychain for Claude Code credential storage
+- `claude_code_linux` — ~/.local/share/claude
+- `codex_macos` — macOS Keychain for Codex credential storage
+- `opencode_linux` — ~/.opencode/bin (Linux only, needed for Landlock exec)
+- `vscode_macos` — ~/.vscode, ~/Library/Application Support/Code
+- `vscode_linux` — ~/.vscode, ~/.config/Code
+
+**Application config groups** (profile and configuration files):
+- `git_config` — Read access to git configuration files (~/.gitconfig, ~/.config/git/)
+
+<Note>
+  Group definitions are located in `crates/nono-cli/data/policy.json`. You can inspect them to see the exact rules applied by each group.
+</Note>
 
 <Note>
   Command blocking is a best-effort surface-level control. It matches against the executable name being invoked directly. A process can bypass this by calling the equivalent syscall from within an allowed interpreter (e.g., `os.remove()` in Python, `fs.unlinkSync()` in Node.js) or by invoking a renamed copy of the binary. For hard filesystem protection, rely on the kernel-enforced deny groups and `unlink_protection`, which cannot be bypassed from userspace regardless of how the operation is invoked.
@@ -735,7 +748,7 @@ Platform-specific groups use `_macos` or `_linux` suffixes by convention.
 
 The base profile that all other profiles extend. Provides system path access, deny groups for sensitive content, and deprecated startup-only command gating. Does not grant working directory access or any user-specific paths.
 
-**Groups:** `deny_credentials`, `deny_keychains_macos`, `deny_keychains_linux`, `deny_browser_data_macos`, `deny_browser_data_linux`, `deny_macos_private`, `deny_shell_history`, `deny_shell_configs`, `system_read_macos`, `system_read_linux`, `system_write_macos`, `system_write_linux`, `user_tools`, `homebrew`, `dangerous_commands`, `dangerous_commands_macos`, `dangerous_commands_linux`
+**Groups:** `deny_credentials`, `deny_keychains_macos`, `deny_keychains_linux`, `deny_browser_data_macos`, `deny_browser_data_linux`, `deny_macos_private`, `deny_shell_history`, `deny_shell_configs`, `system_read_macos`, `system_read_linux_core`, `system_write_macos`, `system_write_linux`, `user_tools`, `homebrew_macos`, `homebrew_linux`, `dangerous_commands`, `dangerous_commands_macos`, `dangerous_commands_linux`
 
 **Network:** Allowed
 

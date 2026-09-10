@@ -1829,7 +1829,13 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     ignored_denial_paths: config.ignored_denial_paths,
                     url_denials: &url_denials,
                 };
-                offer_profile_save_for_child(pty_proxy.as_mut(), &offer)?;
+                // Don't let a prompt failure override the child's exit code.
+                // Unlike the audit-ledger finalization failure, this one is
+                // never downgraded: the child ran, and its own status is
+                // what the caller asked for.
+                if let Err(e) = offer_profile_save_for_child(pty_proxy.as_mut(), &offer) {
+                    crate::output::print_session_finalization_failure(&e, exit_code, exit_code);
+                }
             }
 
             Ok(exit_code)

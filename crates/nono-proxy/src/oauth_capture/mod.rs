@@ -50,6 +50,16 @@ pub struct OAuthCaptureStore {
 const MAX_PERSISTED_PHANTOMS: usize = 4096;
 const PHANTOM_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 
+#[must_use]
+pub fn route_consumer(prefix: &str) -> String {
+    format!("proxy.{prefix}")
+}
+
+#[must_use]
+pub fn route_prefix_for_consumer(consumer: &str) -> Option<&str> {
+    consumer.strip_prefix("proxy.")
+}
+
 impl OAuthCaptureStore {
     pub fn load(configs: &[OAuthCaptureConfig]) -> Result<Self> {
         Self::load_with_persistence(configs, None)

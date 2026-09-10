@@ -78,6 +78,8 @@ pub struct LoadedRoute {
     /// authentication itself rather than accept agent-provided credentials.
     pub requires_managed_credential: bool,
 
+    pub carries_managed_credential: bool,
+
     /// Audit auth mechanism implied by the managed credential configuration.
     /// Kept even if credential material failed to load so fail-closed denial
     /// events can describe what auth shape the route expected.
@@ -114,6 +116,10 @@ impl std::fmt::Debug for LoadedRoute {
             .field(
                 "requires_managed_credential",
                 &self.requires_managed_credential,
+            )
+            .field(
+                "carries_managed_credential",
+                &self.carries_managed_credential,
             )
             .field("managed_auth_mechanism", &self.managed_auth_mechanism)
             .field("managed_injection_mode", &self.managed_injection_mode)
@@ -204,8 +210,16 @@ impl RouteStore {
     /// does a regex match, not a glob compile. Routes with a `tls_ca` field
     /// get a per-route TLS connector built from the custom CA certificate.
     pub async fn load(routes: &[RouteConfig]) -> Result<Self> {
+        Self::load_with_oauth_capture(routes, &[]).await
+    }
+
+    pub async fn load_with_oauth_capture(
+        routes: &[RouteConfig],
+        oauth_capture: &[crate::config::OAuthCaptureConfig],
+    ) -> Result<Self> {
         let mut loaded = HashMap::new();
 
+        let oauth_capture_routes = oauth_capture_route_prefixes(oauth_capture);
         let base_root_store = build_base_root_store();
 
         for route in routes {
@@ -328,8 +342,10 @@ impl RouteStore {
                 || route.oauth2.is_some()
                 || route.aws_auth.is_some()
                 || route.spiffe.is_some();
-            let requires_intercept = requires_managed_credential
+            let carries_managed_credential = requires_managed_credential
                 || !route.redeem_phantoms.is_empty()
+                || oauth_capture_routes.contains(normalized_prefix.as_str());
+            let requires_intercept = carries_managed_credential
                 || !endpoint_policy.allows_all_without_l7()
                 || !upgrade_rules.is_empty();
             let managed_auth_mechanism = auth_mechanism_for_route(route);
@@ -357,6 +373,7 @@ impl RouteStore {
                     tls_config_key,
                     requires_intercept,
                     requires_managed_credential,
+                    carries_managed_credential,
                     managed_auth_mechanism,
                     managed_injection_mode,
                     managed_auth,
@@ -495,6 +512,17 @@ impl RouteStore {
     }
 }
 
+fn oauth_capture_route_prefixes(
+    oauth_capture: &[crate::config::OAuthCaptureConfig],
+) -> std::collections::HashSet<String> {
+    oauth_capture
+        .iter()
+        .flat_map(|config| config.admitted_consumers.iter())
+        .filter_map(|consumer| crate::oauth_capture::route_prefix_for_consumer(consumer))
+        .map(|prefix| prefix.trim_matches('/').to_string())
+        .collect()
+}
+
 /// Whether any configured route targets a loopback upstream that must traverse
 /// the proxy (managed credentials, SPIFFE, or TLS-intercepted custom upstreams).
 #[must_use]
@@ -561,12 +589,13 @@ pub(crate) enum RouteSelection<'a> {
 ///
 /// The *credential layer* is `matched_cred` when any credential route matched,
 /// otherwise `catchall_cred` (so a credential catch-all is still in play when
-/// only credential-less `_ep_` routes matched). Two credential routes in the
-/// active layer are ambiguous (the proxy must not silently pick one). Otherwise
-/// selection prefers, in order:
-/// 1. the single credential route from the active layer — a credential catch-all
-///    thus wins over a credential-less `_ep_` match so the managed token is
-///    injected rather than silently dropped,
+/// only credential-less `_ep_` routes matched). Two routes in the active layer
+/// that require a proxy-owned credential are ambiguous (the proxy must not
+/// silently pick one). Otherwise selection prefers, in order:
+/// 1. a route from the active layer that requires a managed credential, else the
+///    first route in that layer — a credential catch-all thus wins over a
+///    credential-less `_ep_` match so the managed token is injected rather than
+///    silently dropped,
 /// 2. a matched credential-less route (bare endpoint authorization),
 /// 3. a credential-less catch-all (un-credentialed passthrough).
 #[cfg(test)]
@@ -584,17 +613,19 @@ pub(crate) fn select_route<'a>(
     let mut endpoint_authorized = false;
     for (prefix, route) in candidates {
         if route.endpoint_rules.is_empty() {
-            if route.requires_managed_credential {
+            if route.carries_managed_credential {
                 catchall_cred.push((prefix, route));
             } else {
                 catchall_passthrough.push((prefix, route));
             }
         } else if route.endpoint_rules.is_allowed(method, path) {
-            if route.requires_managed_credential {
+            if !route.requires_managed_credential {
+                endpoint_authorized = true;
+            }
+            if route.carries_managed_credential {
                 matched_cred.push((prefix, route));
             } else {
                 matched_passthrough.push((prefix, route));
-                endpoint_authorized = true;
             }
         } else if !route.requires_managed_credential {
             has_endpoint_only_route = true;
@@ -617,13 +648,19 @@ pub(crate) fn select_route<'a>(
     } else {
         &matched_cred
     };
-    if credential_layer.len() > 1 {
-        let names = credential_layer.iter().map(|(p, _)| *p).collect();
-        return RouteSelection::Ambiguous(names);
+    let contested: Vec<&str> = credential_layer
+        .iter()
+        .filter(|(_, route)| route.requires_managed_credential)
+        .map(|(prefix, _)| *prefix)
+        .collect();
+    if contested.len() > 1 {
+        return RouteSelection::Ambiguous(contested);
     }
 
     let selected = credential_layer
-        .first()
+        .iter()
+        .find(|(_, route)| route.requires_managed_credential)
+        .or_else(|| credential_layer.first())
         .copied()
         .or_else(|| matched_passthrough.first().copied())
         .or_else(|| catchall_passthrough.first().copied());
@@ -1333,6 +1370,7 @@ mod tests {
             tls_config_key: None,
             requires_intercept: false,
             requires_managed_credential: false,
+            carries_managed_credential: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
@@ -1589,6 +1627,7 @@ mod tests {
             tls_config_key: None,
             requires_intercept: true,
             requires_managed_credential: true,
+            carries_managed_credential: true,
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
             managed_auth: None,
@@ -1612,6 +1651,7 @@ mod tests {
             tls_config_key: None,
             requires_intercept: true,
             requires_managed_credential: false,
+            carries_managed_credential: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
@@ -1887,6 +1927,136 @@ mod tests {
         assert_eq!(
             select(&candidates, "GET", "/other/repo"),
             Selection::EndpointDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_selection_oauth_capture_not_shadowed_by_endpoint_route() {
+        let ep_route = RouteConfig {
+            prefix: "_ep_*".to_string(),
+            upstream: "https://*".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/**".to_string(),
+            }],
+            ..Default::default()
+        };
+        let oauth_route = RouteConfig {
+            prefix: "anthropic_oauth".to_string(),
+            upstream: "https://api.anthropic.com".to_string(),
+            endpoint_rules: vec![
+                crate::config::EndpointRule {
+                    method: "GET".to_string(),
+                    path: "/v1/mcp_servers".to_string(),
+                },
+                crate::config::EndpointRule {
+                    method: "POST".to_string(),
+                    path: "/v1/messages".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let capture = vec![crate::config::OAuthCaptureConfig {
+            provider: "claude_code".to_string(),
+            token_endpoints: vec![],
+            admitted_consumers: vec![crate::oauth_capture::route_consumer("anthropic_oauth")],
+        }];
+
+        let store = RouteStore::load_with_oauth_capture(&[ep_route, oauth_route], &capture)
+            .await
+            .unwrap();
+        let route = store.get("anthropic_oauth").unwrap();
+        assert!(
+            route.carries_managed_credential,
+            "an admitted oauth_capture consumer must be credential-bearing for selection"
+        );
+        assert!(
+            !route.requires_managed_credential,
+            "the credential arrives with the request, so the fail-closed \
+             availability gate must not claim the proxy owes one"
+        );
+
+        let candidates = store.lookup_all_by_upstream("api.anthropic.com:443");
+        assert_eq!(candidates.len(), 2);
+
+        assert_eq!(
+            select(&candidates, "GET", "/v1/mcp_servers"),
+            Selection::Route("anthropic_oauth"),
+            "oauth_capture route must not be shadowed by the _ep_ wildcard"
+        );
+        assert_eq!(
+            select(&candidates, "POST", "/v1/messages"),
+            Selection::Route("anthropic_oauth"),
+            "a credential route's own rules authorize the request"
+        );
+        assert_eq!(
+            select(&candidates, "DELETE", "/v1/messages"),
+            Selection::EndpointDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_selection_redeem_phantoms_not_shadowed() {
+        let ep_route = RouteConfig {
+            prefix: "_ep_api.example.com".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/**".to_string(),
+            }],
+            ..Default::default()
+        };
+        let redeem_route = RouteConfig {
+            prefix: "example_redeem".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            redeem_phantoms: vec!["example".to_string()],
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/v1/**".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let store = RouteStore::load(&[ep_route, redeem_route]).await.unwrap();
+        let candidates = store.lookup_all_by_upstream("api.example.com:443");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            select(&candidates, "GET", "/v1/thing"),
+            Selection::Route("example_redeem"),
+            "a phantom-redeeming route must not be shadowed by an _ep_ route"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oauth_capture_marking_requires_admitted_consumer() {
+        let oauth_route = RouteConfig {
+            prefix: "anthropic_oauth".to_string(),
+            upstream: "https://api.anthropic.com".to_string(),
+            ..Default::default()
+        };
+        let store = RouteStore::load(std::slice::from_ref(&oauth_route))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .get("anthropic_oauth")
+                .unwrap()
+                .carries_managed_credential
+        );
+
+        let capture = vec![crate::config::OAuthCaptureConfig {
+            provider: "anthropic_oauth".to_string(),
+            token_endpoints: vec![],
+            admitted_consumers: vec!["oauth.anthropic_oauth".to_string()],
+        }];
+        let store = RouteStore::load_with_oauth_capture(&[oauth_route], &capture)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .get("anthropic_oauth")
+                .unwrap()
+                .carries_managed_credential
         );
     }
 
@@ -2229,5 +2399,143 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         .unwrap();
         let store = RouteStore::load(&[route]).await.unwrap();
         assert!(store.get("chat").unwrap().requires_intercept);
+    }
+
+    #[tokio::test]
+    async fn test_credential_route_cannot_lift_endpoint_only_gate() {
+        let ep_route = RouteConfig {
+            prefix: "_ep_*".to_string(),
+            upstream: "https://*".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/**".to_string(),
+            }],
+            ..Default::default()
+        };
+        let cred_route = RouteConfig {
+            prefix: "gh".to_string(),
+            upstream: "https://api.github.com".to_string(),
+            credential_key: Some("env://GH_TOKEN".to_string()),
+            credential_format: Some("Bearer {}".to_string()),
+            env_var: Some("GH_TOKEN".to_string()),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "POST".to_string(),
+                path: "/repos/**".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let store = RouteStore::load(&[ep_route, cred_route]).await.unwrap();
+        let candidates = store.lookup_all_by_upstream("api.github.com:443");
+        assert_eq!(candidates.len(), 2);
+
+        assert_eq!(
+            select(&candidates, "POST", "/repos/x"),
+            Selection::EndpointDenied,
+            "a read-only _ep_ wildcard must still deny POST when only a \
+             credential route authorizes it"
+        );
+        assert_eq!(
+            select(&candidates, "GET", "/repos/x"),
+            Selection::Route("_ep_*")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redeem_and_credential_catchall_is_not_ambiguous() {
+        let redeem_route = RouteConfig {
+            prefix: "redeemer".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            redeem_phantoms: vec!["example".to_string()],
+            ..Default::default()
+        };
+        let cred_route = RouteConfig {
+            prefix: "creds".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://TOK".to_string()),
+            credential_format: Some("Bearer {}".to_string()),
+            env_var: Some("TOK".to_string()),
+            ..Default::default()
+        };
+
+        let store = RouteStore::load(&[redeem_route, cred_route]).await.unwrap();
+        let candidates = store.lookup_all_by_upstream("api.example.com:443");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            select(&candidates, "GET", "/v1/thing"),
+            Selection::Route("creds"),
+            "the route owning a proxy credential wins over a phantom redeemer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_two_provider_routes_one_api_host_is_not_ambiguous() {
+        let provider_route = |prefix: &str| RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: "https://api.anthropic.com".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "*".to_string(),
+                path: "/**".to_string(),
+            }],
+            ..Default::default()
+        };
+        let capture = vec![crate::config::OAuthCaptureConfig {
+            provider: "claude_code".to_string(),
+            token_endpoints: vec![],
+            admitted_consumers: vec![
+                crate::oauth_capture::route_consumer("route_a"),
+                crate::oauth_capture::route_consumer("route_b"),
+            ],
+        }];
+
+        let store = RouteStore::load_with_oauth_capture(
+            &[provider_route("route_a"), provider_route("route_b")],
+            &capture,
+        )
+        .await
+        .unwrap();
+        let candidates = store.lookup_all_by_upstream("api.anthropic.com:443");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            select(&candidates, "POST", "/v1/messages"),
+            Selection::Route("route_a"),
+            "two routes sharing one provider phantom must not 403 as ambiguous"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oauth_capture_consumer_route_requires_intercept() {
+        let oauth_route = RouteConfig {
+            prefix: "anthropic_oauth".to_string(),
+            upstream: "https://api.anthropic.com".to_string(),
+            endpoint_policy: Some(crate::config::EndpointPolicyConfig {
+                default: crate::config::EndpointPolicyDefault {
+                    decision: crate::config::EndpointPolicyDecision::Allow,
+                    backend: None,
+                    timeout_secs: None,
+                },
+                deny: vec![],
+                approve: vec![],
+                allow: vec![],
+            }),
+            ..Default::default()
+        };
+        let capture = vec![crate::config::OAuthCaptureConfig {
+            provider: "claude_code".to_string(),
+            token_endpoints: vec![],
+            admitted_consumers: vec![crate::oauth_capture::route_consumer("anthropic_oauth")],
+        }];
+
+        let store = RouteStore::load_with_oauth_capture(&[oauth_route], &capture)
+            .await
+            .unwrap();
+        let route = store.get("anthropic_oauth").unwrap();
+        assert!(route.carries_managed_credential);
+        assert!(!route.requires_managed_credential);
+        assert!(
+            route.requires_intercept,
+            "the phantom cannot be swapped without L7 visibility"
+        );
+        assert!(store.has_intercept_route("api.anthropic.com:443"));
     }
 }

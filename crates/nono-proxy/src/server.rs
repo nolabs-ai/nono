@@ -1055,7 +1055,7 @@ pub async fn start_with_nonce_resolver(
     let route_store = if config.routes.is_empty() {
         RouteStore::empty()
     } else {
-        RouteStore::load(&config.routes).await?
+        RouteStore::load_with_oauth_capture(&config.routes, &config.oauth_capture).await?
     };
     let route_hosts = route_store.route_upstream_hosts();
     validate_no_proxy_route_conflicts(&config.no_proxy, &route_hosts)?;

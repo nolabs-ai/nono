@@ -2485,6 +2485,46 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
     }
 
     #[tokio::test]
+    async fn test_matched_redeem_route_outranks_credential_catchall() {
+        let redeem_route = RouteConfig {
+            prefix: "redeemer".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            redeem_phantoms: vec!["example".to_string()],
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "POST".to_string(),
+                path: "/v1/messages".to_string(),
+            }],
+            ..Default::default()
+        };
+        let cred_catchall = RouteConfig {
+            prefix: "creds".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://TOK".to_string()),
+            credential_format: Some("Bearer {}".to_string()),
+            env_var: Some("TOK".to_string()),
+            ..Default::default()
+        };
+
+        let store = RouteStore::load(&[redeem_route, cred_catchall])
+            .await
+            .unwrap();
+        let candidates = store.lookup_all_by_upstream("api.example.com:443");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            select(&candidates, "POST", "/v1/messages"),
+            Selection::Route("redeemer"),
+            "an endpoint-matched phantom redeemer wins over a credential catch-all, \
+             so the catch-all's managed credential is not injected for this request"
+        );
+        assert_eq!(
+            select(&candidates, "GET", "/v1/other"),
+            Selection::EndpointDenied,
+            "the redeemer's endpoint rules still gate the upstream: a credential \
+             catch-all must not widen them"
+        );
+    }
+
+    #[tokio::test]
     async fn test_two_provider_routes_one_api_host_is_not_ambiguous() {
         let provider_route = |prefix: &str| RouteConfig {
             prefix: prefix.to_string(),

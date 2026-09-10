@@ -3755,6 +3755,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn select_intercept_route_matched_redeemer_outranks_credential_catchall() {
+        fn req<'a>(method: &'a str, path: &'a str) -> InterceptRouteRequest<'a> {
+            InterceptRouteRequest {
+                method,
+                path,
+                websocket_path: None,
+            }
+        }
+
+        let redeem_route = crate::config::RouteConfig {
+            prefix: "redeemer".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            redeem_phantoms: vec!["example".to_string()],
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "POST".to_string(),
+                path: "/v1/messages".to_string(),
+            }],
+            ..Default::default()
+        };
+        let cred_catchall = crate::config::RouteConfig {
+            prefix: "creds".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://TOK".to_string()),
+            credential_format: Some("Bearer {}".to_string()),
+            env_var: Some("TOK".to_string()),
+            ..Default::default()
+        };
+        let store = RouteStore::load(&[redeem_route, cred_catchall])
+            .await
+            .unwrap();
+
+        match select_intercept_route(
+            &store,
+            "api.example.com",
+            443,
+            req("POST", "/v1/messages"),
+            None,
+            None,
+        )
+        .await
+        {
+            RouteSelection::Selected(Some(selected)) => assert_eq!(
+                selected.id, "redeemer",
+                "an endpoint-matched phantom redeemer wins over a credential catch-all"
+            ),
+            RouteSelection::Selected(None) => {
+                panic!("expected the redeemer route, got passthrough")
+            }
+            RouteSelection::Rejected(status) => {
+                panic!("expected the redeemer route, got a {status} rejection")
+            }
+        }
+
+        match select_intercept_route(
+            &store,
+            "api.example.com",
+            443,
+            req("GET", "/v1/other"),
+            None,
+            None,
+        )
+        .await
+        {
+            RouteSelection::Rejected(status) => assert_eq!(
+                status, 403,
+                "the redeemer's endpoint rules still gate the upstream: a credential \
+                 catch-all must not widen them"
+            ),
+            RouteSelection::Selected(Some(selected)) => {
+                panic!("expected a hard deny, got route '{}'", selected.id)
+            }
+            RouteSelection::Selected(None) => panic!("expected a hard deny, got passthrough"),
+        }
+    }
+
+    #[tokio::test]
     async fn select_intercept_route_credential_route_cannot_lift_endpoint_only_gate() {
         fn req<'a>(method: &'a str, path: &'a str) -> InterceptRouteRequest<'a> {
             InterceptRouteRequest {

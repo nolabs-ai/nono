@@ -2,14 +2,11 @@
 //!
 //! Reusable infrastructure for counting or suppressing deprecation
 //! emissions during a profile parse, independent of any single
-//! deprecation's lifecycle. Currently used by `cmd_validate` (counter) and
-//! `load_profile_extends` (suppression, so a preview parse doesn't warn
-//! twice before the real parse runs).
+//! deprecation's lifecycle.
 
 use std::cell::Cell;
 
 thread_local! {
-    /// `None` when not counting; `Some(n)` inside a counting scope.
     static WARNING_COUNTER: Cell<Option<usize>> = const { Cell::new(None) };
 
     /// Non-zero while inside one or more `WarningSuppressionGuard` scopes.

@@ -221,13 +221,16 @@ fn filter_sessions(
         });
     }
 
-    // Filter by --path
+    // Filter by --path (canonicalize both sides so macOS symlinks like
+    // `/var` → `/private/var` and `/tmp` → `/private/tmp` are handled)
     if let Some(ref path_filter) = args.path {
+        let canonical_filter = nono::path::try_canonicalize(path_filter);
         sessions.retain(|s| {
-            s.metadata
-                .tracked_paths
-                .iter()
-                .any(|p| p.starts_with(path_filter) || path_filter.starts_with(p))
+            s.metadata.tracked_paths.iter().any(|p| {
+                let canonical_p = nono::path::try_canonicalize(p);
+                canonical_p.starts_with(&canonical_filter)
+                    || canonical_filter.starts_with(&canonical_p)
+            })
         });
     }
 
@@ -1373,5 +1376,154 @@ mod tests {
         assert!(!sanitized.chars().any(char::is_control));
         assert!(sanitized.chars().count() <= 4096);
         assert!(sanitized.ends_with("..."));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod path_filter_tests {
+    use super::{SessionInfo, filter_sessions};
+    use crate::cli::AuditListArgs;
+    use nono::undo::SessionMetadata;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn session_with_path(tracked: PathBuf) -> SessionInfo {
+        SessionInfo {
+            metadata: SessionMetadata {
+                session_id: "20260421-111111-12345".to_string(),
+                started: "2026-04-21T11:11:11+01:00".to_string(),
+                ended: Some("2026-04-21T11:11:12+01:00".to_string()),
+                command: vec!["/bin/true".to_string()],
+                executable_identity: None,
+                tracked_paths: vec![tracked],
+                snapshot_count: 0,
+                exit_code: Some(0),
+                merkle_roots: Vec::new(),
+                network_events: Vec::new(),
+                audit_event_count: 0,
+                audit_integrity: None,
+                audit_attestation: None,
+                command_policy_summary: None,
+            },
+            dir: PathBuf::from("/tmp"),
+            disk_size: 0,
+            is_alive: false,
+            is_stale: false,
+        }
+    }
+
+    fn list_args_with_path(p: PathBuf) -> AuditListArgs {
+        AuditListArgs {
+            today: false,
+            since: None,
+            until: None,
+            command: None,
+            path: Some(p),
+            recent: None,
+            no_tools: false,
+            json: false,
+            help: None,
+        }
+    }
+
+    #[test]
+    fn filter_sessions_path_exact_match() {
+        let session = session_with_path(PathBuf::from("/tmp/work"));
+        let args = list_args_with_path(PathBuf::from("/tmp/work"));
+        let out = filter_sessions(vec![session], &args).unwrap();
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn filter_sessions_path_subpath_match() {
+        let session = session_with_path(PathBuf::from("/tmp/work/project"));
+        let args = list_args_with_path(PathBuf::from("/tmp/work"));
+        let out = filter_sessions(vec![session], &args).unwrap();
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn filter_sessions_path_parent_of_tracked() {
+        // tracked is /tmp/work, filter is /tmp/work/project → match because
+        // filter is inside tracked (or tracked is parent of filter)
+        let session = session_with_path(PathBuf::from("/tmp/work"));
+        let args = list_args_with_path(PathBuf::from("/tmp/work/project/subdir"));
+        let out = filter_sessions(vec![session], &args).unwrap();
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn filter_sessions_path_no_match() {
+        let session = session_with_path(PathBuf::from("/tmp/work"));
+        let args = list_args_with_path(PathBuf::from("/other/path"));
+        let out = filter_sessions(vec![session], &args).unwrap();
+        assert_eq!(out.len(), 0);
+    }
+
+    #[test]
+    fn filter_sessions_path_canonicalizes_symlink() {
+        // Simulate macOS /var → /private/var via tempdir symlink
+        let tmp = tempfile::tempdir().unwrap();
+        let private_var = tmp.path().join("private").join("var").join("run");
+        fs::create_dir_all(&private_var).unwrap();
+        let private_file = private_var.join("mywork");
+        fs::create_dir_all(&private_file).unwrap();
+
+        let var_link = tmp.path().join("var");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(tmp.path().join("private").join("var"), &var_link).unwrap();
+
+        // Session tracks canonical /private/var/run/mywork
+        let canonical_tracked = private_file.canonicalize().unwrap();
+        let session = session_with_path(canonical_tracked);
+
+        // User filters by symlink path /var/run (via tmp/var/run)
+        let filter_via_symlink = var_link.join("run");
+        let args = list_args_with_path(filter_via_symlink);
+        let out = filter_sessions(vec![session], &args).unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "symlinked filter path should match canonical tracked path"
+        );
+    }
+
+    #[test]
+    fn filter_sessions_path_canonicalizes_tmp_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let private_tmp = tmp.path().join("private").join("tmp").join("work");
+        fs::create_dir_all(&private_tmp).unwrap();
+
+        let tmp_link = tmp.path().join("tmp");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(tmp.path().join("private").join("tmp"), &tmp_link).unwrap();
+
+        let canonical_tracked = private_tmp.canonicalize().unwrap();
+        let session = session_with_path(canonical_tracked);
+
+        let filter_via_symlink = tmp_link.join("work");
+        let args = list_args_with_path(filter_via_symlink);
+        let out = filter_sessions(vec![session], &args).unwrap();
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn filter_sessions_path_none_returns_all() {
+        let s1 = session_with_path(PathBuf::from("/tmp/a"));
+        let s2 = session_with_path(PathBuf::from("/tmp/b"));
+        let args = AuditListArgs {
+            today: false,
+            since: None,
+            until: None,
+            command: None,
+            path: None,
+            recent: None,
+            no_tools: false,
+            json: false,
+            help: None,
+        };
+        let out = filter_sessions(vec![s1, s2], &args).unwrap();
+        assert_eq!(out.len(), 2);
     }
 }

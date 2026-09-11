@@ -167,6 +167,26 @@ fn migrate_claude_json(legacy: &Path, canonical: &Path, claude_dir: &Path) {
     }
 
     fn relink_legacy(legacy: &Path, canonical: &Path) {
+        // Keep the compatibility link portable when HOME is mounted at a
+        // different path (for example, inside a container). The migration
+        // only links a legacy file to its sibling Claude directory, so this
+        // relationship must be provable before replacing an existing link.
+        let Some(legacy_parent) = legacy.parent() else {
+            warn!(
+                "Cannot create Claude compatibility symlink: {} has no parent",
+                legacy.display()
+            );
+            return;
+        };
+        let Ok(relative_target) = canonical.strip_prefix(legacy_parent) else {
+            warn!(
+                "Cannot create Claude compatibility symlink: {} is not beneath {}",
+                canonical.display(),
+                legacy_parent.display()
+            );
+            return;
+        };
+
         match std::fs::symlink_metadata(legacy) {
             Err(_) => {}
             Ok(meta) if meta.file_type().is_symlink() => {
@@ -180,7 +200,7 @@ fn migrate_claude_json(legacy: &Path, canonical: &Path, claude_dir: &Path) {
             }
             Ok(_) => return, // unexpected non-symlink left behind; don't touch it
         }
-        if let Err(error) = std::os::unix::fs::symlink(canonical, legacy) {
+        if let Err(error) = std::os::unix::fs::symlink(relative_target, legacy) {
             warn!(
                 "Failed to symlink {} -> {}: {error}",
                 legacy.display(),
@@ -1960,7 +1980,8 @@ mod tests {
         let canonical = claude_dir.join("canonical.json");
         let old_style = claude_dir.join("claude.json");
         std::fs::write(&old_style, "old style").expect("write old style");
-        std::os::unix::fs::symlink(&old_style, &legacy).expect("symlink legacy to old style");
+        std::os::unix::fs::symlink(".claude/claude.json", &legacy)
+            .expect("symlink legacy to old style");
 
         migrate_claude_json(&legacy, &canonical, &claude_dir);
 
@@ -1971,7 +1992,37 @@ mod tests {
         assert!(!old_style.exists(), "old-style file should have moved");
         assert_eq!(
             std::fs::read_link(&legacy).expect("legacy should be a symlink"),
-            canonical
+            Path::new("claude/canonical.json")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn migrate_claude_json_preserves_existing_076_canonical_config() {
+        let dir = tempdir().expect("tempdir");
+        let claude_dir = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        let legacy = dir.path().join("legacy.json");
+        let canonical = claude_dir.join("canonical.json");
+        let old_style = claude_dir.join("claude.json");
+        std::fs::write(&canonical, "created by 0.76").expect("write canonical");
+        std::fs::write(&old_style, "pre-0.76 config").expect("write old style");
+        std::os::unix::fs::symlink(".claude/claude.json", &legacy)
+            .expect("symlink legacy to old style");
+
+        migrate_claude_json(&legacy, &canonical, &claude_dir);
+
+        assert_eq!(
+            std::fs::read_to_string(&canonical).expect("read canonical"),
+            "created by 0.76"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&old_style).expect("read old style"),
+            "pre-0.76 config"
+        );
+        assert_eq!(
+            std::fs::read_link(&legacy).expect("read legacy symlink"),
+            Path::new(".claude/claude.json")
         );
     }
 
@@ -1993,7 +2044,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_link(&legacy).expect("legacy should be a symlink"),
-            canonical
+            Path::new("claude/canonical.json")
         );
     }
 

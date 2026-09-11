@@ -186,16 +186,7 @@ fn parse_pid_from_session_id(session_id: &str) -> Option<u32> {
 
 /// Check if a process with the given PID is still alive.
 fn is_process_alive(pid: u32) -> bool {
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-    let nix_pid = Pid::from_raw(pid as i32);
-    match kill(nix_pid, None) {
-        Ok(()) => true,
-        Err(nix::errno::Errno::ESRCH) => false,
-        Err(nix::errno::Errno::EPERM) => true,
-        // Fail-secure: treat other errors as alive to avoid deleting live data.
-        Err(_) => true,
-    }
+    crate::session::is_pid_alive_simple(pid)
 }
 
 /// Calculate the total size of all files in a directory tree.
@@ -339,9 +330,16 @@ mod tests {
     }
 
     #[test]
-    fn is_process_alive_fail_secure_on_invalid_pid() {
-        let _ = is_process_alive(0);
+    fn is_process_alive_rejects_invalid_pid_zero() {
+        assert!(!is_process_alive(0));
+        assert!(!is_process_alive(u32::MAX));
+        assert!(!is_process_alive(i32::MAX as u32 + 1));
+    }
+
+    #[test]
+    fn is_process_alive_does_not_panic_on_edge_pids() {
         let _ = is_process_alive(1);
+        let _ = is_process_alive(i32::MAX as u32);
     }
 
     #[test]

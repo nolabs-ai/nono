@@ -692,8 +692,7 @@
         ]
       },
       "network": { "block": false },
-      "workdir": { "access": "none" },
-      "interactive": false
+      "workdir": { "access": "none" }
     },
     "linux-host-compat": {
       "extends": "default",
@@ -715,8 +714,7 @@
       },
       "filesystem": {},
       "network": { "block": false },
-      "workdir": { "access": "none" },
-      "interactive": false
+      "workdir": { "access": "none" }
     },
     "mise-dev": {
       "extends": "default",
@@ -734,8 +732,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "python-dev": {
       "extends": "default",
@@ -754,8 +751,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "node-dev": {
       "extends": "default",
@@ -773,8 +769,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "bun-dev": {
       "extends": "default",
@@ -792,8 +787,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "go-dev": {
       "extends": "default",
@@ -811,8 +805,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "java-dev": {
       "extends": "default",
@@ -833,8 +826,7 @@
       ],
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "rust-dev": {
       "extends": "default",
@@ -852,8 +844,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     }
   }
 }

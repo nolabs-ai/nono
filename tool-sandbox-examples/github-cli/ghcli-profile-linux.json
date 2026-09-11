@@ -264,7 +264,6 @@
   "allow_launch_services": null,
   "allow_gpu": null,
   "allow_parent_of_protected": null,
-  "interactive": false,
   "skipdirs": [],
   "packs": [],
   "binary": null,

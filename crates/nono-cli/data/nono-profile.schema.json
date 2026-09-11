@@ -106,11 +106,6 @@
       ],
       "description": "Opt-in gate for GPU access (Metal/IOKit on Apple Silicon macOS, render nodes on Linux). Intel Macs are not yet supported. Must be paired with the CLI flag --allow-gpu. Set to null to inherit from the base profile."
     },
-    "interactive": {
-      "type": "boolean",
-      "description": "Deprecated. Parsed for backward compatibility but ignored. Supervised mode preserves TTY by default.",
-      "deprecated": true
-    },
     "packs": {
       "type": "array",
       "items": { "type": "string" },

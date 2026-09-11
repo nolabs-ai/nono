@@ -21,6 +21,35 @@ use nono::{NonoError, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Build canonical path candidates for `--path` filtering.
+///
+/// Tracked paths are stored canonical (from `FsCapability::resolved`), so the
+/// filter is canonicalized once and, on macOS, expanded to both symlink forms
+/// (`/tmp` <-> `/private/tmp`, etc.) to match regardless of user input form.
+/// Stored paths are not re-canonicalized inside the loop to avoid O(N) I/O.
+fn canonical_candidates(path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(2);
+    let primary = nono::path::try_canonicalize(path);
+    candidates.push(primary.clone());
+    #[cfg(target_os = "macos")]
+    {
+        let prefixes: &[(&str, &str)] = &[
+            ("/tmp", "/private/tmp"),
+            ("/etc", "/private/etc"),
+            ("/var", "/private/var"),
+        ];
+        let primary_str = primary.to_string_lossy();
+        for &(short, long) in prefixes {
+            if let Some(rest) = primary_str.strip_prefix(long) {
+                candidates.push(PathBuf::from(format!("{short}{rest}")));
+            } else if let Some(rest) = primary_str.strip_prefix(short) {
+                candidates.push(PathBuf::from(format!("{long}{rest}")));
+            }
+        }
+    }
+    candidates
+}
+
 /// Prefix used for all audit command output
 fn prefix() -> colored::ColoredString {
     let t = theme::current();
@@ -221,15 +250,15 @@ fn filter_sessions(
         });
     }
 
-    // Filter by --path (canonicalize both sides so macOS symlinks like
-    // `/var` → `/private/var` and `/tmp` → `/private/tmp` are handled)
+    // Filter by --path: canonicalize user filter once, compare against
+    // stored canonical tracked paths without per-entry I/O.
     if let Some(ref path_filter) = args.path {
-        let canonical_filter = nono::path::try_canonicalize(path_filter);
+        let filter_candidates = canonical_candidates(path_filter);
         sessions.retain(|s| {
-            s.metadata.tracked_paths.iter().any(|p| {
-                let canonical_p = nono::path::try_canonicalize(p);
-                canonical_p.starts_with(&canonical_filter)
-                    || canonical_filter.starts_with(&canonical_p)
+            s.metadata.tracked_paths.iter().any(|stored| {
+                filter_candidates
+                    .iter()
+                    .any(|filter| stored.starts_with(filter) || filter.starts_with(stored))
             })
         });
     }

@@ -7179,6 +7179,7 @@ mod tests {
                 timeout_secs: None,
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
         base.security.approval_defaults = Some(ApprovalDefaultsConfig {
@@ -7195,6 +7196,7 @@ mod tests {
                 timeout_secs: Some(30),
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
 

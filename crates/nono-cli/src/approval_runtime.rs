@@ -6,7 +6,7 @@ use nono::{ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const WEBHOOK_RESPONSE_LIMIT_BYTES: u64 = 64 * 1024;
 
@@ -138,11 +138,25 @@ impl ApprovalBackend for NamedTerminalApproval {
     }
 }
 
+/// Path of the platform's enrolled approval ingest, relative to the enrolled
+/// platform URL. The poll route is `<this>/{request_id}`.
+const PLATFORM_APPROVALS_PATH: &str = "/api/v1/approvals";
+/// Pause between polls when the server answers `pending` immediately instead
+/// of holding the request open.
+const PLATFORM_POLL_BACKOFF: Duration = Duration::from_millis(250);
+/// Header carrying the client's remaining patience so the server-side hold and
+/// deadline match this backend's `timeout_secs`.
+const HEADER_TIMEOUT_SECS: &str = "X-Nono-Timeout-Secs";
+
 struct WebhookApproval {
     name: String,
     url: String,
     timeout: Duration,
     http: ureq::Agent,
+    /// Present when `auth: "platform"`: sign each request with the enrolled
+    /// key and follow the platform's submit-and-poll contract.
+    platform: Option<crate::platform_client::PlatformState>,
+    poll_backoff: Duration,
 }
 
 #[derive(Serialize)]
@@ -158,11 +172,53 @@ struct WebhookDecisionResponse {
     reason: Option<String>,
 }
 
+/// Platform submit/poll response (`platform-protocol::approvals::ApprovalStatus`).
+#[derive(Deserialize)]
+struct PlatformApprovalStatus {
+    state: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// One hop of the platform exchange.
+enum PlatformStep<'a> {
+    Submit(&'a [u8]),
+    Poll { request_id: &'a str },
+}
+
+struct HttpReply {
+    status: u16,
+    body: String,
+}
+
 impl WebhookApproval {
     fn new(name: &str, config: &ApprovalBackendConfig) -> Result<Self> {
-        let url = config.url.clone().ok_or_else(|| {
-            NonoError::ConfigParse(format!("approval backend '{name}' webhook missing url"))
-        })?;
+        let platform = match config.auth {
+            Some(crate::command_policy::ApprovalBackendAuth::Platform) => Some(
+                crate::platform_client::load_state()?.ok_or_else(|| {
+                    NonoError::ConfigParse(format!(
+                        "approval backend '{name}' uses auth platform but this client is not enrolled; run `nono platform enroll` first"
+                    ))
+                })?,
+            ),
+            None => None,
+        };
+        let url = match (&config.url, &platform) {
+            (Some(url), _) => url.clone(),
+            (None, Some(state)) => {
+                crate::platform_client::endpoint_url(&state.platform_url, PLATFORM_APPROVALS_PATH)?
+            }
+            (None, None) => {
+                return Err(NonoError::ConfigParse(format!(
+                    "approval backend '{name}' webhook missing url"
+                )));
+            }
+        };
+        if platform.is_some() && !crate::command_policy::is_platform_grade_url(&url) {
+            return Err(NonoError::ConfigParse(format!(
+                "approval backend '{name}' with auth platform must use an https URL (plain http is allowed only for loopback)"
+            )));
+        }
         let timeout = Duration::from_secs(config.timeout_secs.unwrap_or(60));
         let tls_config = ureq::tls::TlsConfig::builder()
             .root_certs(ureq::tls::RootCerts::PlatformVerifier)
@@ -177,6 +233,8 @@ impl WebhookApproval {
             url,
             timeout,
             http,
+            platform,
+            poll_backoff: PLATFORM_POLL_BACKOFF,
         })
     }
 
@@ -209,6 +267,209 @@ impl WebhookApproval {
             ))),
         }
     }
+
+    fn http_status_denial(&self, status: u16, started: Instant) -> ApprovalDecision {
+        ApprovalDecision::Denied {
+            reason: format!(
+                "approval webhook '{}' returned HTTP {status} after {}s",
+                self.name,
+                started.elapsed().as_secs()
+            ),
+        }
+    }
+
+    fn read_body(&self, response: &mut ureq::http::Response<ureq::Body>) -> Result<String> {
+        response
+            .body_mut()
+            .with_config()
+            .limit(WEBHOOK_RESPONSE_LIMIT_BYTES)
+            .read_to_string()
+            .map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "failed to read approval webhook '{}' response: {e}",
+                    self.name
+                ))
+            })
+    }
+
+    /// Legacy contract: one blocking POST, the response is the decision. This
+    /// is what the console ingest and the in-cell approval shim speak.
+    fn request_unsigned(&self, body: &[u8], started: Instant) -> Result<ApprovalDecision> {
+        let mut response = self
+            .http
+            .post(&self.url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("Content-Type", "application/json")
+            .header(
+                "User-Agent",
+                &format!("nono-cli/{}", env!("CARGO_PKG_VERSION")),
+            )
+            .header(HEADER_TIMEOUT_SECS, &self.timeout.as_secs().to_string())
+            .send(body)
+            .map_err(|e| {
+                NonoError::SandboxInit(format!("approval webhook '{}' failed: {e}", self.name))
+            })?;
+
+        let status = response.status().as_u16();
+        let response_body = self.read_body(&mut response)?;
+        if !(200..300).contains(&status) {
+            return Ok(self.http_status_denial(status, started));
+        }
+        self.parse_response(&response_body)
+    }
+
+    /// Platform contract: submit, then poll `GET <url>/{request_id}` with
+    /// signed requests until a final state or this backend's timeout. The
+    /// transport is injected so the state machine is testable without HTTP.
+    fn drive_platform_approval(
+        &self,
+        request_id: &str,
+        body: &[u8],
+        started: Instant,
+        mut send: impl FnMut(PlatformStep<'_>, Duration) -> Result<HttpReply>,
+    ) -> Result<ApprovalDecision> {
+        let mut submitted = false;
+        loop {
+            let remaining = self.timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(ApprovalDecision::Timeout);
+            }
+            let step = if submitted {
+                PlatformStep::Poll { request_id }
+            } else {
+                PlatformStep::Submit(body)
+            };
+            let reply = send(step, remaining)?;
+            if !(200..300).contains(&reply.status) {
+                return Ok(self.http_status_denial(reply.status, started));
+            }
+            let status: PlatformApprovalStatus =
+                serde_json::from_str(&reply.body).map_err(|e| {
+                    NonoError::SandboxInit(format!(
+                        "approval webhook '{}' returned invalid JSON: {e}",
+                        self.name
+                    ))
+                })?;
+            match status.state.as_str() {
+                "pending" => {
+                    submitted = true;
+                    if !self.poll_backoff.is_zero() {
+                        std::thread::sleep(self.poll_backoff.min(remaining));
+                    }
+                }
+                "granted" => return Ok(ApprovalDecision::Granted),
+                "denied" => {
+                    return Ok(ApprovalDecision::Denied {
+                        reason: status.reason.unwrap_or_else(|| {
+                            format!("approval webhook '{}' denied request", self.name)
+                        }),
+                    });
+                }
+                "timeout" => return Ok(ApprovalDecision::Timeout),
+                other => {
+                    return Err(NonoError::SandboxInit(format!(
+                        "approval webhook '{}' returned unknown state '{other}'",
+                        self.name
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Stamp the six `nono-request-v1` headers plus the timeout hint for one
+    /// platform request. `path` is the URL path as the server will see it.
+    fn platform_headers(
+        state: &crate::platform_client::PlatformState,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        remaining: Duration,
+    ) -> Result<Vec<(&'static str, String)>> {
+        let signed = crate::platform_client::sign_request_v1(
+            state,
+            method,
+            path,
+            uuid::Uuid::now_v7(),
+            body,
+        )?;
+        Ok(vec![
+            (
+                "X-Nono-Protocol-Version",
+                crate::platform_client::REQUEST_PROTOCOL_V1.to_string(),
+            ),
+            ("X-Nono-Subject-Id", state.subject_id.clone()),
+            ("X-Nono-Timestamp", signed.timestamp),
+            ("X-Nono-Request-Id", signed.request_id),
+            ("X-Nono-Content-SHA256", signed.body_digest),
+            ("X-Nono-Signature", signed.signature),
+            (HEADER_TIMEOUT_SECS, remaining.as_secs().max(1).to_string()),
+        ])
+    }
+
+    fn send_platform(
+        &self,
+        state: &crate::platform_client::PlatformState,
+        step: PlatformStep<'_>,
+        remaining: Duration,
+    ) -> Result<HttpReply> {
+        let mut url = url::Url::parse(&self.url).map_err(|e| {
+            NonoError::ConfigParse(format!(
+                "approval backend '{}' has an invalid url: {e}",
+                self.name
+            ))
+        })?;
+        let (method, body) = match step {
+            PlatformStep::Submit(body) => ("POST", body),
+            PlatformStep::Poll { request_id } => {
+                url.path_segments_mut()
+                    .map_err(|_| {
+                        NonoError::ConfigParse(format!(
+                            "approval backend '{}' url cannot take a path",
+                            self.name
+                        ))
+                    })?
+                    .pop_if_empty()
+                    .push(request_id);
+                ("GET", &[][..])
+            }
+        };
+        let headers = Self::platform_headers(state, method, url.path(), body, remaining)?;
+        let user_agent = format!("nono-cli/{}", env!("CARGO_PKG_VERSION"));
+        let failed = |e: ureq::Error| {
+            NonoError::SandboxInit(format!("approval webhook '{}' failed: {e}", self.name))
+        };
+        let mut response = if method == "POST" {
+            let mut request = self
+                .http
+                .post(url.as_str())
+                .config()
+                .http_status_as_error(false)
+                .build()
+                .header("Content-Type", "application/json")
+                .header("User-Agent", &user_agent);
+            for (name, value) in &headers {
+                request = request.header(*name, value);
+            }
+            request.send(body).map_err(failed)?
+        } else {
+            let mut request = self
+                .http
+                .get(url.as_str())
+                .config()
+                .http_status_as_error(false)
+                .build()
+                .header("User-Agent", &user_agent);
+            for (name, value) in &headers {
+                request = request.header(*name, value);
+            }
+            request.call().map_err(failed)?
+        };
+        let status = response.status().as_u16();
+        let body = self.read_body(&mut response)?;
+        Ok(HttpReply { status, body })
+    }
 }
 
 impl ApprovalBackend for WebhookApproval {
@@ -223,46 +484,16 @@ impl ApprovalBackend for WebhookApproval {
                 self.name
             ))
         })?;
-
-        let mut response = self
-            .http
-            .post(&self.url)
-            .config()
-            .http_status_as_error(false)
-            .build()
-            .header("Content-Type", "application/json")
-            .header(
-                "User-Agent",
-                &format!("nono-cli/{}", env!("CARGO_PKG_VERSION")),
-            )
-            .send(body)
-            .map_err(|e| {
-                NonoError::SandboxInit(format!("approval webhook '{}' failed: {e}", self.name))
-            })?;
-
-        let status = response.status().as_u16();
-        let response_body = response
-            .body_mut()
-            .with_config()
-            .limit(WEBHOOK_RESPONSE_LIMIT_BYTES)
-            .read_to_string()
-            .map_err(|e| {
-                NonoError::SandboxInit(format!(
-                    "failed to read approval webhook '{}' response: {e}",
-                    self.name
-                ))
-            })?;
-
-        if !(200..300).contains(&status) {
-            return Ok(ApprovalDecision::Denied {
-                reason: format!(
-                    "approval webhook '{}' returned HTTP {} after {:?}",
-                    self.name, status, self.timeout
-                ),
-            });
+        let started = Instant::now();
+        match &self.platform {
+            None => self.request_unsigned(&body, started),
+            Some(state) => self.drive_platform_approval(
+                request.request_id(),
+                &body,
+                started,
+                |step, remaining| self.send_platform(state, step, remaining),
+            ),
         }
-
-        self.parse_response(&response_body)
     }
 
     fn backend_name(&self) -> &str {
@@ -343,6 +574,7 @@ impl ChainApproval {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
 
     struct StaticBackend {
         name: &'static str,
@@ -428,6 +660,7 @@ mod tests {
                 timeout_secs: Some(5),
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
 
@@ -451,6 +684,7 @@ mod tests {
                 timeout_secs: None,
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
 
@@ -485,6 +719,7 @@ mod tests {
                 timeout_secs: None,
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
 
@@ -496,12 +731,7 @@ mod tests {
 
     #[test]
     fn webhook_response_parser_accepts_simple_decision_shape() {
-        let backend = WebhookApproval {
-            name: "security-review".to_string(),
-            url: "https://approval.example".to_string(),
-            timeout: Duration::from_secs(1),
-            http: ureq::Agent::new_with_defaults(),
-        };
+        let backend = test_webhook(Duration::from_secs(1));
 
         assert!(
             backend
@@ -515,5 +745,194 @@ mod tests {
                 .unwrap()
                 .is_denied()
         );
+    }
+
+    fn test_webhook(timeout: Duration) -> WebhookApproval {
+        WebhookApproval {
+            name: "security-review".to_string(),
+            url: "https://approval.example/api/v1/approvals".to_string(),
+            timeout,
+            http: ureq::Agent::new_with_defaults(),
+            platform: None,
+            poll_backoff: Duration::ZERO,
+        }
+    }
+
+    fn reply(status: u16, body: &str) -> HttpReply {
+        HttpReply {
+            status,
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn platform_poll_loop_submits_then_polls_until_granted() {
+        let backend = test_webhook(Duration::from_secs(30));
+        let mut steps = Vec::new();
+        let decision = backend
+            .drive_platform_approval("req-1", b"{}", Instant::now(), |step, remaining| {
+                assert!(remaining <= Duration::from_secs(30));
+                match step {
+                    PlatformStep::Submit(body) => {
+                        assert_eq!(body, b"{}");
+                        steps.push("submit");
+                        Ok(reply(202, r#"{"request_id":"req-1","state":"pending"}"#))
+                    }
+                    PlatformStep::Poll { request_id } => {
+                        assert_eq!(request_id, "req-1");
+                        steps.push("poll");
+                        if steps.len() < 3 {
+                            Ok(reply(202, r#"{"request_id":"req-1","state":"pending"}"#))
+                        } else {
+                            Ok(reply(
+                                200,
+                                r#"{"request_id":"req-1","state":"granted","decision":"granted"}"#,
+                            ))
+                        }
+                    }
+                }
+            })
+            .unwrap();
+        assert!(decision.is_granted());
+        assert_eq!(steps, vec!["submit", "poll", "poll"]);
+    }
+
+    #[test]
+    fn platform_poll_loop_gives_up_at_the_configured_timeout() {
+        let backend = test_webhook(Duration::from_millis(40));
+        let mut polls = 0;
+        let decision = backend
+            .drive_platform_approval("req-2", b"{}", Instant::now(), |_step, _remaining| {
+                polls += 1;
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(reply(202, r#"{"state":"pending"}"#))
+            })
+            .unwrap();
+        assert!(matches!(decision, ApprovalDecision::Timeout));
+        assert!(
+            polls >= 2,
+            "expected several polls before giving up, saw {polls}"
+        );
+    }
+
+    #[test]
+    fn platform_poll_loop_reports_immediate_deny_and_server_timeout() {
+        let backend = test_webhook(Duration::from_secs(5));
+        let denied = backend
+            .drive_platform_approval("req-3", b"{}", Instant::now(), |step, _| {
+                assert!(matches!(step, PlatformStep::Submit(_)));
+                Ok(reply(
+                    200,
+                    r#"{"state":"denied","decision":"denied","reason":"not today"}"#,
+                ))
+            })
+            .unwrap();
+        match denied {
+            ApprovalDecision::Denied { reason } => assert_eq!(reason, "not today"),
+            other => panic!("expected denial, got {other:?}"),
+        }
+
+        let timed_out = backend
+            .drive_platform_approval("req-4", b"{}", Instant::now(), |_, _| {
+                Ok(reply(200, r#"{"state":"timeout","decision":"timeout"}"#))
+            })
+            .unwrap();
+        assert!(matches!(timed_out, ApprovalDecision::Timeout));
+    }
+
+    #[test]
+    fn platform_poll_loop_reports_elapsed_time_on_http_errors() {
+        let backend = test_webhook(Duration::from_secs(5));
+        let decision = backend
+            .drive_platform_approval("req-5", b"{}", Instant::now(), |_, _| {
+                Ok(reply(404, r#"{"error":"not_found"}"#))
+            })
+            .unwrap();
+        match decision {
+            ApprovalDecision::Denied { reason } => {
+                assert!(reason.contains("HTTP 404"), "{reason}");
+                assert!(reason.contains("after 0s"), "{reason}");
+            }
+            other => panic!("expected denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn platform_headers_stamp_the_signed_request_contract() {
+        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+        use base64::Engine as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("nono-approval-headers-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("key");
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            &aws_lc_rs::rand::SystemRandom::new(),
+        )
+        .unwrap();
+        std::fs::write(
+            &key_path,
+            base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref()),
+        )
+        .unwrap();
+        let state = crate::platform_client::PlatformState {
+            protocol_version: "1".to_string(),
+            platform_url: "https://platform.example.com".to_string(),
+            tenant_id: "019f0000-0000-7000-8000-000000000001".to_string(),
+            subject_id: "019f0000-0000-7000-8000-000000000002".to_string(),
+            subject_kind: "workload".to_string(),
+            management_mode: "audit_only".to_string(),
+            key_algorithm: "ecdsa_p256_sha256_fixed".to_string(),
+            key_ref: format!("file://{}", key_path.display()),
+            enrolled_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+
+        let headers = WebhookApproval::platform_headers(
+            &state,
+            "POST",
+            "/api/v1/approvals",
+            b"{\"request\":{}}",
+            Duration::from_secs(90),
+        )
+        .unwrap();
+        let names: Vec<&str> = headers.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "X-Nono-Protocol-Version",
+                "X-Nono-Subject-Id",
+                "X-Nono-Timestamp",
+                "X-Nono-Request-Id",
+                "X-Nono-Content-SHA256",
+                "X-Nono-Signature",
+                "X-Nono-Timeout-Secs",
+            ]
+        );
+        let value = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(value("X-Nono-Protocol-Version"), "1");
+        assert_eq!(value("X-Nono-Subject-Id"), state.subject_id);
+        assert_eq!(value("X-Nono-Timeout-Secs"), "90");
+        assert!(value("X-Nono-Signature").starts_with("p256-sha256="));
+        // Body digest is the platform's `sha256:<hex>` shape over the exact bytes.
+        assert_eq!(
+            value("X-Nono-Content-SHA256"),
+            format!(
+                "sha256:{}",
+                sha2::Sha256::digest(b"{\"request\":{}}")
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+        );
+        uuid::Uuid::parse_str(&value("X-Nono-Request-Id")).unwrap();
+        value("X-Nono-Timestamp").parse::<u128>().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

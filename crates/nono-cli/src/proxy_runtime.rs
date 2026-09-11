@@ -4052,6 +4052,7 @@ mod tests {
                 timeout_secs: Some(10),
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
         policies.credentials.insert(

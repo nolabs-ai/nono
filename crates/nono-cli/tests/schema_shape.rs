@@ -592,7 +592,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
     assert_schema_properties(
         &schema,
         "ApprovalBackendConfig",
-        &["backends", "mode", "timeout_secs", "type", "url"],
+        &["auth", "backends", "mode", "timeout_secs", "type", "url"],
     );
     assert_schema_properties(
         &schema,

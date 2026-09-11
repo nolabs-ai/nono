@@ -366,12 +366,24 @@ pub struct ApprovalBackendConfig {
     pub backend_type: ApprovalBackendType,
     #[serde(default)]
     pub url: Option<String>,
+    /// How a webhook backend authenticates to its endpoint. `platform` signs
+    /// every request with this client's platform enrollment key
+    /// (`nono-request-v1`), lets `url` default to the enrolled platform's
+    /// approval route, and switches to submit-and-poll.
+    #[serde(default)]
+    pub auth: Option<ApprovalBackendAuth>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub mode: Option<ApprovalChainMode>,
     #[serde(default)]
     pub backends: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalBackendAuth {
+    Platform,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2161,12 +2173,28 @@ fn validate_approval_backend(
                     format!("approval backend '{name}' type terminal cannot define url, mode, or backends"),
                 );
             }
+            if backend.auth.is_some() {
+                report.error(
+                    "invalid_approval_backend",
+                    format!("approval backend '{name}' type terminal cannot define auth"),
+                );
+            }
         }
         ApprovalBackendType::Webhook => {
-            if backend.url.as_deref().unwrap_or_default().is_empty() {
+            let platform_auth = backend.auth == Some(ApprovalBackendAuth::Platform);
+            let url = backend.url.as_deref().unwrap_or_default();
+            if url.is_empty() && !platform_auth {
                 report.error(
                     "invalid_approval_backend",
                     format!("approval backend '{name}' type webhook must define url"),
+                );
+            }
+            if platform_auth && !url.is_empty() && !is_platform_grade_url(url) {
+                report.error(
+                    "invalid_approval_backend",
+                    format!(
+                        "approval backend '{name}' with auth platform must use an https URL (plain http is allowed only for loopback)"
+                    ),
                 );
             }
             if backend.mode.is_some() || !backend.backends.is_empty() {
@@ -2195,6 +2223,12 @@ fn validate_approval_backend(
                 report.error(
                     "invalid_approval_backend",
                     format!("approval backend '{name}' type chain cannot define url"),
+                );
+            }
+            if backend.auth.is_some() {
+                report.error(
+                    "invalid_approval_backend",
+                    format!("approval backend '{name}' type chain cannot define auth"),
                 );
             }
             for child_backend in &backend.backends {
@@ -2467,6 +2501,19 @@ fn validate_endpoint_policy(
                 report.error("invalid_endpoint_policy", format!("{label} contains NUL"));
             }
         }
+    }
+}
+
+/// Signed platform requests carry an enrolled identity; they never travel over
+/// plain HTTP except to a loopback development platform.
+pub(crate) fn is_platform_grade_url(value: &str) -> bool {
+    match url::Url::parse(value) {
+        Ok(url) => {
+            url.scheme() == "https"
+                || (url.scheme() == "http"
+                    && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")))
+        }
+        Err(_) => false,
     }
 }
 
@@ -5936,7 +5983,115 @@ mod tests {
             timeout_secs: None,
             mode: None,
             backends: Vec::new(),
+            auth: None,
         }
+    }
+
+    #[test]
+    fn security_approval_backends_platform_auth_matrix() {
+        // Platform-signed webhook may omit url: it is derived from enrollment.
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "platform".to_string(),
+            ApprovalBackendConfig {
+                auth: Some(ApprovalBackendAuth::Platform),
+                timeout_secs: Some(120),
+                ..security_backend(ApprovalBackendType::Webhook)
+            },
+        );
+        assert!(validate_security_approval_backends(&backends, None).is_ok());
+
+        // An explicit https URL is fine; loopback http is fine.
+        for url in [
+            "https://platform.example.com/api/v1/approvals",
+            "http://127.0.0.1:8090/api/v1/approvals",
+        ] {
+            let mut backends = BTreeMap::new();
+            backends.insert(
+                "platform".to_string(),
+                ApprovalBackendConfig {
+                    auth: Some(ApprovalBackendAuth::Platform),
+                    url: Some(url.to_string()),
+                    ..security_backend(ApprovalBackendType::Webhook)
+                },
+            );
+            assert!(
+                validate_security_approval_backends(&backends, None).is_ok(),
+                "{url}"
+            );
+        }
+
+        // Plain http to a remote host would leak the signed request in clear.
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "platform".to_string(),
+            ApprovalBackendConfig {
+                auth: Some(ApprovalBackendAuth::Platform),
+                url: Some("http://platform.example.com/api/v1/approvals".to_string()),
+                ..security_backend(ApprovalBackendType::Webhook)
+            },
+        );
+        let err = validate_security_approval_backends(&backends, None)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("https"), "{err}");
+
+        // auth is a webhook concept only.
+        for backend_type in [ApprovalBackendType::Terminal, ApprovalBackendType::Chain] {
+            let mut backends = BTreeMap::new();
+            backends.insert(
+                "gate".to_string(),
+                ApprovalBackendConfig {
+                    auth: Some(ApprovalBackendAuth::Platform),
+                    mode: (backend_type == ApprovalBackendType::Chain)
+                        .then_some(ApprovalChainMode::All),
+                    backends: if backend_type == ApprovalBackendType::Chain {
+                        vec!["other".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..security_backend(backend_type)
+                },
+            );
+            backends.insert(
+                "other".to_string(),
+                security_backend(ApprovalBackendType::Terminal),
+            );
+            let err = validate_security_approval_backends(&backends, None)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(
+                err.contains("cannot define auth"),
+                "{backend_type:?}: {err}"
+            );
+        }
+
+        // A plain webhook still needs its url.
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "hook".to_string(),
+            security_backend(ApprovalBackendType::Webhook),
+        );
+        let err = validate_security_approval_backends(&backends, None)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("must define url"), "{err}");
+    }
+
+    #[test]
+    fn approval_backend_auth_parses_from_profile_json() {
+        let parsed: ApprovalBackendConfig =
+            serde_json::from_str(r#"{"type":"webhook","auth":"platform","timeout_secs":90}"#)
+                .expect("platform auth webhook parses");
+        assert_eq!(parsed.auth, Some(ApprovalBackendAuth::Platform));
+        assert!(parsed.url.is_none());
+        assert!(
+            serde_json::from_str::<ApprovalBackendConfig>(r#"{"type":"webhook","auth":"basic"}"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -6020,6 +6175,7 @@ mod tests {
             ApprovalBackendConfig {
                 mode: Some(ApprovalChainMode::All),
                 backends: vec!["loop".to_string()],
+                auth: None,
                 ..security_backend(ApprovalBackendType::Chain)
             },
         );
@@ -6044,6 +6200,7 @@ mod tests {
                 timeout_secs: Some(0),
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
 

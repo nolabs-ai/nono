@@ -14,7 +14,7 @@
 #   ./tests/integration/test_gpu_ollama.sh
 #
 #   # Or via the integration test runner (auto-skips if ollama not installed):
-#   ./tests/run_integration_tests.sh
+#   ./scripts/run_all_tests.sh
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"

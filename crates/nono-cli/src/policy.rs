@@ -140,8 +140,6 @@ pub struct ProfileDef {
     #[serde(default)]
     pub allow_gpu: Option<bool>,
     #[serde(default)]
-    pub interactive: bool,
-    #[serde(default)]
     pub packs: Vec<String>,
     #[serde(default)]
     pub command_args: Vec<String>,
@@ -181,7 +179,6 @@ impl ProfileDef {
             allow_launch_services: self.allow_launch_services,
             allow_gpu: self.allow_gpu,
             allow_parent_of_protected: None,
-            interactive: self.interactive,
             skipdirs: Vec::new(),
             packs: self.packs.clone(),
             binary: None,

@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 pub fn load_policy_from_str(json: &str) -> Result<TrustPolicy> {
     let policy: TrustPolicy = serde_json::from_str(json)
         .map_err(|e| NonoError::TrustPolicy(format!("failed to parse trust policy: {e}")))?;
-    policy.validate_version()?;
+    policy.validate()?;
     Ok(policy)
 }
 
@@ -67,7 +67,7 @@ pub fn merge_policies(policies: &[TrustPolicy]) -> Result<TrustPolicy> {
     }
 
     for policy in policies {
-        policy.validate_version()?;
+        policy.validate()?;
     }
 
     let mut merged_patterns: Vec<String> = Vec::new();
@@ -136,7 +136,6 @@ pub fn merge_policies(policies: &[TrustPolicy]) -> Result<TrustPolicy> {
 
     Ok(TrustPolicy {
         predicate: Some(TRUST_POLICY_PREDICATE.to_string()),
-        version: None,
         includes: merged_patterns,
         files: merged_files,
         publishers: merged_publishers,
@@ -402,7 +401,6 @@ mod tests {
     ) -> TrustPolicy {
         TrustPolicy {
             predicate: Some(TRUST_POLICY_PREDICATE.to_string()),
-            version: None,
             includes: vec!["SKILLS*".to_string(), "CLAUDE*".to_string()],
             files: vec![],
             publishers,
@@ -447,14 +445,12 @@ mod tests {
     #[test]
     fn load_valid_policy() {
         let json = r#"{
-            "version": 1,
             "includes": ["SKILLS*"],
             "publishers": [],
             "blocklist": { "digests": [] },
             "enforcement": "deny"
         }"#;
         let policy = load_policy_from_str(json).unwrap();
-        assert_eq!(policy.version, Some(1));
         assert_eq!(policy.enforcement, Enforcement::Deny);
         assert_eq!(policy.includes.len(), 1);
     }
@@ -462,7 +458,6 @@ mod tests {
     #[test]
     fn load_policy_with_publishers() {
         let json = r#"{
-            "version": 1,
             "includes": ["SKILLS*"],
             "publishers": [
                 {
@@ -497,7 +492,7 @@ mod tests {
 
     #[test]
     fn load_policy_missing_field() {
-        let json = r#"{ "version": 1 }"#;
+        let json = r#"{}"#;
         let result = load_policy_from_str(json);
         assert!(result.is_err());
     }
@@ -515,7 +510,6 @@ mod tests {
             write!(
                 f,
                 r#"{{
-                    "version": 1,
                     "includes": ["AGENT.MD"],
                     "publishers": [],
                     "blocklist": {{ "digests": [] }},
@@ -658,19 +652,9 @@ mod tests {
         assert_eq!(merged.enforcement, Enforcement::Deny);
     }
 
-    #[test]
-    fn merge_ignores_legacy_version_field() {
-        // version is deprecated — merge succeeds regardless of its value.
-        let p1 = make_policy(Enforcement::Audit, vec![], vec![]);
-        let mut p2 = make_policy(Enforcement::Audit, vec![], vec![]);
-        p2.version = Some(99);
-        assert!(merge_policies(&[p1, p2]).is_ok());
-    }
-
     // -----------------------------------------------------------------------
     // evaluate_file
     // -----------------------------------------------------------------------
-
     #[test]
     fn evaluate_blocked_file() {
         let entry = BlocklistEntry {

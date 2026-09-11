@@ -2471,10 +2471,6 @@ pub struct Profile {
     /// rules protect `~/.nono`. Ignored on Linux. Default is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_parent_of_protected: Option<bool>,
-    /// Deprecated: Parsed for backward compatibility but ignored.
-    /// Supervised mode preserves TTY by default, making this unnecessary.
-    #[serde(default)]
-    pub interactive: bool,
     /// Directory names to skip during trust scanning and rollback preflight.
     /// Treated like built-in heavy directories (for example `target`).
     #[serde(default)]
@@ -2622,8 +2618,6 @@ struct ProfileDeserialize {
     allow_gpu: Option<bool>,
     allow_parent_of_protected: Option<bool>,
     #[serde(default)]
-    interactive: bool,
-    #[serde(default)]
     skipdirs: Vec<String>,
     #[serde(default)]
     packs: Vec<String>,
@@ -2663,7 +2657,6 @@ impl From<ProfileDeserialize> for Profile {
             allow_launch_services: raw.allow_launch_services,
             allow_gpu: raw.allow_gpu,
             allow_parent_of_protected: raw.allow_parent_of_protected,
-            interactive: raw.interactive,
             skipdirs: raw.skipdirs,
             packs: raw.packs,
             binary: raw.binary,
@@ -3957,7 +3950,6 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         allow_parent_of_protected: child
             .allow_parent_of_protected
             .or(base.allow_parent_of_protected),
-        interactive: base.interactive || child.interactive,
         skipdirs: dedup_append(&base.skipdirs, &child.skipdirs),
         packs: dedup_append(&base.packs, &child.packs),
         binary: child.binary.or(base.binary),
@@ -7003,7 +6995,6 @@ mod tests {
             allow_launch_services: Some(false),
             allow_gpu: Some(false),
             allow_parent_of_protected: None,
-            interactive: false,
             skipdirs: vec!["vendor".to_string()],
             packs: vec![],
             binary: None,
@@ -7095,7 +7086,6 @@ mod tests {
             allow_launch_services: Some(true),
             allow_gpu: Some(true),
             allow_parent_of_protected: Some(true),
-            interactive: false,
             skipdirs: vec!["dist".to_string()],
             packs: vec![],
             binary: None,
@@ -7961,25 +7951,6 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_profiles_interactive_or_semantics() {
-        // base=false, child=false -> false
-        let merged = merge_profiles(base_profile(), child_profile());
-        assert!(!merged.interactive);
-
-        // base=true, child=false -> true
-        let mut base = base_profile();
-        base.interactive = true;
-        let merged = merge_profiles(base, child_profile());
-        assert!(merged.interactive);
-
-        // base=false, child=true -> true
-        let mut child = child_profile();
-        child.interactive = true;
-        let merged = merge_profiles(base_profile(), child);
-        assert!(merged.interactive);
-    }
-
-    #[test]
     fn test_merge_profiles_extends_consumed() {
         let child = child_profile(); // has extends = Some(vec!["base"])
         let merged = merge_profiles(base_profile(), child);
@@ -8360,7 +8331,6 @@ mod tests {
             workdir: WorkdirConfig {
                 access: WorkdirAccess::Read,
             },
-            interactive: false,
             ..Default::default()
         };
 
@@ -8373,7 +8343,6 @@ mod tests {
             workdir: WorkdirConfig {
                 access: WorkdirAccess::ReadWrite,
             },
-            interactive: true,
             ..Default::default()
         };
 
@@ -8389,7 +8358,6 @@ mod tests {
             WorkdirAccess::ReadWrite,
             "later base should override workdir"
         );
-        assert!(merged.interactive, "interactive should be OR'd");
     }
 
     #[test]
@@ -8676,6 +8644,19 @@ mod tests {
         assert!(
             result.is_err(),
             "unknown top-level field 'filesytsem' must be rejected, not silently ignored"
+        );
+    }
+
+    #[test]
+    fn test_removed_interactive_field_is_rejected() {
+        let json = r#"{
+            "meta": { "name": "removed-interactive" },
+            "interactive": true
+        }"#;
+        let result: std::result::Result<Profile, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "removed top-level field 'interactive' must be rejected"
         );
     }
 

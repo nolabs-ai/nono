@@ -159,7 +159,6 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | `process_info_mode` | Unavailable | Needs Landlock V6 (Scoping) |
 | `ipc_mode` | Unavailable | Needs Landlock V6 (Scoping) |
 | `capability_elevation` (in profile) | Unavailable | seccomp notify EBUSY |
-| `interactive` mode | Unavailable | Depends on capability elevation |
 | Workdir access levels (none/read/readwrite) | Full | |
 
 ## Hooks
@@ -220,7 +219,7 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | Landlock V4 missing (kernel 6.6 < 6.7) | Per-port network (3) | [Rolling kernel](https://github.com/Nevuly/WSL2-Linux-Kernel-Rolling) or wait for Microsoft kernel upgrade |
 | Landlock V6 missing (kernel 6.6 < 6.12) | signal_mode, process_info_mode, ipc_mode (3) | Rolling kernel or wait for Microsoft kernel upgrade |
 | Landlock V5 missing (kernel 6.6 < 6.10) | Device ioctl filtering (1) | Rolling kernel or wait for Microsoft kernel upgrade |
-| seccomp notify EBUSY | capability_elevation, interactive mode, PTY relay, runtime expansion (4) | microsoft/WSL#9548 — WSL2 userspace issue, persists regardless of kernel version |
+| seccomp notify EBUSY | capability_elevation, PTY relay, runtime expansion (3) | microsoft/WSL#9548 — WSL2 userspace issue, persists regardless of kernel version |
 | Proxy port enforcement (pre-V4) | Credential proxy features (6 blocked by default) | Rolling kernel (V4+ enables native enforcement) or `wsl2_proxy_policy: "insecure_proxy"` opt-in |
 
 **With rolling kernel (6.19+, Landlock V6):** All Landlock-dependent limitations are resolved — **113/118 features (96%) fully available.** Only 5 features remain unavailable, all due to seccomp notify EBUSY (`--capability-elevation` and dependent features). See [WSL2 Support](/cli/internals/wsl2#rolling-release-kernel-community) for install instructions.

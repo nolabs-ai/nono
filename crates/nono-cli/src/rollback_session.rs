@@ -10,7 +10,6 @@ use nono::{NonoError, Result};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 /// Information about a discovered rollback session
 #[derive(Debug)]
@@ -194,36 +193,7 @@ fn is_process_alive(pid: u32) -> bool {
 
 /// Calculate the total size of all files in a directory tree.
 fn calculate_dir_size(dir: &Path) -> u64 {
-    // Harden against symlink loops and silent undercount: disable follow,
-    // cap FDs, and log skips instead of filter_map(ok) droppage.
-    let mut total: u64 = 0;
-    for entry in WalkDir::new(dir)
-        .follow_links(false)
-        .max_open(128)
-        .into_iter()
-    {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("skipping rollback size entry for {}: {e}", dir.display());
-                continue;
-            }
-        };
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(
-                    "skipping rollback size metadata for {}: {e}",
-                    entry.path().display()
-                );
-                continue;
-            }
-        };
-        if metadata.is_file() {
-            total = total.saturating_add(metadata.len());
-        }
-    }
-    total
+    crate::state_paths::calculate_dir_size(dir)
 }
 
 /// Format a byte count as a human-readable string.
@@ -385,6 +355,18 @@ mod tests {
         fs::write(a.join("file.txt"), b"hello").expect("write");
         std::os::unix::fs::symlink(&b, a.join("link_to_b")).expect("symlink");
         std::os::unix::fs::symlink(&a, b.join("link_to_a")).expect("symlink");
+        assert_eq!(calculate_dir_size(dir.path()), 5);
+    }
+
+    #[test]
+    fn calculate_dir_size_ignores_symlink_to_file_outside() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outside = tempfile::TempDir::new().expect("tempdir outside");
+        let outside_file = outside.path().join("outside.txt");
+        fs::write(&outside_file, b"hello").expect("write outside");
+        fs::write(dir.path().join("real.txt"), b"hello").expect("write real");
+        let link = dir.path().join("link_to_outside.txt");
+        std::os::unix::fs::symlink(&outside_file, &link).expect("symlink");
         assert_eq!(calculate_dir_size(dir.path()), 5);
     }
 }

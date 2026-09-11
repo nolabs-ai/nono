@@ -7,6 +7,7 @@
 use nono::{NonoError, Result, try_canonicalize};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 const LEGACY_HOME_SUBDIR: &str = ".nono";
 const LEGACY_REMOVE_BY: &str = "v1.0.0";
@@ -288,6 +289,50 @@ pub fn maybe_migrate_legacy_audit_ledger() -> Result<()> {
     })?;
 
     Ok(())
+}
+
+/// Calculate total size of regular files under `dir`.
+///
+/// Hardened against symlink-based double-counting and silent undercount:
+/// - `follow_links(false)` so symlinked directories are not descended
+/// - `file_type().is_file()` pre-filter so symlink-to-file entries are not
+///   counted via `metadata()` (which would follow the symlink)
+/// - `max_open(128)` to bound FD usage on deep trees
+/// - `tracing::warn` on I/O errors instead of silent `filter_map(ok)`
+pub(crate) fn calculate_dir_size(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    for entry in WalkDir::new(dir)
+        .follow_links(false)
+        .max_open(128)
+        .into_iter()
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("skipping dir size entry for {}: {e}", dir.display());
+                continue;
+            }
+        };
+        // Skip symlinks and non-files before following metadata (which would
+        // resolve symlink targets and count external files).
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "skipping dir size metadata for {}: {e}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
 }
 
 #[cfg(test)]

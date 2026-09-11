@@ -12,7 +12,6 @@ use nono::{NonoError, Result};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 /// Information about a discovered audit session
 #[derive(Debug)]
@@ -271,38 +270,7 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 fn calculate_dir_size(dir: &Path) -> u64 {
-    // Explicitly disable symlink following and cap open FDs so a planted
-    // symlink cycle cannot cause WalkDir to loop or exhaust resources via
-    // silent filter_map(ok) drops. Errors are logged instead of ignored so
-    // `audit cleanup --max-total-size` budgets do not silently undercount.
-    let mut total: u64 = 0;
-    for entry in WalkDir::new(dir)
-        .follow_links(false)
-        .max_open(128)
-        .into_iter()
-    {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("skipping audit size entry for {}: {e}", dir.display());
-                continue;
-            }
-        };
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(
-                    "skipping audit size metadata for {}: {e}",
-                    entry.path().display()
-                );
-                continue;
-            }
-        };
-        if metadata.is_file() {
-            total = total.saturating_add(metadata.len());
-        }
-    }
-    total
+    crate::state_paths::calculate_dir_size(dir)
 }
 
 #[cfg(test)]
@@ -706,5 +674,19 @@ mod tests {
     fn calculate_dir_size_empty_dir_is_zero() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(calculate_dir_size(dir.path()), 0);
+    }
+
+    #[test]
+    fn calculate_dir_size_ignores_symlink_to_file_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        fs::write(&outside_file, b"hello").unwrap();
+        fs::write(dir.path().join("real.txt"), b"hello").unwrap();
+        let link = dir.path().join("link_to_outside.txt");
+        std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+        // Symlink-to-file should not be counted (would double-count external file).
+        // Only real.txt (5) counts, not link.
+        assert_eq!(calculate_dir_size(dir.path()), 5);
     }
 }

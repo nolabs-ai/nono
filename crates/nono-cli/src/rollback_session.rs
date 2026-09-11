@@ -194,13 +194,36 @@ fn is_process_alive(pid: u32) -> bool {
 
 /// Calculate the total size of all files in a directory tree.
 fn calculate_dir_size(dir: &Path) -> u64 {
-    WalkDir::new(dir)
+    // Harden against symlink loops and silent undercount: disable follow,
+    // cap FDs, and log skips instead of filter_map(ok) droppage.
+    let mut total: u64 = 0;
+    for entry in WalkDir::new(dir)
+        .follow_links(false)
+        .max_open(128)
         .into_iter()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("skipping rollback size entry for {}: {e}", dir.display());
+                continue;
+            }
+        };
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "skipping rollback size metadata for {}: {e}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
 }
 
 /// Format a byte count as a human-readable string.
@@ -330,5 +353,38 @@ mod tests {
             .map(|s| s.metadata.session_id.as_str())
             .collect();
         assert!(ids.contains(&"20260421-111111-30001"));
+    }
+
+    #[test]
+    fn calculate_dir_size_does_not_follow_symlinked_dir() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let real_sub = dir.path().join("real");
+        fs::create_dir_all(&real_sub).expect("mkdir real");
+        fs::write(real_sub.join("file.txt"), b"hello").expect("write");
+        let link = dir.path().join("link_to_real");
+        std::os::unix::fs::symlink(&real_sub, &link).expect("symlink");
+        assert_eq!(calculate_dir_size(dir.path()), 5);
+    }
+
+    #[test]
+    fn calculate_dir_size_handles_broken_symlink() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        fs::write(dir.path().join("real.txt"), b"hello").expect("write");
+        let broken = dir.path().join("broken.txt");
+        std::os::unix::fs::symlink(dir.path().join("nonexistent"), &broken).expect("symlink");
+        assert_eq!(calculate_dir_size(dir.path()), 5);
+    }
+
+    #[test]
+    fn calculate_dir_size_handles_symlink_cycle_without_looping() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::create_dir_all(&a).expect("mkdir a");
+        fs::create_dir_all(&b).expect("mkdir b");
+        fs::write(a.join("file.txt"), b"hello").expect("write");
+        std::os::unix::fs::symlink(&b, a.join("link_to_b")).expect("symlink");
+        std::os::unix::fs::symlink(&a, b.join("link_to_a")).expect("symlink");
+        assert_eq!(calculate_dir_size(dir.path()), 5);
     }
 }

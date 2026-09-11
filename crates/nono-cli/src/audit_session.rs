@@ -271,13 +271,38 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 fn calculate_dir_size(dir: &Path) -> u64 {
-    WalkDir::new(dir)
+    // Explicitly disable symlink following and cap open FDs so a planted
+    // symlink cycle cannot cause WalkDir to loop or exhaust resources via
+    // silent filter_map(ok) drops. Errors are logged instead of ignored so
+    // `audit cleanup --max-total-size` budgets do not silently undercount.
+    let mut total: u64 = 0;
+    for entry in WalkDir::new(dir)
+        .follow_links(false)
+        .max_open(128)
         .into_iter()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("skipping audit size entry for {}: {e}", dir.display());
+                continue;
+            }
+        };
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "skipping audit size metadata for {}: {e}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
 }
 
 #[cfg(test)]
@@ -629,5 +654,57 @@ mod tests {
             resolve_session_dir("20260813-120000-4242"),
             Err(NonoError::AuditSessionOutsideRoot { .. })
         ));
+    }
+
+    #[test]
+    fn calculate_dir_size_counts_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        fs::write(dir.path().join("b.txt"), b"world!").unwrap();
+        assert_eq!(calculate_dir_size(dir.path()), 11);
+    }
+
+    #[test]
+    fn calculate_dir_size_does_not_follow_symlinked_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_sub = dir.path().join("real");
+        fs::create_dir_all(&real_sub).unwrap();
+        fs::write(real_sub.join("file.txt"), b"hello").unwrap();
+        let link = dir.path().join("link_to_real");
+        std::os::unix::fs::symlink(&real_sub, &link).unwrap();
+        // WalkDir with follow_links(false) should see the symlink itself
+        // but not descend into it, so only file in real/ counts, not via link.
+        // Total should be 5 (one file), not 10.
+        assert_eq!(calculate_dir_size(dir.path()), 5);
+    }
+
+    #[test]
+    fn calculate_dir_size_handles_broken_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("real.txt"), b"hello").unwrap();
+        let broken = dir.path().join("broken.txt");
+        std::os::unix::fs::symlink(dir.path().join("nonexistent"), &broken).unwrap();
+        // Broken symlink metadata fails; should be skipped, only real.txt counts.
+        assert_eq!(calculate_dir_size(dir.path()), 5);
+    }
+
+    #[test]
+    fn calculate_dir_size_handles_symlink_cycle_without_looping() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("file.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink(&b, a.join("link_to_b")).unwrap();
+        std::os::unix::fs::symlink(&a, b.join("link_to_a")).unwrap();
+        // Must terminate and not double-count; only the one real file.
+        assert_eq!(calculate_dir_size(dir.path()), 5);
+    }
+
+    #[test]
+    fn calculate_dir_size_empty_dir_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(calculate_dir_size(dir.path()), 0);
     }
 }

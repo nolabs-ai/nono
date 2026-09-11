@@ -80,6 +80,22 @@ pub fn legacy_rollback_root() -> Result<PathBuf> {
     Ok(legacy_home_state_root()?.join("rollbacks"))
 }
 
+/// Plaintext OAuth-capture phantom-token store:
+/// `$XDG_STATE_HOME/nono/oauth-capture/providers.json`.
+///
+/// Written only under `OAuthCaptureStoreBackend::File` (and, off macOS, under
+/// `Auto`). On macOS under `Auto`/`Keychain` the proxy passes this path only as
+/// the "persistence enabled" signal and never opens it — see
+/// `OAuthCaptureStore::load_with_runtime_persistence`.
+///
+/// Shared by the writer (`proxy_runtime::build_proxy_config_from_flags`) and the
+/// stale-store warning (`oauth_capture_legacy`) so the two cannot drift.
+pub fn oauth_capture_store_path() -> Result<PathBuf> {
+    Ok(user_state_dir()?
+        .join("oauth-capture")
+        .join("providers.json"))
+}
+
 /// Audit roots to scan when discovering or loading sessions (primary first).
 pub fn audit_discovery_roots() -> Result<Vec<PathBuf>> {
     let primary = audit_root()?;
@@ -351,6 +367,14 @@ mod tests {
         assert_eq!(
             legacy_rollback_root().unwrap(),
             home.join(".nono").join("rollbacks")
+        );
+        assert_eq!(
+            oauth_capture_store_path().unwrap(),
+            tmp.path()
+                .join("state")
+                .join("nono")
+                .join("oauth-capture")
+                .join("providers.json")
         );
     }
 

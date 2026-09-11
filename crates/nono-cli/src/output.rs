@@ -739,6 +739,186 @@ pub fn print_warning(message: &str) {
     eprintln!("  {} {}", fg("warning:", t.red).bold(), fg(message, t.text),);
 }
 
+/// Render the store path for display.
+///
+/// Uncanonicalized on purpose: canonicalizing rewrites `/Users/...` to
+/// `/private/Users/...` on macOS, which would make the `rm` command we print
+/// look alien. `shorten_path_for_profile` compares by path component, not by
+/// string prefix.
+fn stale_oauth_store_display_path(
+    store: &crate::oauth_capture_legacy::StalePlaintextStore,
+) -> String {
+    match xdg_home::home_dir() {
+        Some(home) => crate::profile_save_runtime::shorten_path_for_profile(&store.path, &home),
+        None => store.path.display().to_string(),
+    }
+}
+
+/// `1.4 KB, last written 2026-08-02` — the mtime clause only when the
+/// filesystem reported one.
+fn stale_oauth_store_meta(store: &crate::oauth_capture_legacy::StalePlaintextStore) -> String {
+    let mut meta = crate::audit_session::format_bytes(store.size_bytes);
+    if let Some(modified) = store.modified {
+        let stamp = chrono::DateTime::<chrono::Local>::from(modified);
+        meta.push_str(&format!(", last written {}", stamp.format("%Y-%m-%d")));
+    }
+    meta
+}
+
+/// The shared explanation of what the leftover file is and why it matters.
+fn emit_stale_oauth_store_context(
+    store: &crate::oauth_capture_legacy::StalePlaintextStore,
+    display_path: &str,
+) {
+    let t = theme::current();
+    let emit = crate::startup_prompt::print_terminal_safe_stderr;
+    let body = |line: &str| emit(&format!("           {}", fg(line, t.text)));
+
+    emit("");
+    emit(&format!(
+        "  {} {}",
+        fg("warning:", t.red).bold(),
+        fg(
+            "plaintext OAuth token file left over from the file backend",
+            t.text,
+        ),
+    ));
+    emit("");
+    emit(&format!("           {}", fg(display_path, t.subtext)));
+    emit(&format!(
+        "           {}",
+        fg(&stale_oauth_store_meta(store), t.subtext),
+    ));
+    emit("");
+    body("This session persisted captured OAuth tokens to the macOS Keychain,");
+    body("so nono never opened this file. It still holds OAuth access and");
+    body("refresh tokens in plaintext, protected only by file mode 0600.");
+}
+
+/// Remind, after a clean run, that a plaintext OAuth token file is still on
+/// disk while this session persisted captured tokens to the macOS Keychain.
+///
+/// Two lines, no question: the interactive removal lives in `nono setup`, and
+/// interrupting someone who has just finished a session to ask about a one-time
+/// migration artifact is worse than pointing them at the command. `--silent`,
+/// the clean-exit check, and the emit-once flag are all owned by the caller
+/// (`oauth_capture_legacy::remind_post_exit`).
+///
+/// Routed through `print_terminal_safe_stderr` rather than `eprintln!`: a
+/// supervised PTY may still be in raw mode, where a bare `\n` moves down
+/// without returning the carriage and a two-line block renders as a staircase.
+/// That is also why `print_warning` is not reused here — its label styling is
+/// matched by hand instead.
+pub fn print_stale_oauth_capture_store_reminder(
+    store: &crate::oauth_capture_legacy::StalePlaintextStore,
+) {
+    let t = theme::current();
+    let emit = crate::startup_prompt::print_terminal_safe_stderr;
+
+    emit(&format!(
+        "  {} {}",
+        fg("warning:", t.red).bold(),
+        fg(
+            "plaintext OAuth token file left over from the file backend:",
+            t.text,
+        ),
+    ));
+    emit(&format!(
+        "           {} {}",
+        fg(&stale_oauth_store_display_path(store), t.subtext),
+        fg("— run `nono setup` to remove it.", t.subtext),
+    ));
+}
+
+/// The `rm` instruction plus the reason to think before running it. Shared by
+/// the non-interactive warning and the declined-prompt path.
+fn emit_stale_oauth_store_manual_removal(display_path: &str) {
+    let t = theme::current();
+    let emit = crate::startup_prompt::print_terminal_safe_stderr;
+    let body = |line: &str| emit(&format!("           {}", fg(line, t.text)));
+
+    emit("");
+    body("Left in place. To remove it yourself:");
+    emit("");
+    emit(&format!(
+        "             {}",
+        fg(&format!("rm {display_path}"), t.green),
+    ));
+    emit("");
+    body("Keep it if you may set oauth_capture_store_backend = \"file\" again —");
+    body("under that backend this file is the live store, and removing it");
+    body("forces a fresh login for every captured provider.");
+}
+
+/// Ask whether to remove the leftover plaintext store.
+///
+/// Returns `Some(true)` to remove, `Some(false)` when declined, and `None` when
+/// stdin could not be read. Defaults to **no** on a bare newline: this deletes
+/// live credentials, so the safe answer must be the accidental one.
+///
+/// The caller has already established that both stdin and stderr are TTYs.
+pub fn prompt_stale_oauth_capture_store_removal(
+    store: &crate::oauth_capture_legacy::StalePlaintextStore,
+) -> Option<bool> {
+    let t = theme::current();
+    let emit = crate::startup_prompt::print_terminal_safe_stderr;
+    let display_path = stale_oauth_store_display_path(store);
+
+    emit_stale_oauth_store_context(store, &display_path);
+    emit("");
+    emit(&format!(
+        "           {}",
+        fg(
+            "Removing it forces a fresh login for every captured provider, and",
+            t.text,
+        ),
+    ));
+    emit(&format!(
+        "           {}",
+        fg(
+            "is not what you want if you may set the \"file\" backend again.",
+            t.text,
+        ),
+    ));
+    emit("");
+
+    let mut err = std::io::stderr().lock();
+    let _ = write!(err, "  Remove it now? [y/N] ");
+    let _ = err.flush();
+    drop(err);
+
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return None;
+    }
+    let answer = line.trim().to_ascii_lowercase();
+    Some(answer == "y" || answer == "yes")
+}
+
+/// Confirm the leftover store was removed, and note what that does not cover.
+pub fn print_stale_oauth_capture_store_removed(
+    store: &crate::oauth_capture_legacy::StalePlaintextStore,
+) {
+    let t = theme::current();
+    let emit = crate::startup_prompt::print_terminal_safe_stderr;
+
+    emit(&format!(
+        "  {} {}",
+        badge(" done ", t.green, BADGE_FG_DARK),
+        fg(
+            &format!("removed {}", stale_oauth_store_display_path(store)),
+            t.text,
+        ),
+    ));
+}
+
+/// The user declined removal: restate how to do it by hand.
+pub fn print_stale_oauth_capture_store_declined(
+    store: &crate::oauth_capture_legacy::StalePlaintextStore,
+) {
+    emit_stale_oauth_store_manual_removal(&stale_oauth_store_display_path(store));
+}
+
 /// Print proxy credential warnings collected at startup.
 pub fn print_proxy_diagnostics(diagnostics: &[nono_proxy::ProxyDiagnostic]) {
     if diagnostics.is_empty() {
@@ -1372,8 +1552,9 @@ mod tests {
     use super::theme;
     use super::{
         dry_run_command_line, format_unix_socket_mode_badge, print_blocked_grants,
-        print_capabilities, print_profile_hint, render_diagnostic_footer,
-        render_terminal_block_for_tty,
+        print_capabilities, print_profile_hint, print_stale_oauth_capture_store_declined,
+        print_stale_oauth_capture_store_reminder, print_stale_oauth_capture_store_removed,
+        render_diagnostic_footer, render_terminal_block_for_tty,
     };
     use nono::{CapabilitySet, UnixSocketMode};
     use std::ffi::{OsStr, OsString};
@@ -1483,6 +1664,30 @@ mod tests {
 
         print_capabilities(&caps, &[], 0, true, false);
         print_capabilities(&caps, &[], 1, true, false);
+    }
+
+    #[test]
+    fn stale_oauth_capture_store_renderings_do_not_panic() {
+        use crate::oauth_capture_legacy::StalePlaintextStore;
+
+        // Smoke test: every rendering must survive a path outside $HOME (so
+        // `shorten_path_for_profile` leaves it absolute) and a missing mtime.
+        // The prompt itself is not exercised here — it reads stdin.
+        let store = StalePlaintextStore {
+            path: std::path::PathBuf::from("/tmp/nono-test/oauth-capture/providers.json"),
+            size_bytes: 1_432,
+            modified: Some(std::time::SystemTime::UNIX_EPOCH),
+        };
+        print_stale_oauth_capture_store_reminder(&store);
+        print_stale_oauth_capture_store_removed(&store);
+        print_stale_oauth_capture_store_declined(&store);
+
+        let no_mtime = StalePlaintextStore {
+            modified: None,
+            ..store
+        };
+        print_stale_oauth_capture_store_reminder(&no_mtime);
+        print_stale_oauth_capture_store_declined(&no_mtime);
     }
 
     #[test]

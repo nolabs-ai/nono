@@ -74,6 +74,15 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 # naming in the workspace.
 spiffe-workload = { package = "spiffe", version = "0.16", features = ["jwt-source"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# ACL-restricted Keychain persistence for OAuth-capture tokens (see
+# src/oauth_capture/keychain_persist.rs). Matches the version pinned by
+# nono-cli (crates/nono-cli/Cargo.toml).
+security-framework = "3"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+security-framework-sys = "2"
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros"] }

@@ -484,14 +484,14 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         silent,
         rollback_prompt_disabled: rollback.prompt_disabled,
     });
-    // Both arms return a status rather than an `Err` so the caller still runs the
+    // Both arms yield a status rather than an `Err` so the caller still runs the
     // after-hook and drops the proxy handle; propagating would skip both and
     // leave the TLS-intercept trust bundle behind on `process::exit`.
-    match finalize_result {
+    let reported_exit_code = match finalize_result {
         Err(error) => {
             let reported = exit_code_after_finalization_failure(exit_code);
             output::print_session_finalization_failure(&error, exit_code, reported);
-            Ok(reported)
+            reported
         }
         // A skipped ledger append is the same class of failure as any other
         // unfinished bookkeeping and gets the same downgrade: exiting 0 would
@@ -503,12 +503,30 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         }) => {
             let reported = exit_code_after_finalization_failure(exit_code);
             output::print_audit_ledger_exit_status(exit_code, reported);
-            Ok(reported)
+            reported
         }
         Ok(FinalizeOutcome {
             ledger_recorded: true,
-        }) => Ok(exit_code),
-    }
+        }) => exit_code,
+    };
+
+    // The child — typically a full-screen TUI coding agent — has exited and the
+    // terminal is ours again, so this is the one point in the run where a notice
+    // is actually readable. Passive on purpose: the interactive removal lives in
+    // `nono setup`, because asking here interrupts someone who has just finished
+    // a session and leaves them to relaunch the agent. Deliberately after
+    // `finalize_supervised_exit`, whose rollback review is interactive and would
+    // otherwise scroll this away. The diagnostic footer is not a usable carrier:
+    // `should_print_diagnostic_footer` requires a non-zero exit or a recorded
+    // denial, so it prints nothing on the clean exits this targets.
+    crate::oauth_capture_legacy::remind_post_exit(
+        proxy.map_or(0, |opts| opts.credential_providers.len()),
+        proxy.map_or_else(Default::default, |opts| opts.oauth_capture_store_backend),
+        silent,
+        reported_exit_code,
+    );
+
+    Ok(reported_exit_code)
 }
 
 #[cfg(test)]

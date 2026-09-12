@@ -195,7 +195,9 @@ fn env_flag(key: &str) -> bool {
 }
 
 fn confirm_pull(profile_name: &str, provider: &ProfileProvider) -> Result<bool> {
-    let pack_ref = provider.pack_ref();
+    // Display only — the pull itself uses the unsanitized ref, which the
+    // registry client validates separately.
+    let pack_ref = sanitize_for_terminal(&provider.pack_ref());
     let mut err = io::stderr().lock();
     let _ = writeln!(err);
     let _ = writeln!(err, "  {}  Install {}?", "⊕".cyan(), pack_ref.bold(),);
@@ -264,7 +266,9 @@ enum SkipReason {
 }
 
 fn emit_skipped_hint(provider: &ProfileProvider, reason: SkipReason) {
-    let pack_ref = provider.pack_ref();
+    // Display only, and it is printed as a command for the user to copy —
+    // all the more reason it must not carry escapes.
+    let pack_ref = sanitize_for_terminal(&provider.pack_ref());
     let mut err = io::stderr().lock();
     let _ = writeln!(err);
     match reason {

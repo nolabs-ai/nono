@@ -136,6 +136,29 @@ fn is_affirmative_response(response: &str) -> bool {
 /// - DCS (ESC P), APC (ESC _), PM (ESC ^), SOS (ESC X): all consume through ST
 ///
 /// All control characters (0x00-0x1F, 0x7F) are replaced with space.
+/// A path on its way to a human, with escape sequences stripped on
+/// display.
+///
+/// Use this anywhere a path reaches a terminal, in place of
+/// `Path::display()`. Paths that a sandboxed agent chose are the case
+/// that matters: the agent is the untrusted party by definition here, it
+/// picks its own filenames, and nono prints them back to the user.
+///
+/// Do **not** use it for machine-readable output. `--json` consumers need
+/// the real value, and `serde_json` already escapes control characters,
+/// so there is no injection vector to close there — only data to corrupt.
+pub(crate) fn safe_path(path: &std::path::Path) -> impl std::fmt::Display + '_ {
+    struct SafePath<'a>(&'a std::path::Path);
+
+    impl std::fmt::Display for SafePath<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&sanitize_for_terminal(&self.0.display().to_string()))
+        }
+    }
+
+    SafePath(path)
+}
+
 pub(crate) fn sanitize_for_terminal(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -189,6 +212,42 @@ fn format_access_mode(access: &AccessMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// A sandboxed agent picks its own filenames, and nono prints them
+    /// back to the user's terminal when a session ends. Escapes must not
+    /// survive that trip.
+    #[test]
+    fn safe_path_strips_escapes_from_agent_chosen_names() {
+        let raw = std::path::PathBuf::from("/tmp/ev\u{1b}[2K\u{1b}[31mil.txt");
+        let shown = safe_path(&raw).to_string();
+        assert!(
+            !shown.contains("\u{1b}[2K"),
+            "erase-line survived: {shown:?}"
+        );
+        assert!(
+            !shown.contains("\u{1b}[31m"),
+            "color escape survived: {shown:?}"
+        );
+        assert!(shown.contains("evil.txt"), "visible text lost: {shown:?}");
+    }
+
+    /// Newlines are the other way to forge output — an extra line in a
+    /// change list or a consent prompt reads as nono's own. They are
+    /// folded to spaces, not passed through.
+    #[test]
+    fn safe_path_folds_newlines_rather_than_forging_lines() {
+        let raw = std::path::PathBuf::from("/tmp/a\nSuccessfully restored 0 files\nb.txt");
+        let shown = safe_path(&raw).to_string();
+        assert!(!shown.contains('\n'), "newline survived: {shown:?}");
+    }
+
+    /// An ordinary path must render unchanged — this sits on output the
+    /// user reads on every rollback.
+    #[test]
+    fn safe_path_leaves_ordinary_paths_alone() {
+        let raw = std::path::PathBuf::from("/home/u/project/src/main.rs");
+        assert_eq!(safe_path(&raw).to_string(), "/home/u/project/src/main.rs");
+    }
+
     use super::*;
     use nono::{AccessMode, ApprovalRequest};
 

@@ -101,7 +101,7 @@ fn print_change_details(changes: &[Change]) {
         eprintln!(
             "  {} {} ({}){}",
             symbol,
-            change.path.display(),
+            crate::terminal_approval::safe_path(&change.path),
             theme::fg(label, t.subtext),
             theme::fg(&size_info, t.overlay)
         );

@@ -191,6 +191,24 @@ struct HttpReply {
     body: String,
 }
 
+/// HTTP agent for approval webhooks. Redirects are disabled: a decision must
+/// come from the configured URL itself, otherwise a redirect (including HTTPS
+/// to HTTP) could carry the signed `X-Nono-*` headers to another host and let
+/// that host answer `granted`. A 3xx therefore surfaces as a non-2xx status
+/// and is treated as a denial.
+fn build_agent(timeout: Duration) -> ureq::Agent {
+    let tls_config = ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .tls_config(tls_config)
+        .build()
+        .new_agent()
+}
+
 impl WebhookApproval {
     fn new(name: &str, config: &ApprovalBackendConfig) -> Result<Self> {
         let platform = match config.auth {
@@ -220,14 +238,7 @@ impl WebhookApproval {
             )));
         }
         let timeout = Duration::from_secs(config.timeout_secs.unwrap_or(60));
-        let tls_config = ureq::tls::TlsConfig::builder()
-            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-            .build();
-        let http = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .tls_config(tls_config)
-            .build()
-            .new_agent();
+        let http = build_agent(timeout);
         Ok(Self {
             name: name.to_string(),
             url,
@@ -321,8 +332,10 @@ impl WebhookApproval {
     }
 
     /// Platform contract: submit, then poll `GET <url>/{request_id}` with
-    /// signed requests until a final state or this backend's timeout. The
-    /// transport is injected so the state machine is testable without HTTP.
+    /// signed requests until a final state or this backend's timeout. Each
+    /// hop is given only the remaining budget, both as the server hold hint
+    /// and as its own HTTP timeout. The transport is injected so the state
+    /// machine is testable without HTTP.
     fn drive_platform_approval(
         &self,
         request_id: &str,
@@ -342,6 +355,12 @@ impl WebhookApproval {
                 PlatformStep::Submit(body)
             };
             let reply = send(step, remaining)?;
+            // The deadline is checked again after the round trip: a decision
+            // that arrives once this backend's timeout has elapsed is never
+            // applied, however long the individual request took.
+            if started.elapsed() >= self.timeout {
+                return Ok(ApprovalDecision::Timeout);
+            }
             if !(200..300).contains(&reply.status) {
                 return Ok(self.http_status_denial(reply.status, started));
             }
@@ -436,6 +455,9 @@ impl WebhookApproval {
             }
         };
         let headers = Self::platform_headers(state, method, url.path(), body, remaining)?;
+        // Bound this hop by what is left of the backend timeout, not the whole
+        // configured timeout, so a late poll cannot outlive the deadline.
+        let hop_timeout = remaining.max(Duration::from_secs(1));
         let user_agent = format!("nono-cli/{}", env!("CARGO_PKG_VERSION"));
         let failed = |e: ureq::Error| {
             NonoError::SandboxInit(format!("approval webhook '{}' failed: {e}", self.name))
@@ -446,6 +468,7 @@ impl WebhookApproval {
                 .post(url.as_str())
                 .config()
                 .http_status_as_error(false)
+                .timeout_global(Some(hop_timeout))
                 .build()
                 .header("Content-Type", "application/json")
                 .header("User-Agent", &user_agent);
@@ -459,6 +482,7 @@ impl WebhookApproval {
                 .get(url.as_str())
                 .config()
                 .http_status_as_error(false)
+                .timeout_global(Some(hop_timeout))
                 .build()
                 .header("User-Agent", &user_agent);
             for (name, value) in &headers {
@@ -812,6 +836,35 @@ mod tests {
         assert!(
             polls >= 2,
             "expected several polls before giving up, saw {polls}"
+        );
+    }
+
+    #[test]
+    fn platform_poll_loop_rejects_a_grant_that_arrives_after_the_deadline() {
+        let backend = test_webhook(Duration::from_millis(40));
+        let decision = backend
+            .drive_platform_approval("req-late", b"{}", Instant::now(), |_, remaining| {
+                // The hop is handed only the remaining budget...
+                assert!(remaining <= Duration::from_millis(40));
+                // ...but simulate a server that answers after the deadline.
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(reply(200, r#"{"state":"granted","decision":"granted"}"#))
+            })
+            .unwrap();
+        assert!(
+            matches!(decision, ApprovalDecision::Timeout),
+            "a late grant must not be applied"
+        );
+    }
+
+    #[test]
+    fn approval_webhook_agent_never_follows_redirects() {
+        let agent = build_agent(Duration::from_secs(5));
+        assert_eq!(agent.config().max_redirects(), 0);
+        assert!(!agent.config().max_redirects_will_error());
+        assert_eq!(
+            agent.config().timeouts().global,
+            Some(Duration::from_secs(5))
         );
     }
 

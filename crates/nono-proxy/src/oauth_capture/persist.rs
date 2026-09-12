@@ -51,7 +51,11 @@ pub(super) fn load_persisted_tokens(path: &Path) -> Result<HashMap<String, Store
             phantom,
             StoredOAuthToken {
                 real: Zeroizing::new(token.real.into_bytes()),
-                admitted_consumers: token.admitted_consumers.into_iter().collect(),
+                admitted_consumers: token
+                    .admitted_consumers
+                    .iter()
+                    .map(|consumer| super::normalise_admitted_consumer(consumer))
+                    .collect(),
                 created_at_secs: token.created_at_secs,
             },
         );

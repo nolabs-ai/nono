@@ -1055,7 +1055,7 @@ pub async fn start_with_nonce_resolver(
     let route_store = if config.routes.is_empty() {
         RouteStore::empty()
     } else {
-        RouteStore::load(&config.routes).await?
+        RouteStore::load_with_oauth_capture(&config.routes, &config.oauth_capture).await?
     };
     let route_hosts = route_store.route_upstream_hosts();
     validate_no_proxy_route_conflicts(&config.no_proxy, &route_hosts)?;
@@ -2096,7 +2096,7 @@ async fn handle_forward_http(
     let host_port = crate::route::format_host_port(&host, port);
     let matched_route = state
         .route_store
-        .lookup_by_upstream(&host_port)
+        .lookup_credential_bearing_by_upstream(&host_port)
         .map(|(prefix, _)| prefix.to_string());
     let redeemable = matched_route.as_ref().and_then(|prefix| {
         Some((
@@ -2112,7 +2112,7 @@ async fn handle_forward_http(
                  redeeming phantom headers before forwarding",
                     host_port, prefix
                 );
-                let consumer = format!("proxy.{prefix}");
+                let consumer = crate::oauth_capture::route_consumer(prefix);
                 strip_and_redeem_proxy_headers(header_bytes, &consumer, redeem_phantoms, resolver)
             }
             _ => (strip_proxy_headers(header_bytes), false),

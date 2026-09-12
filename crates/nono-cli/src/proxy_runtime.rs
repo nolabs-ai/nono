@@ -2596,7 +2596,7 @@ fn synthesize_credential_provider_proxy_config(
             consumers_by_provider
                 .entry(route.provider.clone())
                 .or_default()
-                .push(format!("proxy.{prefix}"));
+                .push(nono_proxy::oauth_capture::route_consumer(&prefix));
             if let Some(host_port) = origin_host_port(api_host)? {
                 push_unique(&mut proxy_config.allowed_hosts, host_port);
             }

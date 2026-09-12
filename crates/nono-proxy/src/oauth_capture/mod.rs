@@ -50,6 +50,24 @@ pub struct OAuthCaptureStore {
 const MAX_PERSISTED_PHANTOMS: usize = 4096;
 const PHANTOM_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 
+#[must_use]
+pub fn route_consumer(prefix: &str) -> String {
+    format!("proxy.{}", prefix.trim_matches('/'))
+}
+
+#[must_use]
+pub fn route_prefix_for_consumer(consumer: &str) -> Option<&str> {
+    consumer.strip_prefix("proxy.")
+}
+
+#[must_use]
+fn normalise_admitted_consumer(consumer: &str) -> String {
+    match route_prefix_for_consumer(consumer) {
+        Some(prefix) => route_consumer(prefix),
+        None => consumer.to_string(),
+    }
+}
+
 impl OAuthCaptureStore {
     pub fn load(configs: &[OAuthCaptureConfig]) -> Result<Self> {
         Self::load_with_persistence(configs, None)
@@ -66,7 +84,7 @@ impl OAuthCaptureStore {
             let mut admitted = config
                 .admitted_consumers
                 .iter()
-                .cloned()
+                .map(|consumer| normalise_admitted_consumer(consumer))
                 .collect::<HashSet<_>>();
             admitted.insert(provider_consumer(&config.provider));
             for endpoint in &config.token_endpoints {
@@ -651,6 +669,50 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn persisted_admitted_consumers_are_normalised_on_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "nono-oauth-capture-normalise-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("providers.json");
+
+        let phantom = format!("nono_{}", "a".repeat(64));
+        let mut tokens = serde_json::Map::new();
+        tokens.insert(
+            phantom.clone(),
+            serde_json::json!({
+                "real": "real-access",
+                "admitted_consumers": ["proxy./svc/"],
+                "created_at_secs": now_secs(),
+            }),
+        );
+        fs::write(
+            &path,
+            serde_json::json!({ "version": 1, "tokens": Value::Object(tokens) }).to_string(),
+        )
+        .unwrap();
+
+        let store = store_with_persistence(path);
+        assert_eq!(
+            std::str::from_utf8(
+                &store
+                    .resolve(&phantom, &route_consumer("svc"))
+                    .expect("a persisted phantom must resolve under the normalised consumer")
+            )
+            .unwrap(),
+            "real-access"
+        );
+        assert!(
+            store.resolve(&phantom, "proxy.other").is_none(),
+            "normalisation must not widen the persisted consumer set"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn opaque_fields<const N: usize>(paths: [&str; N]) -> Vec<OAuthTokenResponseFieldConfig> {
         paths
             .into_iter()
@@ -842,5 +904,38 @@ mod tests {
         assert!(p_o.starts_with("oth_"));
         assert_eq!(r_a, "Bearer A");
         assert_eq!(r_o, "Bearer B");
+    }
+
+    #[test]
+    fn admitted_consumer_with_slashed_prefix_resolves_for_loaded_route_key() {
+        let store = OAuthCaptureStore::load(&[OAuthCaptureConfig {
+            provider: "codex".to_string(),
+            token_endpoints: vec![OAuthTokenEndpointConfig {
+                host: "https://auth.openai.com".to_string(),
+                path: "/oauth/token".to_string(),
+                response_fields: opaque_fields(["access_token"]),
+                request_body: OAuthTokenRequestBodyFormat::Auto,
+                request_nonce_fields: vec![],
+            }],
+            admitted_consumers: vec!["proxy./svc/".to_string()],
+        }])
+        .unwrap();
+        let endpoint = store.lookup("auth.openai.com:443", "/oauth/token").unwrap();
+        let rewritten = store
+            .rewrite_response_body(endpoint, br#"{"access_token":"real-access"}"#)
+            .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        let access = json["access_token"].as_str().unwrap();
+
+        assert_eq!(route_consumer("/svc/"), "proxy.svc");
+        assert_eq!(
+            std::str::from_utf8(
+                &store
+                    .resolve(access, &route_consumer("svc"))
+                    .expect("the loaded route key must resolve the phantom")
+            )
+            .unwrap(),
+            "real-access"
+        );
     }
 }

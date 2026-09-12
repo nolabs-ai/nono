@@ -39,6 +39,15 @@ Command fails with "Permission denied" or "Operation not permitted" errors.
 | Relative path resolved differently | Use absolute paths |
 | Symlink target outside sandbox | Grant access to the symlink target |
 | File replaced after sandbox start (Linux) | Grant the containing directory, or restart the sandbox (see below) |
+| Nested sandbox refused (macOS) | Not a path: disable the tool's own sandbox, or drop the inner `nono run` (see below) |
+
+### Nested Sandbox Refused (macOS)
+
+**Symptom:** `sandbox-exec: sandbox_apply: Operation not permitted`, a `sandbox_init` failure with EPERM, or `forbidden-sandbox-reinit` in the sandbox log. A nested `nono run` exits 126 after printing `failed to apply sandbox`.
+
+**Cause:** the command tried to start its own Seatbelt sandbox inside nono's sandbox. macOS refuses `sandbox_init()` from an already-sandboxed process. This denial names no path, so `--allow`, `--read`, `--write`, and profile changes cannot change it, and `nono why --path` has nothing to query. The diagnostic footer reports it as a nested sandbox refusal rather than a path denial.
+
+**Fix:** run the tool with its built-in sandbox disabled so nono stays the enforcement boundary (Codex: `nono run --profile <name> -- codex --sandbox danger-full-access --ask-for-approval on-request`), or, if the failing command was itself `nono run`, drop the inner nono: the outer sandbox already applies.
 
 ### Sensitive Paths
 

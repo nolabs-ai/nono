@@ -16,11 +16,16 @@
 //!   - Variables expanded at execution time: `$PACK_DIR`, `$NS`
 //!     (pack namespace), `$PLUGIN` (pack name, the second segment
 //!     of `<ns>/<pack>`), `$HOME`, `$XDG_CONFIG_HOME`, `$NONO_CONFIG`,
-//!     `$NONO_PACKAGES`. No shell evaluation, no user-controlled inputs
-//!     flow in.
+//!     `$NONO_PACKAGES`, `$NOW`. No shell evaluation.
+//!   - A pack may declare additional variables in `wiring_vars`, each
+//!     backed by an environment variable. That is the one path by which
+//!     user-controlled input reaches a destination path; it is resolved
+//!     and validated exactly once per install by `resolve_vars`, which
+//!     rejects anything not an absolute, traversal-free path.
 //!   - Idempotent: re-running a directive with the same inputs is a
 //!     no-op and reports `wiring_changed = false`.
 
+use crate::package::WiringVar;
 use chrono::Utc;
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
@@ -297,6 +302,9 @@ pub struct WiringContext {
     pub namespace: String,
     /// Pack name (the `<pack>` in `<ns>/<pack>`).
     pub pack_name: String,
+    /// Pack-declared variables, already resolved by `resolve_vars`.
+    /// Empty for packs that only use the built-in set.
+    pub vars: BTreeMap<String, String>,
 }
 
 /// Outcome of executing a directive list.
@@ -683,29 +691,104 @@ fn expand_vars(template: &str, ctx: &WiringContext) -> Result<String> {
     let nono_config_str = nono_config.to_string_lossy().into_owned();
     let nono_packages_str = nono_packages.to_string_lossy().into_owned();
 
+    let builtin = |name: &str| -> Option<String> {
+        match name {
+            "PACK_DIR" => Some(pack_dir.clone()),
+            "NS" => Some(ctx.namespace.clone()),
+            "PLUGIN" => Some(ctx.pack_name.clone()),
+            "HOME" => Some(home_str.clone()),
+            "XDG_CONFIG_HOME" => Some(xdg_str.clone()),
+            "NONO_CONFIG" => Some(nono_config_str.clone()),
+            "NONO_PACKAGES" => Some(nono_packages_str.clone()),
+            // Install-time UTC timestamp (RFC3339, milliseconds).
+            "NOW" => Some(Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()),
+            _ => None,
+        }
+    };
+
     // Uppercase-only start: leaves `$` regex anchors and jq `$var` untouched.
     crate::policy::substitute_vars(
         template,
         |nc| nc.is_ascii_uppercase() || nc == '_',
         |name| -> Result<Option<String>> {
-            match name {
-                "PACK_DIR" => Ok(Some(pack_dir.clone())),
-                "NS" => Ok(Some(ctx.namespace.clone())),
-                "PLUGIN" => Ok(Some(ctx.pack_name.clone())),
-                "HOME" => Ok(Some(home_str.clone())),
-                "XDG_CONFIG_HOME" => Ok(Some(xdg_str.clone())),
-                "NONO_CONFIG" => Ok(Some(nono_config_str.clone())),
-                "NONO_PACKAGES" => Ok(Some(nono_packages_str.clone())),
-                // Install-time UTC timestamp (RFC3339, milliseconds).
-                "NOW" => Ok(Some(
-                    Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-                )),
-                other => Err(NonoError::PackageInstall(format!(
-                    "wiring template references unknown variable '${other}' in '{template}'"
-                ))),
+            if let Some(value) = builtin(name) {
+                return Ok(Some(value));
             }
+            if let Some(value) = ctx.vars.get(name) {
+                return Ok(Some(value.clone()));
+            }
+            Err(NonoError::PackageInstall(format!(
+                "wiring template references unknown variable '${name}' in '{template}'"
+            )))
         },
     )
+}
+
+/// Resolve a pack's declared `wiring_vars` once, before any directive
+/// runs.
+///
+/// Resolving up front rather than per-occurrence matters for more than
+/// speed: `expand_vars` is called per field per directive, so a lazy
+/// resolve would re-read the environment — and re-report any problem —
+/// once for every mention of the variable, and two directives could in
+/// principle disagree if the environment changed mid-install.
+///
+/// An environment value is the one user-controlled input that reaches a
+/// destination path, so it must be an absolute path with no `..`
+/// component. Anything else is a hard error: the variable exists to
+/// point the install somewhere specific, and quietly using the pack's
+/// default instead is how the bug this feature fixes behaved in the
+/// first place. An unset variable is the ordinary case and falls back to
+/// the declared default without comment.
+///
+/// Note what is deliberately *not* checked: containment under `$HOME`.
+/// Relocating an agent's config onto another volume, or behind a
+/// symlink, is a legitimate setup, and a containment rule would reject
+/// it while buying nothing — `expand_to_path` already accepts any
+/// absolute literal destination a pack cares to write, so the check
+/// would constrain honest users without constraining a hostile pack.
+pub fn resolve_vars(
+    declared: &BTreeMap<String, WiringVar>,
+    ctx: &WiringContext,
+) -> Result<BTreeMap<String, String>> {
+    let mut resolved = BTreeMap::new();
+    for (name, var) in declared {
+        resolved.insert(name.clone(), resolve_one_var(name, var, ctx)?);
+    }
+    Ok(resolved)
+}
+
+fn resolve_one_var(name: &str, var: &WiringVar, ctx: &WiringContext) -> Result<String> {
+    let Some(raw) = std::env::var_os(&var.env) else {
+        // Unset: the pack's default is the answer. Expanded against the
+        // built-in table only — `ctx.vars` is still empty at this point,
+        // so a default naming another pack variable fails as unknown
+        // rather than needing cycle detection.
+        return expand_vars(&var.default, ctx);
+    };
+
+    let rejected = |reason: &str| {
+        NonoError::PackageInstall(format!(
+            "${} is set but {reason}, so the wiring variable ${name} cannot be resolved.              Fix or unset ${}, then retry.",
+            var.env, var.env
+        ))
+    };
+
+    let value = raw.to_str().ok_or_else(|| rejected("not valid UTF-8"))?;
+    if value.is_empty() {
+        return Err(rejected("empty"));
+    }
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return Err(rejected(&format!("not an absolute path ('{value}')")));
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(rejected(&format!("contains '..' ('{value}')")));
+    }
+    Ok(value.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1608,6 +1691,7 @@ mod tests {
             pack_dir,
             namespace: "nolabs-ai".to_string(),
             pack_name: "claude".to_string(),
+            vars: BTreeMap::new(),
         }
     }
 
@@ -1645,6 +1729,7 @@ mod tests {
             pack_dir,
             namespace: "ns".to_string(),
             pack_name: "name".to_string(),
+            vars: BTreeMap::new(),
         };
         let _g = match ENV_LOCK.lock() {
             Ok(g) => g,
@@ -1682,6 +1767,7 @@ mod tests {
             pack_dir: PathBuf::from("/p"),
             namespace: "nolabs-ai".to_string(),
             pack_name: "claude".to_string(),
+            vars: BTreeMap::new(),
         };
         let _env = EnvVarGuard::set_all(&[("HOME", home_str), ("XDG_CONFIG_HOME", config_str)]);
         let expected_config = format!("{config_str}/nono/profile-drafts");
@@ -1700,12 +1786,221 @@ mod tests {
         );
     }
 
+    /// A pack declaring one variable, shaped the way the claude pack
+    /// would declare where Claude Code keeps its config. Returns the
+    /// resolve result so rejection tests can assert on the error.
+    fn ctx_with_var(env: &str, default: &str) -> Result<WiringContext> {
+        let mut declared = BTreeMap::new();
+        declared.insert(
+            "AGENT_CONFIG".to_string(),
+            WiringVar {
+                env: env.to_string(),
+                default: default.to_string(),
+            },
+        );
+        let mut ctx = WiringContext {
+            pack_dir: PathBuf::from("/p"),
+            namespace: "ns".to_string(),
+            pack_name: "name".to_string(),
+            vars: BTreeMap::new(),
+        };
+        ctx.vars = resolve_vars(&declared, &ctx)?;
+        Ok(ctx)
+    }
+
+    /// The whole point of the feature: a pack that points at an agent's
+    /// relocated config dir must wire into that dir, not the default.
+    #[test]
+    fn pack_var_prefers_env_value() {
+        with_fake_home(|home| {
+            let relocated = home.join("relocated-agent");
+            std::fs::create_dir_all(&relocated).expect("mkdir");
+            let _env = EnvVarGuard::set_all(&[(
+                "NONO_TEST_AGENT_CONFIG",
+                relocated.to_str().expect("utf8"),
+            )]);
+            let ctx = ctx_with_var("NONO_TEST_AGENT_CONFIG", "$HOME/.agent").expect("resolve");
+            assert_eq!(
+                expand_vars("$AGENT_CONFIG/plugins", &ctx).expect("expand"),
+                format!("{}/plugins", relocated.display())
+            );
+        });
+    }
+
+    /// Packs that declare a variable must keep working for the majority
+    /// who never set the environment variable at all.
+    #[test]
+    fn pack_var_falls_back_to_default_when_env_unset() {
+        with_fake_home(|home| {
+            let guard = EnvVarGuard::set_all(&[("NONO_TEST_AGENT_CONFIG_UNSET", "placeholder")]);
+            guard.remove("NONO_TEST_AGENT_CONFIG_UNSET");
+            let ctx =
+                ctx_with_var("NONO_TEST_AGENT_CONFIG_UNSET", "$HOME/.agent").expect("resolve");
+            assert_eq!(
+                expand_vars("$AGENT_CONFIG/plugins", &ctx).expect("expand"),
+                format!("{}/.agent/plugins", home.display())
+            );
+        });
+    }
+
+    /// A config dir relocated onto another volume by symlink is a normal
+    /// setup, and the earlier `$HOME`-containment rule got it exactly
+    /// backwards: it rejected the value, fell back to the default — the
+    /// same symlink — and wrote outside `$HOME` anyway, after warning
+    /// that it would not. Honor the value instead.
+    #[test]
+    fn pack_var_honors_symlinked_config_dir() {
+        with_fake_home(|home| {
+            let outside = TempDir::new().expect("outside tmpdir");
+            let link = home.join(".agent-link");
+            std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+            let _env = EnvVarGuard::set_all(&[(
+                "NONO_TEST_AGENT_CONFIG_SYMLINK",
+                link.to_str().expect("utf8"),
+            )]);
+            let ctx =
+                ctx_with_var("NONO_TEST_AGENT_CONFIG_SYMLINK", "$HOME/.agent").expect("resolve");
+            assert_eq!(
+                expand_vars("$AGENT_CONFIG/x", &ctx).expect("expand"),
+                format!("{}/x", link.display())
+            );
+        });
+    }
+
+    /// The target directory usually does not exist yet on a first
+    /// install — resolution must not depend on it being there.
+    #[test]
+    fn pack_var_accepts_not_yet_existing_dir() {
+        with_fake_home(|home| {
+            let missing = home.join("not/created/yet");
+            let _env = EnvVarGuard::set_all(&[(
+                "NONO_TEST_AGENT_CONFIG_MISSING",
+                missing.to_str().expect("utf8"),
+            )]);
+            let ctx =
+                ctx_with_var("NONO_TEST_AGENT_CONFIG_MISSING", "$HOME/.agent").expect("resolve");
+            assert_eq!(
+                expand_vars("$AGENT_CONFIG/x", &ctx).expect("expand"),
+                format!("{}/x", missing.display())
+            );
+        });
+    }
+
+    /// Config outside `$HOME` is deliberately allowed: an external
+    /// volume is a legitimate place to keep it, and a containment rule
+    /// would not stop a hostile pack, which can already name any
+    /// absolute destination literally.
+    #[test]
+    fn pack_var_accepts_dir_outside_home() {
+        with_fake_home(|_home| {
+            let outside = TempDir::new().expect("outside tmpdir");
+            let _env = EnvVarGuard::set_all(&[(
+                "NONO_TEST_AGENT_CONFIG_OUTSIDE",
+                outside.path().to_str().expect("utf8"),
+            )]);
+            let ctx =
+                ctx_with_var("NONO_TEST_AGENT_CONFIG_OUTSIDE", "$HOME/.agent").expect("resolve");
+            assert_eq!(
+                expand_vars("$AGENT_CONFIG/x", &ctx).expect("expand"),
+                format!("{}/x", outside.path().display())
+            );
+        });
+    }
+
+    /// Set-but-unusable is a hard error, not a quiet fallback. Falling
+    /// back would reproduce the silent misplacement this feature exists
+    /// to fix: the user asked for a specific directory and nono would
+    /// use a different one while reporting success.
+    #[test]
+    fn pack_var_rejects_unusable_env_values() {
+        // reason fragment the error must mention, and the value producing it
+        let cases: [(&str, &str); 3] = [
+            ("not an absolute path", "relative/path"),
+            ("contains '..'", "/tmp/../escaped"),
+            ("empty", ""),
+        ];
+        for (expected, value) in cases {
+            with_fake_home(|_home| {
+                let _env = EnvVarGuard::set_all(&[("NONO_TEST_AGENT_CONFIG_BAD", value)]);
+                let err = ctx_with_var("NONO_TEST_AGENT_CONFIG_BAD", "$HOME/.agent")
+                    .expect_err("expected rejection");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(expected),
+                    "value {value:?}: expected error mentioning {expected:?}, got: {msg}"
+                );
+                assert!(
+                    msg.contains("NONO_TEST_AGENT_CONFIG_BAD"),
+                    "error should name the offending variable, got: {msg}"
+                );
+            });
+        }
+    }
+
+    /// Defaults resolve against built-ins only. Allowing them to name
+    /// other pack variables would need cycle detection for no gain.
+    #[test]
+    fn pack_var_default_cannot_reference_another_pack_var() {
+        with_fake_home(|_home| {
+            let mut declared = BTreeMap::new();
+            declared.insert(
+                "A".to_string(),
+                WiringVar {
+                    env: "NONO_TEST_AGENT_CONFIG_CHAIN_A".to_string(),
+                    default: "$B/x".to_string(),
+                },
+            );
+            declared.insert(
+                "B".to_string(),
+                WiringVar {
+                    env: "NONO_TEST_AGENT_CONFIG_CHAIN_B".to_string(),
+                    default: "$HOME/b".to_string(),
+                },
+            );
+            let ctx = WiringContext {
+                pack_dir: PathBuf::from("/p"),
+                namespace: "ns".to_string(),
+                pack_name: "name".to_string(),
+                vars: BTreeMap::new(),
+            };
+            assert!(resolve_vars(&declared, &ctx).is_err());
+        });
+    }
+
+    /// A pack cannot shadow a built-in: built-ins are consulted first.
+    #[test]
+    fn pack_var_cannot_shadow_builtin() {
+        with_fake_home(|home| {
+            let _env = EnvVarGuard::set_all(&[("NONO_TEST_AGENT_CONFIG_SHADOW", "/somewhere")]);
+            let mut declared = BTreeMap::new();
+            declared.insert(
+                "HOME".to_string(),
+                WiringVar {
+                    env: "NONO_TEST_AGENT_CONFIG_SHADOW".to_string(),
+                    default: "/other".to_string(),
+                },
+            );
+            let mut ctx = WiringContext {
+                pack_dir: PathBuf::from("/p"),
+                namespace: "ns".to_string(),
+                pack_name: "name".to_string(),
+                vars: BTreeMap::new(),
+            };
+            ctx.vars = resolve_vars(&declared, &ctx).expect("resolve");
+            assert_eq!(
+                expand_vars("$HOME/x", &ctx).expect("expand"),
+                format!("{}/x", home.display())
+            );
+        });
+    }
+
     #[test]
     fn expand_vars_rejects_unknown() {
         let ctx = WiringContext {
             pack_dir: PathBuf::from("/p"),
             namespace: "n".to_string(),
             pack_name: "p".to_string(),
+            vars: BTreeMap::new(),
         };
         assert!(expand_vars("$BOGUS/x", &ctx).is_err());
         // Bare `$` not followed by an uppercase identifier passes through.

@@ -346,8 +346,9 @@ where
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
-                debug!("Upstream read error: {}", e);
-                break;
+                return Err(ProxyError::HttpParse(format!(
+                    "upstream read error while buffering response for OAuth capture rewrite: {e}"
+                )));
             }
             Err(_) => {
                 return Err(ProxyError::HttpParse(

@@ -1972,6 +1972,7 @@ mod tests {
                         },
                     ],
                     request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
+                    response_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
                     request_nonce_fields: vec!["refresh_token".to_string()],
                 }],
                 admitted_consumers: vec!["proxy.test".to_string()],

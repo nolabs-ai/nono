@@ -2636,6 +2636,7 @@ fn synthesize_credential_provider_proxy_config(
                         nono_proxy::config::OAuthTokenRequestBodyFormat::Form
                     }
                 },
+                response_body: nono_proxy::config::OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: endpoint.request_nonce_fields.clone(),
             });
             if let Some(host_port) = origin_host_port(&endpoint.host)? {

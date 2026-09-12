@@ -145,6 +145,35 @@ Predicates support OS, Linux distro and distro-family, version comparisons, nega
 
 If a pack uses `when`, set `min_nono_version` to a CLI release that supports predicates. Older CLIs must refuse the pack rather than silently applying conditional entries unconditionally.
 
+### Agent Config Directories
+
+Wiring destinations expand a fixed set of variables: `$PACK_DIR`, `$NS`, `$PLUGIN`, `$HOME`, `$XDG_CONFIG_HOME`, `$NONO_CONFIG`, `$NONO_PACKAGES`, and `$NOW`. None of them says "wherever this agent keeps its config", which matters for agents that let users relocate it — Claude Code reads `CLAUDE_CONFIG_DIR`, Codex reads `CODEX_HOME`. A pack that hardcodes `$HOME/.claude` writes into a directory the agent never reads, and nothing reports an error.
+
+Declare the variable your pack needs in `wiring_vars` and the CLI resolves it at install time:
+
+```json
+{
+  "wiring_vars": {
+    "CLAUDE_CONFIG": { "env": "CLAUDE_CONFIG_DIR", "default": "$HOME/.claude" }
+  },
+  "wiring": [
+    {
+      "type": "write_file",
+      "source": "hooks/hooks.json",
+      "dest": "$CLAUDE_CONFIG/plugins/marketplaces/$NS/plugins/nono/hooks/hooks.json"
+    }
+  ]
+}
+```
+
+Each declared variable is resolved once, before any directive runs:
+
+- **Unset** — the pack's `default` is used. It expands against the built-in variables only, so a default cannot reference another `wiring_vars` entry.
+- **Set to an absolute path with no `..` component** — that value is used, including when it points outside `$HOME` or through a symlink. Keeping an agent's config on another volume is a supported setup.
+- **Set to anything else** — empty, relative, non-UTF-8, or containing `..` — the install fails with an error naming the variable. It does not fall back to the default: the user asked for a specific directory, and quietly using a different one is the failure mode this feature exists to remove.
+
+Set `min_nono_version` to a release that supports `wiring_vars`. Older CLIs ignore the block and then fail the install on the unknown `$CLAUDE_CONFIG` variable, rather than silently writing to the wrong place.
+
 ### Profiles That Replace a Former Preset
 
 If your pack ships a profile with an `install_as` name that used to be compiled into the CLI (e.g. `claude-code` was a preset until v0.43), you also need to register it in the migration table so users on older versions get a friendly auto-pull prompt instead of a "profile not found" error. See [PACK_PROVIDED_PROFILES](#registering-a-pack-provided-profile) below.

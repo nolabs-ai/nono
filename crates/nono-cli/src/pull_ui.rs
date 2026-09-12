@@ -15,6 +15,18 @@ use crate::package::{PackageRef, PullResponse};
 use colored::Colorize;
 use std::io::{self, Write};
 
+/// Artifact filenames come from the pull response, so they are
+/// pack-controlled text on its way to a terminal. Strip escape sequences
+/// before they reach the screen — a filename carrying ANSI could erase
+/// lines, recolour, or forge rows for files the pack never shipped.
+///
+/// Column width is measured from the sanitized name for the same reason:
+/// escape bytes counted as width inflate the padding calculation and
+/// misalign every row in the block, not only the offending one.
+fn display_name(filename: &str) -> String {
+    crate::terminal_approval::sanitize_for_terminal(filename)
+}
+
 /// Per-file download progress sink. The pull pipeline calls
 /// `started` before each download and `finished` once the digest is
 /// verified. All methods are best-effort and never fail the pull —
@@ -33,7 +45,7 @@ impl ProgressPrinter {
         let name_width = pull
             .artifacts
             .iter()
-            .map(|a| a.filename.len())
+            .map(|a| display_name(&a.filename).len())
             .max()
             .unwrap_or(0);
         let size_width = pull
@@ -60,16 +72,22 @@ impl ProgressPrinter {
     /// `bytes` is the on-disk size of the verified file.
     pub fn finished(&self, filename: &str, bytes: u64) {
         let mut err = io::stderr().lock();
+        let _ = writeln!(err, "{}", self.row(filename, bytes));
+    }
+
+    /// Build the completed-file row. Split out from `finished` so the
+    /// sanitizing below is assertable without capturing stderr.
+    fn row(&self, filename: &str, bytes: u64) -> String {
+        let name = display_name(filename);
         let size = format_size(bytes as i64);
-        let _ = writeln!(
-            err,
+        format!(
             "     {name:<name_w$}   {size:>size_w$}   {tick}",
-            name = filename.dimmed(),
+            name = name.dimmed(),
             name_w = self.name_width,
             size = size.dimmed(),
             size_w = self.size_width,
             tick = "✓".green(),
-        );
+        )
     }
 }
 
@@ -143,6 +161,34 @@ pub fn format_size(bytes: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pack-controlled filename must not carry escapes to the screen.
+    #[test]
+    fn progress_row_strips_terminal_escapes() {
+        let printer = ProgressPrinter {
+            name_width: 20,
+            size_width: 8,
+        };
+        let row = printer.row("eve\u{1b}[2K\u{1b}[31mil.json", 1024);
+        assert!(!row.contains("\u{1b}[2K"), "erase-line survived: {row:?}");
+        assert!(
+            !row.contains("\u{1b}[31m"),
+            "color escape survived: {row:?}"
+        );
+        assert!(row.contains("eveil.json"), "visible text lost: {row:?}");
+    }
+
+    /// Width is measured from what is printed. Measuring the raw string
+    /// would let one hostile filename skew the padding of every row.
+    #[test]
+    fn display_name_length_excludes_escape_bytes() {
+        let raw = "a\u{1b}[31mb.json";
+        assert!(
+            raw.len() > "ab.json".len(),
+            "test fixture should contain escapes"
+        );
+        assert_eq!(display_name(raw).len(), "ab.json".len());
+    }
 
     #[test]
     fn format_size_thresholds() {

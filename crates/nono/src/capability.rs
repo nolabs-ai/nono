@@ -956,6 +956,8 @@ pub struct CapabilitySet {
     unix_sockets: Vec<UnixSocketCapability>,
     /// Network access mode (default: AllowAll)
     network_mode: NetworkMode,
+    /// Omit the implicit macOS resolver grants in restricted network modes.
+    dns_blocked: bool,
     /// Per-port TCP connect allowlist (Linux Landlock V4+ only).
     /// Adding any entry implies Blocked base with specific port exceptions.
     tcp_connect_ports: Vec<u16>,
@@ -1099,9 +1101,37 @@ impl CapabilitySet {
     /// Block network access (builder pattern)
     ///
     /// By default, network access is allowed. Call this to block all network.
+    /// On macOS, the host DNS resolver remains accessible unless
+    /// [`block_dns()`](Self::block_dns) is also called. Explicit socket and
+    /// port grants still apply.
     #[must_use]
     pub fn block_network(mut self) -> Self {
         self.network_mode = NetworkMode::Blocked;
+        self
+    }
+
+    /// Omit the implicit macOS DNS resolver exceptions (builder pattern).
+    ///
+    /// In [`NetworkMode::Blocked`] and [`NetworkMode::ProxyOnly`], this omits
+    /// the Seatbelt grants for the `mDNSResponder` Unix socket. For example,
+    /// Nix dynamic derivations need to prevent host DNS queries as well as
+    /// direct network connections:
+    ///
+    /// ```
+    /// use nono::CapabilitySet;
+    ///
+    /// let caps = CapabilitySet::new().block_network().block_dns();
+    /// assert!(!caps.dns_enabled());
+    /// ```
+    ///
+    /// This does not change the network mode or revoke explicit Unix socket,
+    /// localhost, proxy, or platform-rule grants. It has no enforcement effect
+    /// in [`NetworkMode::AllowAll`] or on Linux, and is not a general DNS
+    /// filter. Callers requiring strict isolation must also avoid granting
+    /// other paths to a resolver. The setting survives network-mode changes.
+    #[must_use]
+    pub fn block_dns(mut self) -> Self {
+        self.dns_blocked = true;
         self
     }
 
@@ -1645,6 +1675,16 @@ impl CapabilitySet {
     #[must_use]
     pub fn network_mode(&self) -> &NetworkMode {
         &self.network_mode
+    }
+
+    /// Whether restricted macOS network modes include implicit resolver grants.
+    ///
+    /// Defaults to `true`. This reports the configuration, not whether DNS is
+    /// reachable through other grants or on another platform. See
+    /// [`block_dns()`](Self::block_dns).
+    #[must_use]
+    pub fn dns_enabled(&self) -> bool {
+        !self.dns_blocked
     }
 
     /// Get per-port TCP connect allowlist
@@ -2968,6 +3008,35 @@ mod tests {
         let caps = CapabilitySet::new().block_network();
         assert_eq!(*caps.network_mode(), NetworkMode::Blocked);
         assert!(caps.is_network_blocked());
+    }
+
+    #[test]
+    fn test_dns_exceptions_enabled_by_default() {
+        assert!(CapabilitySet::default().dns_enabled());
+        assert!(CapabilitySet::new().block_network().dns_enabled());
+        assert!(CapabilitySet::new().proxy_only(8080).dns_enabled());
+    }
+
+    #[test]
+    fn test_block_dns_is_independent_of_network_mode() {
+        let caps = CapabilitySet::new().block_dns();
+        assert_eq!(*caps.network_mode(), NetworkMode::AllowAll);
+        assert!(!caps.dns_enabled());
+
+        let caps = caps.clone().block_network();
+        assert_eq!(*caps.network_mode(), NetworkMode::Blocked);
+        assert!(!caps.dns_enabled());
+        assert!(
+            !CapabilitySet::new()
+                .block_network()
+                .block_dns()
+                .dns_enabled()
+        );
+
+        let caps = caps.proxy_only(8080);
+        assert!(!caps.dns_enabled());
+        let caps = caps.set_network_mode(NetworkMode::AllowAll);
+        assert!(!caps.dns_enabled());
     }
 
     #[test]

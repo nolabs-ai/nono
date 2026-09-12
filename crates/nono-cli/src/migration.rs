@@ -17,6 +17,7 @@ use crate::cli::PullArgs;
 use crate::package::ProfileProvider;
 use crate::package_cmd;
 use crate::registry_client::{PullReason, RegistryClient, resolve_registry_url};
+use crate::terminal_approval::sanitize_for_terminal;
 use colored::Colorize;
 use nono::Result;
 use std::io::{self, IsTerminal, Write};
@@ -206,10 +207,16 @@ fn confirm_pull(profile_name: &str, provider: &ProfileProvider) -> Result<bool> 
     let _ = writeln!(err);
 
     let label_w = "Provenance".len();
+    // Registry-supplied, and rendered before anything is downloaded or
+    // signature-verified. This is a consent prompt, so injected escapes
+    // could redraw the very lines the user is being asked to approve.
     write_field(
         &mut err,
         "Publisher",
-        &format!("{} GitHub organisation", provider.namespace),
+        &format!(
+            "{} GitHub organisation",
+            sanitize_for_terminal(&provider.namespace)
+        ),
         label_w,
     );
     write_field(
@@ -219,7 +226,12 @@ fn confirm_pull(profile_name: &str, provider: &ProfileProvider) -> Result<bool> 
         label_w,
     );
     if let Some(summary) = provider.installs_summary.as_deref() {
-        write_field(&mut err, "Installs", summary, label_w);
+        write_field(
+            &mut err,
+            "Installs",
+            &sanitize_for_terminal(summary),
+            label_w,
+        );
     }
 
     let _ = writeln!(err);

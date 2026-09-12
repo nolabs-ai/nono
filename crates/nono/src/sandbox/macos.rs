@@ -867,19 +867,29 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // macOS resolves all DNS through /var/run/mDNSResponder (a Unix domain
     // socket). Seatbelt classifies connect(2) on Unix sockets as
     // network-outbound, so (deny network*) blocks DNS. These rules allow
-    // AF_UNIX socket creation and outbound to the mDNSResponder path (both
-    // /var/run and /private/var/run since /var is a symlink on macOS).
+    // outbound to the mDNSResponder path (both /var/run and /private/var/run
+    // since /var is a symlink on macOS).
+    // Callers can omit these implicit grants with CapabilitySet::block_dns().
     const MDNS_RULES: &str = "\
-(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))\n\
 (allow network-outbound (path \"/private/var/run/mDNSResponder\"))\n\
 (allow network-outbound (path \"/var/run/mDNSResponder\"))\n";
 
     let localhost_ports = caps.localhost_ports();
     let has_localhost_tcp = !localhost_ports.is_empty() || !merged_ranges.is_empty();
+    // Explicit Unix socket grants still need socket creation when the
+    // implicit DNS exception is disabled.
+    if !matches!(caps.network_mode(), NetworkMode::AllowAll)
+        && (caps.dns_enabled() || !caps.unix_socket_capabilities().is_empty())
+    {
+        profile
+            .push_str("(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))\n");
+    }
     match caps.network_mode() {
         NetworkMode::Blocked => {
             profile.push_str("(deny network*)\n");
-            profile.push_str(MDNS_RULES);
+            if caps.dns_enabled() {
+                profile.push_str(MDNS_RULES);
+            }
             // Unix socket grants (see #685 / #696). Only explicit
             // UnixSocketCapability entries emit network-outbound rules;
             // generic FsCapability grants no longer implicitly grant
@@ -907,7 +917,9 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         NetworkMode::ProxyOnly { port, bind_ports } => {
             // Block all network, then allow only localhost TCP to the proxy port.
             profile.push_str("(deny network*)\n");
-            profile.push_str(MDNS_RULES);
+            if caps.dns_enabled() {
+                profile.push_str(MDNS_RULES);
+            }
             // Unix socket grants (see Blocked branch above).
             emit_unix_socket_rules(&mut profile, caps)?;
             profile.push_str(&format!(
@@ -2282,6 +2294,63 @@ mod tests {
             ),
             "blocked mode must allow AF_UNIX SOCK_STREAM for mDNSResponder"
         );
+    }
+
+    #[test]
+    fn test_generate_profile_dns_disabled_in_restricted_modes() -> Result<()> {
+        for caps in [
+            CapabilitySet::new().block_network(),
+            CapabilitySet::new().proxy_only(12345),
+        ] {
+            let profile = generate_profile(&caps.block_dns())?;
+            assert!(profile.contains("(deny network*)"));
+            assert!(!profile.contains("mDNSResponder"));
+            assert!(!profile.contains("(socket-domain AF_UNIX)"));
+            assert!(!profile.contains("(allow network-outbound)"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_dns_preserves_explicit_socket_and_tcp_grants() -> Result<()> {
+        for caps in [
+            CapabilitySet::new().block_network(),
+            CapabilitySet::new().proxy_only(12345),
+        ] {
+            let mut caps = caps.block_dns().allow_localhost_port(3000);
+            caps.add_unix_socket(crate::UnixSocketCapability {
+                original: PathBuf::from("/tmp/build.sock"),
+                resolved: PathBuf::from("/private/tmp/build.sock"),
+                mode: crate::UnixSocketMode::Connect,
+                scope: crate::SocketScope::File,
+                source: Default::default(),
+            });
+            let profile = generate_profile(&caps)?;
+
+            assert!(!profile.contains("mDNSResponder"));
+            assert!(profile.contains("(deny network*)"));
+            assert!(profile.contains("(socket-domain AF_UNIX)"));
+            assert!(
+                profile.contains("(allow network-outbound (path \"/private/tmp/build.sock\"))")
+            );
+            assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3000\"))"));
+            if matches!(caps.network_mode(), NetworkMode::ProxyOnly { .. }) {
+                assert!(
+                    profile.contains("(allow network-outbound (remote tcp \"localhost:12345\"))")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_dns_does_not_restrict_allow_all() -> Result<()> {
+        let caps = CapabilitySet::new();
+        assert_eq!(
+            generate_profile(&caps)?,
+            generate_profile(&caps.block_dns())?
+        );
+        Ok(())
     }
 
     #[test]

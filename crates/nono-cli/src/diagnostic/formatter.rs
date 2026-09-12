@@ -351,6 +351,25 @@ fn looks_like_missing_path(line: &str) -> bool {
 /// Seatbelt operation name for a refused nested `sandbox_init()`.
 const SANDBOX_REINIT_OPERATION: &str = "forbidden-sandbox-reinit";
 
+/// Whether a macOS sandbox-log line records `marker` as the denied operation,
+/// rather than merely mentioning it in a path or other text.
+#[cfg(any(target_os = "macos", test))]
+fn sandbox_log_denies_operation(line: &str, marker: &str) -> bool {
+    let Some((_, after_deny)) = line.split_once("deny(") else {
+        return false;
+    };
+    let Some((count, after_count)) = after_deny.split_once(')') else {
+        return false;
+    };
+    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    after_count
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|operation| operation == marker)
+}
+
 /// True when a stderr line shows the platform refusing to initialize a
 /// sandbox from inside nono's sandbox.
 ///
@@ -358,16 +377,28 @@ const SANDBOX_REINIT_OPERATION: &str = "forbidden-sandbox-reinit";
 /// logs it as `forbidden-sandbox-reinit`. In userland that surfaces as
 /// `sandbox-exec: sandbox_apply: Operation not permitted` from a tool that
 /// wraps `sandbox-exec` (Codex), or as a `sandbox_init` failure when `nono run`
-/// is nested. Generic "Operation not permitted" lines are deliberately not
-/// matched here: without one of the sandbox-init markers they say nothing
-/// about the mechanism (issue #1646).
+/// is nested. Match those complete producer-shaped signatures rather than bare
+/// operation names: paths such as `sandbox_init` or `sandbox_apply` can also
+/// appear in ordinary permission failures and need their normal remediation.
+/// This diagnostic is macOS-only because it describes Seatbelt behavior.
 fn looks_like_sandbox_reinit(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    if lower.contains(SANDBOX_REINIT_OPERATION) {
-        return true;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = line;
+        false
     }
-    let refused = lower.contains("operation not permitted") || lower.contains("eperm");
-    refused && (lower.contains("sandbox_apply") || lower.contains("sandbox_init"))
+
+    #[cfg(target_os = "macos")]
+    {
+        let lower = line.to_ascii_lowercase();
+        let refused = lower.contains("operation not permitted") || lower.contains("eperm");
+        (lower.contains("sandbox:")
+            && sandbox_log_denies_operation(&lower, SANDBOX_REINIT_OPERATION))
+            || (refused
+                && (lower.contains("sandbox-exec: sandbox_apply:")
+                    || lower.contains("sandbox initialization failed: sandbox_apply:")
+                    || lower.contains("sandbox initialization failed: sandbox_init:")))
+    }
 }
 
 fn render_diagnostic_block(body: &str) -> String {
@@ -1225,12 +1256,10 @@ impl<'a> DiagnosticFormatter<'a> {
         }
         lines.push("[nono]".to_string());
 
-        // Standard mode renders the verdict directly: it has no
-        // system-service block to route the refusal through (violations are
-        // only collected in supervised mode). This is the one caller of the
-        // `SandboxReinit` arm in `format_primary_verdict_guidance`.
-        if let Some(verdict @ ErrorVerdict::SandboxReinit(_)) = self.primary_verdict.as_ref() {
-            self.format_primary_verdict_guidance(&mut lines, verdict);
+        // Standard mode has no system-service block, so render an unsuppressed
+        // stderr observation directly.
+        if let Some(observed) = sandbox_reinit {
+            self.format_sandbox_reinit_guidance(&mut lines, observed);
             lines.push("[nono]".to_string());
         }
 
@@ -1376,6 +1405,13 @@ impl<'a> DiagnosticFormatter<'a> {
     /// Carried in the primary verdict because `analyze_error_output` ranks it
     /// above every other observation (see the verdict ordering there).
     fn sandbox_reinit_observation(&self) -> Option<&str> {
+        if self
+            .suppressed_system_service_operations
+            .iter()
+            .any(|operation| operation == SANDBOX_REINIT_OPERATION)
+        {
+            return None;
+        }
         match &self.primary_verdict {
             Some(ErrorVerdict::SandboxReinit(line)) => Some(line.as_str()),
             _ => None,
@@ -1459,7 +1495,7 @@ impl<'a> DiagnosticFormatter<'a> {
     }
 
     fn has_error_observation(&self) -> bool {
-        self.primary_verdict.is_some()
+        self.primary_observation_verdict().is_some()
             || self.blocked_protected_file.is_some()
             || !self.observed_path_hints.is_empty()
             || !self.missing_path_hints.is_empty()
@@ -4664,6 +4700,7 @@ mod tests {
     /// program path in front of the message is not a denied path; before the
     /// fix it became a read+write hint that the footer rendered as
     /// `--allow /usr/bin/sandbox-exec`, a grant that cannot change the outcome.
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_analyze_error_output_sandbox_reinit_yields_no_path_hint() {
         let observation = analyze_error_output(
@@ -4686,6 +4723,7 @@ mod tests {
         assert!(observation.has_findings());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_analyze_error_output_sandbox_reinit_outranks_missing_path() {
         // A later "No such file" line must not reframe the failure as a
@@ -4728,6 +4766,105 @@ mod tests {
     }
 
     #[test]
+    fn test_analyze_error_output_path_marker_names_are_not_sandbox_reinit() {
+        for (line, path) in [
+            (
+                "touch: /tmp/sandbox_apply.c: Operation not permitted\n",
+                "/tmp/sandbox_apply.c",
+            ),
+            (
+                "mkdir: /tmp/sandbox_init: Operation not permitted\n",
+                "/tmp/sandbox_init",
+            ),
+        ] {
+            let observation = analyze_error_output(line, &[], None);
+
+            assert!(
+                !matches!(
+                    observation.primary_verdict,
+                    Some(ErrorVerdict::SandboxReinit(_))
+                ),
+                "path marker must not be reclassified as a sandbox re-initialization: {line}"
+            );
+            assert_eq!(
+                observation.path_hints,
+                vec![ObservedPathHint {
+                    path: PathBuf::from(path),
+                    access: AccessMode::Write,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn test_analyze_error_output_bare_marker_name_is_not_sandbox_reinit() {
+        for line in [
+            "touch: sandbox_apply: Operation not permitted\n",
+            "mkdir: sandbox_init: Operation not permitted\n",
+        ] {
+            let observation = analyze_error_output(line, &[], None);
+
+            assert!(
+                !matches!(
+                    observation.primary_verdict,
+                    Some(ErrorVerdict::SandboxReinit(_))
+                ),
+                "bare path marker must not be reclassified as a sandbox re-initialization: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_analyze_error_output_reinit_named_missing_path_is_not_sandbox_reinit() {
+        let observation = analyze_error_output(
+            "cat: /var/log/forbidden-sandbox-reinit.log: No such file or directory\n",
+            &[],
+            None,
+        );
+
+        assert_eq!(
+            observation.primary_verdict,
+            Some(ErrorVerdict::MissingPath(PathBuf::from(
+                "/var/log/forbidden-sandbox-reinit.log"
+            )))
+        );
+    }
+
+    #[test]
+    fn test_sandbox_log_path_named_reinit_is_not_reinit_operation() {
+        let observation = analyze_error_output(
+            "Sandbox: cat(1234) deny(1) file-read-data /tmp/forbidden-sandbox-reinit.log\n",
+            &[],
+            None,
+        );
+
+        assert!(!matches!(
+            observation.primary_verdict,
+            Some(ErrorVerdict::SandboxReinit(_))
+        ));
+        assert!(!sandbox_log_denies_operation(
+            "sandbox: cat(1234) deny(1) file-read-data /tmp/forbidden-sandbox-reinit.log",
+            SANDBOX_REINIT_OPERATION
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_analyze_error_output_standalone_reinit_operation_still_matches() {
+        let observation = analyze_error_output(
+            "Sandbox: nono(1234) deny(1) forbidden-sandbox-reinit\n",
+            &[],
+            None,
+        );
+
+        assert!(matches!(
+            observation.primary_verdict,
+            Some(ErrorVerdict::SandboxReinit(_))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn test_standard_footer_sandbox_reinit_names_cause_not_path_grants() {
         let caps = make_test_caps();
         let observation = analyze_error_output(
@@ -4755,6 +4892,7 @@ mod tests {
         assert!(!output.contains("To grant additional access"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_standard_footer_exit_126_sandbox_reinit_does_not_blame_binary() {
         // A nested `nono run` on macOS exits 126 after its child prints this.
@@ -4762,7 +4900,7 @@ mod tests {
         // directory) would send the user to a path grant that changes nothing.
         let caps = make_test_caps();
         let observation = analyze_error_output(
-            "nono: failed to apply sandbox in supervised child: Sandbox initialization failed: sandbox_init: Operation not permitted\n",
+            "nono: failed to apply sandbox in supervised child: Sandbox initialization failed: sandbox_apply: Operation not permitted\n",
             &[],
             None,
         );
@@ -4783,6 +4921,7 @@ mod tests {
         assert!(!output.contains("binaries in that directory"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_standard_footer_sandbox_reinit_keeps_genuine_path_hint() {
         // A real path denial elsewhere in the output is still real: the
@@ -4801,6 +4940,7 @@ mod tests {
         assert!(output.contains("/Users/alice/notes.txt"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_supervised_footer_sandbox_reinit_from_stderr_routes_to_cause() {
         let caps = make_test_caps();
@@ -4850,6 +4990,7 @@ mod tests {
         assert!(!output.contains("nono why --path"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_sandbox_reinit_stderr_and_log_dedupe_to_one_diagnostic() {
         let caps = make_test_caps();
@@ -4885,6 +5026,74 @@ mod tests {
         assert_eq!(output.matches("forbidden-sandbox-reinit —").count(), 1);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_suppressed_sandbox_reinit_stderr_is_not_readded_to_report() {
+        let caps = make_test_caps();
+        let suppressed = vec![SANDBOX_REINIT_OPERATION.to_string()];
+        let observation = analyze_error_output(
+            "sandbox-exec: sandbox_apply: Operation not permitted\n",
+            &[],
+            None,
+        );
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_suppressed_system_service_operations(&suppressed)
+            .with_error_observation(observation);
+        let report = formatter.build_session_report(1);
+
+        assert!(!report.diagnostics.iter().any(is_sandbox_reinit_diagnostic));
+
+        let standard_output = format_footer_with_session_report(
+            DiagnosticFormatter::new(&caps)
+                .with_suppressed_system_service_operations(&suppressed)
+                .with_error_observation(analyze_error_output(
+                    "sandbox-exec: sandbox_apply: Operation not permitted\n",
+                    &[],
+                    None,
+                )),
+            1,
+        );
+        assert!(!standard_output.contains("Nested sandbox refused:"));
+        assert!(!standard_output.contains("forbidden-sandbox-reinit"));
+
+        let unrelated_violation = vec![SandboxViolation {
+            operation: "mach-lookup".to_string(),
+            target: Some("com.apple.logd".to_string()),
+        }];
+        let supervised_output = format_footer_with_session_report(
+            DiagnosticFormatter::new(&caps)
+                .with_mode(DiagnosticMode::Supervised)
+                .with_sandbox_violations(&unrelated_violation)
+                .with_suppressed_system_service_operations(&suppressed)
+                .with_error_observation(analyze_error_output(
+                    "sandbox-exec: sandbox_apply: Operation not permitted\n",
+                    &[],
+                    None,
+                )),
+            1,
+        );
+        assert!(supervised_output.contains("mach-lookup (com.apple.logd)"));
+        assert!(!supervised_output.contains("forbidden-sandbox-reinit"));
+        assert!(!supervised_output.contains("observed: sandbox-exec"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn test_sandbox_reinit_stderr_is_not_classified_off_macos() {
+        let observation = analyze_error_output(
+            "sandbox-exec: sandbox_apply: Operation not permitted\n",
+            &[],
+            None,
+        );
+
+        assert!(!matches!(
+            observation.primary_verdict,
+            Some(ErrorVerdict::SandboxReinit(_))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_sandbox_reinit_json_report_carries_no_grant_remediation() {
         // Standard mode has no kernel log; the stderr observation alone must

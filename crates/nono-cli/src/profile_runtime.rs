@@ -126,13 +126,33 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
         }
         let (namespace, name) = (parts[0], parts[1]);
 
+        // pack_ref may use a namespace retired by a registry rename (e.g.
+        // `always-further/claude` -> `nolabs-ai/claude`); remediation should
+        // point at the namespace that still resolves.
+        let pull_ref = crate::package_status::canonicalize_legacy_pack_ref(pack_ref)
+            .unwrap_or_else(|| pack_ref.clone());
+
+        // No auto-migration — just flag it, even when the pack is otherwise fine.
+        if pull_ref != *pack_ref {
+            tracing::warn!(
+                "Pack '{}' is installed under a namespace that has been retired. \
+                 Migrate with: nono remove {} && nono pull {}, then update any \
+                 'extends'/'packs' entries in your profile from '{}' to '{}'.",
+                pack_ref,
+                pack_ref,
+                pull_ref,
+                pack_ref,
+                pull_ref
+            );
+        }
+
         let install_dir = package::package_install_dir(namespace, name)?;
         if !install_dir.exists() {
             tracing::warn!(
                 "Pack '{}' declared by profile but not installed. \
                  Install it with: nono pull {}",
                 pack_ref,
-                pack_ref
+                pull_ref
             );
             continue;
         }
@@ -142,7 +162,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                 package: pack_ref.clone(),
                 reason: format!(
                     "pack '{}' has no lockfile entry - reinstall with: nono pull {} --force",
-                    pack_ref, pack_ref
+                    pack_ref, pull_ref
                 ),
             }
         })?;
@@ -152,7 +172,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
             if !artifact_path.exists() {
                 return Err(nono::NonoError::PackageInstall(format!(
                     "pack '{}' is missing artifact '{}'. Reinstall with: nono pull {} --force",
-                    pack_ref, artifact_name, pack_ref
+                    pack_ref, artifact_name, pull_ref
                 )));
             }
 
@@ -173,7 +193,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                      Expected: {}\n\
                      Found:    {}\n\
                      Reinstall with: nono pull {} --force",
-                    pack_ref, artifact_name, locked_artifact.sha256, hash, pack_ref
+                    pack_ref, artifact_name, locked_artifact.sha256, hash, pull_ref
                 )));
             }
         }
@@ -214,7 +234,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                 package: pack_ref.clone(),
                 reason: format!(
                     "pack '{}' is missing .nono-trust.bundle - reinstall with: nono pull {} --force",
-                    pack_ref, pack_ref
+                    pack_ref, pull_ref
                 ),
             });
         }
@@ -227,10 +247,16 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                 package: pack_ref.clone(),
                 reason: format!(
                     "pack '{}' has no signer identity in the lockfile - reinstall with: nono pull {} --force",
-                    pack_ref, pack_ref
+                    pack_ref, pull_ref
                 ),
             })?;
-        verify_stored_bundles(&install_dir, &bundle_path, pack_ref, Some(pinned_signer))?;
+        verify_stored_bundles(
+            &install_dir,
+            &bundle_path,
+            pack_ref,
+            &pull_ref,
+            Some(pinned_signer),
+        )?;
     }
 
     Ok(())
@@ -245,6 +271,7 @@ fn verify_stored_bundles(
     install_dir: &Path,
     bundle_path: &Path,
     pack_ref: &str,
+    pull_ref: &str,
     pinned_signer: Option<&str>,
 ) -> crate::Result<()> {
     let bundle_content = std::fs::read_to_string(bundle_path).map_err(|e| {
@@ -347,7 +374,7 @@ fn verify_stored_bundles(
             nono::NonoError::PackageInstall(format!(
                 "Sigstore verification failed for '{}' in pack '{}': {}\n\
                  Reinstall with: nono pull {} --force",
-                artifact_name, pack_ref, e, pack_ref
+                artifact_name, pack_ref, e, pull_ref
             ))
         })?;
 
@@ -375,7 +402,7 @@ fn verify_stored_bundles(
                     reason: format!(
                         "signer identity mismatch for '{}': bundle was signed by '{}' \
                          but lockfile pins '{}'. Reinstall with: nono pull {} --force",
-                        artifact_name, verified_uri, pinned, pack_ref
+                        artifact_name, verified_uri, pinned, pull_ref
                     ),
                 });
             }
@@ -1567,6 +1594,64 @@ mod tests {
         );
     }
 
+    // #1634: a pack referenced under a retired namespace must be told to
+    // reinstall under the namespace that still resolves.
+    #[test]
+    fn test_missing_artifact_error_suggests_current_namespace_for_legacy_pack_ref() {
+        let result = with_config_env(|config_dir| {
+            let (_install_dir, mut artifacts) =
+                build_pack_with_scripts(config_dir, "always-further", "claude", &[]);
+            // Declare an artifact in the lockfile that was never written to
+            // disk, reproducing the "missing artifact" failure from the issue.
+            artifacts.insert(
+                "README.md".to_string(),
+                package::LockedArtifact {
+                    sha256: "0".repeat(64),
+                    artifact_type: package::ArtifactType::Profile,
+                },
+            );
+            write_test_lockfile(config_dir, &[("always-further/claude", artifacts)]);
+
+            verify_profile_packs(
+                &["always-further/claude".to_string()],
+                &profile::Profile::default(),
+            )
+        });
+
+        let message = result
+            .expect_err("missing artifact must be rejected")
+            .to_string();
+        assert!(
+            message.contains("nono pull nolabs-ai/claude --force"),
+            "expected remediation to suggest the current namespace, got: {message}"
+        );
+        assert!(
+            !message.contains("nono pull always-further/claude"),
+            "remediation must not suggest the retired namespace, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_legacy_pack_ref_only_rewrites_known_legacy_refs() {
+        assert_eq!(
+            crate::package_status::canonicalize_legacy_pack_ref("always-further/claude"),
+            Some("nolabs-ai/claude".to_string())
+        );
+        assert_eq!(
+            crate::package_status::canonicalize_legacy_pack_ref("always-further/claude@1.2.3"),
+            Some("nolabs-ai/claude@1.2.3".to_string())
+        );
+        // Already-canonical and unrelated refs pass through unchanged.
+        assert_eq!(
+            crate::package_status::canonicalize_legacy_pack_ref("nolabs-ai/claude"),
+            None
+        );
+        assert_eq!(
+            crate::package_status::canonicalize_legacy_pack_ref("acme/widget"),
+            None
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Test 4: store-extends-store — each hook from its own pack's artifacts
     //
@@ -1725,6 +1810,38 @@ mod tests {
         assert!(
             err.to_string().contains("missing .nono-trust.bundle"),
             "unexpected error: {err}"
+        );
+    }
+
+    // #1634: same fix, but through verify_stored_bundles's separate code path.
+    #[test]
+    fn test_missing_trust_bundle_error_suggests_current_namespace_for_legacy_pack_ref() {
+        let result = with_config_env(|config_dir| {
+            let artifact_content = r#"{"meta":{"name":"claude"}}"#;
+            let (_, artifacts) = build_pack_with_scripts(
+                config_dir,
+                "always-further",
+                "claude",
+                &[("package.json", artifact_content)],
+            );
+            write_test_lockfile(config_dir, &[("always-further/claude", artifacts)]);
+
+            verify_profile_packs(
+                &["always-further/claude".to_string()],
+                &profile::Profile::default(),
+            )
+        });
+
+        let message = result
+            .expect_err("locked pack without trust bundle must fail verification")
+            .to_string();
+        assert!(
+            message.contains("nono pull nolabs-ai/claude --force"),
+            "expected remediation to suggest the current namespace, got: {message}"
+        );
+        assert!(
+            !message.contains("nono pull always-further/claude"),
+            "remediation must not suggest the retired namespace, got: {message}"
         );
     }
 

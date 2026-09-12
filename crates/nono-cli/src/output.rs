@@ -1345,6 +1345,8 @@ pub fn print_profile_hint(program: &str, pack_ref: &str, silent: bool) {
         return;
     }
 
+    let pull_ref = crate::package_status::canonicalize_legacy_pack_ref(pack_ref)
+        .unwrap_or_else(|| pack_ref.to_string());
     let t = theme::current();
     eprintln!(
         "  {}",
@@ -1359,7 +1361,7 @@ pub fn print_profile_hint(program: &str, pack_ref: &str, silent: bool) {
         "  {}",
         fg(
             &format!(
-                "Try: nono run --profile {pack_ref} -- {program}  (install first: nono pull {pack_ref})"
+                "Try: nono run --profile {pack_ref} -- {program}  (install first: nono pull {pull_ref})"
             ),
             t.subtext,
         )

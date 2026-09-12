@@ -1,0 +1,61 @@
+{
+  "$comment": "Response shapes from docs/protocols/approval-webhook-v1.md and the decision each must produce.",
+  "signed": [
+    {
+      "name": "submit accepted, still pending after the server hold",
+      "http_status": 202,
+      "body": { "request_id": "req-1", "state": "pending" },
+      "expected": "pending"
+    },
+    {
+      "name": "granted by a reviewer",
+      "http_status": 200,
+      "body": { "request_id": "req-1", "state": "granted", "decision": "granted" },
+      "expected": "granted"
+    },
+    {
+      "name": "granted by a live session grant on submit",
+      "http_status": 200,
+      "body": { "request_id": "req-1", "state": "granted", "decision": "granted" },
+      "expected": "granted"
+    },
+    {
+      "name": "denied with a reason",
+      "http_status": 200,
+      "body": { "request_id": "req-1", "state": "denied", "decision": "denied", "reason": "not today" },
+      "expected": "denied"
+    },
+    {
+      "name": "timed out on the server before a decision",
+      "http_status": 200,
+      "body": { "request_id": "req-1", "state": "timeout", "decision": "timeout", "reason": "no decision before the client deadline" },
+      "expected": "timeout"
+    },
+    {
+      "name": "rejected signature",
+      "http_status": 401,
+      "body": { "error": "Unauthorized", "message": "unauthorized" },
+      "expected": "denied"
+    },
+    {
+      "name": "unknown or foreign request id on poll",
+      "http_status": 404,
+      "body": { "error": "Not Found", "message": "not found" },
+      "expected": "denied"
+    },
+    {
+      "name": "redirect is never followed",
+      "http_status": 302,
+      "body": {},
+      "expected": "denied"
+    }
+  ],
+  "unsigned": [
+    { "name": "simple grant", "body": { "decision": "granted" }, "expected": "granted" },
+    { "name": "grant synonym", "body": { "decision": "allow" }, "expected": "granted" },
+    { "name": "deny with reason", "body": { "decision": "denied", "reason": "policy" }, "expected": "denied" },
+    { "name": "deny synonym", "body": { "decision": "reject" }, "expected": "denied" },
+    { "name": "timeout", "body": { "decision": "timeout" }, "expected": "timeout" },
+    { "name": "signed status shape also parses unsigned", "body": { "request_id": "req-1", "state": "granted", "decision": "granted" }, "expected": "granted" }
+  ]
+}

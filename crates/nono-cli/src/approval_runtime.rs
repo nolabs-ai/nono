@@ -303,8 +303,9 @@ impl WebhookApproval {
             })
     }
 
-    /// Legacy contract: one blocking POST, the response is the decision. This
-    /// is what the console ingest and the in-cell approval shim speak.
+    /// Unsigned contract: one blocking POST, the response body is the
+    /// decision. Any approval endpoint that does not verify enrolled
+    /// identities speaks this (`docs/protocols/approval-webhook-v1.md`).
     fn request_unsigned(&self, body: &[u8], started: Instant) -> Result<ApprovalDecision> {
         let mut response = self
             .http
@@ -331,11 +332,11 @@ impl WebhookApproval {
         self.parse_response(&response_body)
     }
 
-    /// Platform contract: submit, then poll `GET <url>/{request_id}` with
-    /// signed requests until a final state or this backend's timeout. Each
-    /// hop is given only the remaining budget, both as the server hold hint
-    /// and as its own HTTP timeout. The transport is injected so the state
-    /// machine is testable without HTTP.
+    /// Signed contract (`docs/protocols/approval-webhook-v1.md`): submit, then
+    /// poll `GET <url>/{request_id}` with signed requests until a final state
+    /// or this backend's timeout. Each hop is given only the remaining budget,
+    /// both as the server hold hint and as its own HTTP timeout. The transport
+    /// is injected so the state machine is testable without HTTP.
     fn drive_platform_approval(
         &self,
         request_id: &str,
@@ -987,5 +988,125 @@ mod tests {
         uuid::Uuid::parse_str(&value("X-Nono-Request-Id")).unwrap();
         value("X-Nono-Timestamp").parse::<u128>().unwrap();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[derive(Deserialize)]
+    struct StatusFixture {
+        name: String,
+        http_status: u16,
+        body: serde_json::Value,
+        expected: String,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyFixture {
+        name: String,
+        body: serde_json::Value,
+        expected: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ApprovalStatusFixtures {
+        signed: Vec<StatusFixture>,
+        unsigned: Vec<LegacyFixture>,
+    }
+
+    fn decision_name(decision: &ApprovalDecision) -> &'static str {
+        match decision {
+            ApprovalDecision::Granted => "granted",
+            ApprovalDecision::Denied { .. } => "denied",
+            ApprovalDecision::Timeout => "timeout",
+        }
+    }
+
+    /// The documented response shapes (`docs/protocols/approval-webhook-v1.md`)
+    /// map to the decisions the protocol promises.
+    #[test]
+    fn approval_status_fixtures_match_protocol_document() {
+        let fixtures: ApprovalStatusFixtures = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/approval-status-v1.json"
+        ))
+        .expect("valid approval status fixture");
+        let backend = test_webhook(Duration::from_secs(30));
+
+        for fixture in &fixtures.signed {
+            let body = fixture.body.to_string();
+            let mut polls = 0;
+            let decision = backend
+                .drive_platform_approval("req-fixture", b"{}", Instant::now(), |_, _| {
+                    polls += 1;
+                    if polls == 1 {
+                        Ok(reply(fixture.http_status, &body))
+                    } else {
+                        // A pending fixture is followed by a grant so the loop ends.
+                        Ok(reply(200, r#"{"state":"granted","decision":"granted"}"#))
+                    }
+                })
+                .expect(&fixture.name);
+            if fixture.expected == "pending" {
+                assert_eq!(polls, 2, "{}: pending must be polled again", fixture.name);
+                assert!(decision.is_granted(), "{}", fixture.name);
+            } else {
+                assert_eq!(polls, 1, "{}: final states end the exchange", fixture.name);
+                assert_eq!(
+                    decision_name(&decision),
+                    fixture.expected,
+                    "{}",
+                    fixture.name
+                );
+            }
+        }
+
+        for fixture in &fixtures.unsigned {
+            let decision = backend
+                .parse_response(&fixture.body.to_string())
+                .expect(&fixture.name);
+            assert_eq!(
+                decision_name(&decision),
+                fixture.expected,
+                "{}",
+                fixture.name
+            );
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct CanonicalFixture {
+        method: String,
+        path: String,
+        subject_id: String,
+        timestamp_ms: String,
+        request_id: String,
+        body_digest: String,
+        canonical: String,
+    }
+
+    /// The poll is a bodiless GET: its content digest is the SHA-256 of zero
+    /// bytes, and the canonical string follows `nono-request-v1` unchanged.
+    #[test]
+    fn approval_poll_canonical_request_matches_fixture() {
+        let fixture: CanonicalFixture = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/approval-poll-request-v1.json"
+        ))
+        .expect("valid poll fixture");
+        assert_eq!(
+            crate::platform_client::canonical_request_v1(
+                &fixture.method,
+                &fixture.path,
+                &fixture.subject_id,
+                &fixture.timestamp_ms,
+                &fixture.request_id,
+                &fixture.body_digest,
+            ),
+            fixture.canonical
+        );
+        let empty_digest = format!(
+            "sha256:{}",
+            sha2::Sha256::digest(b"")
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(fixture.body_digest, empty_digest);
     }
 }

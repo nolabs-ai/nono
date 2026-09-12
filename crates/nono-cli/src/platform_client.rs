@@ -426,7 +426,7 @@ fn validate_wire_identifier(name: &str, value: &str) -> Result<()> {
     }
 }
 
-fn validate_platform_url(value: &str) -> Result<String> {
+pub(crate) fn validate_platform_url(value: &str) -> Result<String> {
     let mut url = url::Url::parse(value)
         .map_err(|error| NonoError::ConfigParse(format!("invalid platform URL: {error}")))?;
     let loopback_http =

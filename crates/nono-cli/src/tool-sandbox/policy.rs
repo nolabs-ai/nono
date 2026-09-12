@@ -1307,6 +1307,7 @@ mod intercept_tests {
                 timeout_secs: Some(30),
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
 

@@ -588,20 +588,6 @@ impl CredentialStore {
         })
     }
 
-    /// Deprecated wrapper around [`Self::load_with_diagnostics`].
-    #[deprecated(
-        since = "0.64.0",
-        note = "Use `load_with_diagnostics` instead. Will be removed in 1.0.0."
-    )]
-    pub async fn load(
-        routes: &[RouteConfig],
-        tls_connector: &TlsConnector,
-    ) -> Result<CredentialStore> {
-        Self::load_with_diagnostics(routes, tls_connector, None)
-            .await
-            .map(|outcome| outcome.store)
-    }
-
     /// Create an empty credential store (no credential injection).
     #[must_use]
     pub fn empty() -> Self {
@@ -1215,7 +1201,7 @@ mod tests {
     #[test]
     fn test_is_empty_false_with_only_oauth2_routes() {
         // Simulate a store with only OAuth2 routes by constructing directly.
-        // We can't call load() with a real OAuth2 config (no token server),
+        // We cannot load a real OAuth2 route here (there is no token server),
         // so we build the struct manually to test the is_empty/len logic.
         use std::time::Duration;
 
@@ -1401,7 +1387,7 @@ mod tests {
 
         let outcome = CredentialStore::load_with_diagnostics(&routes, &tls, None).await;
 
-        // load() should succeed (route skipped, not hard error)
+        // The load should succeed (route skipped, not hard error).
         assert!(
             outcome.is_ok(),
             "load should not fail on unreachable OAuth2 endpoint"

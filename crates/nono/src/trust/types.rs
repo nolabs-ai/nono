@@ -8,16 +8,6 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Current supported trust policy format version.
-/// Deprecated: versioning is now encoded in [`TRUST_POLICY_PREDICATE`].
-///
-/// Will be removed in v1.0.0.
-#[deprecated(
-    since = "0.66.0",
-    note = "versioning is encoded in TRUST_POLICY_PREDICATE; this constant and the version field will be removed in v1.0.0"
-)]
-pub const TRUST_POLICY_VERSION: u32 = 1;
-
 /// Predicate URI that identifies a JSON file as a nono trust policy.
 ///
 /// Files lacking this field are not nono policies and should be skipped rather
@@ -31,6 +21,7 @@ pub const TRUST_POLICY_PREDICATE: &str = "https://nono.sh/attestation/trust-poli
 /// Multiple policies are merged: publishers and blocklist entries are unioned,
 /// enforcement uses the strictest level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustPolicy {
     /// Predicate URI identifying this file as a nono trust policy.
     ///
@@ -38,12 +29,6 @@ pub struct TrustPolicy {
     /// field are treated as non-nono JSON and skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicate: Option<String>,
-    /// Deprecated: versioning is encoded in the `predicate` URI.
-    ///
-    /// Parsed from existing policy files for backward compatibility but has no
-    /// runtime effect. Will be removed in v1.0.0.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<u32>,
     /// Glob patterns identifying files under attestation (relative to working directory)
     pub includes: Vec<String>,
     /// Explicit file paths at arbitrary locations to attest.
@@ -66,7 +51,6 @@ impl Default for TrustPolicy {
     fn default() -> Self {
         Self {
             predicate: Some(TRUST_POLICY_PREDICATE.to_string()),
-            version: None,
             includes: Vec::new(),
             files: Vec::new(),
             publishers: Vec::new(),
@@ -103,7 +87,7 @@ impl TrustPolicy {
     ///
     /// Returns `NonoError::TrustPolicy` if the predicate is present but
     /// unrecognised, or if collection sizes exceed safe bounds.
-    pub fn validate_version(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if let Some(predicate) = &self.predicate
             && predicate != TRUST_POLICY_PREDICATE
         {
@@ -540,7 +524,6 @@ mod tests {
     fn sample_policy() -> TrustPolicy {
         TrustPolicy {
             predicate: Some(TRUST_POLICY_PREDICATE.to_string()),
-            version: None,
             includes: vec![
                 "SKILLS*.md".to_string(),
                 "CLAUDE*.md".to_string(),
@@ -1058,13 +1041,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_version_accepts_policy() {
+    fn validate_accepts_policy() {
         let policy = sample_policy();
-        assert!(policy.validate_version().is_ok());
+        assert!(policy.validate().is_ok());
     }
 
     #[test]
-    fn legacy_version_field_is_accepted_and_ignored() {
+    fn legacy_version_field_is_rejected() {
         let json = r#"{
             "predicate": "https://nono.sh/attestation/trust-policy/v1",
             "version": 1,
@@ -1073,9 +1056,7 @@ mod tests {
             "blocklist": { "digests": [] },
             "enforcement": "deny"
         }"#;
-        let parsed: TrustPolicy = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.version, Some(1));
-        assert!(parsed.validate_version().is_ok());
+        assert!(serde_json::from_str::<TrustPolicy>(json).is_err());
     }
 
     #[test]
@@ -1083,7 +1064,6 @@ mod tests {
         let policy = sample_policy();
         let json = serde_json::to_string_pretty(&policy).unwrap();
         let parsed: TrustPolicy = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.version, None);
         assert_eq!(parsed.publishers.len(), 2);
         assert_eq!(parsed.blocklist.digests.len(), 1);
         assert_eq!(parsed.enforcement, Enforcement::Deny);

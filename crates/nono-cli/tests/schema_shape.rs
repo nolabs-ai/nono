@@ -115,7 +115,6 @@ fn test_schema_top_level_profile_matches_rust_model() {
             "allow_launch_services",
             "allow_gpu",
             "allow_parent_of_protected",
-            "interactive",
             "skipdirs",
             "packs",
             "binary",

@@ -691,6 +691,8 @@ fn expand_vars(template: &str, ctx: &WiringContext) -> Result<String> {
     let nono_config_str = nono_config.to_string_lossy().into_owned();
     let nono_packages_str = nono_packages.to_string_lossy().into_owned();
 
+    // Keep in step with BUILTIN_VAR_NAMES below; `validate_var_name`
+    // uses that list to reject a pack variable that would be shadowed.
     let builtin = |name: &str| -> Option<String> {
         match name {
             "PACK_DIR" => Some(pack_dir.clone()),
@@ -753,9 +755,73 @@ pub fn resolve_vars(
 ) -> Result<BTreeMap<String, String>> {
     let mut resolved = BTreeMap::new();
     for (name, var) in declared {
+        validate_var_name(name)?;
         resolved.insert(name.clone(), resolve_one_var(name, var, ctx)?);
     }
     Ok(resolved)
+}
+
+/// Names the built-in table supplies. A pack variable may not reuse one:
+/// built-ins are consulted first, so the declaration would be dead config.
+const BUILTIN_VAR_NAMES: &[&str] = &[
+    "PACK_DIR",
+    "NS",
+    "PLUGIN",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "NONO_CONFIG",
+    "NONO_PACKAGES",
+    "NOW",
+];
+
+/// Reject a declared name that could never be referenced, or one that a
+/// built-in would shadow. Both are silent dead config otherwise: an
+/// unmatched `$name` is left verbatim in the destination by
+/// `substitute_vars`, so the pack writes to a path with a literal `$` in
+/// it, and a shadowed name simply never takes effect.
+///
+/// The accepted shape mirrors what `policy::substitute_vars` will match —
+/// an uppercase letter or `_`, then letters, digits or `_`. Note the
+/// continuation deliberately allows lowercase, so `FOO_bar` is valid;
+/// requiring all-caps throughout would reject names that work.
+fn validate_var_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let shape_ok = matches!(chars.next(), Some(c) if c.is_ascii_uppercase() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !shape_ok {
+        return Err(NonoError::PackageInstall(format!(
+            "wiring_vars key '{name}' can never be referenced: a name must start with \
+             an uppercase letter or '_', then contain only letters, digits or '_'"
+        )));
+    }
+    if BUILTIN_VAR_NAMES.contains(&name) {
+        return Err(NonoError::PackageInstall(format!(
+            "wiring_vars key '{name}' shadows a built-in variable, which is always \
+             consulted first — rename it"
+        )));
+    }
+    Ok(())
+}
+
+/// Why a resolved root cannot be used as a destination, or `None` if it
+/// can. A relative value is as bad as a traversing one: `expand_to_path`
+/// rejects `..` but not relative paths, so it would land wherever
+/// `nono pull` happened to be run from.
+fn root_rejection(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return Some("empty".to_string());
+    }
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return Some(format!("not an absolute path ('{value}')"));
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Some(format!("contains '..' ('{value}')"));
+    }
+    None
 }
 
 fn resolve_one_var(name: &str, var: &WiringVar, ctx: &WiringContext) -> Result<String> {
@@ -764,29 +830,31 @@ fn resolve_one_var(name: &str, var: &WiringVar, ctx: &WiringContext) -> Result<S
         // built-in table only — `ctx.vars` is still empty at this point,
         // so a default naming another pack variable fails as unknown
         // rather than needing cycle detection.
-        return expand_vars(&var.default, ctx);
+        //
+        // The default is pack-authored rather than user-supplied, but it
+        // gets the same check: a malformed one should fail the install
+        // loudly instead of writing to a relative path.
+        let value = expand_vars(&var.default, ctx)?;
+        if let Some(reason) = root_rejection(&value) {
+            return Err(NonoError::PackageInstall(format!(
+                "wiring_vars['{name}'].default is {reason}; a pack must declare an \
+                 absolute, traversal-free path"
+            )));
+        }
+        return Ok(value);
     };
 
     let rejected = |reason: &str| {
         NonoError::PackageInstall(format!(
-            "${} is set but {reason}, so the wiring variable ${name} cannot be resolved.              Fix or unset ${}, then retry.",
+            "${} is set but {reason}, so the wiring variable ${name} cannot be resolved. \
+             Fix or unset ${}, then retry.",
             var.env, var.env
         ))
     };
 
     let value = raw.to_str().ok_or_else(|| rejected("not valid UTF-8"))?;
-    if value.is_empty() {
-        return Err(rejected("empty"));
-    }
-    let path = Path::new(value);
-    if !path.is_absolute() {
-        return Err(rejected(&format!("not an absolute path ('{value}')")));
-    }
-    if path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(rejected(&format!("contains '..' ('{value}')")));
+    if let Some(reason) = root_rejection(value) {
+        return Err(rejected(&reason));
     }
     Ok(value.to_string())
 }
@@ -1967,30 +2035,124 @@ mod tests {
         });
     }
 
-    /// A pack cannot shadow a built-in: built-ins are consulted first.
+    fn declared(name: &str, env: &str, default: &str) -> BTreeMap<String, WiringVar> {
+        let mut declared = BTreeMap::new();
+        declared.insert(
+            name.to_string(),
+            WiringVar {
+                env: env.to_string(),
+                default: default.to_string(),
+            },
+        );
+        declared
+    }
+
+    fn bare_ctx() -> WiringContext {
+        WiringContext {
+            pack_dir: PathBuf::from("/p"),
+            namespace: "ns".to_string(),
+            pack_name: "name".to_string(),
+            vars: BTreeMap::new(),
+        }
+    }
+
+    /// Shadowing a built-in is dead config — built-ins are consulted
+    /// first — so say so at install time instead of ignoring it.
     #[test]
-    fn pack_var_cannot_shadow_builtin() {
+    fn pack_var_rejects_name_shadowing_builtin() {
+        with_fake_home(|_home| {
+            for name in BUILTIN_VAR_NAMES {
+                let err = resolve_vars(
+                    &declared(name, "NONO_TEST_AGENT_CONFIG_SHADOW", "/somewhere"),
+                    &bare_ctx(),
+                )
+                .expect_err("expected rejection");
+                assert!(
+                    err.to_string().contains("shadows a built-in"),
+                    "{name}: unexpected error: {err}"
+                );
+            }
+        });
+    }
+
+    /// A name the expander can never match would be left verbatim in the
+    /// destination, so the pack would write to a path containing a
+    /// literal `$`. Reject it rather than produce that.
+    #[test]
+    fn pack_var_rejects_unreferenceable_name() {
+        with_fake_home(|_home| {
+            for name in ["claude_config", "9LIVES", "", "HAS-DASH"] {
+                let err = resolve_vars(
+                    &declared(name, "NONO_TEST_AGENT_CONFIG_BADNAME", "/somewhere"),
+                    &bare_ctx(),
+                )
+                .expect_err("expected rejection");
+                assert!(
+                    err.to_string().contains("can never be referenced"),
+                    "{name:?}: unexpected error: {err}"
+                );
+            }
+        });
+    }
+
+    /// `substitute_vars` allows lowercase after the first character, so
+    /// validation must too — rejecting these would refuse names that work.
+    #[test]
+    fn pack_var_accepts_mixed_case_name() {
         with_fake_home(|home| {
-            let _env = EnvVarGuard::set_all(&[("NONO_TEST_AGENT_CONFIG_SHADOW", "/somewhere")]);
-            let mut declared = BTreeMap::new();
-            declared.insert(
-                "HOME".to_string(),
-                WiringVar {
-                    env: "NONO_TEST_AGENT_CONFIG_SHADOW".to_string(),
-                    default: "/other".to_string(),
-                },
-            );
-            let mut ctx = WiringContext {
-                pack_dir: PathBuf::from("/p"),
-                namespace: "ns".to_string(),
-                pack_name: "name".to_string(),
-                vars: BTreeMap::new(),
-            };
-            ctx.vars = resolve_vars(&declared, &ctx).expect("resolve");
+            let mut ctx = bare_ctx();
+            ctx.vars = resolve_vars(
+                &declared(
+                    "Agent_config2",
+                    "NONO_TEST_AGENT_CONFIG_MIXED",
+                    "$HOME/.agent",
+                ),
+                &ctx,
+            )
+            .expect("resolve");
             assert_eq!(
-                expand_vars("$HOME/x", &ctx).expect("expand"),
-                format!("{}/x", home.display())
+                expand_vars("$Agent_config2/x", &ctx).expect("expand"),
+                format!("{}/.agent/x", home.display())
             );
+        });
+    }
+
+    /// The default is pack-authored rather than user-supplied, but an
+    /// unusable one still has to fail: `expand_to_path` rejects `..` and
+    /// not relative paths, so a relative default would write wherever
+    /// `nono pull` was run from.
+    #[test]
+    fn pack_var_rejects_unusable_default() {
+        with_fake_home(|_home| {
+            for default in ["relative/dir", "", "/tmp/../escaped"] {
+                let err = resolve_vars(
+                    &declared("AGENT_CONFIG", "NONO_TEST_AGENT_CONFIG_UNSET_DEF", default),
+                    &bare_ctx(),
+                )
+                .expect_err("expected rejection");
+                assert!(
+                    err.to_string().contains(".default is"),
+                    "{default:?}: unexpected error: {err}"
+                );
+            }
+        });
+    }
+
+    /// Guards the hand-maintained BUILTIN_VAR_NAMES list against drifting
+    /// away from the table `expand_vars` actually consults.
+    #[test]
+    fn builtin_var_names_all_resolve() {
+        with_fake_home(|_home| {
+            let ctx = bare_ctx();
+            for name in BUILTIN_VAR_NAMES {
+                let expanded = expand_vars(&format!("${name}"), &ctx)
+                    .unwrap_or_else(|e| panic!("{name} should be a known built-in: {e}"));
+                assert_ne!(
+                    expanded,
+                    format!("${name}"),
+                    "{name} was left unexpanded, so it is not actually a built-in"
+                );
+            }
         });
     }
 

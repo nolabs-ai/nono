@@ -241,14 +241,31 @@ pub struct ProfileProvidersResponse {
     pub providers: Vec<ProfileProvider>,
 }
 
+/// Signer identity recorded in the lockfile for packs installed without
+/// signature verification (air-gapped / internal-registry mode). Pull and
+/// run-time code key off this sentinel: the SHA-256 integrity checks still
+/// run, but Sigstore bundle verification is skipped. Distinct from the
+/// `keyed:`/`https://github.com/...` identities used by signed packs.
+pub const UNSIGNED_SIGNER_IDENTITY: &str = "unsigned:internal-registry";
+
+fn default_scan_passed() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullResponse {
     pub namespace: String,
     pub name: String,
     pub version: String,
-    pub provenance: PullProvenance,
+    // Optional so a static registry can omit it (unsigned packs). When present
+    // it carries the signed-pack provenance recorded at publish time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PullProvenance>,
     pub artifacts: Vec<PullArtifact>,
+    // Empty for unsigned packs served by a static registry (no bundle).
+    #[serde(default)]
     pub bundle_url: String,
+    #[serde(default = "default_scan_passed")]
     pub scan_passed: bool,
 }
 
@@ -268,6 +285,7 @@ pub struct PullProvenance {
 pub struct PullArtifact {
     pub filename: String,
     pub sha256_digest: String,
+    #[serde(default)]
     pub size_bytes: i64,
     pub download_url: String,
 }
@@ -387,6 +405,26 @@ mod tests {
         assert_eq!(parsed.namespace, "acme");
         assert_eq!(parsed.name, "claude-code");
         assert_eq!(parsed.version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn pull_response_deserializes_without_provenance_or_bundle() {
+        // The minimal shape a static (unsigned) registry emits: no provenance,
+        // no bundle_url, no scan_passed, and artifacts without size_bytes.
+        let json = r#"{
+            "namespace": "acme",
+            "name": "widget",
+            "version": "1.0.0",
+            "artifacts": [
+                { "filename": "package.json", "sha256_digest": "abc", "download_url": "/files/acme/widget/1.0.0/package.json" }
+            ]
+        }"#;
+        let pull: PullResponse = serde_json::from_str(json).expect("deserialize minimal pull");
+        assert!(pull.provenance.is_none());
+        assert!(pull.bundle_url.is_empty());
+        assert!(pull.scan_passed, "scan_passed should default to true");
+        assert_eq!(pull.artifacts.len(), 1);
+        assert_eq!(pull.artifacts[0].size_bytes, 0);
     }
 
     #[test]

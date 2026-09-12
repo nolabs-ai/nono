@@ -180,6 +180,104 @@ export NONO_REGISTRY=https://registry.example.com/api/v1
 nono pull acme-corp/internal-agent
 ```
 
+## Air-Gapped / Internal Registry (Unsigned Packs)
+
+For air-gapped fleets that distribute packs from an internal **static** registry (e.g. an nginx serving pre-generated files), nono can install and update packs without Sigstore signature verification. Integrity is still enforced by per-artifact SHA-256, and TLS host verification is unaffected — only signature verification is turned off.
+
+> **Security note:** disabling signature verification removes supply-chain provenance. Only do this when the registry and the network path to it are trusted (internal HTTPS with an MDM-trusted corporate CA, or a trusted internal network). `verify = false` does **not** disable TLS.
+
+### Fleet configuration
+
+Point the fleet at the internal registry and disable verification in a single managed `~/.config/nono/config.toml` (push it via MDM/Jamf):
+
+```toml
+[registry]
+url = "https://nono-registry.corp.internal"
+verify = false
+
+[updates]
+check = false
+```
+
+- `url` — the registry **host root** (no `/api/v1` suffix; the client appends `/api/v1/packages/...` itself).
+- `verify = false` — install/update unsigned packs (SHA-256 still checked).
+- `[updates] check = false` — suppress upstream update phone-home (also implied by `verify = false`).
+
+The same can be set ad hoc with the `--insecure` flag (`nono pull --insecure ...`, `nono update --insecure`) or the `NONO_REGISTRY_INSECURE` environment variable.
+
+Once configured, the usual commands work offline against the internal registry:
+
+```bash
+nono pull my-org/my-pack
+nono update
+```
+
+Packs installed this way carry no `.nono-trust.bundle`; their lockfile entry records the `unsigned:internal-registry` signer identity, and `nono run` skips Sigstore re-verification for them while still checking artifact digests.
+
+> Migrating a pack that was previously installed from the signed public registry to the internal unsigned one is a signer change, so it needs a one-time `nono pull --force` (or `nono remove` first).
+
+### Generating the static registry
+
+On the publishing side (e.g. a CI job), build the pack directory (`package.json` + artifact files), then emit the static tree:
+
+```bash
+nono pack publish-static my-org/my-pack --pack-dir ./dist --out ./registry
+```
+
+This writes, under `--out`:
+
+```text
+api/v1/packages/<ns>/<name>/versions/<version>/pull   # pull manifest (JSON)
+api/v1/packages/<ns>/<name>/versions/latest/pull      # newest version (by semver)
+api/v1/packages/<ns>/<name>/status                    # {schema_version, latest}
+files/<ns>/<name>/<version>/<filename>                # artifact bytes
+```
+
+Re-running for a new version is additive; `latest` and `status` always track the highest published semver. Serve the `--out` directory as the document root of any static HTTP server (nginx with `autoindex off`); the `?installed=` query string on the status endpoint is ignored, so a static file is sufficient.
+
+### GitLab CI example
+
+A typical internal pipeline **seeds** the working docroot from the nginx host, runs `nono pack publish-static` to add the current version, then syncs the docroot back. Seeding matters: `publish-static` computes `latest`/`status` from the version directories present under `--out`, so it must see the previously published versions to keep `latest` at the true highest semver (and to make `rsync --delete` safe). The `nono` binary must already be on the runner — bake it into the runner image or fetch it from an internal artifact store. `publish-static` needs no internet and no signing, so this works on air-gapped runners; only the rsync steps reach the nginx host.
+
+```yaml
+# .gitlab-ci.yml
+stages: [publish]
+
+variables:
+  REGISTRY_OUT: "$CI_PROJECT_DIR/registry"          # working docroot on the runner
+  NGINX_HOST: "deploy@nono-registry.corp.internal"  # rsync user@host
+  NGINX_DOCROOT: "/srv/www/nono-registry"           # document root on the host
+
+publish:packs:
+  # Image/runner providing `nono`, rsync, and ssh.
+  image: registry.corp.internal/ci/nono-publisher:latest
+  rules:
+    - if: '$CI_COMMIT_TAG'        # publish on tags only
+  before_script:
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+    - echo "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+  script:
+    - nono --version
+    # 1. Seed the working docroot from the host so prior versions are present.
+    - mkdir -p "$REGISTRY_OUT"
+    - rsync -az "$NGINX_HOST:$NGINX_DOCROOT/" "$REGISTRY_OUT/" || true
+    # 2. Add the current build of each pack. packs/<dir> holds a built pack
+    #    (package.json + artifact files); the version comes from package.json.
+    - |
+      for pack in packs/*/; do
+        name="$(basename "$pack")"
+        nono pack publish-static "my-org/${name}" \
+          --pack-dir "$pack" \
+          --out "$REGISTRY_OUT"
+      done
+    # 3. Mirror the updated docroot back to the host (--delete is safe because
+    #    the tree was seeded from it).
+    - rsync -az --delete "$REGISTRY_OUT/" "$NGINX_HOST:$NGINX_DOCROOT/"
+```
+
+`DEPLOY_SSH_KEY` and `DEPLOY_KNOWN_HOSTS` are masked/protected CI/CD variables. The seed step (`|| true`) tolerates a first-run empty host. Because publishing is unsigned, the runner needs no egress to Sigstore — only internal access to the nginx host.
+
 ## Pack Store Layout
 
 Installed packs live under `~/.config/nono/packages/<namespace>/<name>/`. Each pack directory contains the verified artifacts and a lockfile entry tracking the installed version and signer identity.

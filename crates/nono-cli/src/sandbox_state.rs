@@ -550,16 +550,10 @@ pub fn load_sandbox_state() -> Option<SandboxState> {
 /// Check if a process with the given PID is currently running
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-
-    let nix_pid = Pid::from_raw(pid as i32);
-    match kill(nix_pid, None) {
-        Ok(()) => true,
-        Err(nix::errno::Errno::ESRCH) => false,
-        Err(nix::errno::Errno::EPERM) => true,
-        _ => true,
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
     }
+    crate::session::is_pid_alive_simple(pid)
 }
 
 #[cfg(not(unix))]

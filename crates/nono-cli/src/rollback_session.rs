@@ -186,10 +186,7 @@ fn parse_pid_from_session_id(session_id: &str) -> Option<u32> {
 
 /// Check if a process with the given PID is still alive.
 fn is_process_alive(pid: u32) -> bool {
-    // kill(pid, 0) checks if the process exists without sending a signal
-    // SAFETY: This is a standard POSIX way to check process existence.
-    // Signal 0 does not actually send anything.
-    unsafe { nix::libc::kill(pid as nix::libc::pid_t, 0) == 0 }
+    crate::session::is_pid_alive_simple(pid)
 }
 
 /// Calculate the total size of all files in a directory tree.
@@ -330,5 +327,68 @@ mod tests {
             .map(|s| s.metadata.session_id.as_str())
             .collect();
         assert!(ids.contains(&"20260421-111111-30001"));
+    }
+
+    #[test]
+    fn is_process_alive_rejects_invalid_pid_zero() {
+        assert!(!is_process_alive(0));
+        assert!(!is_process_alive(u32::MAX));
+        assert!(!is_process_alive(i32::MAX as u32 + 1));
+    }
+
+    #[test]
+    fn is_process_alive_does_not_panic_on_edge_pids() {
+        let _ = is_process_alive(1);
+        let _ = is_process_alive(i32::MAX as u32);
+    }
+
+    #[test]
+    fn build_session_info_marks_running_session_not_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid = std::process::id();
+        let session_id = format!("20260421-111111-{pid}");
+        let metadata = SessionMetadata {
+            session_id: session_id.clone(),
+            started: "2026-04-21T11:11:11+01:00".to_string(),
+            ended: None,
+            command: vec!["/bin/sleep".to_string()],
+            executable_identity: None,
+            tracked_paths: vec![PathBuf::from("/tmp/work")],
+            snapshot_count: 0,
+            exit_code: None,
+            merkle_roots: Vec::new(),
+            network_events: Vec::new(),
+            audit_event_count: 0,
+            audit_integrity: None,
+            audit_attestation: None,
+            command_policy_summary: None,
+        };
+        let info = build_session_info(dir.path().to_path_buf(), metadata);
+        assert!(info.is_alive, "current process should be alive");
+        assert!(!info.is_stale, "running session must not be stale");
+    }
+
+    #[test]
+    fn build_session_info_marks_dead_session_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let metadata = SessionMetadata {
+            session_id: "20260421-111111-99999999".to_string(),
+            started: "2026-04-21T11:11:11+01:00".to_string(),
+            ended: None,
+            command: vec!["/bin/false".to_string()],
+            executable_identity: None,
+            tracked_paths: vec![PathBuf::from("/tmp/work")],
+            snapshot_count: 0,
+            exit_code: None,
+            merkle_roots: Vec::new(),
+            network_events: Vec::new(),
+            audit_event_count: 0,
+            audit_integrity: None,
+            audit_attestation: None,
+            command_policy_summary: None,
+        };
+        let info = build_session_info(dir.path().to_path_buf(), metadata);
+        assert!(!info.is_alive, "dead PID should not be alive");
+        assert!(info.is_stale, "ended=None + dead PID should be stale");
     }
 }

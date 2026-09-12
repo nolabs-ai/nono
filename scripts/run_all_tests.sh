@@ -260,6 +260,26 @@ done
 
 PASSED_SUITES=0
 FAILED_SUITES=0
+# Describe how a suite exited. Without this, an assertion failure (1), a
+# timeout (124) and a fatal signal (>128, which is how an OOM kill or a
+# stray process-group kill shows up) are indistinguishable in CI output —
+# the exit code is recorded per suite and then only ever tested against
+# zero. That ambiguity is why intermittent suite failures have been hard
+# to attribute after the fact.
+describe_exit() {
+    local code="$1"
+    if [[ "$code" -eq 124 ]]; then
+        echo "timed out after ${SUITE_TIMEOUT}s"
+    elif [[ "$code" -gt 128 && "$code" -lt 256 ]]; then
+        local signum=$((code - 128))
+        local signame
+        signame=$(kill -l "$signum" 2>/dev/null) || signame="unknown"
+        echo "killed by SIG${signame} (exit $code)"
+    else
+        echo "exit $code"
+    fi
+}
+
 FAILED_NAMES=""
 
 for i in "${!SUITE_NAMES[@]}"; do
@@ -281,9 +301,10 @@ for i in "${!SUITE_NAMES[@]}"; do
         echo -e "${GREEN}Suite PASSED${NC}: $name"
         PASSED_SUITES=$((PASSED_SUITES + 1))
     else
-        echo -e "${RED}Suite FAILED${NC}: $name"
+        how=$(describe_exit "$exit_code")
+        echo -e "${RED}Suite FAILED${NC}: $name ($how)"
         FAILED_SUITES=$((FAILED_SUITES + 1))
-        FAILED_NAMES="$FAILED_NAMES  - $name\n"
+        FAILED_NAMES="$FAILED_NAMES  - $name ($how)\n"
     fi
 done
 

@@ -606,6 +606,14 @@ struct InstallSummary {
 }
 
 fn validate_pull_response(package_ref: &PackageRef, pull: &PullResponse) -> Result<()> {
+    // The registry supplies these and nothing has validated them yet.
+    // `version` is displayed by the install summary and `namespace`/`name`
+    // are echoed in the mismatch error just below, so both reach a
+    // terminal before any signature has been checked.
+    reject_control_chars(&pull.version, "package version")?;
+    reject_control_chars(&pull.namespace, "package namespace")?;
+    reject_control_chars(&pull.name, "package name")?;
+
     if pull.namespace != package_ref.namespace || pull.name != package_ref.name {
         return Err(NonoError::PackageVerification {
             package: package_ref.key(),
@@ -1344,6 +1352,20 @@ mod tests {
             err.contains("control characters"),
             "error should say why: {err:?}"
         );
+    }
+
+    /// The registry's own metadata is untrusted too: `version` reaches the
+    /// install summary, and `namespace`/`name` are echoed in the mismatch
+    /// error — both before anything is signature-verified.
+    #[test]
+    fn pull_response_metadata_rejects_control_characters() {
+        for field in ["package version", "package namespace", "package name"] {
+            assert!(
+                reject_control_chars("1.0\u{1b}[2K.0", field).is_err(),
+                "{field} should reject control characters"
+            );
+        }
+        assert!(reject_control_chars("1.0.0", "package version").is_ok());
     }
 
     /// Ordinary names must keep working — this guard sits on the path

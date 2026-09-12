@@ -39,7 +39,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Nix
+      # The Determinate Nix Installer dropped Intel macOS support
+      # (DeterminateSystems/nix-src#224), so use the official Nix
+      # installer on macos-26-intel. Other runners keep the Determinate
+      # installer for its magic-nix-cache integration.
+      - name: Install Nix (Intel macOS)
+        if: matrix.runner == 'macos-26-intel'
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+
+      - name: Install Nix (other platforms)
+        if: matrix.runner != 'macos-26-intel'
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       # Linux-only: the v14 static binary fails on arm64-darwin (libc++ symbol
@@ -52,9 +61,20 @@ jobs:
       - name: nix flake check
         run: nix flake check --no-build
 
-      - name: nix build
+      - name: nix build (source)
         run: nix build . --print-build-logs
+
+      # The prebuilt target fetches a release tarball by version from
+      # Cargo.toml. On release-prep PRs the tag may not exist yet, so
+      # only exercise this path outside PRs (main pushes, tags, manual).
+      - name: nix build (prebuilt)
+        if: github.event_name != 'pull_request'
+        run: nix build .#prebuilt --print-build-logs
 
       - name: nix run -- --version
         if: github.event_name != 'pull_request'
         run: nix run . -- --version
+
+      - name: nix run .#prebuilt -- --version
+        if: github.event_name != 'pull_request'
+        run: nix run .#prebuilt -- --version

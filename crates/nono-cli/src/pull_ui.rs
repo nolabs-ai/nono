@@ -85,6 +85,7 @@ pub fn render_summary(
     install_dir: &std::path::Path,
     installed_artifacts: usize,
     copied_to_project: usize,
+    wiring_roots: &[std::path::PathBuf],
 ) {
     let mut err = io::stderr().lock();
     let _ = writeln!(err);
@@ -109,6 +110,12 @@ pub fn render_summary(
         format!("{installed_artifacts} artifact(s)").dimmed(),
     );
 
+    // Where the pack was stored is not where its agent files went.
+    // Report both: with `wiring_vars`, two installs of the same pack on
+    // one machine can write to different places, and a summary that only
+    // ever names the package store cannot tell them apart.
+    render_wiring_roots(&mut err, wiring_roots);
+
     if copied_to_project > 0 {
         let _ = writeln!(err);
         let _ = writeln!(
@@ -117,6 +124,39 @@ pub fn render_summary(
         );
     }
     let _ = writeln!(err);
+}
+
+/// At most `MAX_SHOWN` roots, then a count. A pack writing into many
+/// trees is unusual; truncating keeps one anomalous pack from burying
+/// the rest of the summary.
+const MAX_SHOWN_ROOTS: usize = 3;
+
+fn render_wiring_roots(err: &mut impl Write, roots: &[std::path::PathBuf]) {
+    let Some((first, rest)) = roots.split_first() else {
+        return;
+    };
+    let _ = writeln!(
+        err,
+        "     {label}    {body}",
+        label = "Wired into".bold(),
+        body = first.display().to_string().dimmed(),
+    );
+    for root in rest.iter().take(MAX_SHOWN_ROOTS - 1) {
+        let _ = writeln!(
+            err,
+            "                   {}",
+            root.display().to_string().dimmed()
+        );
+    }
+    if let Some(hidden) = rest.len().checked_sub(MAX_SHOWN_ROOTS - 1)
+        && hidden > 0
+    {
+        let _ = writeln!(
+            err,
+            "                   {}",
+            format!("+{hidden} more").dimmed()
+        );
+    }
 }
 
 /// "1.30 KB" / "412 B" / "2.10 MB" — three significant digits. Human
@@ -143,6 +183,49 @@ pub fn format_size(bytes: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rendered(roots: &[&str]) -> String {
+        let roots: Vec<std::path::PathBuf> = roots.iter().map(std::path::PathBuf::from).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        render_wiring_roots(&mut buf, &roots);
+        String::from_utf8(buf).expect("utf8")
+    }
+
+    /// A pack with no wiring must not print an empty heading.
+    #[test]
+    fn wiring_roots_render_nothing_when_empty() {
+        assert_eq!(rendered(&[]), "");
+    }
+
+    /// The module's own rule: every line still parses with ANSI
+    /// stripped, so assert on content rather than styling.
+    #[test]
+    fn wiring_roots_render_each_root() {
+        let out = rendered(&["/home/u/.claude", "/home/u/.config/nono/profile-drafts"]);
+        assert!(out.contains("Wired into"), "missing label: {out}");
+        assert!(out.contains("/home/u/.claude"), "missing first root: {out}");
+        assert!(
+            out.contains("/home/u/.config/nono/profile-drafts"),
+            "missing second root: {out}"
+        );
+        assert!(
+            !out.contains("more"),
+            "should not truncate two roots: {out}"
+        );
+    }
+
+    /// Truncation must report an accurate remainder — an undercount
+    /// would hide a directory the pack wrote to, which is the very
+    /// thing this output exists to prevent.
+    #[test]
+    fn wiring_roots_truncate_with_accurate_count() {
+        let out = rendered(&["/a", "/b", "/c", "/d", "/e"]);
+        for shown in ["/a", "/b", "/c"] {
+            assert!(out.contains(shown), "expected {shown} shown: {out}");
+        }
+        assert!(out.contains("+2 more"), "expected remainder of 2: {out}");
+        assert!(!out.contains("/d"), "fourth root should be hidden: {out}");
+    }
 
     #[test]
     fn format_size_thresholds() {

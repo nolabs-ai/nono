@@ -131,6 +131,14 @@ pub fn render_summary(
 /// the rest of the summary.
 const MAX_SHOWN_ROOTS: usize = 3;
 
+/// Paths here come from the pack's own wiring directives, so they are
+/// pack-controlled text heading for a terminal. Strip escape sequences
+/// before display — a directory name carrying ANSI could otherwise
+/// rewrite the summary around it and misreport where the install wrote.
+fn display_root(root: &std::path::Path) -> String {
+    crate::terminal_approval::sanitize_for_terminal(&root.display().to_string())
+}
+
 fn render_wiring_roots(err: &mut impl Write, roots: &[std::path::PathBuf]) {
     let Some((first, rest)) = roots.split_first() else {
         return;
@@ -139,14 +147,10 @@ fn render_wiring_roots(err: &mut impl Write, roots: &[std::path::PathBuf]) {
         err,
         "     {label}    {body}",
         label = "Wired into".bold(),
-        body = first.display().to_string().dimmed(),
+        body = display_root(first).dimmed(),
     );
     for root in rest.iter().take(MAX_SHOWN_ROOTS - 1) {
-        let _ = writeln!(
-            err,
-            "                   {}",
-            root.display().to_string().dimmed()
-        );
+        let _ = writeln!(err, "                   {}", display_root(root).dimmed());
     }
     if let Some(hidden) = rest.len().checked_sub(MAX_SHOWN_ROOTS - 1)
         && hidden > 0
@@ -225,6 +229,24 @@ mod tests {
         }
         assert!(out.contains("+2 more"), "expected remainder of 2: {out}");
         assert!(!out.contains("/d"), "fourth root should be hidden: {out}");
+    }
+
+    /// Wiring paths are pack-controlled text on its way to a terminal.
+    /// An escape sequence in a directory name must not survive to the
+    /// screen, where it could rewrite the summary around it and
+    /// misreport where the install actually wrote.
+    #[test]
+    fn wiring_roots_strip_terminal_escapes() {
+        let out = rendered(&["/home/u/\u{1b}[2K\u{1b}[31mevil"]);
+        // Assert on the injected sequences rather than "no ESC at all":
+        // `.dimmed()` emits its own escapes whenever color is enabled,
+        // so a blanket check would pass or fail based on the terminal.
+        assert!(!out.contains("\u{1b}[2K"), "erase-line survived: {out:?}");
+        assert!(
+            !out.contains("\u{1b}[31m"),
+            "color escape survived: {out:?}"
+        );
+        assert!(out.contains("evil"), "path text should remain: {out:?}");
     }
 
     #[test]

@@ -59,6 +59,8 @@ pub(crate) struct PreparedProfile {
     /// plan reuses this instead of resolving — and re-hashing — every
     /// controlled binary a second time.
     pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
+    pub(crate) network_approval_mode: Option<String>,
+    pub(crate) network_approval_timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -997,6 +999,12 @@ fn prepare_profile_with_options(
             .and_then(|profile| profile.command_policies.clone()),
         set_vars: expand_profile_set_vars(loaded_profile.as_ref(), workdir)?,
         resolved_command_binaries,
+        network_approval_mode: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.network.approval_mode.clone()),
+        network_approval_timeout_secs: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.network.approval_timeout_secs),
         loaded_profile,
     })
 }

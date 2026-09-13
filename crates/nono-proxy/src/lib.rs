@@ -47,8 +47,9 @@ pub mod token;
 pub mod test_env;
 
 pub use config::ProxyConfig;
+pub use connect::ApprovalChannelRequest;
 pub use credential::{CredentialLoadOutcome, CredentialStore};
 pub use diagnostic::{ProxyDiagnostic, ProxyDiagnosticCode, ProxyDiagnosticSeverity};
 pub use error::{ProxyError, Result};
-pub use server::{ProxyHandle, start};
+pub use server::{ProxyHandle, start, start_with_approval};
 pub use token::NonceResolver;

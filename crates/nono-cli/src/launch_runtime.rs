@@ -170,6 +170,12 @@ pub(crate) struct ProxyLaunchOptions {
     /// buffer. Set from `--no-audit`. Does not change filter, credentials,
     /// or fail-closed auth.
     pub(crate) audit_disabled: bool,
+    pub(crate) network_approval_mode: crate::network_approval::NetworkApprovalMode,
+    pub(crate) network_approval_timeout_secs: u64,
+    /// The nono profile name from `--profile` (e.g., "claude-code"). Used by
+    /// `ConfigWriter` to persist "Approve Always" / "Deny Always" decisions
+    /// to the correct profile JSON file so they survive restarts.
+    pub(crate) profile_name: Option<String>,
 }
 
 impl ProxyLaunchOptions {

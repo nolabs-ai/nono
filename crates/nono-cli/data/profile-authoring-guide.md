@@ -370,8 +370,23 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 | `listen_port_range`     | array of `[start, end]`           | `[]`     | Inclusive port ranges for TCP listen (bind only). Multiple ranges are supported. Example: `[[8000, 8100], [9000, 9010]]`. Overlapping ranges are merged automatically. Same platform limits as `open_port_range`. |
 | `no_proxy`              | array of string                   | `[]`     | Additional client-side `NO_PROXY` / `no_proxy` entries in proxy mode. This does not grant network access; direct connections still require matching sandbox permissions. Entries must be host patterns only (safe single-label local alias, canonical IP literal, `*.` wildcard suffix, or leading-dot suffix); bare multi-label domains, protected metadata suffix tokens, URLs, credentials, ports, paths, comma-separated lists, and `*` are rejected. |
 | `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). Defines the route only — the proxy does not activate unless the service name also appears in `credentials`. |
-| `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). |
-| `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. |
+| `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). Alias: `external_proxy`. |
+| `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. Alias: `external_proxy_bypass`. |
+| `approval_mode`         | string                            | `"off"`  | How to handle requests to blocked hosts: `"off"` (deny immediately), `"ask"` (OS notification with action buttons). |
+| `approval_timeout_secs` | integer                           | `60`     | Seconds to wait for user approval before denying. Only applies when `approval_mode` is not `"off"`. |
+
+Example — allow API access but block known trackers, with runtime approval for unknown hosts:
+
+```json
+{
+  "network": {
+    "allow_domain": ["api.openai.com", "*.googleapis.com"],
+    "deny_domain": ["*.tracker.io", "ads.example.com"],
+    "approval_mode": "ask",
+    "approval_timeout_secs": 30
+  }
+}
+```
 
 #### Hostname wildcard patterns
 

@@ -192,20 +192,14 @@ pub(crate) async fn open_tcp_upstream(upstream: &UpstreamSpec<'_>) -> Result<Tcp
     match upstream.strategy {
         UpstreamStrategy::Direct { resolved_addrs } => {
             if resolved_addrs.is_empty() {
-                let addr = format!("{}:{}", upstream.host, upstream.port);
-                match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(&addr))
-                    .await
-                {
-                    Ok(Ok(s)) => Ok(s),
-                    Ok(Err(e)) => Err(ProxyError::UpstreamConnect {
-                        host: upstream.host.to_string(),
-                        reason: e.to_string(),
-                    }),
-                    Err(_) => Err(ProxyError::UpstreamConnect {
-                        host: upstream.host.to_string(),
-                        reason: "connection timed out".to_string(),
-                    }),
-                }
+                // Same fail-closed contract as CONNECT (`connect.rs`): never
+                // re-resolve the hostname. An empty slice means DNS failed or
+                // was skipped, so a second lookup would bypass the link-local
+                // metadata check already applied to `resolved_addrs`.
+                Err(ProxyError::UpstreamConnect {
+                    host: upstream.host.to_string(),
+                    reason: "DNS resolution returned no addresses".to_string(),
+                })
             } else {
                 connect_to_resolved(resolved_addrs, upstream.host).await
             }
@@ -510,6 +504,38 @@ mod tests {
         assert!(text.contains("Content-Length: 7"));
         assert!(!text.to_ascii_lowercase().contains("transfer-encoding"));
         assert!(text.ends_with(r#"{"b":2}"#));
+    }
+
+    #[tokio::test]
+    async fn open_tcp_upstream_fails_closed_when_resolved_addrs_empty() {
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        let connector = TlsConnector::from(std::sync::Arc::new(config));
+        let spec = UpstreamSpec {
+            scheme: UpstreamScheme::Http,
+            host: "does-not-resolve.invalid",
+            port: 80,
+            strategy: UpstreamStrategy::Direct {
+                resolved_addrs: &[],
+            },
+            tls_connector: &connector,
+        };
+        let err = open_tcp_upstream(&spec).await.expect_err("empty addrs");
+        match err {
+            ProxyError::UpstreamConnect { host, reason } => {
+                assert_eq!(host, "does-not-resolve.invalid");
+                assert!(
+                    reason.contains("DNS resolution returned no addresses"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected UpstreamConnect, got {other}"),
+        }
     }
 
     #[test]

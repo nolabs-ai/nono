@@ -359,15 +359,25 @@ jobs:
           sha256sums_url = next(
               (a["browser_download_url"] for a in release["assets"]
                if a["name"] == "SHA256SUMS.txt"), None)
+          if not sha256sums_url:
+              raise SystemExit(f"SHA256SUMS.txt is missing from release {tag}")
           expected_hashes = {}
-          if sha256sums_url:
-              with urllib.request.urlopen(sha256sums_url) as r:
-                  for line in r.read().decode().splitlines():
-                      parts = line.split(None, 1)
-                      if len(parts) == 2:
-                          expected_hashes[parts[1].strip()] = "sha256:" + parts[0]
+          with urllib.request.urlopen(sha256sums_url) as r:
+              for line in r.read().decode().splitlines():
+                  parts = line.split(None, 1)
+                  if len(parts) == 2:
+                      expected_hashes[parts[1].strip()] = "sha256:" + parts[0]
 
           src = open("flake.nix").read()
+          hashes_start = src.find("prebuiltHashes = {")
+          if hashes_start == -1:
+              raise SystemExit("could not find prebuiltHashes block in flake.nix")
+          hashes_end = src.find("};", hashes_start)
+          if hashes_end == -1:
+              raise SystemExit("could not find end of prebuiltHashes block in flake.nix")
+          before_hashes = src[:hashes_start]
+          hashes_src = src[hashes_start:hashes_end]
+          after_hashes = src[hashes_end:]
           for sys_, sub in asset_map.items():
               # Find the tarball asset for this platform
               match = next(
@@ -380,11 +390,13 @@ jobs:
 
               # Cross-check against SHA256SUMS.txt before pinning
               expected = expected_hashes.get(match)
+              if not expected:
+                  raise SystemExit(
+                      f"SHA256SUMS.txt has no checksum for '{match}' in release {tag}")
               cmd = [
                   "nix", "store", "prefetch-file", "--json", "--hash-type", "sha256",
               ]
-              if expected:
-                  cmd += ["--expected-hash", expected]
+              cmd += ["--expected-hash", expected]
               cmd += [url]
               out = json.loads(subprocess.check_output(cmd))
               sri = out["hash"]
@@ -392,14 +404,21 @@ jobs:
 
               # Update the prebuiltHashes entry for this system
               pat = re.compile(r'("' + re.escape(sys_) + r'" = ")([^"]*)(")')
-              src, n = pat.subn(lambda m, s=sri: m.group(1) + s + m.group(3), src, count=1)
+              hashes_src, n = pat.subn(
+                  lambda m, s=sri: m.group(1) + s + m.group(3), hashes_src, count=1)
               if n != 1:
                   raise SystemExit(
                       f"could not find prebuiltHashes entry for {sys_} in flake.nix")
 
+          src = before_hashes + hashes_src + after_hashes
           open("flake.nix", "w").write(src)
           print(f"Updated prebuiltHashes for {version}: {list(asset_map)}")
           PYEOF
+
+      - name: Verify prebuilt package
+        run: |
+          nix build .#prebuilt --print-build-logs
+          nix run .#prebuilt -- --version
 
       - name: Open PR
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1

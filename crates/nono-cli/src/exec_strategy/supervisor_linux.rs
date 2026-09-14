@@ -679,6 +679,35 @@ pub(super) enum NetworkDecision {
     Deny,
 }
 
+/// Whether a trapped network syscall on address `family` carries no policy
+/// decision under `policy`, so the supervisor must resume it untouched.
+///
+/// The network BPF filter traps `connect`/`bind`/`sendto`/`sendmsg`/`sendmmsg`
+/// by syscall number and cannot see the address family, so every mode
+/// receives sockaddrs it does not mediate:
+///
+/// - **AF_UNIX-only mode** (`linux.af_unix_mediation = "pathname"`, no
+///   proxy): TCP/UDP is Landlock's job, so non-`AF_UNIX` passes through.
+/// - **Proxy-only mode without AF_UNIX mediation** (`network.allow_domain`
+///   etc.): the filter exists to force TCP through the proxy. Unix-domain IPC
+///   is out of scope and stays governed by Landlock filesystem rules exactly
+///   as it is without a proxy, so `AF_UNIX` passes through. Denying it here
+///   broke JVM attach, Mockito, and every other local-IPC user the moment a
+///   domain allowlist was configured (issue #1901).
+/// - **Combined mode** (proxy + AF_UNIX mediation): everything is in scope.
+///
+/// Callers use this both for the policy decision (`Allow`) and to skip the
+/// rate limiter, so high-volume out-of-scope traffic cannot starve the
+/// decisions that matter.
+pub(super) fn network_notification_out_of_scope(policy: SeccompPolicy, family: u16) -> bool {
+    let is_unix = family == libc::AF_UNIX as u16;
+    match (policy.proxy_fallback, policy.af_unix_mediation) {
+        (false, true) => !is_unix,
+        (true, false) => is_unix,
+        _ => false,
+    }
+}
+
 /// Pure policy function: given a trapped syscall and the sockaddr the child
 /// passed in, decide whether the supervisor should allow or deny it.
 ///
@@ -687,17 +716,23 @@ pub(super) enum NetworkDecision {
 ///
 /// Policy:
 ///
-/// 1. **Pathname `AF_UNIX` is allowlist-mediated.** Filesystem-backed Unix
-///    sockets like `/tmp/test.sock` are IPC bound to a real path, so the
+/// 0. **Out-of-scope families pass through** (see
+///    [`network_notification_out_of_scope`]). In proxy-only mode without
+///    `linux.af_unix_mediation`, every `AF_UNIX` operation is allowed; in
+///    AF_UNIX-only mode, every non-`AF_UNIX` operation is allowed.
+///
+/// 1. **Pathname `AF_UNIX` is allowlist-mediated** when
+///    `linux.af_unix_mediation = "pathname"` is enabled. Filesystem-backed
+///    Unix sockets like `/tmp/test.sock` are IPC bound to a real path, so the
 ///    supervisor canonicalizes that path and checks it against explicit
 ///    [`UnixSocketCapability`] grants.
 ///
-///    **Abstract and unnamed `AF_UNIX` are denied.** The abstract namespace
-///    (`sun_path[0] == '\0'`) lives outside the filesystem, so pathname
-///    capabilities cannot mediate it. Unnamed sockets (addrlen == 2) have
-///    no path to check.
+///    **Abstract and unnamed `AF_UNIX` are denied** in that mode. The
+///    abstract namespace (`sun_path[0] == '\0'`) lives outside the
+///    filesystem, so pathname capabilities cannot mediate it. Unnamed sockets
+///    (addrlen == 2) have no path to check.
 ///
-/// 2. For `AF_INET`/`AF_INET6`:
+/// 2. For `AF_INET`/`AF_INET6` in proxy-only mode:
 ///    - `connect()` is allowed only to `127.0.0.1:proxy_port` (the nono proxy).
 ///    - `bind()` is allowed on ports in `proxy_bind_ports` or within any range in `proxy_bind_port_ranges`.
 ///    - Everything else is denied.
@@ -711,9 +746,21 @@ pub(super) fn decide_network_notification(
         SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO, UnixSocketKind,
     };
 
-    // AF_UNIX: allow only filesystem-backed (pathname) sockets that match an
-    // explicit socket capability. Abstract/unnamed sockets bypass pathname
-    // mediation, so deny them.
+    if network_notification_out_of_scope(config.seccomp_policy, sockaddr.family) {
+        debug!(
+            "Seccomp network mediation: family={} is out of scope for this mode \
+             (proxy_fallback={}, af_unix_mediation={}); allowing syscall nr={}",
+            sockaddr.family,
+            config.seccomp_policy.proxy_fallback,
+            config.seccomp_policy.af_unix_mediation,
+            syscall
+        );
+        return NetworkDecision::Allow;
+    }
+
+    // AF_UNIX with mediation enabled: allow only filesystem-backed (pathname)
+    // sockets that match an explicit socket capability. Abstract/unnamed
+    // sockets bypass pathname mediation, so deny them.
     if sockaddr.family == libc::AF_UNIX as u16 {
         match sockaddr.unix_kind {
             Some(UnixSocketKind::Pathname) => {
@@ -735,14 +782,6 @@ pub(super) fn decide_network_notification(
                 return NetworkDecision::Deny;
             }
         }
-    }
-
-    if config.seccomp_policy.af_unix_mediation && !config.seccomp_policy.proxy_fallback {
-        debug!(
-            "AF_UNIX-only seccomp mediation: allowing non-AF_UNIX syscall family={} nr={}",
-            sockaddr.family, syscall
-        );
-        return NetworkDecision::Allow;
     }
 
     match syscall {
@@ -1149,20 +1188,18 @@ fn handle_received_network_notification(
         }
     };
 
-    // In AfUnixOnly mode the BPF filter traps by syscall number and cannot
-    // distinguish address families, so TCP/UDP calls arrive here too. They
-    // carry no policy decision — pass them through without consuming a
-    // rate-limiter token, which would otherwise starve legitimate network
-    // traffic once the burst is exhausted.
-    if config.seccomp_policy.af_unix_mediation
-        && !config.seccomp_policy.proxy_fallback
-        && sockaddrs.iter().all(|s| s.family != libc::AF_UNIX as u16)
+    // The BPF filter traps by syscall number and cannot distinguish address
+    // families, so every mode receives sockaddrs it does not mediate: TCP/UDP
+    // in AF_UNIX-only mode, and AF_UNIX in proxy-only mode without
+    // `linux.af_unix_mediation`. Those carry no policy decision — pass them
+    // through without consuming a rate-limiter token, which would otherwise
+    // starve legitimate traffic once the burst is exhausted.
+    if sockaddrs
+        .iter()
+        .all(|s| network_notification_out_of_scope(config.seccomp_policy, s.family))
     {
         if let Err(e) = continue_notif(notify_fd, notif.id) {
-            debug!(
-                "continue_notif failed for non-AF_UNIX pass-through (AfUnixOnly): {}",
-                e
-            );
+            debug!("continue_notif failed for out-of-scope pass-through: {}", e);
             return deny_notif(notify_fd, notif.id);
         }
         return Ok(());
@@ -1670,15 +1707,21 @@ mod tests {
         ));
     }
 
-    // --- decide_network_notification tests (issue #685) ---------------------
+    // --- decide_network_notification tests (issue #685, #1901) --------------
     //
-    // These exercise the proxy-only seccomp fallback path that runs on
-    // Landlock < V4 kernels. The key invariant: pathname `AF_UNIX` must be
-    // checked against the explicit Unix-socket allowlist instead of being
-    // decided by TCP proxy ports.
+    // These exercise the seccomp network supervisor. Key invariants:
+    // - With `linux.af_unix_mediation = "pathname"`, pathname `AF_UNIX` is
+    //   checked against the explicit Unix-socket allowlist instead of being
+    //   decided by TCP proxy ports (#685).
+    // - In proxy-only mode (`network.allow_domain`) without AF_UNIX mediation,
+    //   `AF_UNIX` is out of scope and passes through; only TCP is forced to
+    //   the proxy (#1901).
 
     mod network_decision {
-        use super::super::{NetworkDecision, SupervisorConfig, decide_network_notification};
+        use super::super::{
+            NetworkDecision, SupervisorConfig, decide_network_notification,
+            network_notification_out_of_scope,
+        };
         use nix::libc;
         use nono::sandbox::{
             SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO, SockaddrInfo,
@@ -1744,14 +1787,35 @@ mod tests {
                 proxy_bind_ports,
                 proxy_bind_port_ranges,
                 unix_socket_allowlist,
+                // Combined mode: proxy-only TCP enforcement plus pathname
+                // AF_UNIX mediation. AF_UNIX allowlist checks only apply
+                // when `af_unix_mediation` is on; see
+                // `make_proxy_only_config` for the mediation-off variant.
                 seccomp_policy: super::super::SeccompPolicy {
                     capability_elevation: false,
                     proxy_fallback: true,
-                    af_unix_mediation: false,
+                    af_unix_mediation: true,
                     proc_comm_notify: false,
                 },
                 tool_sandbox_runtime: None,
             }
+        }
+
+        /// Proxy-only mode as selected by `network.allow_domain` on a profile
+        /// that leaves `linux.af_unix_mediation` at its default (off).
+        fn make_proxy_only_config<'a>(
+            backend: &'a DenyAllBackend,
+            proxy_port: u16,
+            proxy_bind_ports: Vec<u16>,
+        ) -> SupervisorConfig<'a> {
+            let mut config = make_config(backend, proxy_port, proxy_bind_ports, &[]);
+            config.seccomp_policy = super::super::SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            };
+            config
         }
 
         fn unix_pathname(path: &Path) -> SockaddrInfo {
@@ -1963,9 +2027,9 @@ mod tests {
             );
         }
 
-        /// Scope-limit test: abstract-namespace AF_UNIX (`sun_path[0] == 0`)
-        /// is not covered by pathname socket capabilities, so it stays
-        /// denied.
+        /// Scope-limit test: with AF_UNIX mediation enabled, abstract-namespace
+        /// AF_UNIX (`sun_path[0] == 0`) is not covered by pathname socket
+        /// capabilities, so it stays denied.
         #[test]
         fn af_unix_abstract_is_denied() {
             let backend = DenyAllBackend;
@@ -1981,8 +2045,9 @@ mod tests {
             );
         }
 
-        /// Unnamed AF_UNIX (`addrlen == 2`) has no path to check, so fail
-        /// closed — consistent with abstract handling.
+        /// With AF_UNIX mediation enabled, unnamed AF_UNIX (`addrlen == 2`)
+        /// has no path to check, so fail closed — consistent with abstract
+        /// handling.
         #[test]
         fn af_unix_unnamed_is_denied() {
             let backend = DenyAllBackend;
@@ -1991,6 +2056,151 @@ mod tests {
                 decide_network_notification(test_pid(), SYS_BIND, &unix_unnamed(), &config),
                 NetworkDecision::Deny
             );
+        }
+
+        // --- issue #1901: proxy-only mode must not mediate AF_UNIX ----------
+
+        /// Regression for #1901: `network.allow_domain` alone (proxy-only,
+        /// `af_unix_mediation` off) must not deny pathname `bind(AF_UNIX)`,
+        /// even with no socket grant. This is what broke JVM attach / Mockito.
+        #[test]
+        fn proxy_only_without_af_unix_mediation_allows_pathname_bind_without_grant() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "p.sock");
+            let config = make_proxy_only_config(&backend, 8080, Vec::new());
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &unix_pathname(&path), &config),
+                NetworkDecision::Allow,
+                "AF_UNIX is out of scope for proxy-only enforcement (#1901)"
+            );
+        }
+
+        /// Same for connect/sendto/sendmsg/sendmmsg on an unlisted pathname socket.
+        #[test]
+        fn proxy_only_without_af_unix_mediation_allows_pathname_connect_and_send() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "p.sock");
+            let _listener = UnixListener::bind(&path).expect("bind unix listener");
+            let config = make_proxy_only_config(&backend, 8080, Vec::new());
+            for syscall in [SYS_CONNECT, SYS_SENDTO, SYS_SENDMSG, SYS_SENDMMSG] {
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        syscall,
+                        &unix_pathname(&path),
+                        &config
+                    ),
+                    NetworkDecision::Allow,
+                    "syscall {syscall} on an unlisted AF_UNIX path must pass through"
+                );
+            }
+        }
+
+        /// Abstract and unnamed AF_UNIX are only denied when mediation is on.
+        /// The #1901 reporter saw abstract binds fail too, which is what
+        /// proved the denial was not a filesystem grant issue.
+        #[test]
+        fn proxy_only_without_af_unix_mediation_allows_abstract_and_unnamed() {
+            let backend = DenyAllBackend;
+            let config = make_proxy_only_config(&backend, 8080, Vec::new());
+            for syscall in [SYS_BIND, SYS_CONNECT, SYS_SENDTO] {
+                assert_eq!(
+                    decide_network_notification(test_pid(), syscall, &unix_abstract(), &config),
+                    NetworkDecision::Allow,
+                    "abstract AF_UNIX syscall {syscall} must pass through"
+                );
+            }
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &unix_unnamed(), &config),
+                NetworkDecision::Allow
+            );
+        }
+
+        /// Security-critical: the #1901 pass-through is family-scoped. In the
+        /// same proxy-only config, TCP must still be forced to the proxy.
+        #[test]
+        fn proxy_only_without_af_unix_mediation_still_enforces_tcp() {
+            let backend = DenyAllBackend;
+            let config = make_proxy_only_config(&backend, 8080, vec![3000]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(8080), &config),
+                NetworkDecision::Deny,
+                "external TCP connect must still be denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(9999), &config),
+                NetworkDecision::Deny,
+                "loopback TCP connect to a non-proxy port must still be denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(8080), &config),
+                NetworkDecision::Allow,
+                "loopback TCP connect to the proxy port is allowed"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(3001), &config),
+                NetworkDecision::Deny,
+                "TCP bind outside proxy_bind_ports must still be denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(3000), &config),
+                NetworkDecision::Allow
+            );
+        }
+
+        /// Full truth table for the scope predicate shared by the policy
+        /// decision and the rate-limiter bypass.
+        #[test]
+        fn network_notification_out_of_scope_truth_table() {
+            use super::super::SeccompPolicy;
+            let policy = |proxy_fallback, af_unix_mediation| SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback,
+                af_unix_mediation,
+                proc_comm_notify: false,
+            };
+            let unix = libc::AF_UNIX as u16;
+            let inet = libc::AF_INET as u16;
+            let inet6 = libc::AF_INET6 as u16;
+
+            // Proxy-only, mediation off: AF_UNIX out of scope, TCP in scope.
+            assert!(network_notification_out_of_scope(policy(true, false), unix));
+            assert!(!network_notification_out_of_scope(
+                policy(true, false),
+                inet
+            ));
+            assert!(!network_notification_out_of_scope(
+                policy(true, false),
+                inet6
+            ));
+
+            // AF_UNIX-only: TCP out of scope, AF_UNIX in scope.
+            assert!(!network_notification_out_of_scope(
+                policy(false, true),
+                unix
+            ));
+            assert!(network_notification_out_of_scope(policy(false, true), inet));
+            assert!(network_notification_out_of_scope(
+                policy(false, true),
+                inet6
+            ));
+
+            // Combined: everything in scope.
+            assert!(!network_notification_out_of_scope(policy(true, true), unix));
+            assert!(!network_notification_out_of_scope(policy(true, true), inet));
+
+            // Neither: no network notify fd is installed, but fail closed
+            // (nothing is declared out of scope) if one somehow arrives.
+            assert!(!network_notification_out_of_scope(
+                policy(false, false),
+                unix
+            ));
+            assert!(!network_notification_out_of_scope(
+                policy(false, false),
+                inet
+            ));
         }
 
         /// Security-critical: the `AF_UNIX → Allow` short-circuit must not

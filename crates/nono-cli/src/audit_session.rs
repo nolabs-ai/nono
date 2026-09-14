@@ -266,8 +266,9 @@ fn parse_pid_from_session_id(session_id: &str) -> Option<u32> {
 }
 
 fn is_process_alive(pid: u32) -> bool {
-    // SAFETY: POSIX kill(pid, 0) checks process existence without sending a signal.
-    unsafe { nix::libc::kill(pid as nix::libc::pid_t, 0) == 0 }
+    // Delegate to shared helper to avoid duplication with session.rs and
+    // rollback_session.rs; handles EPERM→alive, pid 0 / >i32::MAX guard.
+    crate::session::is_pid_alive_simple(pid)
 }
 
 fn calculate_dir_size(dir: &Path) -> u64 {
@@ -629,5 +630,82 @@ mod tests {
             resolve_session_dir("20260813-120000-4242"),
             Err(NonoError::AuditSessionOutsideRoot { .. })
         ));
+    }
+
+    #[test]
+    fn is_current_process_alive() {
+        assert!(is_process_alive(std::process::id()));
+    }
+
+    #[test]
+    fn dead_process_not_alive() {
+        // PID 99999999 is almost certainly not in use; if it is, ESRCH vs EPERM
+        // both map correctly (EPERM is alive, ESRCH is dead). Use a high PID
+        // that would return ESRCH on most systems.
+        assert!(!is_process_alive(99_999_999));
+    }
+
+    #[test]
+    fn is_process_alive_rejects_invalid_pid_zero() {
+        // PID 0 would be kill(pid,0) process-group check; guard returns false.
+        assert!(!is_process_alive(0));
+        assert!(!is_process_alive(u32::MAX));
+        assert!(!is_process_alive(i32::MAX as u32 + 1));
+    }
+
+    #[test]
+    fn is_process_alive_does_not_panic_on_edge_pids() {
+        let _ = is_process_alive(1);
+        let _ = is_process_alive(i32::MAX as u32);
+    }
+
+    #[test]
+    fn build_session_info_marks_running_session_not_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let session_id = format!("20260421-111111-{pid}");
+        let metadata = SessionMetadata {
+            session_id: session_id.clone(),
+            started: "2026-04-21T11:11:11+01:00".to_string(),
+            ended: None,
+            command: vec!["/bin/sleep".to_string()],
+            executable_identity: None,
+            tracked_paths: vec![PathBuf::from("/tmp/work")],
+            snapshot_count: 0,
+            exit_code: None,
+            merkle_roots: Vec::new(),
+            network_events: Vec::new(),
+            audit_event_count: 0,
+            audit_integrity: None,
+            audit_attestation: None,
+            command_policy_summary: None,
+        };
+        let info = build_session_info(dir.path().to_path_buf(), metadata);
+        assert!(info.is_alive, "current process should be alive");
+        assert!(!info.is_stale, "running session must not be stale");
+    }
+
+    #[test]
+    fn build_session_info_marks_dead_session_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = SessionMetadata {
+            session_id: "20260421-111111-99999999".to_string(),
+            started: "2026-04-21T11:11:11+01:00".to_string(),
+            ended: None,
+            command: vec!["/bin/false".to_string()],
+            executable_identity: None,
+            tracked_paths: vec![PathBuf::from("/tmp/work")],
+            snapshot_count: 0,
+            exit_code: None,
+            merkle_roots: Vec::new(),
+            network_events: Vec::new(),
+            audit_event_count: 0,
+            audit_integrity: None,
+            audit_attestation: None,
+            command_policy_summary: None,
+        };
+        let info = build_session_info(dir.path().to_path_buf(), metadata);
+        assert!(!info.is_alive, "dead PID should not be alive");
+        assert!(info.is_stale, "ended=None + dead PID should be stale");
     }
 }

@@ -1350,10 +1350,10 @@ where
     let response_rewrite: Option<InterceptResponseRewrite<'_>> =
         if let Some(endpoint) = oauth_endpoint {
             Some(Box::new(
-                move |status: u16, _headers: &[(String, String)], body: &[u8]| {
+                move |status: u16, headers: &[(String, String)], body: &[u8]| {
                     if (200..300).contains(&status) {
                         ctx.oauth_capture_store
-                            .rewrite_response_body(endpoint, body)
+                            .rewrite_response_body(endpoint, headers, body)
                     } else {
                         ctx.oauth_capture_store
                             .inspect_capture_host_response(&host_port, &path, status, body)

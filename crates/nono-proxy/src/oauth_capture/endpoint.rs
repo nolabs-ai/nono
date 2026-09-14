@@ -11,6 +11,7 @@ pub struct LoadedOAuthEndpoint {
     pub(super) path: String,
     pub(super) response_fields: Vec<ResponseField>,
     pub(super) request_body: OAuthTokenRequestBodyFormat,
+    pub(super) response_body: OAuthTokenRequestBodyFormat,
     pub(super) request_nonce_fields: Vec<String>,
     pub(super) admitted_consumers: HashSet<String>,
 }
@@ -55,6 +56,7 @@ pub(super) fn load_endpoint(
         path: endpoint.path.clone(),
         response_fields: endpoint_response_fields(endpoint)?,
         request_body: endpoint.request_body,
+        response_body: endpoint.response_body,
         request_nonce_fields: endpoint.request_nonce_fields.clone(),
         admitted_consumers,
     })

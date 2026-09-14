@@ -10,6 +10,8 @@
 //! until `exec()`. This module carefully prepares all data in the parent (where
 //! allocation is safe) and uses only raw libc calls in the child.
 
+#[cfg(target_os = "linux")]
+mod clone_files;
 pub(crate) mod env_sanitization;
 #[cfg(target_os = "linux")]
 mod supervisor_linux;
@@ -238,8 +240,8 @@ impl SeccompPolicy {
         self.proxy_fallback || self.af_unix_mediation
     }
 
-    /// Whether the child must be made dumpable so the supervisor can use
-    /// `pidfd_getfd` to steal the network notify fd.
+    /// Whether the child must remain dumpable for the supervisor to read
+    /// syscall arguments through procfs during notification mediation.
     pub fn child_requires_dumpable(self) -> bool {
         self.needs_openat_notify() || self.needs_network_notify()
     }
@@ -473,18 +475,22 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 ///
 /// # Sandbox Application in Child
 ///
-/// The child calls `Sandbox::apply_auto()` after fork, which allocates memory (generating
-/// Seatbelt profile strings on macOS, opening Landlock PathFds on Linux). This is safe
-/// because we validate threading context before fork — known-safe thread contexts
-/// (keyring workers, crypto pool) are idle and not holding allocator locks.
+/// Linux network-notification sessions use a short `CLONE_FILES` bootstrap.
+/// The parent prepares the kernel ruleset against the known child's procfs
+/// entries; the child installs a single, optionally combined notification
+/// filter, detaches its descriptor table, and applies the ruleset before exec.
+/// That child path uses no allocator or locks, including on failure.
+/// Other sessions retain the fork path, whose allocating sandbox setup relies
+/// on the threading-context validation below.
 ///
 /// # Process Flow
 ///
 /// 1. Prepare all data for exec in parent (CString conversion)
 /// 2. Verify threading context allows fork
-/// 3. Fork into parent and child
-/// 4. Child: apply Landlock, install seccomp-notify, close inherited FDs, exec
-/// 5. Parent: apply PR_SET_DUMPABLE(0) + PT_DENY_ATTACH, receive seccomp fd, run supervisor loop
+/// 3. Fork, or raw clone for Linux network notifications
+/// 4. Harden parent and complete any listener handoff before running untrusted code
+/// 5. Child: apply restrictions, close inherited FDs in its private table, exec
+/// 6. Parent: run the existing supervisor loop
 ///
 /// When a PTY pair is provided, the child runs behind the PTY proxy so the
 /// parent can capture terminal output for diagnostics while the child still sees
@@ -582,7 +588,17 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     let needs_child_ipc = supervisor.is_some();
 
     let socket_pair = if needs_child_ipc {
-        Some(SupervisorSocket::pair()?)
+        let pair = SupervisorSocket::pair()?;
+        #[cfg(target_os = "linux")]
+        let pair = if config.seccomp_policy.needs_network_notify() {
+            (
+                clone_files::promote_supervisor_socket(pair.0)?,
+                clone_files::promote_supervisor_socket(pair.1)?,
+            )
+        } else {
+            pair
+        };
+        Some(pair)
     } else {
         None
     };
@@ -878,9 +894,60 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // Clear any stale forwarding target before forking.
     clear_signal_forwarding_target();
 
-    // SAFETY: fork() is safe here because we validated threading context.
-    // Child will call Sandbox::apply_auto() which allocates, but this is safe
-    // because the child is single-threaded (validated above).
+    // Serialize notification listener ownership, including destruction, across
+    // shared-table bootstraps. Ordinary proxy I/O threads remain concurrent.
+    #[cfg(target_os = "linux")]
+    let _listener_ownership_guard = if config.seccomp_policy.child_requires_dumpable() {
+        Some(clone_files::lock_listener_ownership()?)
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let mut clone_bootstrap = if config.seccomp_policy.needs_network_notify() {
+        if !supervisor.is_some_and(|sup| sup.seccomp_policy == config.seccomp_policy) {
+            return Err(NonoError::SandboxInit(
+                "Network notifications require a supervisor with matching notification policy"
+                    .into(),
+            ));
+        }
+        let mut caps = config.caps.clone();
+        caps.widen_procfs_self_to_proc();
+        if let Some(ref path) = url_listener_socket_path {
+            caps.add_unix_socket(UnixSocketCapability::new_file(
+                path,
+                UnixSocketMode::Connect,
+            )?);
+        }
+        Some(clone_files::spawn(
+            config,
+            clone_files::Command {
+                program: &program_c,
+                argv: &argv_ptrs,
+                envp: &envp_ptrs,
+                cwd: &current_dir_c,
+                supervisor_fd: child_sock_fd,
+                pty_slave: pty_slave_fd,
+                resource_procs: resource_procs_fd,
+                #[cfg(test)]
+                fault: clone_files::Fault::None,
+            },
+            &caps,
+            Sandbox::detect_abi()?,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let fork_result = if let Some(ref bootstrap) = clone_bootstrap {
+        Ok(ForkResult::Parent {
+            child: bootstrap.child,
+        })
+    } else {
+        // SAFETY: legacy path's threading context was checked above.
+        unsafe { fork() }
+    };
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: legacy path's threading context was checked above.
     let fork_result = unsafe { fork() };
 
     match fork_result {
@@ -1158,135 +1225,8 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     }
                 }
 
-                // If the parent determined that network seccomp-notify is
-                // needed, install exactly one connect/bind notify filter and
-                // tell the parent its fd number.
-                //
-                // Ordering is critical: the filter is installed AFTER the
-                // notify fd number is sent to the parent. This means no
-                // fd-based exemption is needed in the filter — the filter is
-                // a pure allowlist. The parent uses pidfd_getfd to acquire
-                // the fd from this process after reading the number.
-                //
-                // The notify fd is kept alive in `proxy_notify_fd_keep` past
-                // close_inherited_fds so the parent can call pidfd_getfd
-                // before the fd is closed. It is O_CLOEXEC and closes at exec.
-                let install_network_notify = config.seccomp_policy.needs_network_notify();
-                let mut proxy_notify_fd_keep: Option<std::os::fd::OwnedFd> = None;
-                if install_network_notify && nono::sandbox::is_wsl2() {
-                    let msg =
-                        b"nono: WSL2 detected, seccomp network notify required but unavailable\n";
-                    unsafe {
-                        libc::write(
-                            libc::STDERR_FILENO,
-                            msg.as_ptr().cast::<libc::c_void>(),
-                            msg.len(),
-                        );
-                        libc::_exit(126);
-                    }
-                } else if install_network_notify && let Some(fd) = child_sock_fd {
-                    let notify_result = if config.seccomp_policy.proxy_fallback {
-                        let has_bind = match effective_caps.network_mode() {
-                            nono::NetworkMode::ProxyOnly { bind_ports, .. } => {
-                                !bind_ports.is_empty()
-                            }
-                            _ => false,
-                        };
-                        nono::sandbox::install_seccomp_proxy_filter(has_bind)
-                    } else {
-                        nono::sandbox::install_seccomp_af_unix_filter()
-                    };
-
-                    match notify_result {
-                        Ok(proxy_notify_fd) => {
-                            // Write the raw fd number via write() — not intercepted
-                            // by the BPF filter (which only traps connect/bind/send*).
-                            // The parent reads this number and calls pidfd_getfd.
-                            let fd_num = proxy_notify_fd.as_raw_fd();
-                            let fd_bytes = fd_num.to_ne_bytes();
-                            let written = loop {
-                                // SAFETY: fd is a valid socket fd; fd_bytes is
-                                // a valid 4-byte buffer.
-                                let n = unsafe {
-                                    libc::write(
-                                        fd,
-                                        fd_bytes.as_ptr().cast::<libc::c_void>(),
-                                        fd_bytes.len(),
-                                    )
-                                };
-                                if n < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
-                                    continue;
-                                }
-                                break n;
-                            };
-                            if written < 0 {
-                                let detail = format!(
-                                    "nono: failed to write proxy seccomp notify fd number: {}\n",
-                                    std::io::Error::last_os_error()
-                                );
-                                let msg = detail.as_bytes();
-                                unsafe {
-                                    libc::write(
-                                        libc::STDERR_FILENO,
-                                        msg.as_ptr().cast::<libc::c_void>(),
-                                        msg.len(),
-                                    );
-                                    libc::_exit(126);
-                                }
-                            }
-                            // Block until the parent acks that it has called
-                            // pidfd_getfd. This prevents exec (and O_CLOEXEC
-                            // closing the notify fd) before the parent acquires
-                            // its own copy. read() is not trapped by the BPF
-                            // filter (only connect/bind/send* are), so this
-                            // does not deadlock. Loop on EINTR so a signal
-                            // cannot cause the child to proceed prematurely.
-                            let mut ack = [0u8; 1];
-                            loop {
-                                // SAFETY: fd is a valid socket fd; ack is a
-                                // valid 1-byte buffer.
-                                let n = unsafe {
-                                    libc::read(fd, ack.as_mut_ptr().cast::<libc::c_void>(), 1)
-                                };
-                                if n < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
-                                    continue;
-                                }
-                                break;
-                            }
-                            // Keep alive past close_inherited_fds so the parent
-                            // can call pidfd_getfd. O_CLOEXEC closes it at exec.
-                            proxy_notify_fd_keep = Some(proxy_notify_fd);
-                        }
-                        Err(e) => {
-                            let detail =
-                                format!("nono: seccomp proxy filter not available: {}\n", e);
-                            let msg = detail.as_bytes();
-                            unsafe {
-                                libc::write(
-                                    libc::STDERR_FILENO,
-                                    msg.as_ptr().cast::<libc::c_void>(),
-                                    msg.len(),
-                                );
-                                libc::_exit(126);
-                            }
-                        }
-                    }
-                } else if install_network_notify {
-                    let msg =
-                        b"nono: seccomp network notify required but supervisor socket is unavailable\n";
-                    unsafe {
-                        libc::write(
-                            libc::STDERR_FILENO,
-                            msg.as_ptr().cast::<libc::c_void>(),
-                            msg.len(),
-                        );
-                        libc::_exit(126);
-                    }
-                }
-                if let Some(ref pnf) = proxy_notify_fd_keep {
-                    child_keep_fds.push(pnf.as_raw_fd());
-                }
-
+                // Network notification sessions take the allocation-free
+                // CLONE_FILES path and never enter this legacy fork child.
                 if !config.seccomp_policy.child_requires_dumpable() {
                     use nix::sys::prctl;
 
@@ -1430,8 +1370,9 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             // notify fd from the child. If the child cannot provide it, this is
             // a sandbox initialisation failure rather than a degraded mode.
             #[cfg(target_os = "linux")]
-            let seccomp_notify_fd: Option<OwnedFd> = if config.seccomp_policy.needs_openat_notify()
-            {
+            let seccomp_notify_fd: Option<OwnedFd> = if clone_bootstrap.is_some() {
+                None
+            } else if config.seccomp_policy.needs_openat_notify() {
                 if let Some(ref sup_sock) = supervisor_sock {
                     match sup_sock.recv_fd() {
                         Ok(fd) => {
@@ -1459,80 +1400,10 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 None
             };
 
-            // On Linux: if the parent determined seccomp proxy fallback is needed,
-            // receive the proxy notify fd number from the child and acquire the
-            // fd via pidfd_getfd. The child writes the raw fd number via write()
-            // rather than SCM_RIGHTS so the AF_UNIX BPF filter (installed after
-            // the write) cannot intercept it.
             #[cfg(target_os = "linux")]
-            let proxy_notify_fd: Option<OwnedFd> = if config.seccomp_policy.needs_network_notify() {
-                if let Some(ref sup_sock) = supervisor_sock {
-                    match sup_sock.recv_raw_fd_number() {
-                        Ok(child_fd_num) => {
-                            let result = acquire_fd_from_child(child, child_fd_num);
-                            // Always ack so the child's blocking read unblocks
-                            // and exec can proceed (O_CLOEXEC closes the fd at
-                            // exec, which is safe only after pidfd_getfd ran).
-                            // Loop on EINTR so a signal cannot silently drop
-                            // the ack and leave the child blocked forever.
-                            let ack = [1u8];
-                            loop {
-                                // SAFETY: sup_sock fd is valid; ack is a
-                                // valid 1-byte buffer.
-                                let n = unsafe {
-                                    libc::write(
-                                        sup_sock.as_raw_fd(),
-                                        ack.as_ptr().cast::<libc::c_void>(),
-                                        1,
-                                    )
-                                };
-                                if n < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
-                                    continue;
-                                }
-                                break;
-                            }
-                            match result {
-                                Ok(fd) => {
-                                    debug!(
-                                        "Acquired proxy seccomp notify fd from child via pidfd_getfd"
-                                    );
-                                    Some(fd)
-                                }
-                                Err(e) => {
-                                    let _ = signal::kill(child, Signal::SIGKILL);
-                                    let _ = waitpid(child, None);
-                                    // Unwrap to avoid doubling the "Sandbox
-                                    // initialization failed: " prefix.
-                                    let detail = match e {
-                                        NonoError::SandboxInit(msg) => msg,
-                                        other => other.to_string(),
-                                    };
-                                    return Err(NonoError::SandboxInit(format!(
-                                        "failed to acquire required network seccomp notify fd from child: {detail}"
-                                    )));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = signal::kill(child, Signal::SIGKILL);
-                            let _ = waitpid(child, None);
-                            return Err(NonoError::SandboxInit(format!(
-                                "Failed to receive required network seccomp notify fd number from child: {}",
-                                e
-                            )));
-                        }
-                    }
-                } else {
-                    let _ = signal::kill(child, Signal::SIGKILL);
-                    let _ = waitpid(child, None);
-                    return Err(NonoError::SandboxInit(
-                        "Network seccomp notify is required but no supervisor socket was created"
-                            .to_string(),
-                    ));
-                }
-            } else {
-                None
-            };
+            let proxy_notify_fd: Option<OwnedFd> = clone_bootstrap
+                .as_mut()
+                .and_then(|bootstrap| bootstrap.network.take());
 
             // Set up signal forwarding.
             setup_signal_forwarding(child, pty_proxy.as_ref().map(|p| p.poll_fds().0));
@@ -3116,11 +2987,17 @@ fn run_supervisor_loop(
                 if let Some(proxy_notify_idx) = proxy_notify_idx
                     && pfds[proxy_notify_idx].revents & libc::POLLIN != 0
                     && let Some(pfd) = proxy_notify_raw_fd
-                    && let Err(e) = supervisor_linux::handle_network_notification(
+                    && let Err(e) = supervisor_linux::handle_combined_notification(
                         pfd,
+                        child,
                         config,
-                        &mut rate_limiter,
-                        &mut denials.fs,
+                        initial_caps,
+                        supervisor_linux::SeccompNotificationState {
+                            rate_limiter: &mut rate_limiter,
+                            denials: &mut denials.fs,
+                            trust_interceptor: trust_interceptor.as_mut(),
+                            pty: pty.as_deref_mut(),
+                        },
                         &mut ipc_denials,
                     )
                 {
@@ -3882,49 +3759,6 @@ fn validate_url(url: &str, config: &SupervisorConfig<'_>) -> std::result::Result
 }
 
 /// Clear `FD_CLOEXEC` on a file descriptor so it survives `execve()`.
-/// Acquire a copy of file descriptor `child_fd` from process `child` using
-/// `pidfd_open` + `pidfd_getfd` (Linux 5.6+).
-///
-/// Used to receive the proxy seccomp notify fd: the child writes the fd
-/// number via `write()` (not `SCM_RIGHTS`, which would be intercepted by the
-/// AF_UNIX BPF filter), and the parent calls this to pull the fd across the
-/// process boundary without any filter involvement.
-#[cfg(target_os = "linux")]
-fn acquire_fd_from_child(
-    child: nix::unistd::Pid,
-    child_fd: std::os::unix::io::RawFd,
-) -> Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd as _;
-    let pidfd_raw =
-        unsafe { libc::syscall(libc::SYS_pidfd_open, child.as_raw() as libc::pid_t, 0_u32) };
-    if pidfd_raw < 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "pidfd_open failed for child {}: {}",
-            child.as_raw(),
-            std::io::Error::last_os_error()
-        )));
-    }
-    // SAFETY: pidfd_open returned a fresh owned fd.
-    let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(pidfd_raw as i32) };
-    let new_fd_raw =
-        unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), child_fd, 0_u32) };
-    if new_fd_raw < 0 {
-        let err = std::io::Error::last_os_error();
-        let hint = if err.raw_os_error() == Some(libc::EPERM) {
-            " (this commonly happens inside a container: pidfd_getfd requires \
-             CAP_SYS_PTRACE, which container runtimes drop by default -- retry with \
-             `docker run --cap-add=SYS_PTRACE ...` or the equivalent for your runtime)"
-        } else {
-            ""
-        };
-        return Err(NonoError::SandboxInit(format!(
-            "pidfd_getfd failed for child fd {child_fd}: {err}{hint}"
-        )));
-    }
-    // SAFETY: pidfd_getfd returned a fresh owned fd duplicated from the child.
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(new_fd_raw as i32) })
-}
-
 fn clear_close_on_exec(fd: i32) -> Result<()> {
     // SAFETY: `fcntl` is called with a valid fd owned by this process.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };

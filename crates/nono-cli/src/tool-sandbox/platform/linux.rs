@@ -488,6 +488,17 @@ impl PreparedToolSandboxRuntime {
         Ok(())
     }
 
+    pub(crate) fn prepare_outer_exec_gate(&self) -> Result<OwnedFd> {
+        let ruleset = prepare_outer_exec_gate(
+            &self.inner.allowed_outer_exec_files,
+            &self.inner.plan.outer_exec_writable_dirs,
+            self.inner.landlock_abi,
+        )?;
+        Option::<OwnedFd>::from(ruleset).ok_or_else(|| {
+            NonoError::SandboxInit("tool-sandbox execution gate was not created".to_string())
+        })
+    }
+
     pub(crate) fn apply_outer_exec_gate(&self) -> Result<()> {
         apply_outer_exec_gate(
             &self.inner.allowed_outer_exec_files,
@@ -1753,7 +1764,13 @@ fn handle_shim_stream_inner(
                             "tool-sandbox token broker lock poisoned".to_string(),
                         )
                     })?;
-                    broker.store_named(credential.clone(), captured, grants.clone(), template)
+                    broker.store_named(
+                        credential.clone(),
+                        captured,
+                        grants.clone(),
+                        template,
+                        crate::tool_sandbox::token_broker::NamedValuePolicy::SingleActiveValue,
+                    )
                 };
                 record_command_policy_audit(
                     audit_recorder.as_ref(),
@@ -3111,6 +3128,17 @@ fn apply_outer_exec_gate(
     writable_dirs: &[PathBuf],
     abi: nono::DetectedAbi,
 ) -> Result<()> {
+    let status = prepare_outer_exec_gate(paths, writable_dirs, abi)?
+        .restrict_self()
+        .map_err(|err| NonoError::SandboxInit(format!("tool-sandbox restrict_self: {err}")))?;
+    ensure_outer_exec_gate_fully_enforced(status.ruleset)
+}
+
+fn prepare_outer_exec_gate(
+    paths: &[PathBuf],
+    writable_dirs: &[PathBuf],
+    abi: nono::DetectedAbi,
+) -> Result<landlock::RulesetCreated> {
     if !abi.has_execute() {
         return Err(NonoError::SandboxInit(format!(
             "tool-sandbox outer exec gate requires Landlock ABI V3+; detected {}",
@@ -3190,12 +3218,7 @@ fn apply_outer_exec_gate(
             })?;
     }
 
-    let status = ruleset.restrict_self().map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "tool-sandbox outer exec gate restrict_self failed: {err}"
-        ))
-    })?;
-    ensure_outer_exec_gate_fully_enforced(status.ruleset)
+    Ok(ruleset)
 }
 
 fn ensure_outer_exec_gate_fully_enforced(status: landlock::RulesetStatus) -> Result<()> {
@@ -4589,20 +4612,13 @@ fn join_relay_thread(
     })?
 }
 
+/// Re-derives a nonce by re-reading `credential`'s statically configured
+/// source; `None` means it has none, so the caller re-runs the capture.
 fn issue_existing_ambient_credential_nonce(
     state: &ToolSandboxState,
     credential: &str,
     grants: crate::tool_sandbox::token_broker::GrantSet,
 ) -> Result<Option<String>> {
-    {
-        let mut broker = state.token_broker.lock().map_err(|_| {
-            NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
-        })?;
-        if let Some(nonce) = broker.issue_named(credential) {
-            return Ok(Some(nonce));
-        }
-    }
-
     let Some(value) = load_ambient_credential_source(state, credential)? else {
         return Ok(None);
     };
@@ -4618,6 +4634,7 @@ fn issue_existing_ambient_credential_nonce(
         value,
         grants,
         template,
+        crate::tool_sandbox::token_broker::NamedValuePolicy::SingleActiveValue,
     )))
 }
 

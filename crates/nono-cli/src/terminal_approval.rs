@@ -4,8 +4,8 @@
 //! additional filesystem access. This is the default approval backend
 //! for `nono run`.
 
-use nono::{AccessMode, ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result};
-use std::io::{BufRead, IsTerminal, Write};
+use nono::{AccessMode, ApprovalBackend, ApprovalDecision, ApprovalRequest, Result};
+use std::io::IsTerminal;
 
 /// Interactive terminal approval backend.
 ///
@@ -105,21 +105,9 @@ impl ApprovalBackend for TerminalApproval {
             }
         }
         eprintln!("[nono]");
-        eprint!("[nono] Grant access? [y/N] ");
-        let _ = std::io::stderr().flush();
+        let input = crate::terminal_prompt::read_consent_line("[nono] Grant access? [y/N] ")?;
 
-        // Read from /dev/tty, not stdin (which belongs to the sandboxed child)
-        let tty = std::fs::File::open("/dev/tty").map_err(|e| {
-            NonoError::SandboxInit(format!("Failed to open /dev/tty for approval prompt: {e}"))
-        })?;
-        let mut reader = std::io::BufReader::new(tty);
-        let mut input = String::new();
-        reader.read_line(&mut input).map_err(|e| {
-            NonoError::SandboxInit(format!("Failed to read approval response: {e}"))
-        })?;
-
-        let input = input.trim().to_lowercase();
-        if input == "y" || input == "yes" {
+        if is_affirmative_response(&input) {
             eprintln!("[nono] Access granted.");
             Ok(ApprovalDecision::Granted)
         } else {
@@ -133,6 +121,10 @@ impl ApprovalBackend for TerminalApproval {
     fn backend_name(&self) -> &str {
         "terminal"
     }
+}
+
+fn is_affirmative_response(response: &str) -> bool {
+    matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Strip control characters and ANSI escape sequences from untrusted input
@@ -259,6 +251,15 @@ mod tests {
     fn test_terminal_approval_backend_name() {
         let backend = TerminalApproval;
         assert_eq!(backend.backend_name(), "terminal");
+    }
+
+    #[test]
+    fn terminal_approval_requires_explicit_yes() {
+        assert!(is_affirmative_response("y"));
+        assert!(is_affirmative_response(" YES \n"));
+        assert!(!is_affirmative_response(""));
+        assert!(!is_affirmative_response("n"));
+        assert!(!is_affirmative_response("anything else"));
     }
 
     // ── non-TTY auto-deny (all three variants) ────────────────────────────────

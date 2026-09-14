@@ -1,6 +1,6 @@
 ---
 title: Session Lifecycle
-description: Manage live sandbox sessions with ps, attach, detach, stop, inspect, and prune
+description: Manage live sandbox sessions with ps, attach, detach, stop, inspect, and session cleanup
 ---
 
 nono can manage long-lived sandbox sessions as a runtime. Each session is supervised with a PTY-backed terminal, so you can attach and detach from the session terminal at will without stopping the underlying process.
@@ -24,7 +24,7 @@ A session is not frozen just because you detached from it. The sandboxed process
 | `nono detach <id>` | Drop the current terminal attachment without stopping the session |
 | `nono stop <id>` | Ask the supervisor to terminate the session cleanly |
 | `nono inspect <id>` | Show session metadata and current state |
-| `nono prune` | Remove old session records from the local registry |
+| `nono session cleanup` | Remove old session records from the local registry |
 
 ## Session States
 
@@ -200,21 +200,21 @@ The rollup is recomputed from the session's audit event log, which the superviso
 
 ## Pruning Old Session Records
 
-Exited sessions stay in the registry until you remove them. Use `nono prune` to clean them up:
+Exited sessions stay in the registry until you remove them. Use `nono session cleanup` to clean them up:
 
 ```bash
-nono prune
+nono session cleanup
 ```
 
 Common variants:
 
 ```bash
-nono prune --dry-run
-nono prune --older-than 7
-nono prune --keep 20
+nono session cleanup --dry-run
+nono session cleanup --older-than 7
+nono session cleanup --keep 20
 ```
 
-`nono prune` currently skips sessions in `running` state and removes exited sessions. `paused` sessions are treated more conservatively elsewhere in the runtime than they are here, so do not use `prune` as a maintenance step for paused/stopped sessions until that behavior is tightened.
+`nono session cleanup` currently skips sessions in `running` state and removes exited sessions. `paused` sessions are treated more conservatively elsewhere in the runtime than they are here, so do not use it as a maintenance step for paused/stopped sessions until that behavior is tightened.
 
 ## Common Workflows
 

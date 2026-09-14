@@ -67,14 +67,9 @@ fn test_schema_network_config_matches_rust_model() {
             "allow_http2",
             "network_profile",
             "allow_domain",
-            "proxy_allow",
-            "allow_proxy",
             "deny_domain",
             "credentials",
-            "proxy_credentials",
             "open_port",
-            "port_allow",
-            "allow_port",
             "open_port_range",
             "listen_port",
             "listen_port_range",
@@ -83,9 +78,7 @@ fn test_schema_network_config_matches_rust_model() {
             "custom_credentials",
             "tls_intercept",
             "upstream_proxy",
-            "external_proxy",
             "upstream_bypass",
-            "external_proxy_bypass",
         ],
     );
 }
@@ -109,7 +102,6 @@ fn test_schema_top_level_profile_matches_rust_model() {
             "diagnostics",
             "linux",
             "env_credentials",
-            "secrets",
             "environment",
             "command_policies",
             "credential_capture",
@@ -119,7 +111,6 @@ fn test_schema_top_level_profile_matches_rust_model() {
             "hooks",
             "session_hooks",
             "rollback",
-            "undo",
             "open_urls",
             "allow_launch_services",
             "allow_gpu",
@@ -983,7 +974,6 @@ fn test_schema_filesystem_config_matches_rust_model() {
             "deny",
             "bypass_protection",
             "suppress_save_prompt",
-            "ignore",
         ],
     );
 }

@@ -25,7 +25,7 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | `nono detach` | Full | PTY detach |
 | `nono logs` | Full | Session event logs, pure userspace |
 | `nono inspect` | Full | Session state, pure userspace |
-| `nono prune` | Full | Session cleanup, pure userspace |
+| `nono session cleanup` | Full | Session cleanup, pure userspace |
 | `nono profile` (init/list/show/diff/validate/groups/schema/guide) | Full | Pure logic |
 
 ## Filesystem Permissions
@@ -40,7 +40,7 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | `--write-file` (write-only single file) | Full | Landlock V1+ |
 | `--allow-cwd` | Full | |
 | `--workdir` | Full | Variable expansion only |
-| `--bypass-protection` | Full | Renamed in #594; legacy alias accepted until v1.0.0 |
+| `--bypass-protection` | Full | |
 | `--skip-dir` | Full | |
 | File rename across directories | Full | Landlock V2 (Refer) |
 | File truncation control | Full | Landlock V3 (Truncate) |

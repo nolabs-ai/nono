@@ -24,7 +24,10 @@ echo ""
 echo -e "${BLUE}=== TLS Interception Wire-up Tests ===${NC}"
 
 verify_nono_binary
-ensure_sandbox_supported
+if ! require_working_sandbox "TLS interception suite"; then
+    print_summary
+    exit 0
+fi
 
 echo ""
 
@@ -39,28 +42,28 @@ echo "--- Trust bundle env-var injection ---"
 # whether the credential resolves or not — interception activates because
 # the route declares L7 requirements, regardless of resolution.
 #
-# `--proxy-credential anthropic` enables the `anthropic` route from the
+# `--credential anthropic` enables the `anthropic` route from the
 # embedded network policy. We then `printenv` inside the sandbox and
 # verify the four trust env vars are set.
 
 expect_output_contains "SSL_CERT_FILE injected when intercept active" \
     "SSL_CERT_FILE=" \
-    "$NONO_BIN" run --network-profile minimal-public --proxy-credential anthropic \
+    "$NONO_BIN" run --network-profile minimal --credential anthropic \
         -- printenv
 
 expect_output_contains "REQUESTS_CA_BUNDLE injected when intercept active" \
     "REQUESTS_CA_BUNDLE=" \
-    "$NONO_BIN" run --network-profile minimal-public --proxy-credential anthropic \
+    "$NONO_BIN" run --network-profile minimal --credential anthropic \
         -- printenv
 
 expect_output_contains "NODE_EXTRA_CA_CERTS injected when intercept active" \
     "NODE_EXTRA_CA_CERTS=" \
-    "$NONO_BIN" run --network-profile minimal-public --proxy-credential anthropic \
+    "$NONO_BIN" run --network-profile minimal --credential anthropic \
         -- printenv
 
 expect_output_contains "CURL_CA_BUNDLE injected when intercept active" \
     "CURL_CA_BUNDLE=" \
-    "$NONO_BIN" run --network-profile minimal-public --proxy-credential anthropic \
+    "$NONO_BIN" run --network-profile minimal --credential anthropic \
         -- printenv
 
 # =============================================================================
@@ -79,7 +82,7 @@ echo "--- Diagnostic banner ---"
 
 expect_output_contains "diagnostic banner shows route prefix" \
     "Proxy routes:" \
-    bash -c "RUST_LOG=info '$NONO_BIN' run --network-profile minimal-public --proxy-credential anthropic -- printenv 2>&1 | head -50"
+    bash -c "RUST_LOG=info '$NONO_BIN' run --network-profile minimal --credential anthropic -- printenv 2>&1 | head -50"
 
 # =============================================================================
 # Summary

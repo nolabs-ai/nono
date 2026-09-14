@@ -112,6 +112,9 @@ The default backend reads approval from `/dev/tty` directly (since stdin belongs
         Allow? [y/N]
 ```
 
+The prompt ignores and discards terminal input during a one-second arming
+window before accepting a response. An empty response defaults to denial.
+
 ### Webhook / Policy Approval (planned)
 
 Future backends will support:

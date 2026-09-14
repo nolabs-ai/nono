@@ -6,6 +6,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TESTS_DIR="$PROJECT_ROOT/tests"
+
+case "${1:-}" in
+    "")
+        ;;
+    --help|-h)
+        echo "Usage: $0"
+        echo "Runs every tests/integration/test_*.sh suite."
+        exit 0
+        ;;
+    *)
+        echo "Unknown option: $1" >&2
+        echo "Usage: $0" >&2
+        exit 2
+        ;;
+esac
 
 # Colors
 RED='\033[0;31m'
@@ -52,8 +68,8 @@ echo -e "Platform: $(uname -s) $(uname -m)"
 echo ""
 
 # Make test scripts executable
-chmod +x "$SCRIPT_DIR"/integration/*.sh 2>/dev/null || true
-chmod +x "$SCRIPT_DIR"/lib/*.sh 2>/dev/null || true
+chmod +x "$TESTS_DIR"/integration/*.sh 2>/dev/null || true
+chmod +x "$TESTS_DIR"/lib/*.sh 2>/dev/null || true
 
 # =============================================================================
 # Run Test Suites in Parallel (with concurrency limit)
@@ -141,29 +157,15 @@ cleanup_test_audit_artifacts() {
 trap 'cleanup_test_audit_artifacts; rm -rf "$RESULTS_DIR" "$TEST_ENV_DIR"' EXIT
 
 # All suites to run (script:name pairs)
-SUITES=(
-    "test_fs_access.sh:Filesystem Access"
-    "test_sensitive_paths.sh:Sensitive Paths"
-    "test_system_paths.sh:System Paths"
-    "test_binary_exec.sh:Binary Execution"
-    "test_network.sh:Network"
-    "test_commands.sh:Dangerous Commands"
-    "test_edge_cases.sh:Edge Cases"
-    "test_policy_queries.sh:Policy Queries"
-    "test_shell.sh:Shell"
-    "test_profiles.sh:Profiles"
-    "test_pack_resolution.sh:Pack Resolution"
-    "test_client_startup.sh:Client Startup"
-    "test_silent_output.sh:Silent Output"
-    "test_env_sanitization.sh:Env Sanitization"
-    "test_child_tool_boundaries.sh:Child / Tool Boundaries"
-    "test_exec_strategy.sh:Exec Strategy"
-    "test_trust_cli.sh:Trust CLI"
-    "test_audit.sh:Audit Trail"
-    "test_rollback.sh:Rollback"
-    "test_setup.sh:Setup"
-    "test_bypass_protection.sh:Bypass Protection"
-)
+# Discover every shell suite so newly added suites cannot be omitted from CI.
+SUITES=()
+for suite_path in "$TESTS_DIR"/integration/test_*.sh; do
+    suite_script=$(basename "$suite_path")
+    suite_name="${suite_script#test_}"
+    suite_name="${suite_name%.sh}"
+    suite_name="${suite_name//_/ }"
+    SUITES+=("$suite_script:$suite_name")
+done
 
 TOTAL_SUITES=${#SUITES[@]}
 SUITE_NAMES=()
@@ -196,7 +198,7 @@ launch_suite() {
     local exit_file="${output_file%.out}.exit"
 
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$SUITE_TIMEOUT" bash "$SCRIPT_DIR/integration/$script" > "$output_file" 2>&1
+        timeout "$SUITE_TIMEOUT" bash "$TESTS_DIR/integration/$script" > "$output_file" 2>&1
         rc=$?
         if [[ "$rc" -eq 124 ]]; then
             echo "" >> "$output_file"
@@ -204,7 +206,7 @@ launch_suite() {
         fi
         echo "$rc" > "$exit_file"
     else
-        bash "$SCRIPT_DIR/integration/$script" > "$output_file" 2>&1; rc=$?
+        bash "$TESTS_DIR/integration/$script" > "$output_file" 2>&1; rc=$?
         echo "$rc" > "$exit_file"
     fi
 }

@@ -188,10 +188,22 @@ pub(super) fn handle_seccomp_notification(
     initial_caps: &[InitialCapability],
     state: SeccompNotificationState<'_>,
 ) -> Result<()> {
+    let notif = nono::sandbox::recv_notif(notify_fd)?;
+    handle_received_filesystem_notification(notify_fd, child, config, initial_caps, state, notif)
+}
+
+fn handle_received_filesystem_notification(
+    notify_fd: std::os::fd::RawFd,
+    child: Pid,
+    config: &SupervisorConfig<'_>,
+    initial_caps: &[InitialCapability],
+    state: SeccompNotificationState<'_>,
+    notif: nono::sandbox::SeccompNotif,
+) -> Result<()> {
     use nono::sandbox::{
         SYS_OPENAT, SYS_OPENAT2, classify_access_from_flags, continue_notif, deny_notif, inject_fd,
-        notif_id_valid, read_notif_path, read_open_how, recv_notif, resolve_notif_path,
-        respond_notif_errno, validate_openat2_size,
+        notif_id_valid, read_notif_path, read_open_how, resolve_notif_path, respond_notif_errno,
+        validate_openat2_size,
     };
     let SeccompNotificationState {
         rate_limiter,
@@ -201,7 +213,6 @@ pub(super) fn handle_seccomp_notification(
     } = state;
 
     // 1. Receive the notification
-    let notif = recv_notif(notify_fd)?;
 
     // 2. Read the path from the child's memory (args[1] = pathname for openat/openat2)
     //    Then resolve dirfd-relative paths using /proc/PID/fd/DIRFD or /proc/PID/cwd.
@@ -726,7 +737,7 @@ pub(super) fn decide_network_notification(
         }
     }
 
-    if config.seccomp_policy.af_unix_mediation {
+    if config.seccomp_policy.af_unix_mediation && !config.seccomp_policy.proxy_fallback {
         debug!(
             "AF_UNIX-only seccomp mediation: allowing non-AF_UNIX syscall family={} nr={}",
             sockaddr.family, syscall
@@ -936,6 +947,42 @@ fn canonicalize_unix_socket_bind_path(
 /// `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, which preserves platform compatibility
 /// but carries the documented userspace-pointer TOCTOU limitation described
 /// by `read_notif_sockaddr`.
+pub(super) fn handle_combined_notification(
+    notify_fd: std::os::fd::RawFd,
+    child: Pid,
+    config: &SupervisorConfig<'_>,
+    initial_caps: &[InitialCapability],
+    state: SeccompNotificationState<'_>,
+    ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+) -> Result<()> {
+    let notif = nono::sandbox::recv_notif(notify_fd)?;
+    if matches!(
+        notif.data.nr,
+        nono::sandbox::SYS_OPENAT | nono::sandbox::SYS_OPENAT2
+    ) {
+        if !config.seccomp_policy.needs_openat_notify() {
+            return nono::sandbox::deny_notif(notify_fd, notif.id);
+        }
+        handle_received_filesystem_notification(
+            notify_fd,
+            child,
+            config,
+            initial_caps,
+            state,
+            notif,
+        )
+    } else {
+        handle_received_network_notification(
+            notify_fd,
+            config,
+            state.rate_limiter,
+            state.denials,
+            ipc_denials,
+            notif,
+        )
+    }
+}
+
 pub(super) fn handle_network_notification(
     notify_fd: std::os::fd::RawFd,
     config: &SupervisorConfig<'_>,
@@ -943,13 +990,30 @@ pub(super) fn handle_network_notification(
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) -> nono::error::Result<()> {
+    let notif = nono::sandbox::recv_notif(notify_fd)?;
+    handle_received_network_notification(
+        notify_fd,
+        config,
+        rate_limiter,
+        denials,
+        ipc_denials,
+        notif,
+    )
+}
+
+fn handle_received_network_notification(
+    notify_fd: std::os::fd::RawFd,
+    config: &SupervisorConfig<'_>,
+    rate_limiter: &mut RateLimiter,
+    denials: &mut Vec<DenialRecord>,
+    ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+    notif: nono::sandbox::SeccompNotif,
+) -> nono::error::Result<()> {
     use nono::sandbox::{
         SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO, continue_notif, deny_notif,
-        notif_id_valid, read_mmsghdr_dests, read_msghdr_dest, read_notif_sockaddr, recv_notif,
+        notif_id_valid, read_mmsghdr_dests, read_msghdr_dest, read_notif_sockaddr,
         respond_notif_errno,
     };
-
-    let notif = recv_notif(notify_fd)?;
 
     // Read sockaddr from child's memory. The location depends on the syscall:
     //   connect(fd, sockaddr*, addrlen):   args[1] = sockaddr*, args[2] = addrlen
@@ -1091,6 +1155,7 @@ pub(super) fn handle_network_notification(
     // rate-limiter token, which would otherwise starve legitimate network
     // traffic once the burst is exhausted.
     if config.seccomp_policy.af_unix_mediation
+        && !config.seccomp_policy.proxy_fallback
         && sockaddrs.iter().all(|s| s.family != libc::AF_UNIX as u16)
     {
         if let Err(e) = continue_notif(notify_fd, notif.id) {

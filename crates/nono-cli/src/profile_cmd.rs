@@ -252,9 +252,7 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
     );
     root.insert("workdir".to_string(), serde_json::Value::Object(workdir));
 
-    // filesystem (minimal has allow + read; full adds all fields, including
-    // the canonical replacements for the legacy `policy` patch keys —
-    // see deprecated_schema.rs for the migration mapping).
+    // filesystem (minimal has allow + read; full adds all fields).
     let mut filesystem = serde_json::Map::new();
     filesystem.insert("allow".to_string(), serde_json::Value::Array(vec![]));
     filesystem.insert("read".to_string(), serde_json::Value::Array(vec![]));
@@ -857,13 +855,9 @@ fn print_profile_line(name: &str, result: &Result<Profile>, t: &theme::Theme) {
 pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
     // Order matters: `load_profile_extends` opens an internal
     // `WarningSuppressionGuard` for its preview parse, so deprecation
-    // warnings fire only on the subsequent real `load_profile` call —
-    // exactly once per legacy key per file (the design's contract,
-    // line 141). DO NOT swap or merge these two calls without
-    // preserving that suppression scope, or warnings will double-emit.
-    // See the regression test `legacy_all_keys_shows_byte_equal_canonical_equivalent`
-    // in tests/deprecated_schema.rs which asserts the exact 9-warning
-    // count on `legacy_all_keys.json`.
+    // warnings fire only on the subsequent real `load_profile` call.
+    // DO NOT swap or merge these two calls without preserving that
+    // suppression scope, or warnings will double-emit.
     let raw_extends = profile::load_profile_extends(&args.profile);
     let profile = profile::load_profile_no_migrate(&args.profile)?;
 
@@ -1281,8 +1275,7 @@ fn profile_to_json(
         val["linux"] = serde_json::json!({ "af_unix_mediation": v });
     }
 
-    // Filesystem (canonical schema). Legacy keys deserialize into these fields
-    // via `deprecated_schema::LegacyPolicyPatch` before reaching `Profile`.
+    // Filesystem (canonical schema).
     val["filesystem"] = serde_json::json!({
         "allow": profile.filesystem.allow,
         "read": profile.filesystem.read,
@@ -3737,9 +3730,8 @@ mod tests {
         assert!(!minimal_obj.contains_key("network"));
         assert!(!minimal_obj.contains_key("hooks"));
 
-        // Full filesystem has all canonical fields, including the new
-        // `deny` and `bypass_protection` (canonical replacements for the
-        // legacy `policy` patch — see deprecated_schema.rs).
+        // Full filesystem has all canonical fields, including `deny` and
+        // `bypass_protection`.
         let full_fs = full_obj["filesystem"].as_object().expect("fs object");
         assert!(full_fs.contains_key("write"));
         assert!(full_fs.contains_key("allow_file"));

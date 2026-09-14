@@ -238,12 +238,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run integration tests
-        run: |
-          if [[ -f ./tests/run_integration_tests.sh ]]; then
-            ./tests/run_integration_tests.sh
-          else
-            echo "No integration tests found, skipping"
-          fi
+        run: ./scripts/run_all_tests.sh
 
   audit:
     name: Cargo Audit

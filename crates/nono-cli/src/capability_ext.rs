@@ -2474,8 +2474,8 @@ mod tests {
             r#"{
                 "extends": "default",
                 "meta": { "name": "groups-test" },
-                "security": {
-                    "groups": ["node_runtime", "rust_runtime", "unlink_protection"]
+                "groups": {
+                    "include": ["node_runtime", "rust_runtime", "unlink_protection"]
                 }
             }"#,
         )
@@ -3269,7 +3269,6 @@ mod tests {
         let json = format!(
             r#"{{
                 "meta": {{ "name": "test-unix-socket" }},
-                "security": {{ "groups": [] }},
                 "filesystem": {{ "{field}": ["{value}"] }}
             }}"#
         );

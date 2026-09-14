@@ -19,7 +19,7 @@ use crate::package_cmd;
 use crate::registry_client::{PullReason, RegistryClient, resolve_registry_url};
 use colored::Colorize;
 use nono::Result;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 
 const ENV_AUTO_MIGRATE: &str = "NONO_AUTO_MIGRATE";
 const ENV_NO_MIGRATE: &str = "NONO_NO_MIGRATE";
@@ -139,13 +139,14 @@ pub fn check_and_run(profile_name: &str) -> Result<MigrationOutcome> {
     };
 
     let auto = env_flag(ENV_AUTO_MIGRATE);
-    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    let interactive =
+        io::stderr().is_terminal() && crate::terminal_prompt::consent_prompt_available();
 
     if !auto && !interactive {
         emit_skipped_hint(&chosen, SkipReason::NonInteractive);
         return Ok(MigrationOutcome::Skipped);
     }
-    if !auto && !confirm_pull(profile_name, &chosen) {
+    if !auto && !confirm_pull(profile_name, &chosen)? {
         emit_skipped_hint(&chosen, SkipReason::Declined);
         return Ok(MigrationOutcome::Skipped);
     }
@@ -192,7 +193,7 @@ fn env_flag(key: &str) -> bool {
     )
 }
 
-fn confirm_pull(profile_name: &str, provider: &ProfileProvider) -> bool {
+fn confirm_pull(profile_name: &str, provider: &ProfileProvider) -> Result<bool> {
     let pack_ref = provider.pack_ref();
     let mut err = io::stderr().lock();
     let _ = writeln!(err);
@@ -234,16 +235,14 @@ fn confirm_pull(profile_name: &str, provider: &ProfileProvider) -> bool {
     );
 
     let _ = writeln!(err);
-    let _ = write!(err, "  Continue? [Y/n] ");
-    let _ = err.flush();
     drop(err);
 
-    let mut line = String::new();
-    if io::stdin().lock().read_line(&mut line).is_err() {
-        return false;
-    }
-    let answer = line.trim().to_ascii_lowercase();
-    answer.is_empty() || answer == "y" || answer == "yes"
+    let line = crate::terminal_prompt::read_consent_line("  Continue? [y/N] ")?;
+    Ok(is_affirmative_response(&line))
+}
+
+fn is_affirmative_response(response: &str) -> bool {
+    matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 #[derive(Clone, Copy)]
@@ -359,5 +358,14 @@ mod tests {
         };
         let _env = EnvVarGuard::set_all(&[("NONO_TEST_FLAG_VALUE", "0")]);
         assert!(!env_flag("NONO_TEST_FLAG_VALUE"));
+    }
+
+    #[test]
+    fn migration_confirmation_requires_explicit_yes() {
+        assert!(is_affirmative_response("y"));
+        assert!(is_affirmative_response(" YES \n"));
+        assert!(!is_affirmative_response(""));
+        assert!(!is_affirmative_response("n"));
+        assert!(!is_affirmative_response("anything else"));
     }
 }

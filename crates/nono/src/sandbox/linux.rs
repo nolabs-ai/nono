@@ -119,7 +119,8 @@ enum StaticNetworkFilter {
 }
 
 /// A Landlock ruleset whose allocation and path opening happened in the
-/// parent, before a raw-cloned child exists.
+/// parent. A synchronized child can use the resulting kernel ruleset without
+/// accessing the parent's allocation-dependent state.
 ///
 /// `apply_raw()` creates the ruleset, adds the already-opened path/port rules,
 /// and restricts the calling task using raw syscalls only.  It neither
@@ -139,9 +140,26 @@ impl PreparedLandlockSandbox {
         &self.fallback
     }
 
-    /// Apply this prepared policy without heap allocation or libc coordination
-    /// wrappers.  This is intended for the child side of raw `clone(2)`.
-    pub fn apply_raw(&self) -> std::result::Result<(), RawSandboxError> {
+    /// Create the kernel ruleset without restricting the calling process.
+    ///
+    /// This lets a supervisor prepare rules for a known child PID and share the
+    /// resulting descriptor during a synchronized `CLONE_FILES` bootstrap.
+    /// The caller must still set no_new_privs, restrict the child with this
+    /// ruleset, and install the matching static network filter.
+    #[must_use = "the prepared ruleset must be applied to the child"]
+    pub fn create_ruleset(&self) -> Result<OwnedFd> {
+        let fd = self.create_ruleset_raw().map_err(|error| {
+            NonoError::SandboxInit(format!(
+                "prepared Landlock ruleset {:?}: {}",
+                error.stage(),
+                std::io::Error::from_raw_os_error(error.errno())
+            ))
+        })?;
+        // SAFETY: create_ruleset_raw returned a fresh, uniquely owned fd.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn create_ruleset_raw(&self) -> std::result::Result<RawFd, RawSandboxError> {
         // SAFETY: all pointers below refer to fixed-size stack values or data
         // owned by `self`, which remains live for the duration of each syscall.
         unsafe {
@@ -202,6 +220,25 @@ impl PreparedLandlockSandbox {
                 }
             }
 
+            Ok(ruleset_fd)
+        }
+    }
+
+    /// Install only the prepared static network filter, without allocation.
+    ///
+    /// This does not enforce filesystem or Landlock port rules. Callers using
+    /// `create_ruleset` must separately restrict the child with that ruleset.
+    #[must_use = "a failed filter installation must prevent exec"]
+    pub fn apply_static_network_raw(&self) -> std::result::Result<(), RawSandboxError> {
+        install_static_network_filter_raw(self.static_network_filter)
+    }
+
+    /// Apply this prepared policy without heap allocation or libc coordination
+    /// wrappers. This is intended for the child side of raw `clone(2)`.
+    pub fn apply_raw(&self) -> std::result::Result<(), RawSandboxError> {
+        let ruleset_fd = self.create_ruleset_raw()?;
+        // SAFETY: ruleset_fd is newly owned and all syscall arguments are scalar.
+        unsafe {
             if libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
                 let errno = raw_errno();
                 libc::syscall(libc::SYS_close, ruleset_fd);
@@ -789,6 +826,15 @@ pub fn apply_landlock(caps: &CapabilitySet) -> Result<()> {
 /// Same contract as `apply_landlock` but avoids re-probing the kernel ABI.
 pub fn apply_landlock_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<()> {
     apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly).map(|_| ())
+}
+
+/// Prepare Landlock-only enforcement without installing a seccomp fallback.
+#[must_use = "preparation failure must prevent sandbox launch"]
+pub fn prepare_landlock_with_abi(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+) -> Result<PreparedLandlockSandbox> {
+    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly)
 }
 
 /// Apply Landlock filesystem/process sandboxing and use seccomp for TCP
@@ -3385,6 +3431,45 @@ pub struct PreparedSeccompNotifyFilter {
 }
 
 impl PreparedSeccompNotifyFilter {
+    /// Add filesystem notifications to this network notification program.
+    ///
+    /// Linux permits only one NEW_LISTENER filter per thread. A combined
+    /// supervisor must dispatch this listener by syscall number. The original
+    /// network program and its relative jumps are retained unchanged.
+    #[must_use]
+    pub fn with_openat_notifications(self) -> Self {
+        let mut filter = vec![
+            SockFilterInsn {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_DATA_NR_OFFSET,
+            },
+            SockFilterInsn {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 1,
+                jf: 0,
+                k: SYS_OPENAT as u32,
+            },
+            SockFilterInsn {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 0,
+                jf: 1,
+                k: SYS_OPENAT2 as u32,
+            },
+            SockFilterInsn {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_USER_NOTIF,
+            },
+        ];
+        filter.extend_from_slice(self.filter.as_slice());
+        Self {
+            filter: prepend_seccomp_arch_guard_vec(filter, SECCOMP_RET_ERRNO | libc::EPERM as u32),
+        }
+    }
+
     /// Install the prepared filter and return the listener as a borrowed raw
     /// slot.  The caller must establish private fd-table ownership before
     /// constructing `OwnedFd` or running Rust destructors for this slot.
@@ -5199,6 +5284,56 @@ mod tests {
         assert_eq!(proxy.filter.len(), 37);
         let unix = prepare_seccomp_af_unix_filter();
         assert_eq!(unix.filter.len(), 14);
+    }
+
+    #[test]
+    fn combined_notifications_preserve_network_filter_decisions() {
+        for original in [
+            prepare_seccomp_proxy_filter(false),
+            prepare_seccomp_proxy_filter(true),
+            prepare_seccomp_af_unix_filter(),
+        ] {
+            let network = original.filter.as_slice().to_vec();
+            let combined = original.with_openat_notifications();
+            for syscall in [SYS_OPENAT, SYS_OPENAT2] {
+                assert_eq!(
+                    evaluate_static_bpf(combined.filter.as_slice(), syscall, [0; 6]),
+                    SECCOMP_RET_USER_NOTIF
+                );
+            }
+            for syscall in [
+                SYS_SOCKET,
+                SYS_SOCKETPAIR,
+                SYS_CONNECT,
+                SYS_BIND,
+                SYS_SENDTO,
+                SYS_SENDMSG,
+                SYS_SENDMMSG,
+                libc::SYS_read as i32,
+                libc::SYS_write as i32,
+                libc::SYS_execve as i32,
+                SYS_IO_URING_SETUP,
+            ] {
+                for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
+                    for kind in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_RAW] {
+                        let args = [family as u64, kind as u64, 0, 0, 0, 0];
+                        assert_eq!(
+                            evaluate_static_bpf(combined.filter.as_slice(), syscall, args),
+                            evaluate_static_bpf(&network, syscall, args)
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                evaluate_static_bpf_with_arch(
+                    combined.filter.as_slice(),
+                    NATIVE_AUDIT_ARCH ^ 1,
+                    SYS_OPENAT as u32,
+                    [0; 6]
+                ),
+                SECCOMP_RET_ERRNO | libc::EPERM as u32
+            );
+        }
     }
 
     #[test]

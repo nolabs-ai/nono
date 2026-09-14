@@ -1196,8 +1196,9 @@ impl CapabilitySet {
 
     /// Allow an inclusive range of localhost ports for bidirectional IPC.
     ///
-    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a
-    /// range; use `allow_localhost_port(0)` for the macOS `localhost:*` wildcard).
+    /// Returns an error if `start` is 0 or `end` is 0 (port 0 has no defined
+    /// meaning in a range; use `allow_localhost_port(0)` for the macOS
+    /// `localhost:*` wildcard), or if `end < start`.
     ///
     /// See [`localhost_port_ranges`](Self::localhost_port_ranges) for
     /// platform-specific behaviour and expansion limits.
@@ -1207,6 +1208,17 @@ impl CapabilitySet {
                 "port range starting at 0 is invalid; port 0 has no defined meaning in a range"
                     .to_string(),
             ));
+        }
+        if end == 0 {
+            return Err(NonoError::ConfigParse(
+                "port range ending at 0 is invalid; port 0 has no defined meaning in a range"
+                    .to_string(),
+            ));
+        }
+        if end < start {
+            return Err(NonoError::ConfigParse(format!(
+                "port range end {end} is less than start {start}"
+            )));
         }
         self.localhost_port_ranges.push((start, end));
         Ok(self)
@@ -1385,13 +1397,25 @@ impl CapabilitySet {
 
     /// Add an inclusive localhost port range for bidirectional IPC (mutable).
     ///
-    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a range).
+    /// Returns an error if `start` is 0, `end` is 0, or `end < start` (port 0
+    /// has no defined meaning in a range).
     pub fn add_localhost_port_range(&mut self, start: u16, end: u16) -> Result<()> {
         if start == 0 {
             return Err(NonoError::ConfigParse(
                 "port range starting at 0 is invalid; port 0 has no defined meaning in a range"
                     .to_string(),
             ));
+        }
+        if end == 0 {
+            return Err(NonoError::ConfigParse(
+                "port range ending at 0 is invalid; port 0 has no defined meaning in a range"
+                    .to_string(),
+            ));
+        }
+        if end < start {
+            return Err(NonoError::ConfigParse(format!(
+                "port range end {end} is less than start {start}"
+            )));
         }
         self.localhost_port_ranges.push((start, end));
         Ok(())
@@ -3077,6 +3101,57 @@ mod tests {
         );
         let mut caps = CapabilitySet::new();
         assert!(caps.add_localhost_port_range(0, 100).is_err());
+    }
+
+    #[test]
+    fn test_localhost_port_range_rejects_zero_end() {
+        assert!(
+            CapabilitySet::new()
+                .allow_localhost_port_range(100, 0)
+                .is_err()
+        );
+        let mut caps = CapabilitySet::new();
+        assert!(caps.add_localhost_port_range(100, 0).is_err());
+    }
+
+    #[test]
+    fn test_localhost_port_range_rejects_inverted() {
+        assert!(
+            CapabilitySet::new()
+                .allow_localhost_port_range(5000, 4000)
+                .is_err()
+        );
+        assert!(
+            CapabilitySet::new()
+                .allow_localhost_port_range(8080, 8000)
+                .is_err()
+        );
+        let mut caps = CapabilitySet::new();
+        assert!(caps.add_localhost_port_range(5000, 4000).is_err());
+    }
+
+    #[test]
+    fn test_localhost_port_range_accepts_single_port_range() {
+        // start == end is valid (single port expressed as range)
+        let caps = CapabilitySet::new()
+            .allow_localhost_port_range(3000, 3000)
+            .expect("single-port range should be valid");
+        assert_eq!(caps.localhost_port_ranges(), &[(3000, 3000)]);
+    }
+
+    #[test]
+    fn test_localhost_port_range_accepts_valid_ranges() {
+        let caps = CapabilitySet::new()
+            .allow_localhost_port_range(1, 1024)
+            .expect("valid")
+            .allow_localhost_port_range(5000, 5000)
+            .expect("valid")
+            .allow_localhost_port_range(49152, 65535)
+            .expect("valid");
+        assert_eq!(
+            caps.localhost_port_ranges(),
+            &[(1, 1024), (5000, 5000), (49152, 65535)]
+        );
     }
 
     #[test]

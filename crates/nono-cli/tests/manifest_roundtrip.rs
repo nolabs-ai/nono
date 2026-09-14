@@ -43,7 +43,7 @@ fn manifest_includes_group_deny_paths() {
     // The node-dev profile includes deny_credentials group which denies ~/.ssh, ~/.gnupg, etc.
     // The exported manifest must include these deny paths.
     let output = nono_bin()
-        .args(["policy", "show", "node-dev", "--format", "manifest"])
+        .args(["profile", "show", "node-dev", "--format", "manifest"])
         .output()
         .expect("failed to run nono");
 
@@ -101,7 +101,7 @@ fn manifest_override_deny_removes_deny_from_export() {
 
     let output = nono_bin()
         .args([
-            "policy",
+            "profile",
             "show",
             profile_path.to_str().expect("path"),
             "--format",
@@ -141,7 +141,7 @@ fn manifest_override_deny_removes_deny_from_export() {
 fn manifest_includes_group_blocked_commands() {
     // Profiles with the dangerous_commands group should export blocked commands.
     let output = nono_bin()
-        .args(["policy", "show", "node-dev", "--format", "manifest"])
+        .args(["profile", "show", "node-dev", "--format", "manifest"])
         .output()
         .expect("failed to run nono");
 
@@ -171,7 +171,7 @@ fn manifest_includes_group_blocked_commands() {
 fn manifest_includes_group_allow_paths() {
     // Profiles with system_read_* groups should include system read paths as grants.
     let output = nono_bin()
-        .args(["policy", "show", "node-dev", "--format", "manifest"])
+        .args(["profile", "show", "node-dev", "--format", "manifest"])
         .output()
         .expect("failed to run nono");
 
@@ -215,7 +215,7 @@ fn manifest_includes_workdir_grant() {
         &profile_path,
         r#"{
             "meta": { "name": "test-workdir", "description": "test" },
-            "security": { "groups": ["deny_credentials"] },
+            "groups": { "include": ["deny_credentials"] },
             "workdir": { "access": "readwrite" }
         }"#,
     )
@@ -225,7 +225,7 @@ fn manifest_includes_workdir_grant() {
 
     let output = nono_bin()
         .args([
-            "policy",
+            "profile",
             "show",
             profile_path.to_str().expect("path"),
             "--format",
@@ -275,7 +275,6 @@ fn manifest_grants_are_deduplicated() {
     let profile_json = format!(
         r#"{{
             "meta": {{ "name": "dedup-test", "description": "test" }},
-            "security": {{ "groups": [] }},
             "workdir": {{ "access": "readwrite" }},
             "filesystem": {{ "allow": ["{workdir_str}"] }}
         }}"#
@@ -285,7 +284,7 @@ fn manifest_grants_are_deduplicated() {
 
     let output = nono_bin()
         .args([
-            "policy",
+            "profile",
             "show",
             profile_path.to_str().expect("path"),
             "--format",
@@ -880,7 +879,7 @@ proptest! {
         // Export as manifest via CLI
         let output = nono_bin()
             .args([
-                "policy",
+                "profile",
                 "show",
                 profile_path.to_str().expect("path"),
                 "--format",
@@ -925,7 +924,7 @@ proptest! {
 #[test]
 fn all_builtin_profiles_manifest_round_trip_is_complete() {
     let list_output = nono_bin()
-        .args(["policy", "profiles", "--json"])
+        .args(["profile", "list", "--json"])
         .output()
         .expect("failed to run nono");
     assert!(list_output.status.success());
@@ -945,7 +944,7 @@ fn all_builtin_profiles_manifest_round_trip_is_complete() {
 
         // Get the profile JSON to see its groups
         let profile_output = nono_bin()
-            .args(["policy", "show", name, "--json"])
+            .args(["profile", "show", name, "--json"])
             .output()
             .expect("failed to run nono");
         assert!(
@@ -964,7 +963,7 @@ fn all_builtin_profiles_manifest_round_trip_is_complete() {
 
         // Export as manifest
         let manifest_output = nono_bin()
-            .args(["policy", "show", name, "--format", "manifest"])
+            .args(["profile", "show", name, "--format", "manifest"])
             .output()
             .expect("failed to run nono");
         assert!(

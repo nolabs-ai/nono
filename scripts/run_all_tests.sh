@@ -78,10 +78,11 @@ chmod +x "$TESTS_DIR"/lib/*.sh 2>/dev/null || true
 # Temp directory for suite output files
 RESULTS_DIR=$(mktemp -d)
 TEST_ENV_DIR=$(mktemp -d)
-# Keep XDG state outside /tmp. The Linux system_write policy deliberately
-# grants /tmp, and nono must reject a capability that would cover its own
-# state root. This directory is still per-run and removed by the exit trap.
-TEST_XDG_PARENT="${XDG_CACHE_HOME:-$HOME/.cache}"
+# Keep XDG state outside /tmp and HOME. The Linux system_write policy grants
+# /tmp, while the bypass-protection suite intentionally grants paths below
+# HOME; either location would overlap nono's protected state root. /var/tmp is
+# writable but is not part of either capability surface. Override when needed.
+TEST_XDG_PARENT="${NONO_TEST_XDG_PARENT:-/var/tmp}"
 mkdir -p "$TEST_XDG_PARENT"
 TEST_XDG_DIR=$(mktemp -d "$TEST_XDG_PARENT/nono-integration.XXXXXX")
 

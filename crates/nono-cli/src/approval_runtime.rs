@@ -279,12 +279,12 @@ impl WebhookApproval {
         }
     }
 
-    fn http_status_denial(&self, status: u16, started: Instant) -> ApprovalDecision {
+    fn http_status_denial(&self, status: u16, elapsed: Duration) -> ApprovalDecision {
         ApprovalDecision::Denied {
             reason: format!(
                 "approval webhook '{}' returned HTTP {status} after {}s",
                 self.name,
-                started.elapsed().as_secs()
+                elapsed.as_secs()
             ),
         }
     }
@@ -327,7 +327,7 @@ impl WebhookApproval {
         let status = response.status().as_u16();
         let response_body = self.read_body(&mut response)?;
         if !(200..300).contains(&status) {
-            return Ok(self.http_status_denial(status, started));
+            return Ok(self.http_status_denial(status, started.elapsed()));
         }
         self.parse_response(&response_body)
     }
@@ -342,11 +342,24 @@ impl WebhookApproval {
         request_id: &str,
         body: &[u8],
         started: Instant,
+        send: impl FnMut(PlatformStep<'_>, Duration) -> Result<HttpReply>,
+    ) -> Result<ApprovalDecision> {
+        self.drive_platform_approval_with_elapsed(request_id, body, || started.elapsed(), send)
+    }
+
+    /// The poll-loop state machine with an injected monotonic elapsed-time
+    /// source. Keeping time separate from transport lets its deadline behavior
+    /// be tested without wall-clock sleeps or scheduler-dependent assertions.
+    fn drive_platform_approval_with_elapsed(
+        &self,
+        request_id: &str,
+        body: &[u8],
+        mut elapsed: impl FnMut() -> Duration,
         mut send: impl FnMut(PlatformStep<'_>, Duration) -> Result<HttpReply>,
     ) -> Result<ApprovalDecision> {
         let mut submitted = false;
         loop {
-            let remaining = self.timeout.saturating_sub(started.elapsed());
+            let remaining = self.timeout.saturating_sub(elapsed());
             if remaining.is_zero() {
                 return Ok(ApprovalDecision::Timeout);
             }
@@ -359,11 +372,12 @@ impl WebhookApproval {
             // The deadline is checked again after the round trip: a decision
             // that arrives once this backend's timeout has elapsed is never
             // applied, however long the individual request took.
-            if started.elapsed() >= self.timeout {
+            let elapsed_after_reply = elapsed();
+            if elapsed_after_reply >= self.timeout {
                 return Ok(ApprovalDecision::Timeout);
             }
             if !(200..300).contains(&reply.status) {
-                return Ok(self.http_status_denial(reply.status, started));
+                return Ok(self.http_status_denial(reply.status, elapsed_after_reply));
             }
             let status: PlatformApprovalStatus =
                 serde_json::from_str(&reply.body).map_err(|e| {
@@ -825,32 +839,46 @@ mod tests {
     #[test]
     fn platform_poll_loop_gives_up_at_the_configured_timeout() {
         let backend = test_webhook(Duration::from_millis(40));
+        let elapsed = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+        let clock = std::rc::Rc::clone(&elapsed);
         let mut polls = 0;
         let decision = backend
-            .drive_platform_approval("req-2", b"{}", Instant::now(), |_step, _remaining| {
-                polls += 1;
-                std::thread::sleep(Duration::from_millis(10));
-                Ok(reply(202, r#"{"state":"pending"}"#))
-            })
+            .drive_platform_approval_with_elapsed(
+                "req-2",
+                b"{}",
+                || clock.get(),
+                |_step, _remaining| {
+                    polls += 1;
+                    elapsed.set(elapsed.get() + Duration::from_millis(10));
+                    Ok(reply(202, r#"{"state":"pending"}"#))
+                },
+            )
             .unwrap();
         assert!(matches!(decision, ApprovalDecision::Timeout));
-        assert!(
-            polls >= 2,
-            "expected several polls before giving up, saw {polls}"
+        assert_eq!(
+            polls, 4,
+            "the fourth 10 ms reply reaches the 40 ms deadline"
         );
     }
 
     #[test]
     fn platform_poll_loop_rejects_a_grant_that_arrives_after_the_deadline() {
         let backend = test_webhook(Duration::from_millis(40));
+        let elapsed = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+        let clock = std::rc::Rc::clone(&elapsed);
         let decision = backend
-            .drive_platform_approval("req-late", b"{}", Instant::now(), |_, remaining| {
-                // The hop is handed only the remaining budget...
-                assert!(remaining <= Duration::from_millis(40));
-                // ...but simulate a server that answers after the deadline.
-                std::thread::sleep(Duration::from_millis(60));
-                Ok(reply(200, r#"{"state":"granted","decision":"granted"}"#))
-            })
+            .drive_platform_approval_with_elapsed(
+                "req-late",
+                b"{}",
+                || clock.get(),
+                |_, remaining| {
+                    // The hop is handed only the remaining budget...
+                    assert_eq!(remaining, Duration::from_millis(40));
+                    // ...but a server response can still arrive after it.
+                    elapsed.set(Duration::from_millis(60));
+                    Ok(reply(200, r#"{"state":"granted","decision":"granted"}"#))
+                },
+            )
             .unwrap();
         assert!(
             matches!(decision, ApprovalDecision::Timeout),

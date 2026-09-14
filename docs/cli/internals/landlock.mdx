@@ -139,8 +139,11 @@ surfaces. On Linux, a process that can reach a filesystem-backed Unix socket
 path may be able to communicate with a user-session service through that
 socket unless nono separately mediates AF_UNIX `connect(2)` and `bind(2)`.
 
-For compatibility, this mediation is off by default on Landlock V4+ kernels.
-Profiles that need stricter IPC isolation can opt in:
+For compatibility, this mediation is off by default. Turning on proxy-only
+network mode (for example with `network.allow_domain`) does not enable it: the
+proxy's seccomp filter only forces TCP through the proxy, and Unix-domain IPC
+stays governed by the filesystem rules alone. Profiles that need stricter IPC
+isolation can opt in:
 
 ```json
 {

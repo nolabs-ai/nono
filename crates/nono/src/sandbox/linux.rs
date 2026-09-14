@@ -2980,9 +2980,11 @@ fn selected_static_network_filter(
 /// - `AF_INET`/`AF_INET6`: allow connect/send destinations to
 ///   `localhost:proxy_port`; allow bind on ports in the configured bind-ports
 ///   list; deny others.
-/// - pathname `AF_UNIX`: route to the supervisor, which checks the explicit
-///   Unix socket capability allowlist against the requested path.
-/// - abstract/unnamed `AF_UNIX`: deny (see `decide_network_notification`).
+/// - `AF_UNIX`: route to the supervisor. When the client has opted in to
+///   pathname AF_UNIX mediation, the supervisor checks pathname sockets
+///   against the explicit Unix socket capability allowlist and denies
+///   abstract/unnamed ones; otherwise it resumes them untouched, since the
+///   proxy filter only exists to force TCP through the proxy.
 ///
 /// `has_bind_ports` is retained for API compatibility but no longer
 /// influences filter routing — a previous version routed bind directly to

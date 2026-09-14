@@ -381,7 +381,9 @@ pub struct SupervisorConfig<'a> {
     /// Inclusive bind port ranges allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub proxy_bind_port_ranges: Vec<(u16, u16)>,
-    /// Pathname AF_UNIX socket grants allowed for seccomp proxy-only fallback.
+    /// Pathname AF_UNIX socket grants enforced by the seccomp supervisor when
+    /// `linux.af_unix_mediation = "pathname"` is enabled. Unused in proxy-only
+    /// mode without that opt-in, where AF_UNIX passes through (issue #1901).
     #[cfg(target_os = "linux")]
     pub unix_socket_allowlist: &'a [nono::UnixSocketCapability],
     /// Prepared tool-sandbox runtime listener for command-policy shim requests.

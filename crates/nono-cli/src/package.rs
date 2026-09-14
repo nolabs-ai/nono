@@ -304,6 +304,11 @@ pub fn parse_package_ref(input: &str) -> Result<PackageRef> {
 }
 
 fn validate_package_component(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(NonoError::PackageInstall(format!(
+            "invalid package {label}: must not be empty"
+        )));
+    }
     if value == "." || value == ".." {
         return Err(NonoError::PackageInstall(format!(
             "invalid package {label} '{value}': '.' and '..' are not allowed"
@@ -426,5 +431,11 @@ mod tests {
             err.to_string().contains("'.' and '..' are not allowed"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_empty_package_install_dir_components() {
+        assert!(package_install_dir("", "name").is_err());
+        assert!(package_install_dir("namespace", "").is_err());
     }
 }

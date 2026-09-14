@@ -115,7 +115,6 @@ fn test_schema_top_level_profile_matches_rust_model() {
             "allow_launch_services",
             "allow_gpu",
             "allow_parent_of_protected",
-            "interactive",
             "skipdirs",
             "packs",
             "binary",
@@ -592,7 +591,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
     assert_schema_properties(
         &schema,
         "ApprovalBackendConfig",
-        &["backends", "mode", "timeout_secs", "type", "url"],
+        &["auth", "backends", "mode", "timeout_secs", "type", "url"],
     );
     assert_schema_properties(
         &schema,

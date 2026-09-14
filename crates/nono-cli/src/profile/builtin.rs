@@ -41,7 +41,6 @@ mod tests {
         let profile = get_builtin("default").expect("Profile not found");
         assert_eq!(profile.meta.name, "default");
         assert_eq!(profile.workdir.access, WorkdirAccess::None);
-        assert!(!profile.interactive);
         assert!(!profile.network.block);
     }
 

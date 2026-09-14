@@ -1,0 +1,9 @@
+{
+  "method": "GET",
+  "path": "/api/v1/approvals/proxy-endpoint-approval-example-api-1789198307331603818",
+  "subject_id": "019f0000-0000-7000-8000-000000000002",
+  "timestamp_ms": "1789198310000",
+  "request_id": "0197d04c-c000-7000-8000-000000000002",
+  "body_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "canonical": "nono-request-v1\nGET\n/api/v1/approvals/proxy-endpoint-approval-example-api-1789198307331603818\n019f0000-0000-7000-8000-000000000002\n1789198310000\n0197d04c-c000-7000-8000-000000000002\nsha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

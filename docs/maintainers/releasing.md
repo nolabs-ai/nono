@@ -16,10 +16,10 @@ git pull origin main
 git checkout -b release-vX.Y.Z
 ```
 
-Preview the release first. Without a version, the script fetches release tags
-and derives the next version from conventional commits: features bump minor and
-fix-only changes bump patch. Supply one when you need a specific stable or
-prerelease version.
+Preview the release first. The script fetches release tags and, without a
+version, derives the next version from conventional commits: features bump
+minor and fix-only changes bump patch. Supply one when you need a specific
+stable or prerelease version.
 
 ```bash
 ./scripts/prepare-release.sh --dry-run

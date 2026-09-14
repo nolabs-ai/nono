@@ -109,10 +109,8 @@ CLI_PROXY_VERSION=$(dependency_version "$CLI_MANIFEST" nono-proxy)
 [[ "$CLI_CORE_VERSION" == "$CORE_VERSION" ]] || die "nono-cli's nono dependency ($CLI_CORE_VERSION) does not match $CORE_VERSION"
 [[ "$CLI_PROXY_VERSION" == "$CORE_VERSION" ]] || die "nono-cli's nono-proxy dependency ($CLI_PROXY_VERSION) does not match $CORE_VERSION"
 
-if [[ -z "$REQUESTED_VERSION" ]]; then
-    echo "Fetching release tags from origin..."
-    git fetch --tags origin || die "could not fetch release tags from origin"
-fi
+echo "Fetching release tags from origin..."
+git fetch --tags origin || die "could not fetch release tags from origin"
 PREVIOUS_TAG=$(latest_tag)
 [[ -n "$PREVIOUS_TAG" ]] || die "no release tag found; supply VERSION explicitly"
 RELEASE_BASE=$(latest_release_commit "$CORE_VERSION")

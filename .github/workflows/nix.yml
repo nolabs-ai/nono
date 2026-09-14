@@ -49,7 +49,7 @@ jobs:
 
       - name: Install Nix (other platforms)
         if: matrix.runner != 'macos-26-intel'
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
 
       # Linux-only: the v14 static binary fails on arm64-darwin (libc++ symbol
       # mismatch). Gated to non-PR events to prevent cache poisoning from forks.

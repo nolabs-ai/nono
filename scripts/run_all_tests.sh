@@ -78,6 +78,12 @@ chmod +x "$TESTS_DIR"/lib/*.sh 2>/dev/null || true
 # Temp directory for suite output files
 RESULTS_DIR=$(mktemp -d)
 TEST_ENV_DIR=$(mktemp -d)
+# Keep XDG state outside /tmp. The Linux system_write policy deliberately
+# grants /tmp, and nono must reject a capability that would cover its own
+# state root. This directory is still per-run and removed by the exit trap.
+TEST_XDG_PARENT="${XDG_CACHE_HOME:-$HOME/.cache}"
+mkdir -p "$TEST_XDG_PARENT"
+TEST_XDG_DIR=$(mktemp -d "$TEST_XDG_PARENT/nono-integration.XXXXXX")
 
 export NONO_NO_UPDATE_CHECK=1
 # Suppress the migration prompt (--profile <pack-name> when the pack
@@ -88,9 +94,9 @@ export NONO_NO_UPDATE_CHECK=1
 export NONO_NO_MIGRATE=1
 export NONO_NO_SAVE_PROMPT=1
 
-# Each suite receives an isolated XDG_STATE_HOME below TEST_ENV_DIR, so audit
+# Each suite receives an isolated XDG_STATE_HOME outside /tmp, so audit
 # sessions, rollback snapshots, and ledgers never touch the caller's state.
-trap 'rm -rf "$RESULTS_DIR" "$TEST_ENV_DIR"' EXIT
+trap 'rm -rf "$RESULTS_DIR" "$TEST_ENV_DIR" "$TEST_XDG_DIR"' EXIT
 
 # All suites to run (script:name pairs)
 # Discover every shell suite so newly added suites cannot be omitted from CI.
@@ -132,7 +138,7 @@ launch_suite() {
     local output_file="$2"
     local exit_file="${output_file%.out}.exit"
     local suite_id="${script%.sh}"
-    local suite_env_dir="$TEST_ENV_DIR/suites/$suite_id"
+    local suite_env_dir="$TEST_XDG_DIR/suites/$suite_id"
 
     # Suites run in parallel and must not share mutable XDG state. In
     # particular, rollback and audit suites otherwise race on the default

@@ -156,6 +156,12 @@ The changelog is auto-generated from commit messages at release time.
 Use the right type. A `fix` that is labeled `chore` will not appear in the
 release notes under Bug Fixes.
 
+## Releases
+
+Maintainers preparing a release must follow the
+[release runbook](./docs/maintainers/releasing.md). It defines the release PR,
+tagging, publication, and recovery process.
+
 ---
 
 ## Contribution Process

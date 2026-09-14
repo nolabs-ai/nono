@@ -52,6 +52,13 @@ make fmt-check       # Format check
 make fmt             # Auto-format
 ```
 
+## Release Changes
+
+Before changing release tooling, release workflows, or release-package
+configuration, read [the maintainer release runbook](docs/maintainers/releasing.md).
+The runbook defines the release version contract and the required preparation
+and review sequence; do not duplicate a competing release procedure elsewhere.
+
 ## Coding Standards
 
 - **Error Handling**: Use `NonoError` for all errors; propagation via `?` only.

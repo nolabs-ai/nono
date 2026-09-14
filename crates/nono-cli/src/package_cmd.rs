@@ -111,6 +111,7 @@ pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
         &install_dir,
         install.installed_artifacts,
         install.copied_to_project,
+        &crate::wiring::written_roots(&install.wiring_record),
     );
 
     // Direct-pull path: if the user just installed the canonical claude

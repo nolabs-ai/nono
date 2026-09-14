@@ -733,6 +733,30 @@ pub fn print_session_finalization_failure(
     eprintln!("    {}", fg(&status, t.subtext));
 }
 
+/// Report a failed optional profile-save prompt without implying that the
+/// completed sandbox session is incomplete.
+pub fn print_profile_save_failure(error: &NonoError, child_exit_code: i32) {
+    let t = theme::current();
+    eprintln!();
+    eprintln!(
+        "  {} {}",
+        fg("warning:", t.red).bold(),
+        fg("profile save failed after the command exited", t.text),
+    );
+    eprintln!("    {}", fg(&error.to_string(), t.text));
+    eprintln!(
+        "    {}",
+        fg(
+            "No profile changes were saved; the command's exit status is preserved.",
+            t.subtext
+        ),
+    );
+    eprintln!(
+        "    {}",
+        fg(&format!("the command exited {child_exit_code}"), t.subtext),
+    );
+}
+
 /// Print a styled warning message to stderr
 pub fn print_warning(message: &str) {
     let t = theme::current();

@@ -126,6 +126,13 @@ fn offer_profile_save_for_child(
     crate::profile_save_runtime::offer_save_run_profile(offer)
 }
 
+fn preserve_child_exit_after_profile_save(result: Result<()>, child_exit_code: i32) -> i32 {
+    if let Err(error) = result {
+        crate::output::print_profile_save_failure(&error, child_exit_code);
+    }
+    child_exit_code
+}
+
 /// Linux procfs context for resolving child-relative procfs paths in the supervisor.
 ///
 /// `/proc/self/...` must refer to the sandboxed child process, not the unsandboxed
@@ -1676,7 +1683,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 }
             }
 
-            if !specialized_diagnostic
+            let reported_exit_code = if !specialized_diagnostic
                 && should_offer_profile_save(
                     config.no_diagnostics,
                     exit_code,
@@ -1684,8 +1691,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     &prompt_error_observation,
                     &visible_sandbox_violations,
                     &url_denials,
-                )
-            {
+                ) {
                 // Clear the forwarding target before prompting. The child is
                 // already dead; keeping CHILD_PID set would cause forward_signal
                 // to send Ctrl-C to the dead PID, swallowing it silently.
@@ -1700,16 +1706,16 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     ignored_denial_paths: config.ignored_denial_paths,
                     url_denials: &url_denials,
                 };
-                // Don't let a prompt failure override the child's exit code.
-                // Unlike the audit-ledger finalization failure, this one is
-                // never downgraded: the child ran, and its own status is
-                // what the caller asked for.
-                if let Err(e) = offer_profile_save_for_child(pty_proxy.as_mut(), &offer) {
-                    crate::output::print_session_finalization_failure(&e, exit_code, exit_code);
-                }
-            }
+                // An optional profile-save failure never changes the child status.
+                preserve_child_exit_after_profile_save(
+                    offer_profile_save_for_child(pty_proxy.as_mut(), &offer),
+                    exit_code,
+                )
+            } else {
+                exit_code
+            };
 
-            Ok(exit_code)
+            Ok(reported_exit_code)
         }
         Err(e) => Err(NonoError::SandboxInit(format!("fork() failed: {}", e))),
     }
@@ -4850,6 +4856,14 @@ mod tests {
             &[],
             &[],
         ));
+    }
+
+    #[test]
+    fn profile_save_failure_preserves_child_exit_code() {
+        let result = Err(NonoError::LearnError("unable to save profile".to_string()));
+
+        assert_eq!(preserve_child_exit_after_profile_save(result, 0), 0);
+        assert_eq!(preserve_child_exit_after_profile_save(Ok(()), 42), 42);
     }
 
     #[test]

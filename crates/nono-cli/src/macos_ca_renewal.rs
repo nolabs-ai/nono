@@ -19,7 +19,7 @@ const MIN_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// After a declined prompt or failed trust write: re-prompting hourly would be
 /// worse than the expiry.
-const BACKOFF_AFTER_FAILURE: Duration = Duration::from_secs(6 * 3600);
+pub(crate) const BACKOFF_AFTER_FAILURE: Duration = Duration::from_secs(6 * 3600);
 
 /// Watch the live interception CA and keep it renewed for the life of the process.
 ///
@@ -182,12 +182,12 @@ fn install(rotator: &InterceptCaRotator, key_der: &[u8], cert_pem: &str) -> nono
 
 /// Advisory lock so two sessions renewing at once produce one prompt, and one
 /// Keychain write, rather than two.
-struct RenewalLock {
+pub(crate) struct RenewalLock {
     _lock: nix::fcntl::Flock<std::fs::File>,
 }
 
 impl RenewalLock {
-    fn acquire() -> nono::Result<Option<Self>> {
+    pub(crate) fn acquire() -> nono::Result<Option<Self>> {
         let dir = crate::state_paths::user_state_dir()?;
         std::fs::create_dir_all(&dir).map_err(|e| {
             nono::NonoError::SandboxInit(format!(

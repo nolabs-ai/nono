@@ -17,10 +17,14 @@ use security_framework::passwords;
 use security_framework::trust_settings::{Domain, TrustSettings, TrustSettingsForCertificate};
 use security_framework_sys::base::SecCertificateRef;
 use security_framework_sys::trust_settings::{SecTrustSettingsDomain, kSecTrustSettingsDomainUser};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 use x509_parser::pem::parse_x509_pem;
 use zeroize::Zeroizing;
+
+use crate::macos_ca_renewal::{BACKOFF_AFTER_FAILURE, RenewalLock};
 
 /// Internal error type to distinguish user-cancelled trust prompts, and prompts
 /// that couldn't be shown at all, from other failures without relying on string
@@ -38,6 +42,44 @@ enum TrustCertError {
 // with other apps. set_generic_password overwrites on conflict (desired).
 const KEYCHAIN_SERVICE: &str = "nono-proxy-ca";
 const KEYCHAIN_ACCOUNT: &str = "ca-bundle";
+
+// Fingerprint-keyed, so a marker from a since-rotated cert never suppresses
+// renewal of the cert actually in use.
+fn backoff_marker_path(fingerprint: &str) -> Result<PathBuf> {
+    let dir = crate::state_paths::user_state_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        NonoError::SandboxInit(format!("cannot create state dir '{}': {e}", dir.display()))
+    })?;
+    Ok(dir.join(format!("proxy-ca-renewal-backoff-{fingerprint}")))
+}
+
+// Hashes the DER, not the PEM text, so re-encoding the same cert never changes the fingerprint.
+fn cert_fingerprint(cert_pem: &str) -> Result<String> {
+    let der = pem_to_der(cert_pem)?;
+    let digest = Sha256::digest(&der);
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn renewal_backed_off(cert_pem: &str) -> Result<bool> {
+    let path = backoff_marker_path(&cert_fingerprint(cert_pem)?)?;
+    let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+        return Ok(false);
+    };
+    let elapsed = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::ZERO);
+    Ok(elapsed < BACKOFF_AFTER_FAILURE)
+}
+
+fn record_renewal_backoff(cert_pem: &str) -> Result<()> {
+    let path = backoff_marker_path(&cert_fingerprint(cert_pem)?)?;
+    std::fs::write(&path, []).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "cannot write renewal backoff marker '{}': {e}",
+            path.display()
+        ))
+    })
+}
 
 /// Load or generate a shared CA and ensure it's trusted in the macOS user
 /// trust store. Returns `Some(PreloadedCa)` on success, `None` if the user
@@ -61,6 +103,35 @@ fn try_ensure_trusted_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
             match cert_validity(&cert_pem)? {
                 CertValidity::Valid => {}
                 state => {
+                    // Only rate-limit the soft RenewDue window. A fully Expired cert
+                    // must always retry: a stale marker can delay renewal, never block
+                    // it outright, or an untrusted fallback would persist indefinitely.
+                    if state == CertValidity::RenewDue && renewal_backed_off(&cert_pem)? {
+                        debug!("proxy CA renewal recently declined; deferring retry");
+                        return Ok(Some(PreloadedCa { key_der, cert_pem }));
+                    }
+
+                    // Renewal writes to the trust store and prompts; one prompt per
+                    // machine. A lock loser just serves the current cert rather than
+                    // piling up its own prompt behind the winner's.
+                    let Some(_lock) = RenewalLock::acquire()? else {
+                        debug!("another process is renewing the proxy CA; serving current cert");
+                        return Ok(Some(PreloadedCa { key_der, cert_pem }));
+                    };
+
+                    // Re-read: the lock winner may have already renewed while we waited.
+                    if let Some((locked_key_der, locked_cert_pem)) = load_existing_ca()?
+                        && locked_cert_pem != cert_pem
+                        && cert_validity(&locked_cert_pem)? == CertValidity::Valid
+                        && stored_cert_is_trusted(&locked_cert_pem)?
+                    {
+                        debug!("adopting proxy CA renewed by another process");
+                        return Ok(Some(PreloadedCa {
+                            key_der: locked_key_der,
+                            cert_pem: locked_cert_pem,
+                        }));
+                    }
+
                     debug!("stored proxy CA needs renewal ({state:?}); re-issuing over stored key");
                     return match rotate_ca(&key_der, &cert_pem, validity, state)? {
                         RotateOutcome::Cert(ca) => Ok(Some(ca)),
@@ -248,9 +319,11 @@ fn rotate_ca(
             TrustCertError::UserCancelled => {
                 // The old cert is untouched, so declining costs nothing until it expires.
                 if state == CertValidity::RenewDue {
+                    record_renewal_backoff(old_cert_pem)?;
                     warn!(
                         "Proxy CA renewal cancelled; continuing on the current \
-                         certificate. It will be retried next launch."
+                         certificate. Retry is rate-limited; it won't re-prompt on \
+                         every launch."
                     );
                     return Ok(RotateOutcome::Cert(PreloadedCa {
                         key_der: key_der.clone(),
@@ -700,5 +773,51 @@ mod tests {
         assert!(!is_user_cancelled_osstatus(0));
         // interaction-not-allowed is a distinct case, handled separately in trust_cert
         assert!(!is_user_cancelled_osstatus(ERR_SEC_INTERACTION_NOT_ALLOWED));
+    }
+
+    fn with_fake_state_home<T>(f: impl FnOnce() -> T) -> T {
+        let home = tempfile::tempdir().unwrap();
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_STATE_HOME",
+            &home.path().display().to_string(),
+        )]);
+        f()
+    }
+
+    #[test]
+    fn cert_fingerprint_differs_for_different_certs() {
+        let a = generate_test_ca();
+        let b = generate_test_ca();
+        assert_ne!(
+            cert_fingerprint(a.cert_pem()).unwrap(),
+            cert_fingerprint(b.cert_pem()).unwrap()
+        );
+        assert_eq!(
+            cert_fingerprint(a.cert_pem()).unwrap(),
+            cert_fingerprint(a.cert_pem()).unwrap()
+        );
+    }
+
+    #[test]
+    fn renewal_backoff_is_keyed_to_the_specific_cert() {
+        with_fake_state_home(|| {
+            let a = generate_test_ca();
+            let b = generate_test_ca();
+
+            assert!(!renewal_backed_off(a.cert_pem()).unwrap());
+            record_renewal_backoff(a.cert_pem()).unwrap();
+
+            assert!(
+                renewal_backed_off(a.cert_pem()).unwrap(),
+                "a just-declined cert must be backed off"
+            );
+            assert!(
+                !renewal_backed_off(b.cert_pem()).unwrap(),
+                "a marker for one cert must never suppress renewal of a different cert"
+            );
+        });
     }
 }

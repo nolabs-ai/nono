@@ -64,6 +64,9 @@ We aim to:
 * Provide fixes or mitigations where possible
 * Coordinate disclosure with reporters
 
+Maintainers use the private [security response runbook](./docs/maintainers/security-response.md)
+to assess, remediate, and coordinate disclosures.
+
 ### Safe Harbor
 
 When conducting security research in good faith and in accordance with this policy, we consider your research to be authorized. We will not initiate legal action against you for research that adheres to these guidelines.

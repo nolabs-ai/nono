@@ -11,8 +11,13 @@ before writing code. A five-minute conversation saves a rejected PR.
 
 ## Before You Write Code
 
-For anything beyond a typo fix, open an issue first or find an existing one.
-PRs without a linked issue will not be reviewed.
+For external contributions and agent-proposed work beyond a typo fix, open an
+issue first or find an existing one. PRs without a linked issue will not be
+reviewed.
+
+Maintainers may make routine, maintainer-directed changes without a tracking
+issue. This does not bypass the review, security, DCO, attribution, governance,
+or NEP requirements that apply to the change.
 
 This is especially true for changes that touch the Landlock enforcement path,
 the sandbox policy model, or the credential proxy. Those areas have security
@@ -30,14 +35,14 @@ for writing one.
 
 ---
 
-## Read CLAUDE.md First
+## Read AGENTS.md First
 
-Before touching any code, read [CLAUDE.md](./CLAUDE.md). It is the
+Before touching any code, read [AGENTS.md](./AGENTS.md). It is the
 authoritative source for this project's coding standards, security
 requirements, error handling conventions, and platform-specific constraints.
 The PR checklist references it directly.
 
-A few things from CLAUDE.md that affect every contribution:
+A few things from AGENTS.md that affect every contribution:
 
 **Error handling.** Use `NonoError` for all errors. Propagate with `?`.
 Never use `.unwrap()` or `.expect()`. This is enforced by Clippy and will
@@ -160,7 +165,10 @@ release notes under Bug Fixes.
 
 Maintainers preparing a release must follow the
 [release runbook](./docs/maintainers/releasing.md). It defines the release PR,
-tagging, publication, and recovery process.
+tagging process.
+
+Day-to-day maintainer work is covered by the
+[maintainer operations guide](./docs/maintainers/maintaining.md).
 
 ---
 
@@ -168,8 +176,10 @@ tagging, publication, and recovery process.
 
 **1. Open or find an issue.**
 
-Every PR must reference an existing issue. Open one before writing code.
-PRs without a linked issue will not be reviewed.
+External contributions and agent-proposed work must reference an existing
+issue. Open one before writing code. Maintainer-directed routine work may
+proceed without a tracking issue, but significant and security-critical work
+continues to follow [GOVERNANCE.md](./GOVERNANCE.md) and the NEP process.
 
 **2. Fork the repo and create a branch.**
 
@@ -182,7 +192,7 @@ Match the branch name to your commit type. `fix/proxy-rotation` is good.
 
 **3. Write the code.**
 
-Follow [CLAUDE.md](./CLAUDE.md) for all coding standards. Key requirements
+Follow [AGENTS.md](./AGENTS.md) for all coding standards. Key requirements
 repeated here for visibility:
 
 - Use `NonoError` for all errors. Propagate with `?`.
@@ -219,7 +229,8 @@ will be asked to amend before review begins.
 **5. Open a pull request against `main`.**
 
 The PR template will prompt you for:
-- A linked issue (`Closes #NNN`)
+- A linked issue (`Closes #NNN`) for external and agent-proposed work, or a
+  maintainer-directed-work statement
 - A summary of what the PR does and why
 - A test plan describing how you verified the change
 - A checklist including DCO signoff confirmation
@@ -230,7 +241,7 @@ pretends coverage is complete.
 
 If your PR was generated or assisted by an AI tool, complete the Agent
 Disclosure and Agent Compliance Check sections in the PR template.
-See [CLAUDE.md](./CLAUDE.md) for the full agent contribution policy,
+See [AGENTS.md](./AGENTS.md) for the full agent contribution policy,
 including hard stop conditions that prohibit certain automated contributions.
 
 **6. Review.**
@@ -266,6 +277,9 @@ https://github.com/nolabs-ai/nono/security/advisories/new
 
 See [SECURITY.md](./SECURITY.md) for the full disclosure policy, including
 guidance on LLM-generated findings.
+
+Maintainers handling a private report must follow the
+[security response runbook](./docs/maintainers/security-response.md).
 
 ---
 

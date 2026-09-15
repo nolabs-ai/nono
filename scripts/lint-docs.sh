@@ -24,12 +24,6 @@
 #   "override_deny", "exclude_groups", "allowed_commands"
 #
 # Allowlist (files where the tokens are legitimately retained):
-#   - deprecated_schema.rs / deprecated_policy.rs
-#     (the modules that deserialize and warn about the legacy keys)
-#   - tests/fixtures/legacy_profiles/
-#     (legacy JSON fixtures exercising the deprecation path)
-#   - docs/plans/
-#     (design docs referencing the old schema by name)
 #   - CHANGELOG.md
 #     (release notes calling out the rename)
 #
@@ -45,11 +39,6 @@ forbidden='policy\.add_|policy\.override_deny|policy\.exclude_groups|security\.g
 # Permanent allowlist entries — these files legitimately document, test, or
 # deserialize the legacy keys and must always be allowed to mention them.
 permanent_allow=(
-  'crates/nono-cli/src/deprecated_schema\.rs'
-  'crates/nono-cli/src/deprecated_policy\.rs'
-  'crates/nono-cli/tests/deprecated_schema\.rs'
-  'crates/nono-cli/tests/deprecated_policy\.rs'
-  'crates/nono-cli/tests/fixtures/legacy_profiles/'
   # Lint script tests legitimately mention forbidden tokens — they
   # describe what the scripts forbid and assert that violations are
   # caught (negative-path proofs for both the alias inventory and the
@@ -60,9 +49,8 @@ permanent_allow=(
   # location is …") that must mention the old key names to verify they're
   # absent from the regenerated JSON schema.
   'crates/nono-cli/tests/schema_shape\.rs'
-  # command_blocking_deprecation.rs intentionally exercises the legacy
-  # security.allowed_commands / policy.add_deny_commands JSON shapes in its
-  # tests to verify deprecation warnings fire on those fields.
+  # This deprecated command-blocking compatibility path retains a regression
+  # fixture for the legacy `security.allowed_commands` schema.
   'crates/nono-cli/src/command_blocking_deprecation\.rs'
   # The capability manifest is a SEPARATE schema (consumed by nono-ffi)
   # whose `allowed_commands` field is canonical for that schema and
@@ -71,7 +59,6 @@ permanent_allow=(
   'crates/nono/tests/manifest_types\.rs'
   'crates/nono/tests/capability_manifest_schema\.rs'
   'docs/cli/internals/capability-manifest\.mdx'
-  'docs/plans/'
   'CHANGELOG\.md'
 )
 
@@ -94,8 +81,7 @@ if [ -n "$hits" ]; then
   echo "lint-docs: forbidden legacy tokens found outside the allowlist:" >&2
   echo "$hits" >&2
   echo "" >&2
-  echo "See docs/plans/2026-04-24-issue-594-phase-2-schema-plan.md Task F4" >&2
-  echo "for the forbidden-token list and allowlist rationale." >&2
+  echo "See this script's forbidden-token list and allowlist rationale." >&2
   exit 1
 fi
 

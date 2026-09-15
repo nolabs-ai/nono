@@ -181,7 +181,7 @@ impl SetupRunner {
                   1. Check your kernel config: CONFIG_SECURITY_LANDLOCK=y\n\
                   2. Add to boot params: lsm=landlock,lockdown,yama,integrity,apparmor\n\
                   3. Reboot your system\n\n\
-                See: https://github.com/nolabs-ai/nono/docs/troubleshooting.md#landlock-not-supported",
+                See: https://docs.nono.sh/cli/usage/troubleshooting#linux-landlock-not-supported",
                 e
             )))?;
 

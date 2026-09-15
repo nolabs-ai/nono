@@ -3,7 +3,7 @@ nep: 0001
 title: Pre-1.0.0 tech debt, deprecation, and API-freeze cleanup
 authors:
   - Aleksy Siek
-status: draft
+status: proposed
 created: 2026-08-31
 superseded-by:
 ---

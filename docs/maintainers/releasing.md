@@ -13,7 +13,7 @@ Start with a clean, current `main`, then create a release branch:
 ```bash
 git checkout main
 git pull origin main
-git checkout -b release-vX.Y.Z
+git checkout -b release/vX.Y.Z
 ```
 
 Preview the release first. The script fetches release tags and, without a
@@ -37,7 +37,7 @@ Commit the generated version, lockfile, and changelog changes:
 ```bash
 git add .
 git commit -s -m "chore: release vX.Y.Z"
-git push origin release-vX.Y.Z
+git push origin release/vX.Y.Z
 ```
 
 Open a PR titled `chore: release vX.Y.Z`; this starts the release PR checks.

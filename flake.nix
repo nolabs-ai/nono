@@ -45,9 +45,66 @@
         platforms = allSystems;
       };
     };
+
+    # Map Nix system triples to the release tarball target strings.
+    releaseTarget = system: {
+      "x86_64-linux" = "x86_64-unknown-linux-gnu";
+      "aarch64-linux" = "aarch64-unknown-linux-gnu";
+      "x86_64-darwin" = "x86_64-apple-darwin";
+      "aarch64-darwin" = "aarch64-apple-darwin";
+    }.${system};
+
+    # Per-platform SHA-256 hashes for the release tarballs.
+    # Auto-updated by the `update-nix-hashes` job in release.yml
+    # after each release — no manual maintenance needed.
+    prebuiltHashes = {
+      "x86_64-linux" = "86bcf7a134d6f47e064ad0f2561f1be02b9fffc643708c3ec2dd4070e82b798e";
+      "aarch64-linux" = "7f523123be72d825635bbe63cb8b672318b974fc3ca841cd30c696f1d540c168";
+      "x86_64-darwin" = "b69ac49b9f29187958f02fac2580dfb38bf0ce149bc5385a4f1afe765be309b6";
+      "aarch64-darwin" = "1b413e61758f5e212f1c683b95c3aadb3799a01dbd54685dd7eae33782de7f12";
+    };
+
+    prebuiltFor = system: let pkgs = pkgsFor system; in pkgs.stdenv.mkDerivation {
+      pname = "nono-prebuilt";
+      inherit version;
+      src = pkgs.fetchurl {
+        url = "https://github.com/nolabs-ai/nono/releases/download/v${version}/nono-v${version}-${releaseTarget system}.tar.gz";
+        sha256 = prebuiltHashes.${system};
+      };
+
+      # autoPatchelfHook patches the Linux binary's dynamic linker
+      # and shared library references. Darwin binaries are already
+      # self-contained and don't need patching.
+      nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+        pkgs.autoPatchelfHook
+      ];
+
+      # The Linux release binary links against libgcc_s.so.1.
+      buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+        pkgs.gcc.cc.lib
+      ];
+
+      # The tarball contains a single `nono` binary at the root.
+      sourceRoot = ".";
+
+      installPhase = ''
+        runHook preInstall
+        install -Dm755 nono $out/bin/nono
+        runHook postInstall
+      '';
+
+      meta = with pkgs.lib; {
+        description = "Secure, kernel-enforced sandbox for AI agents, MCP and LLM workloads (prebuilt release binary)";
+        homepage = "https://github.com/nolabs-ai/nono";
+        license = licenses.asl20;
+        mainProgram = "nono";
+        platforms = allSystems;
+      };
+    };
   in {
     packages = forAllSystems (system: rec {
       nono = nonoFor system;
+      prebuilt = prebuiltFor system;
       default = nono;
     });
 

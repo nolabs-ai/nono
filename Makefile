@@ -6,7 +6,11 @@
 #   make check        Run clippy and format check
 #   make release      Build release binaries
 
-.PHONY: all build build-lib build-cli build-ffi build-arm64 test test-lib test-cli test-ffi test-spiffe check clippy fmt clean install audit help
+.PHONY: all build build-lib build-cli build-ffi build-arm64 test test-workspace test-lib test-cli test-ffi test-doc test-one test-repeat test-spiffe check clippy fmt clean install audit help
+
+# Keep Rust panic locations available in both local and CI test output. A
+# caller can still override this (for example, RUST_BACKTRACE=full make test).
+RUST_BACKTRACE ?= 1
 
 # Default target
 all: build
@@ -40,19 +44,44 @@ build-arm64:
 	@cross build --release --target aarch64-unknown-linux-gnu -p nono-cli
 
 # Test targets
-test: test-lib test-cli test-ffi
+#
+# Match the regular Rust CI coverage. The former package-by-package aggregate
+# omitted nono-proxy and any future workspace members.
+test: test-workspace
+
+test-workspace:
+	RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --workspace --no-fail-fast
 
 test-lib:
-	cargo test -p nono
+	RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test -p nono --no-fail-fast
 
 test-cli:
-	cargo test -p nono-cli
+	RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test -p nono-cli --no-fail-fast
 
 test-ffi:
-	cargo test -p nono-ffi
+	RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test -p nono-ffi --no-fail-fast
 
 test-doc:
-	cargo test --doc
+	RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --doc --workspace --no-fail-fast
+
+# Run one exact test with live process output. Usage:
+#   make test-one TEST=approval_runtime::tests::platform_poll_loop_gives_up_at_the_configured_timeout
+test-one:
+	@test -n "$(TEST)" || { echo "Usage: make test-one TEST=<exact-test-name>" >&2; exit 2; }
+	RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --workspace --no-fail-fast "$(TEST)" -- --exact --nocapture --test-threads=1
+
+# Repeat one exact test serially to reproduce intermittent failures. Usage:
+#   make test-repeat TEST=<exact-test-name> COUNT=100
+COUNT ?= 20
+test-repeat:
+	@test -n "$(TEST)" || { echo "Usage: make test-repeat TEST=<exact-test-name> [COUNT=<iterations>]" >&2; exit 2; }
+	@set -eu; \
+	i=1; \
+	while [ "$$i" -le "$(COUNT)" ]; do \
+		echo "==> $$i/$(COUNT): $(TEST)"; \
+		RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --workspace --no-fail-fast "$(TEST)" -- --exact --nocapture --test-threads=1; \
+		i=$$((i + 1)); \
+	done
 
 test-spiffe:
 	bash scripts/spire-test.sh
@@ -115,7 +144,7 @@ lint-docs:
 	bash scripts/lint-docs.sh
 
 # CI simulation (what CI would run)
-ci: check test audit lint-docs
+ci: check test test-doc audit lint-docs
 	@echo "CI checks passed"
 
 # Help
@@ -132,10 +161,13 @@ help:
 	@echo ""
 	@echo "Test:"
 	@echo "  make test           Run all tests"
+	@echo "  make test-workspace Run all workspace Rust tests"
 	@echo "  make test-lib       Run library tests only"
 	@echo "  make test-cli       Run CLI tests only"
 	@echo "  make test-ffi       Run C FFI tests only"
 	@echo "  make test-doc       Run doc tests only"
+	@echo "  make test-one TEST=<name>             Run one exact Rust test with live output"
+	@echo "  make test-repeat TEST=<name> COUNT=N  Repeat one exact Rust test serially"
 	@echo "  make test-spiffe    Run SPIFFE/SPIRE integration tests (downloads SPIRE if needed)"
 	@echo ""
 	@echo "Check:"

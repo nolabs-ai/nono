@@ -1,6 +1,6 @@
 [package]
 name = "nono"
-version = "0.76.0"
+version = "0.77.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -77,7 +77,7 @@ prettyplease = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true
-jsonschema = "0.48"
+jsonschema = "0.56"
 
 [lints]
 workspace = true

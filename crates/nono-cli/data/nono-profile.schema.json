@@ -106,11 +106,6 @@
       ],
       "description": "Opt-in gate for GPU access (Metal/IOKit on Apple Silicon macOS, render nodes on Linux). Intel Macs are not yet supported. Must be paired with the CLI flag --allow-gpu. Set to null to inherit from the base profile."
     },
-    "interactive": {
-      "type": "boolean",
-      "description": "Deprecated. Parsed for backward compatibility but ignored. Supervised mode preserves TTY by default.",
-      "deprecated": true
-    },
     "packs": {
       "type": "array",
       "items": { "type": "string" },
@@ -1731,7 +1726,12 @@
         },
         "url": {
           "type": "string",
-          "description": "Webhook URL for webhook approval backends."
+          "description": "Webhook URL for webhook approval backends. Optional when auth is platform: nono then derives <platform_url>/api/v1/approvals from its enrollment."
+        },
+        "auth": {
+          "type": "string",
+          "enum": ["platform"],
+          "description": "Webhook authentication. platform signs every request with this client's platform enrollment key (nono-request-v1), requires an https or loopback URL, and switches to submit-and-poll against the platform approval ledger."
         },
         "timeout_secs": {
           "type": "integer",

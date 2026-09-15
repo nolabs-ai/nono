@@ -10,7 +10,6 @@ use nono::{NonoError, Result};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 /// Information about a discovered rollback session
 #[derive(Debug)]
@@ -129,7 +128,7 @@ pub fn total_storage_bytes() -> Result<u64> {
         if !seen_roots.insert(root.clone()) || !root.exists() {
             continue;
         }
-        total = total.saturating_add(calculate_dir_size(&root));
+        total = total.saturating_add(state_paths::calculate_dir_size(&root));
     }
     Ok(total)
 }
@@ -148,7 +147,7 @@ fn build_session_info(dir: PathBuf, metadata: SessionMetadata) -> SessionInfo {
     let pid = parse_pid_from_session_id(&metadata.session_id);
     let is_alive = pid.map(is_process_alive).unwrap_or(false);
     let is_stale = metadata.ended.is_none() && !is_alive;
-    let disk_size = calculate_dir_size(&dir);
+    let disk_size = state_paths::calculate_dir_size(&dir);
 
     SessionInfo {
         metadata,
@@ -190,17 +189,6 @@ fn is_process_alive(pid: u32) -> bool {
     // SAFETY: This is a standard POSIX way to check process existence.
     // Signal 0 does not actually send anything.
     unsafe { nix::libc::kill(pid as nix::libc::pid_t, 0) == 0 }
-}
-
-/// Calculate the total size of all files in a directory tree.
-fn calculate_dir_size(dir: &Path) -> u64 {
-    WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
 }
 
 /// Format a byte count as a human-readable string.
@@ -261,22 +249,6 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
-    }
-
-    #[test]
-    fn discover_sessions_empty_dir() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let size = calculate_dir_size(dir.path());
-        assert_eq!(size, 0);
-    }
-
-    #[test]
-    fn calculate_dir_size_works() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        fs::write(dir.path().join("a.txt"), b"hello").expect("write");
-        fs::write(dir.path().join("b.txt"), b"world!").expect("write");
-        let size = calculate_dir_size(dir.path());
-        assert_eq!(size, 11); // 5 + 6
     }
 
     #[test]

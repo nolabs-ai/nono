@@ -12,6 +12,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: "1"
 
 jobs:
   actionlint:
@@ -142,10 +143,10 @@ jobs:
           echo "OK: no libdbus dependency"
 
       - name: Run tests
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --verbose --no-fail-fast
 
       - name: Run doc tests
-        run: cargo test --doc --workspace --verbose
+        run: cargo test --doc --workspace --verbose --no-fail-fast
 
   fmt:
     name: Rustfmt

@@ -258,17 +258,11 @@ mod tests {
         let cache = UpstreamH2Cache::new();
         let filter = ProxyFilter::allow_all();
 
-        // Override ProxyFilter resolution by using the inner probe directly
-        // (ProxyFilter::allow_all skips DNS, resolved_addrs will be empty).
-        // We test the cache logic by calling get_or_probe twice against a
-        // real server and checking connect_count reaches exactly 1.
+        // get_or_probe -> check_host. allow_all still resolves localhost, so
+        // the probe connects to the pinned address (no hostname re-resolve).
         let r1 = cache
             .get_or_probe("localhost", port, &filter, &connector, None, "test")
             .await;
-        // get_or_probe with allow_all calls probe_upstream_h2 which calls
-        // filter.check_host — for allow_all this returns empty resolved_addrs,
-        // so open_tcp_upstream falls back to direct hostname resolution.
-        // The counter will be 1 after the first probe.
         let count_after_first = connect_count.load(Ordering::SeqCst);
 
         let r2 = cache

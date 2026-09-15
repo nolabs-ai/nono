@@ -56,6 +56,14 @@ The top-level `command_policies` object accepts these fields:
 | `approval_defaults` | object | Default approval backend and timeout. |
 | `entrypoint` | command name | Legacy session hint. Prefer `commands.<name>.sandbox` or `commands.<name>.from.session`. |
 
+Each entry under `approval_backends` is one of:
+
+| `type` | Fields | Use |
+|---|---|---|
+| `terminal` | `timeout_secs` | Prompt the operator in the terminal. |
+| `webhook` | `url`, `auth`, `timeout_secs` | Ask an HTTP endpoint. Omit `auth` for a plain endpoint that answers the `POST` with the decision. Set `auth: "platform"` to sign every request with this client's enrollment key and follow the submit-and-poll exchange; `url` may then be omitted and defaults to the enrolled platform's approval route. Both variants are specified in `docs/protocols/approval-webhook-v1.md`. |
+| `chain` | `mode` (`all` or `any`), `backends` | Combine other backends. |
+
 Each entry under `commands` uses the command name as the key:
 
 | Field | Value | Use |

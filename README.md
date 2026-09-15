@@ -72,11 +72,17 @@ brew install nono
 
 #### Nix
 
-The project provides a Nix flake that builds from source (first run compiles the crate and its dependencies):
+The project provides a Nix flake with two outputs:
+
+- `#default` (from source) — builds from source using `buildRustPackage` (first run compiles the crate and its dependencies)
+- `#prebuilt` — fetches the official release binary from GitHub Releases (fast, no compilation)
 
 ```bash
-# Run without installing
+# Run without installing (from source)
 nix run github:nolabs-ai/nono
+
+# Run the prebuilt binary (no compilation)
+nix run github:nolabs-ai/nono#prebuilt
 
 # Install into your profile
 nix profile add github:nolabs-ai/nono

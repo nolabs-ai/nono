@@ -304,6 +304,16 @@ pub fn parse_package_ref(input: &str) -> Result<PackageRef> {
 }
 
 fn validate_package_component(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(NonoError::PackageInstall(format!(
+            "invalid package {label}: must not be empty"
+        )));
+    }
+    if value == "." || value == ".." {
+        return Err(NonoError::PackageInstall(format!(
+            "invalid package {label} '{value}': '.' and '..' are not allowed"
+        )));
+    }
     if value
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -325,7 +335,17 @@ pub fn package_store_dir() -> Result<PathBuf> {
 }
 
 pub fn package_install_dir(namespace: &str, name: &str) -> Result<PathBuf> {
-    Ok(package_store_dir()?.join(namespace).join(name))
+    validate_package_component("namespace", namespace)?;
+    validate_package_component("name", name)?;
+    let store = package_store_dir()?;
+    let dir = store.join(namespace).join(name);
+    if !dir.starts_with(&store) {
+        return Err(NonoError::PackageInstall(format!(
+            "package install path {} escapes the package store",
+            dir.display()
+        )));
+    }
+    Ok(dir)
 }
 
 pub fn package_groups_path(namespace: &str, name: &str) -> Result<PathBuf> {
@@ -393,5 +413,29 @@ mod tests {
     fn rejects_invalid_package_ref() {
         let err = parse_package_ref("broken").expect_err("must fail");
         assert!(err.to_string().contains("expected <namespace>/<name>"));
+    }
+
+    #[test]
+    fn rejects_dotdot_package_ref() {
+        let err = parse_package_ref("../..").expect_err("parent refs must fail");
+        assert!(
+            err.to_string().contains("'.' and '..' are not allowed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_dot_package_component() {
+        let err = parse_package_ref("./.").expect_err("dot refs must fail");
+        assert!(
+            err.to_string().contains("'.' and '..' are not allowed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_package_install_dir_components() {
+        assert!(package_install_dir("", "name").is_err());
+        assert!(package_install_dir("namespace", "").is_err());
     }
 }

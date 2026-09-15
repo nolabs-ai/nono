@@ -12,7 +12,6 @@ use nono::{NonoError, Result};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 /// Information about a discovered audit session
 #[derive(Debug)]
@@ -234,7 +233,7 @@ fn build_session_info(dir: PathBuf, metadata: SessionMetadata) -> SessionInfo {
     let pid = parse_pid_from_session_id(&metadata.session_id);
     let is_alive = pid.map(is_process_alive).unwrap_or(false);
     let is_stale = metadata.ended.is_none() && !is_alive;
-    let disk_size = calculate_dir_size(&dir);
+    let disk_size = state_paths::calculate_dir_size(&dir);
 
     SessionInfo {
         metadata,
@@ -268,16 +267,6 @@ fn parse_pid_from_session_id(session_id: &str) -> Option<u32> {
 fn is_process_alive(pid: u32) -> bool {
     // SAFETY: POSIX kill(pid, 0) checks process existence without sending a signal.
     unsafe { nix::libc::kill(pid as nix::libc::pid_t, 0) == 0 }
-}
-
-fn calculate_dir_size(dir: &Path) -> u64 {
-    WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
 }
 
 #[cfg(test)]

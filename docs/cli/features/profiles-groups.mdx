@@ -477,17 +477,6 @@ The `hooks` field is a legacy declaration surface: since v0.44.0, setting it in 
 
 This is unrelated to **Session Hooks** above, which is a currently-active profile feature for running host-privileged setup/cleanup scripts around the sandboxed process itself.
 
-### Interactive Mode (deprecated)
-
-The `interactive` field is parsed for backward compatibility but ignored. Supervised mode (the default) preserves the TTY, making this field unnecessary.
-
-```json
-{
-  "meta": { "name": "my-agent" },
-  "interactive": true
-}
-```
-
 ### Rollback Exclusions
 
 The `rollback` section controls which files are excluded from [atomic rollback](/cli/features/atomic-rollbacks) snapshots:

@@ -20,6 +20,10 @@ pub struct SandboxState {
     pub unix_sockets: Vec<UnixSocketCapState>,
     /// Whether network is blocked
     pub net_blocked: bool,
+    /// Whether implicit macOS DNS resolver grants are disabled.
+    /// Older states retain their original DNS-enabled behavior.
+    #[serde(default)]
+    pub dns_blocked: bool,
     /// Resource ceilings (memory and max processes). Absent in states from older
     /// nono builds; `#[serde(default)]` keeps those loadable. Plain numbers, so
     /// unlike paths they need no re-validation.
@@ -84,6 +88,7 @@ impl SandboxState {
                 })
                 .collect(),
             net_blocked: caps.is_network_blocked(),
+            dns_blocked: !caps.dns_enabled(),
             resource_limits: caps.resource_limits().copied(),
         }
     }
@@ -170,6 +175,9 @@ impl SandboxState {
         }
 
         caps.set_network_blocked(self.net_blocked);
+        if self.dns_blocked {
+            caps = caps.block_dns();
+        }
 
         if let Some(limits) = self.resource_limits {
             caps = caps.with_resource_limits(limits);
@@ -195,6 +203,42 @@ impl SandboxState {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_dns_blocking_roundtrip() -> crate::error::Result<()> {
+        for caps in [
+            CapabilitySet::new(),
+            CapabilitySet::new().block_network(),
+            CapabilitySet::new().proxy_only(8080),
+        ] {
+            for block_dns in [false, true] {
+                let caps = if block_dns {
+                    caps.clone().block_dns()
+                } else {
+                    caps.clone()
+                };
+                let json = SandboxState::from_caps(&caps).to_json()?;
+                let restored = SandboxState::from_json(&json)
+                    .map_err(|e| crate::error::NonoError::ConfigParse(e.to_string()))?
+                    .to_caps()?;
+                assert_eq!(restored.dns_enabled(), caps.dns_enabled());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_legacy_state_keeps_dns_enabled() -> crate::error::Result<()> {
+        for net_blocked in [false, true] {
+            let json = format!(r#"{{ "fs": [], "net_blocked": {net_blocked} }}"#);
+            let restored = SandboxState::from_json(&json)
+                .map_err(|e| crate::error::NonoError::ConfigParse(e.to_string()))?
+                .to_caps()?;
+            assert!(restored.dns_enabled());
+            assert_eq!(restored.is_network_blocked(), net_blocked);
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_state_roundtrip() {

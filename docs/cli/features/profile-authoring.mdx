@@ -497,8 +497,9 @@ the profile:
   sees the host environment, so a denied variable is exactly the kind that can
   be kept from the child and still printed in a ledger.
 - **Credential destinations.** The destination of an `env_credentials`
-  mapping, of a `command_policies.credentials` entry, and of a
-  `network.custom_credentials` route.
+  mapping, of a `command_policies.credentials` entry, of a
+  `network.custom_credentials` route, and the `env_var` of a
+  `credential_routes` entry.
 
 Declaring a variable as a credential is what makes its name secret, so
 repeating it under a redaction key would only create an opportunity to typo or

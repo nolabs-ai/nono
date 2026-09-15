@@ -1185,13 +1185,15 @@ pub(crate) fn prepare_profile_for_preflight(
 /// that every member of it holds a secret, and widening redaction to a whole
 /// family would hide the non-secret context that makes a ledger readable.
 ///
-/// Three further sources carry a credential to a destination variable:
+/// Four further sources carry a credential to a destination variable:
 ///
 /// - `env_credentials`, whose values are destination names;
 /// - `command_policies.credentials`, whose `env_var` the mediated child sees;
 /// - `network.custom_credentials`, whose `env_var` (or, for a bare keystore
 ///   account name, that name uppercased, matching the proxy's own derivation)
-///   carries the phantom token.
+///   carries the phantom token;
+/// - `credential_routes`, whose `env_var` carries the provider's token to the
+///   sandbox-visible environment.
 ///
 /// Deliberately excluded, because their values are not secrets and are useful
 /// in a ledger: `local-socket` credentials, whose `env_var` holds a socket
@@ -1228,6 +1230,15 @@ fn collect_derived_redaction_env_vars(profile: &profile::Profile) -> Vec<String>
             if let Some(env_var) = credential.env_var.as_ref() {
                 names.insert(env_var.clone());
             }
+        }
+    }
+
+    // A credential route binds a provider to the sandbox-visible variable that
+    // carries its token. `base_url_env_var` is excluded above; it holds a
+    // loopback URL, not a secret.
+    for route in &profile.credential_routes {
+        if let Some(env_var) = route.env_var.as_ref() {
+            names.insert(env_var.clone());
         }
     }
 
@@ -2281,6 +2292,46 @@ mod derived_redaction_tests {
                 readable
             );
         }
+    }
+
+    /// A credential route binds a provider's token to a sandbox-visible
+    /// variable, so that variable is a credential destination exactly like a
+    /// `command_policies.credentials` `env_var`. Its `base_url_env_var` holds
+    /// a loopback URL and stays readable.
+    #[test]
+    fn a_credential_route_redacts_its_destination_variable() {
+        let profile = profile_from(
+            r#"{
+                "credential_providers": {
+                    "claude_code": {
+                        "type": "oauth_capture",
+                        "token_endpoints": [
+                            {
+                                "host": "https://platform.claude.com",
+                                "path": "/v1/oauth/token",
+                                "response_fields": [
+                                    { "path": "access_token", "kind": "opaque" }
+                                ]
+                            }
+                        ],
+                        "api_hosts": ["https://api.anthropic.com"]
+                    }
+                },
+                "credential_routes": [
+                    {
+                        "name": "anthropic_oauth",
+                        "provider": "claude_code",
+                        "env_var": "ANTHROPIC_AUTH_TOKEN",
+                        "base_url_env_var": "ANTHROPIC_BASE_URL"
+                    }
+                ]
+            }"#,
+        );
+
+        let derived = collect_derived_redaction_env_vars(&profile);
+
+        assert_eq!(derived, vec!["ANTHROPIC_AUTH_TOKEN".to_string()]);
+        assert!(!derived.contains(&"ANTHROPIC_BASE_URL".to_string()));
     }
 
     /// The two kinds of declaration overlap in practice: a variable can be

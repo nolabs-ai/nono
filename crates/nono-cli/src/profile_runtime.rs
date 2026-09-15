@@ -47,6 +47,14 @@ pub(crate) struct PreparedProfile {
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
+    /// `diagnostics.redaction.extra_env_vars` from the profile: extra
+    /// environment-variable name globs to redact in diagnostics and audit
+    /// records. Add-only; never removes a secure default.
+    pub(crate) redaction_extra_env_vars: Vec<String>,
+    /// Environment variable names the profile itself marks as secret,
+    /// derived from the profile rather than authored. See
+    /// [`collect_derived_redaction_env_vars`].
+    pub(crate) redaction_derived_env_vars: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
     pub(crate) case_insensitive_env_vars: bool,
@@ -972,6 +980,14 @@ fn prepare_profile_with_options(
             .as_ref()
             .map(|profile| profile.diagnostics.suppress_system_services.clone())
             .unwrap_or_default(),
+        redaction_extra_env_vars: loaded_profile
+            .as_ref()
+            .map(|profile| profile.diagnostics.redaction.extra_env_vars.clone())
+            .unwrap_or_default(),
+        redaction_derived_env_vars: loaded_profile
+            .as_ref()
+            .map(collect_derived_redaction_env_vars)
+            .unwrap_or_default(),
         // Patterns are validated at profile load; already well-formed here.
         allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
             profile
@@ -1142,6 +1158,108 @@ pub(crate) fn prepare_profile_for_preflight(
             hook_output_silent: true,
         },
     )
+}
+
+/// Environment variable names the profile itself marks as secret.
+///
+/// Declaring a variable as a credential is what makes its name secret, so an
+/// author should not have to repeat that name under
+/// `diagnostics.redaction.extra_env_vars` for it to be kept out of
+/// diagnostics and audit output. A name omitted there is a silent leak, and
+/// the profile already holds the information needed to avoid it. These names
+/// are folded into the redaction policy alongside the authored list.
+///
+/// `environment.deny_vars` is one such declaration: stripping a variable
+/// before it reaches the child says its value is a credential. Diagnostics
+/// and audit output are written by the supervisor, which still sees the host
+/// environment, so a denied variable is exactly the kind that can be stripped
+/// from the child and still printed in a ledger.
+///
+/// Only exact `deny_vars` entries are taken. A glob entry such as `DD_*` is a
+/// blast radius for stripping — a family denied for uniformity — not a claim
+/// that every member of it holds a secret, and widening redaction to a whole
+/// family would hide the non-secret context that makes a ledger readable.
+///
+/// Four further sources carry a credential to a destination variable:
+///
+/// - `env_credentials`, whose values are destination names;
+/// - `command_policies.credentials`, whose `env_var` the mediated child sees;
+/// - `network.custom_credentials`, whose `env_var` (or, for a bare keystore
+///   account name, that name uppercased, matching the proxy's own derivation)
+///   carries the phantom token;
+/// - `credential_routes`, whose `env_var` carries the provider's token to the
+///   sandbox-visible environment.
+///
+/// Deliberately excluded, because their values are not secrets and are useful
+/// in a ledger: `local-socket` credentials, whose `env_var` holds a socket
+/// path; `base_url_env_var`, which holds a loopback URL; and
+/// `network.tls_intercept.ca_env_vars`, which hold a CA certificate path.
+///
+/// Returned as exact names, never globs — a derived entry must not silently
+/// widen to a family of variables the author never mentioned.
+fn collect_derived_redaction_env_vars(profile: &profile::Profile) -> Vec<String> {
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // `deny_vars` entries the author wrote out in full. Globs are skipped; see
+    // the note above on why a denied family is not a family of secrets.
+    if let Some(env_config) = profile.environment.as_ref() {
+        names.extend(
+            env_config
+                .deny_vars
+                .iter()
+                .filter(|name| !name.contains('*'))
+                .cloned(),
+        );
+    }
+
+    // `env_credentials` maps a keystore account name to a destination variable.
+    names.extend(profile.env_credentials.mappings.values().cloned());
+
+    if let Some(command_policies) = profile.command_policies.as_ref() {
+        for credential in command_policies.credentials.values() {
+            if credential.credential_type
+                == crate::command_policy::CommandCredentialType::LocalSocket
+            {
+                continue;
+            }
+            if let Some(env_var) = credential.env_var.as_ref() {
+                names.insert(env_var.clone());
+            }
+        }
+    }
+
+    // A credential route binds a provider to the sandbox-visible variable that
+    // carries its token. `base_url_env_var` is excluded above; it holds a
+    // loopback URL, not a secret.
+    for route in &profile.credential_routes {
+        if let Some(env_var) = route.env_var.as_ref() {
+            names.insert(env_var.clone());
+        }
+    }
+
+    for (name, credential) in &profile.network.custom_credentials {
+        if let Some(env_var) = credential.env_var.as_ref() {
+            names.insert(env_var.clone());
+            continue;
+        }
+        // The proxy derives the SDK env var from a bare keystore account name
+        // by uppercasing it; a URI reference requires an explicit `env_var`,
+        // which the branch above already took.
+        let bare = credential
+            .credential_key
+            .as_ref()
+            .filter(|key| !key.contains("://"));
+        if let Some(key) = bare {
+            names.insert(key.to_uppercase());
+        } else if credential.credential_key.is_none() && credential.auth.is_none() {
+            // Nothing names a destination for this route; `name` is the route
+            // label, not an environment variable, so there is nothing to add.
+            let _ = name;
+        }
+    }
+
+    names.retain(|name| !name.is_empty());
+    names.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -1946,6 +2064,251 @@ mod tests {
                 .and_then(|e| e.allow_vars.as_ref()),
             None,
             "set_vars-only environment should not activate the allow filter"
+        );
+    }
+}
+
+#[cfg(test)]
+mod derived_redaction_tests {
+    use super::*;
+
+    fn profile_from(json: &str) -> profile::Profile {
+        serde_json::from_str(json).expect("test profile parses")
+    }
+
+    /// A credential's destination variable is redacted because the profile
+    /// declares the credential, with no entry under
+    /// `diagnostics.redaction.extra_env_vars`. That omission is the footgun
+    /// this derivation removes.
+    #[test]
+    fn declaring_a_credential_redacts_its_destination_variable() {
+        let profile = profile_from(
+            r#"{
+                "env_credentials": { "openai_api_key": "OPENAI_API_KEY" },
+                "command_policies": {
+                    "credentials": {
+                        "gitlab": {
+                            "type": "proxy",
+                            "env_var": "ACME_GITLAB_TOKEN",
+                            "upstream": "https://gitlab.example.com",
+                            "credential_key": "gitlab_token",
+                            "base_url_env_var": "ACME_GITLAB_BASE_URL"
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        let derived = collect_derived_redaction_env_vars(&profile);
+
+        assert!(derived.contains(&"OPENAI_API_KEY".to_string()));
+        assert!(derived.contains(&"ACME_GITLAB_TOKEN".to_string()));
+        // A loopback URL is not a secret and stays readable in the ledger.
+        assert!(!derived.contains(&"ACME_GITLAB_BASE_URL".to_string()));
+    }
+
+    /// A `local-socket` credential's `env_var` holds a socket path, not a
+    /// secret. Redacting it would cost diagnostic value for no gain.
+    #[test]
+    fn a_local_socket_path_is_not_treated_as_a_credential_value() {
+        let profile = profile_from(
+            r#"{
+                "command_policies": {
+                    "credentials": {
+                        "ssh-agent": { "type": "local-socket", "env_var": "SSH_AUTH_SOCK" }
+                    }
+                }
+            }"#,
+        );
+
+        assert!(collect_derived_redaction_env_vars(&profile).is_empty());
+    }
+
+    /// The proxy derives the phantom's env var from a bare keystore account
+    /// name by uppercasing it. Derivation has to agree, or the phantom's
+    /// destination is left unredacted.
+    #[test]
+    fn a_bare_keystore_account_name_derives_the_same_name_the_proxy_uses() {
+        let profile = profile_from(
+            r#"{
+                "network": {
+                    "custom_credentials": {
+                        "telegram": {
+                            "upstream": "https://api.telegram.org",
+                            "credential_key": "telegram_bot_token"
+                        },
+                        "explicit": {
+                            "upstream": "https://api.example.com",
+                            "credential_key": "op://vault/item/field",
+                            "env_var": "EXAMPLE_API_KEY"
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        let derived = collect_derived_redaction_env_vars(&profile);
+
+        assert!(derived.contains(&"TELEGRAM_BOT_TOKEN".to_string()));
+        assert!(derived.contains(&"EXAMPLE_API_KEY".to_string()));
+    }
+
+    /// Derived entries are exact names. A credential named `ACME_TOKEN` must
+    /// not widen redaction to everything that looks like it.
+    #[test]
+    fn derived_entries_are_exact_names_not_globs() {
+        let profile = profile_from(
+            r#"{
+                "command_policies": {
+                    "credentials": {
+                        "acme": {
+                            "type": "proxy",
+                            "env_var": "ACME_TOKEN",
+                            "upstream": "https://api.acme.example",
+                            "credential_key": "acme_token"
+                        }
+                    }
+                }
+            }"#,
+        );
+        let derived = collect_derived_redaction_env_vars(&profile);
+        assert_eq!(derived, vec!["ACME_TOKEN".to_string()]);
+
+        let mut redactions = nono::ScrubPolicy::secure_default();
+        for name in &derived {
+            redactions.add_env_var(name);
+        }
+        assert_ne!(
+            nono::scrub_env_name_with_policy("ACME_TOKEN", &redactions),
+            "ACME_TOKEN"
+        );
+        assert_eq!(
+            nono::scrub_env_name_with_policy("ACME_TOKEN_ID", &redactions),
+            "ACME_TOKEN_ID"
+        );
+    }
+
+    /// A profile that declares no credential must not widen redaction at all.
+    #[test]
+    fn a_profile_without_credentials_derives_nothing() {
+        assert!(collect_derived_redaction_env_vars(&profile_from("{}")).is_empty());
+    }
+
+    /// Stripping a variable from the child says its value is a credential.
+    /// The supervisor still sees the host environment when it writes a
+    /// ledger, so a denied name is redacted without being listed anywhere.
+    #[test]
+    fn an_exact_deny_var_is_redacted_without_being_listed() {
+        let profile = profile_from(
+            r#"{
+                "environment": { "deny_vars": ["PGPASSWORD", "VAULT_TOKEN"] }
+            }"#,
+        );
+
+        let derived = collect_derived_redaction_env_vars(&profile);
+
+        assert!(derived.contains(&"PGPASSWORD".to_string()));
+        assert!(derived.contains(&"VAULT_TOKEN".to_string()));
+    }
+
+    /// A glob in `deny_vars` is a blast radius for stripping, not a claim
+    /// that every member of the family holds a secret. Honouring it here
+    /// would redact the non-secret context that makes a ledger readable, so
+    /// only the exact entries alongside it are taken.
+    #[test]
+    fn a_deny_var_glob_does_not_widen_redaction() {
+        let profile = profile_from(
+            r#"{
+                "environment": {
+                    "deny_vars": ["DD_*", "DATADOG_*", "DD_API_KEY", "DD_APP_KEY"]
+                }
+            }"#,
+        );
+
+        let derived = collect_derived_redaction_env_vars(&profile);
+
+        assert_eq!(
+            derived,
+            vec!["DD_API_KEY".to_string(), "DD_APP_KEY".to_string()]
+        );
+
+        let mut redactions = nono::ScrubPolicy::secure_default();
+        for name in &derived {
+            redactions.add_env_var(name);
+        }
+        // Configuration, not a secret, and denied only for family uniformity.
+        for readable in ["DD_SITE", "DD_ENV", "DD_SERVICE", "DD_VERSION"] {
+            assert_eq!(
+                nono::scrub_env_name_with_policy(readable, &redactions),
+                readable
+            );
+        }
+    }
+
+    /// A credential route binds a provider's token to a sandbox-visible
+    /// variable, so that variable is a credential destination exactly like a
+    /// `command_policies.credentials` `env_var`. Its `base_url_env_var` holds
+    /// a loopback URL and stays readable.
+    #[test]
+    fn a_credential_route_redacts_its_destination_variable() {
+        let profile = profile_from(
+            r#"{
+                "credential_providers": {
+                    "claude_code": {
+                        "type": "oauth_capture",
+                        "token_endpoints": [
+                            {
+                                "host": "https://platform.claude.com",
+                                "path": "/v1/oauth/token",
+                                "response_fields": [
+                                    { "path": "access_token", "kind": "opaque" }
+                                ]
+                            }
+                        ],
+                        "api_hosts": ["https://api.anthropic.com"]
+                    }
+                },
+                "credential_routes": [
+                    {
+                        "name": "anthropic_oauth",
+                        "provider": "claude_code",
+                        "env_var": "ANTHROPIC_AUTH_TOKEN",
+                        "base_url_env_var": "ANTHROPIC_BASE_URL"
+                    }
+                ]
+            }"#,
+        );
+
+        let derived = collect_derived_redaction_env_vars(&profile);
+
+        assert_eq!(derived, vec!["ANTHROPIC_AUTH_TOKEN".to_string()]);
+        assert!(!derived.contains(&"ANTHROPIC_BASE_URL".to_string()));
+    }
+
+    /// The two kinds of declaration overlap in practice: a variable can be
+    /// both denied to the child and named as a credential destination. It
+    /// must appear once, not twice.
+    #[test]
+    fn a_name_that_is_both_denied_and_injected_is_derived_once() {
+        let profile = profile_from(
+            r#"{
+                "environment": { "deny_vars": ["GITLAB_TOKEN"] },
+                "command_policies": {
+                    "credentials": {
+                        "gitlab": {
+                            "type": "proxy",
+                            "env_var": "GITLAB_TOKEN",
+                            "upstream": "https://gitlab.example.com",
+                            "credential_key": "gitlab_token"
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        assert_eq!(
+            collect_derived_redaction_env_vars(&profile),
+            vec!["GITLAB_TOKEN".to_string()]
         );
     }
 }

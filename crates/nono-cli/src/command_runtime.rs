@@ -3,7 +3,7 @@ use crate::exec_strategy;
 use crate::execution_runtime::execute_sandboxed;
 use crate::launch_runtime::{
     ExecutionFlags, LaunchPlan, SessionLaunchOptions, load_configured_detach_sequence,
-    load_configured_redaction_policy, prepare_run_launch_plan, resolve_requested_workdir,
+    prepare_run_launch_plan, profile_redaction_policy, resolve_requested_workdir,
     select_exec_strategy,
 };
 use crate::output;
@@ -215,7 +215,10 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
                 prepared.secrets.len()
             );
         }
-        let redaction_policy = load_configured_redaction_policy()?;
+        let redaction_policy = profile_redaction_policy(
+            &prepared.redaction_extra_env_vars,
+            &prepared.redaction_derived_env_vars,
+        )?;
         output::print_dry_run(&program, &cmd_args, &redaction_policy, silent);
         return Ok(());
     }
@@ -245,7 +248,10 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
                 prepared.secrets.len()
             );
         }
-        let redaction_policy = load_configured_redaction_policy()?;
+        let redaction_policy = profile_redaction_policy(
+            &prepared.redaction_extra_env_vars,
+            &prepared.redaction_derived_env_vars,
+        )?;
         output::print_dry_run(shell_path.as_os_str(), &[], &redaction_policy, silent);
         return Ok(());
     }
@@ -289,7 +295,6 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         no_diagnostics: true,
         startup_timeout_secs: args.startup_timeout_secs,
         network,
-        redaction_policy: load_configured_redaction_policy()?,
         session: SessionLaunchOptions {
             session_id: Some(session_id),
             session_name: args.name,
@@ -350,7 +355,10 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
                 prepared.secrets.len()
             );
         }
-        let redaction_policy = load_configured_redaction_policy()?;
+        let redaction_policy = profile_redaction_policy(
+            &prepared.redaction_extra_env_vars,
+            &prepared.redaction_derived_env_vars,
+        )?;
         output::print_dry_run(&program, &cmd_args, &redaction_policy, silent);
         return Ok(());
     }

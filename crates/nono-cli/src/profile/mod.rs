@@ -1287,8 +1287,18 @@ fn validate_profile_no_proxy(profile: &Profile) -> Result<()> {
     )
 }
 
-/// Validate `environment.allow_vars`/`deny_vars` glob patterns.
+/// Validate `environment.allow_vars`/`deny_vars` and
+/// `diagnostics.redaction.extra_env_vars` glob patterns.
 fn validate_profile_env_var_patterns(profile: &Profile) -> Result<()> {
+    let redaction_vars = &profile.diagnostics.redaction.extra_env_vars;
+    if !redaction_vars.is_empty()
+        && let Some(err) = crate::exec_strategy::validate_env_var_patterns(
+            redaction_vars,
+            "diagnostics.redaction.extra_env_vars",
+        )
+    {
+        return Err(NonoError::ProfileParse(err));
+    }
     let Some(env_config) = profile.environment.as_ref() else {
         return Ok(());
     };
@@ -2140,6 +2150,30 @@ pub struct DiagnosticsConfig {
     /// `forbidden-exec-sugid`, from post-run output.
     #[serde(default)]
     pub suppress_system_services: Vec<String>,
+
+    /// Extra redaction applied to diagnostic and audit output.
+    #[serde(default)]
+    pub redaction: RedactionConfig,
+}
+
+/// Profile-supplied additions to the output redaction policy.
+///
+/// This is output hygiene, not enforcement: it changes what nono writes into
+/// diagnostics and audit records, and never what the sandboxed child can
+/// read. Entries are add-only — a profile can widen redaction but cannot
+/// stop a secure default from being redacted. Removing a default still
+/// requires `[redaction].unsafe_redaction_overrides` in user config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionConfig {
+    /// Environment variable name patterns whose values are replaced with
+    /// `[REDACTED]` in diagnostics and audit records.
+    ///
+    /// Uses the same glob syntax as `environment.deny_vars` (`"DEPLOY_TOKEN"`,
+    /// `"ACME_*"`, `"*_SECRET"`) and is matched case-insensitively against the
+    /// whole variable name. Inherited additively through `extends`.
+    #[serde(default)]
+    pub extra_env_vars: Vec<String>,
 }
 
 /// Which sandboxing mechanism nono should install on Linux.
@@ -3850,6 +3884,12 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             sandbox_policy: child.linux.sandbox_policy.or(base.linux.sandbox_policy),
         },
         diagnostics: DiagnosticsConfig {
+            redaction: RedactionConfig {
+                extra_env_vars: dedup_append(
+                    &base.diagnostics.redaction.extra_env_vars,
+                    &child.diagnostics.redaction.extra_env_vars,
+                ),
+            },
             suppress_system_services: dedup_append(
                 &base.diagnostics.suppress_system_services,
                 &child.diagnostics.suppress_system_services,
@@ -8154,6 +8194,89 @@ mod tests {
         let creds = merged.network.resolved_credentials();
         assert!(creds.contains(&"base_cred".to_string()));
         assert!(creds.contains(&"child_cred".to_string()));
+    }
+
+    #[test]
+    fn test_merge_profiles_diagnostics_redaction_env_vars_append() {
+        let mut base = base_profile();
+        base.diagnostics.redaction.extra_env_vars =
+            vec!["ACME_API_KEY".to_string(), "ACME_*".to_string()];
+        let mut child = child_profile();
+        child.diagnostics.redaction.extra_env_vars =
+            vec!["ACME_*".to_string(), "WIDGET_TOKEN".to_string()];
+
+        let merged = merge_profiles(base, child);
+
+        assert_eq!(
+            merged.diagnostics.redaction.extra_env_vars,
+            vec![
+                "ACME_API_KEY".to_string(),
+                "ACME_*".to_string(),
+                "WIDGET_TOKEN".to_string(),
+            ],
+            "a child profile widens the inherited redaction list, never replaces it"
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_redaction_rejects_empty_pattern() {
+        let mut profile = base_profile();
+        profile.diagnostics.redaction.extra_env_vars = vec![String::new()];
+
+        let err = validate_profile_env_var_patterns(&profile)
+            .expect_err("an empty pattern must be rejected, not silently ignored");
+
+        assert!(
+            err.to_string()
+                .contains("diagnostics.redaction.extra_env_vars"),
+            "error should name the offending field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_redaction_accepts_globs_and_exact_names() {
+        let mut profile = base_profile();
+        profile.diagnostics.redaction.extra_env_vars = vec![
+            "ACME_API_KEY".to_string(),
+            "ACME_*".to_string(),
+            "*_SECRET".to_string(),
+        ];
+
+        assert!(validate_profile_env_var_patterns(&profile).is_ok());
+    }
+
+    #[test]
+    fn test_diagnostics_redaction_parses_from_json() {
+        let profile: Profile = serde_json::from_str(
+            r#"{
+                "diagnostics": {
+                    "redaction": { "extra_env_vars": ["ACME_*"] }
+                }
+            }"#,
+        )
+        .expect("profile with diagnostics.redaction should parse");
+
+        assert_eq!(
+            profile.diagnostics.redaction.extra_env_vars,
+            vec!["ACME_*".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_redaction_rejects_unknown_key() {
+        let parsed: std::result::Result<Profile, _> = serde_json::from_str(
+            r#"{
+                "diagnostics": {
+                    "redaction": { "allow_unredacted": ["PATH"] }
+                }
+            }"#,
+        );
+
+        assert!(
+            parsed.is_err(),
+            "diagnostics.redaction must not accept unknown keys; \
+             a typo there would silently fail to redact"
+        );
     }
 
     #[test]

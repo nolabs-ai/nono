@@ -5560,6 +5560,48 @@ mod tests {
         ResolvedExecutableShape,
     };
 
+    #[test]
+    fn env_display_redacts_values_matching_profile_patterns() {
+        // The audit path for a mediated child dumps its whole environment.
+        // A profile-supplied pattern must reach this choke point, or a
+        // credential a deployment knows about is written out in cleartext.
+        let mut redactions = nono::ScrubPolicy::secure_default();
+        redactions.add_env_var_pattern("ACME_*");
+
+        let env = vec![
+            b"ACME_API_KEY=super-secret".to_vec(),
+            b"acme_app_key=also-secret".to_vec(),
+            b"PATH=/usr/bin".to_vec(),
+        ];
+
+        let entries = env_display(&env, &redactions);
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].value_display, "[REDACTED]");
+        assert_eq!(entries[1].value_display, "[REDACTED]");
+        assert_eq!(
+            entries[2].value_display, "/usr/bin",
+            "non-matching variables stay visible"
+        );
+    }
+
+    #[test]
+    fn env_display_without_patterns_matches_secure_default() {
+        let redactions = nono::ScrubPolicy::secure_default();
+        let env = vec![
+            b"ACME_API_KEY=super-secret".to_vec(),
+            b"OPENAI_API_KEY=provider-secret".to_vec(),
+        ];
+
+        let entries = env_display(&env, &redactions);
+
+        assert_eq!(
+            entries[0].value_display, "super-secret",
+            "patterns are opt-in; behavior is unchanged without a profile"
+        );
+        assert_eq!(entries[1].value_display, "[REDACTED]");
+    }
+
     fn test_binary(name: &str, path: &Path) -> Result<ResolvedCommandBinary> {
         let canonical = path
             .canonicalize()

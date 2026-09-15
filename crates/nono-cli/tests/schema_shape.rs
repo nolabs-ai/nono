@@ -1114,7 +1114,17 @@ fn test_schema_rollback_config_matches_rust_model() {
 #[test]
 fn test_schema_diagnostics_config_matches_rust_model() {
     let schema = load_schema();
-    assert_schema_properties(&schema, "DiagnosticsConfig", &["suppress_system_services"]);
+    assert_schema_properties(
+        &schema,
+        "DiagnosticsConfig",
+        &["suppress_system_services", "redaction"],
+    );
+}
+
+#[test]
+fn test_schema_redaction_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(&schema, "RedactionConfig", &["extra_env_vars"]);
 }
 
 #[test]

@@ -481,6 +481,70 @@ not change sandbox enforcement — it only hides matching violations from
 post-run output and save-profile prompts. Values merge additively across
 profile inheritance, like other list fields.
 
+### Redacting Extra Environment Variables from Diagnostics and Audit Records
+
+nono redacts the values of well-known secret-bearing environment variables —
+`OPENAI_API_KEY`, `GITHUB_TOKEN`, and similar — wherever it writes command
+context into diagnostics, session records, or the audit log.
+
+A variable the profile itself marks as secret is redacted without being listed
+anywhere. Two kinds of declaration count, and both are read straight out of
+the profile:
+
+- **Denied variables.** An exact name under `environment.deny_vars` is
+  stripped before the child starts, which says its value is a credential.
+  Diagnostics and the audit log are written by the supervisor, which still
+  sees the host environment, so a denied variable is exactly the kind that can
+  be kept from the child and still printed in a ledger.
+- **Credential destinations.** The destination of an `env_credentials`
+  mapping, of a `command_policies.credentials` entry, of a
+  `network.custom_credentials` route, and the `env_var` of a
+  `credential_routes` entry.
+
+Declaring a variable as a credential is what makes its name secret, so
+repeating it under a redaction key would only create an opportunity to typo or
+forget it.
+
+Two things are deliberately left readable, because their values are not
+secrets and a ledger is worth less without them: socket paths
+(`local-socket` credentials) and `base_url_env_var`; and glob entries in
+`deny_vars`. A pattern like `ACME_*` is a blast radius for stripping — a
+family denied for uniformity — not a claim that every member of it holds a
+secret, so only the exact entries written alongside it are derived.
+
+That covers what the profile declares. Anything else — a variable exported by
+the host shell and deliberately passed through, or one injected by tooling
+outside the profile — is not something nono can infer. List those under
+`diagnostics.redaction.extra_env_vars`:
+
+```json
+{
+  "diagnostics": {
+    "redaction": {
+      "extra_env_vars": ["DEPLOY_TOKEN", "ACME_*", "*_SECRET"]
+    }
+  }
+}
+```
+
+Entries use the same glob syntax as `environment.deny_vars` — `*` matches any
+run of characters and is anchored to the whole variable name — and are matched
+case-insensitively. Both features resolve patterns through one matcher, so a
+pattern that denies a variable also redacts it. Values merge additively across profile inheritance, so a
+child profile widens the inherited list rather than replacing it.
+
+This is output hygiene, not enforcement: it changes what nono writes, never
+what the sandboxed process can read. To stop a variable from reaching the child
+at all, use `environment.deny_vars` — which, per the derivation above, also
+redacts it. A variable you deliberately pass through is the case this key
+exists for.
+
+The list is add-only. A profile can widen redaction but cannot stop a secure
+default from being redacted; removing a default still requires
+`[redaction].unsafe_redaction_overrides` in user config. Names added through
+a profile are recorded in the audit log's redaction-policy diff, so a record
+documents how its own scrubbing differed from the default.
+
 For path denials that should stay visible but skip save prompts, use
 `filesystem.suppress_save_prompt` instead. To disable all diagnostic footers,
 use `--no-diagnostics`.

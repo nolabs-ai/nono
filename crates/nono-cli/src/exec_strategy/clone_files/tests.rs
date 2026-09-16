@@ -2,6 +2,7 @@ use super::*;
 use crate::exec_strategy::{SeccompPolicy, SupervisorConfig, ThreadingContext, supervisor_linux};
 use nono::{AccessMode, FsCapability};
 use std::ffi::CString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -827,6 +828,8 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
         let port = proxy.local_addr().map_err(NonoError::Io)?.port();
         let mut caps = capabilities(port, 34568)?;
         let directory = tempfile::tempdir().map_err(NonoError::Io)?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(NonoError::Io)?;
         std::os::unix::fs::symlink("/usr/bin/python3", directory.path().join("python3"))
             .map_err(NonoError::Io)?;
         std::os::unix::fs::symlink("/usr/bin/true", directory.path().join("true"))

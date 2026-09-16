@@ -354,6 +354,7 @@ impl PreparedToolSandboxRuntime {
             shims_by_command.values().chain(url_open_shim.iter()),
             &plan,
             &shim_source,
+            outer_caps,
         )?;
         tool_sandbox_profile_log!(
             "prepare:build_outer_exec_files: {:?} ({} paths)",
@@ -3037,17 +3038,18 @@ fn build_outer_exec_files<'a>(
     shims: impl IntoIterator<Item = &'a ShimIdentity>,
     plan: &ResolvedToolSandboxPlan,
     shim_source: &Path,
+    outer_caps: &CapabilitySet,
 ) -> Result<Vec<PathBuf>> {
     let controlled_ids = controlled_exec_ids(plan);
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
 
     for shim in shims {
-        add_outer_exec_file_with_deps(&shim.path, &mut seen, &mut paths)?;
+        add_outer_exec_file_with_deps(&shim.path, outer_caps, &mut seen, &mut paths)?;
     }
-    add_outer_exec_file_with_deps(shim_source, &mut seen, &mut paths)?;
+    add_outer_exec_file_with_deps(shim_source, outer_caps, &mut seen, &mut paths)?;
     for path in &plan.allowed_direct_bypasses {
-        add_outer_exec_file_with_deps(path, &mut seen, &mut paths)?;
+        add_outer_exec_file_with_deps(path, outer_caps, &mut seen, &mut paths)?;
     }
 
     for dir in &plan.executable_dirs {
@@ -3072,7 +3074,11 @@ fn build_outer_exec_files<'a>(
             let canonical = path
                 .canonicalize()
                 .map_err(|source| NonoError::PathCanonicalization { path, source })?;
-            if let Err(err) = add_outer_exec_file_with_deps(&canonical, &mut seen, &mut paths) {
+            if let Err(err) =
+                validate_outer_exec_file_immutable(&canonical, outer_caps).and_then(|()| {
+                    add_outer_exec_file_with_deps(&canonical, outer_caps, &mut seen, &mut paths)
+                })
+            {
                 debug!(
                     "tool-sandbox outer exec gate skipped {}: {}",
                     canonical.display(),
@@ -3101,6 +3107,86 @@ fn controlled_exec_ids(plan: &ResolvedToolSandboxPlan) -> HashSet<FileId> {
 }
 
 fn add_outer_exec_file_with_deps(
+    path: &Path,
+    outer_caps: &CapabilitySet,
+    seen: &mut HashSet<FileId>,
+    paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    // A script needs its shebang interpreter in Landlock's execute allowlist.
+    let Some(header) = read_executable_header(path) else {
+        return add_outer_exec_elf_closure(path, seen, paths);
+    };
+    let shape = classify_executable_shape(path, &header)?;
+    if shape.kind != ResolvedExecutableKind::ShebangScript {
+        return add_outer_exec_elf_closure(path, seen, paths);
+    }
+    let interpreter = shape.interpreter.ok_or_else(|| {
+        NonoError::SandboxInit(format!(
+            "tool-sandbox script {} has no resolved shebang interpreter",
+            path.display()
+        ))
+    })?;
+    let interpreter = trusted_outer_exec_interpreter(&interpreter, outer_caps)?;
+
+    // `env` re-execs its target; grant that file, never a broad PATH.
+    let target = env_shebang_target_interpreter(&interpreter, &shape.interpreter_args)
+        .map(|target| trusted_outer_exec_interpreter(&target, outer_caps))
+        .transpose()?;
+
+    // Avoid partial grants when rejecting a wrapper.
+    add_outer_exec_elf_closure(path, seen, paths)?;
+    add_outer_exec_elf_closure(&interpreter, seen, paths)?;
+    if let Some(target) = target {
+        add_outer_exec_elf_closure(&target, seen, paths)?;
+    }
+    Ok(())
+}
+
+/// Reject mutable interpreters, including targets selected by `env`.
+fn trusted_outer_exec_interpreter(path: &Path, outer_caps: &CapabilitySet) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(NonoError::SandboxInit(format!(
+            "tool-sandbox script interpreter is not absolute: {}",
+            path.display()
+        )));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|source| NonoError::PathCanonicalization {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    validate_outer_exec_file_immutable(&canonical, outer_caps)?;
+    Ok(canonical)
+}
+
+fn validate_outer_exec_file_immutable(path: &Path, outer_caps: &CapabilitySet) -> Result<()> {
+    let metadata = fs::metadata(path).map_err(|source| NonoError::ConfigRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "tool-sandbox outer executable is not an executable file: {}",
+            path.display()
+        )));
+    }
+    reject_group_or_world_writable_path(path, &metadata, "outer executable")?;
+    let parent = path.parent().ok_or_else(|| {
+        NonoError::SandboxInit(format!(
+            "tool-sandbox outer executable has no parent directory: {}",
+            path.display()
+        ))
+    })?;
+    let parent_metadata = fs::metadata(parent).map_err(|source| NonoError::ConfigRead {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    reject_group_or_world_writable_path(parent, &parent_metadata, "outer executable directory")?;
+    validate_controlled_file(path, outer_caps, "outer executable", false)
+}
+
+fn add_outer_exec_elf_closure(
     path: &Path,
     seen: &mut HashSet<FileId>,
     paths: &mut Vec<PathBuf>,
@@ -5338,7 +5424,7 @@ thread_local! {
     /// Memoizes shared-library name resolution, keyed by
     /// `(soname, search_dirs, interpreter_dir)` — the only inputs that
     /// determine the result.
-    static ELF_LIB_CACHE: RefCell<HashMap<(String, Vec<String>, Option<PathBuf>), PathBuf>> =
+    static ELF_LIB_CACHE: RefCell<HashMap<ElfLibCacheKey, PathBuf>> =
         RefCell::new(HashMap::new());
     /// Memoizes `parse_elf` (which reads the whole file) keyed by canonical path,
     /// so each shared object is read+parsed once per pass rather than once per
@@ -5348,6 +5434,8 @@ thread_local! {
     /// `statx` used for closure dedup runs once per file per pass.
     static ELF_FILEID_CACHE: RefCell<HashMap<PathBuf, FileId>> = RefCell::new(HashMap::new());
 }
+
+type ElfLibCacheKey = (String, Vec<String>, Option<PathBuf>);
 
 /// Clears the per-pass ELF-resolution memo caches. Called at the start of each
 /// batch that computes dependency closures so a fresh pass (or a later run in
@@ -7236,6 +7324,149 @@ mod tests {
         let phantom = format!("nono_{}", "a".repeat(64));
         let stdout = nonce_stdout(phantom.clone());
         assert_eq!(stdout, phantom.into_bytes());
+    }
+
+    #[test]
+    fn outer_exec_gate_includes_direct_shebang_interpreter() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let script = tmp.path().join("wrapped-tool");
+        fs::write(&script, b"#!/bin/sh\nprintf wrapped-tool\\n").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: script.clone(),
+                source,
+            }
+        })?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o500)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: script.clone(),
+                source,
+            }
+        })?;
+
+        reset_elf_resolution_cache();
+        let mut seen = HashSet::new();
+        let mut paths = Vec::new();
+        add_outer_exec_file_with_deps(&script, &CapabilitySet::new(), &mut seen, &mut paths)?;
+
+        let script = script
+            .canonicalize()
+            .map_err(|source| NonoError::PathCanonicalization {
+                path: script,
+                source,
+            })?;
+        let shell = Path::new("/bin/sh").canonicalize().map_err(|source| {
+            NonoError::PathCanonicalization {
+                path: PathBuf::from("/bin/sh"),
+                source,
+            }
+        })?;
+        assert!(
+            paths.contains(&script),
+            "outer gate must permit the script itself"
+        );
+        assert!(
+            paths.contains(&shell),
+            "outer gate must permit the script's interpreter: {paths:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outer_exec_gate_includes_env_shebang_reexec_target() -> Result<()> {
+        let env = Path::new("/usr/bin/env");
+        if !env.is_file() {
+            return Ok(());
+        }
+        let Some(target) = env_shebang_target_interpreter(env, &["sh".to_string()]) else {
+            return Ok(());
+        };
+        let tmp = test_tempdir()?;
+        let script = tmp.path().join("env-wrapped-tool");
+        fs::write(&script, b"#!/usr/bin/env sh\nprintf env-wrapped-tool\\n").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: script.clone(),
+                source,
+            }
+        })?;
+
+        reset_elf_resolution_cache();
+        let mut seen = HashSet::new();
+        let mut paths = Vec::new();
+        add_outer_exec_file_with_deps(&script, &CapabilitySet::new(), &mut seen, &mut paths)?;
+
+        let env = env
+            .canonicalize()
+            .map_err(|source| NonoError::PathCanonicalization {
+                path: env.to_path_buf(),
+                source,
+            })?;
+        let target = target
+            .canonicalize()
+            .map_err(|source| NonoError::PathCanonicalization {
+                path: target,
+                source,
+            })?;
+        assert!(paths.contains(&env), "outer gate must permit /usr/bin/env");
+        assert!(
+            paths.contains(&target),
+            "outer gate must permit env's re-exec target: {paths:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outer_exec_gate_rejects_an_env_shebang_target_writable_by_outer_caps() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let interpreter_dir = tmp.path().join("trusted-interpreter-dir");
+        fs::create_dir(&interpreter_dir).map_err(|source| NonoError::ConfigWrite {
+            path: interpreter_dir.clone(),
+            source,
+        })?;
+        fs::set_permissions(&interpreter_dir, fs::Permissions::from_mode(0o700)).map_err(
+            |source| NonoError::ConfigWrite {
+                path: interpreter_dir.clone(),
+                source,
+            },
+        )?;
+        let interpreter = interpreter_dir.join("interpreter");
+        fs::copy("/bin/sh", &interpreter).map_err(|source| NonoError::ConfigWrite {
+            path: interpreter.clone(),
+            source,
+        })?;
+        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o500)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: interpreter.clone(),
+                source,
+            }
+        })?;
+        let script = tmp.path().join("wrapped-tool");
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env -S PATH={} interpreter\nexit 0\n",
+                interpreter_dir.display()
+            ),
+        )
+        .map_err(|source| NonoError::ConfigWrite {
+            path: script.clone(),
+            source,
+        })?;
+
+        let mut outer_caps = CapabilitySet::new();
+        outer_caps.add_fs(FsCapability::new_file(&interpreter, AccessMode::ReadWrite)?);
+        let mut seen = HashSet::new();
+        let mut paths = Vec::new();
+        let err = add_outer_exec_file_with_deps(&script, &outer_caps, &mut seen, &mut paths)
+            .expect_err("an env target mutable to the outer session must not enter the allowlist");
+        assert!(
+            err.to_string().contains("writable by the outer session"),
+            "unexpected rejection: {err}"
+        );
+        assert!(
+            paths.is_empty(),
+            "a rejected wrapper must add no partial grant"
+        );
+        Ok(())
     }
 
     #[test]

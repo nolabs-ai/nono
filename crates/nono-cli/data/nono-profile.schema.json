@@ -2330,6 +2330,22 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Non-filesystem sandbox operation names to hide from diagnostic footers, such as forbidden-exec-sugid."
+        },
+        "redaction": {
+          "$ref": "#/$defs/RedactionConfig",
+          "description": "Extra redaction applied to diagnostic and audit output. Add-only: a profile can widen redaction but cannot stop a secure default from being redacted."
+        }
+      }
+    },
+    "RedactionConfig": {
+      "type": "object",
+      "description": "Profile-supplied additions to the output redaction policy. This is output hygiene, not enforcement: it changes what nono writes, never what the sandboxed process can read.",
+      "additionalProperties": false,
+      "properties": {
+        "extra_env_vars": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Environment variable name patterns whose values are replaced with [REDACTED] in diagnostics and audit records. Same glob syntax as environment.deny_vars (\"DEPLOY_TOKEN\", \"ACME_*\", \"*_SECRET\"), matched case-insensitively against the whole name. Inherited additively through extends."
         }
       }
     },

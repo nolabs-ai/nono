@@ -275,10 +275,22 @@ fn command_policies_allows_immutable_store_shebang_wrapper() {
     fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o500))
         .expect("seal package-specific interpreter");
 
+    let wrapped = store_dir.join(".pi-wrapped");
+    fs::write(
+        &wrapped,
+        format!(
+            "#!{}\nexec /usr/bin/printf 'wrapped ok\\n'\n",
+            interpreter.display()
+        ),
+    )
+    .expect("write wrapped executable");
+    fs::set_permissions(&wrapped, fs::Permissions::from_mode(0o500))
+        .expect("seal wrapped executable");
+
     let wrapper = store_dir.join("pi");
     fs::write(
         &wrapper,
-        format!("#!{}\nprintf 'wrapped ok\\n'\n", interpreter.display()),
+        format!("#!{}\nexec {}\n", interpreter.display(), wrapped.display()),
     )
     .expect("write wrapper");
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o500)).expect("seal wrapper");
@@ -288,7 +300,7 @@ fn command_policies_allows_immutable_store_shebang_wrapper() {
         &format!(
             r#"{{
                 "meta": {{ "name": "cmd-policies-store-wrapper-test" }},
-                "filesystem": {{ "allow": ["{workspace}", "{store_dir}"] }},
+                "filesystem": {{ "allow": ["{workspace}"], "read": ["{store_dir}"] }},
                 "network": {{ "block": true }},
                 "command_policies": {{
                     "commands": {{
@@ -304,7 +316,7 @@ fn command_policies_allows_immutable_store_shebang_wrapper() {
     t.run()
         .profile(&profile)
         .no_rollback()
-        .exec(Argv::new("bash").arg("-c").arg(wrapper.as_os_str()))
+        .exec(Argv::new(wrapper.as_os_str()))
         .assert_success("an immutable package-specific shebang wrapper executes")
         .assert_stdout_contains("wrapped ok");
 }

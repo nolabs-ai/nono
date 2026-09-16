@@ -849,6 +849,7 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: &policy,
+                initial_program: Path::new("/usr/bin/python3"),
                 resolved_command_binaries: None,
                 audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
                     None,

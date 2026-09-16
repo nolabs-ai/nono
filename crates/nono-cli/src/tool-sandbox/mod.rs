@@ -75,6 +75,8 @@ mod url_shim;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) struct ToolSandboxPrepare<'a> {
     pub(crate) config: &'a crate::command_policy::CommandPoliciesConfig,
+    #[cfg(target_os = "linux")]
+    pub(crate) initial_program: &'a std::path::Path,
     /// Command binaries already resolved (canonicalized, stat'd, hashed)
     /// while validating the profile. When present, plan construction reuses
     /// this instead of resolving — and re-hashing — every controlled binary

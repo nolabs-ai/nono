@@ -257,6 +257,7 @@ impl PreparedToolSandboxRuntime {
     pub(crate) fn prepare(input: super::ToolSandboxPrepare<'_>) -> Result<Self> {
         let super::ToolSandboxPrepare {
             config,
+            initial_program,
             resolved_command_binaries,
             audit_context,
             allowed_commands,
@@ -355,6 +356,7 @@ impl PreparedToolSandboxRuntime {
             &plan,
             &shim_source,
             outer_caps,
+            Some(initial_program),
         )?;
         tool_sandbox_profile_log!(
             "prepare:build_outer_exec_files: {:?} ({} paths)",
@@ -3039,17 +3041,52 @@ fn build_outer_exec_files<'a>(
     plan: &ResolvedToolSandboxPlan,
     shim_source: &Path,
     outer_caps: &CapabilitySet,
+    initial_program: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     let controlled_ids = controlled_exec_ids(plan);
     let mut seen = HashSet::new();
+    let mut script_seen = HashSet::new();
     let mut paths = Vec::new();
 
     for shim in shims {
-        add_outer_exec_file_with_deps(&shim.path, outer_caps, &mut seen, &mut paths)?;
+        add_outer_exec_file_with_deps(
+            &shim.path,
+            outer_caps,
+            &mut seen,
+            &mut script_seen,
+            &mut paths,
+        )?;
     }
-    add_outer_exec_file_with_deps(shim_source, outer_caps, &mut seen, &mut paths)?;
+    add_outer_exec_file_with_deps(
+        shim_source,
+        outer_caps,
+        &mut seen,
+        &mut script_seen,
+        &mut paths,
+    )?;
     for path in &plan.allowed_direct_bypasses {
-        add_outer_exec_file_with_deps(path, outer_caps, &mut seen, &mut paths)?;
+        add_outer_exec_file_with_deps(path, outer_caps, &mut seen, &mut script_seen, &mut paths)?;
+    }
+    if let Some(path) = initial_program {
+        let canonical = path
+            .canonicalize()
+            .map_err(|source| NonoError::PathCanonicalization {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let metadata = fs::metadata(&canonical).map_err(|source| NonoError::ConfigRead {
+            path: canonical.clone(),
+            source,
+        })?;
+        if !controlled_ids.contains(&file_id(&metadata)) {
+            add_outer_exec_file_with_deps(
+                &canonical,
+                outer_caps,
+                &mut seen,
+                &mut script_seen,
+                &mut paths,
+            )?;
+        }
     }
 
     for dir in &plan.executable_dirs {
@@ -3076,7 +3113,13 @@ fn build_outer_exec_files<'a>(
                 .map_err(|source| NonoError::PathCanonicalization { path, source })?;
             if let Err(err) =
                 validate_outer_exec_file_immutable(&canonical, outer_caps).and_then(|()| {
-                    add_outer_exec_file_with_deps(&canonical, outer_caps, &mut seen, &mut paths)
+                    add_outer_exec_file_with_deps(
+                        &canonical,
+                        outer_caps,
+                        &mut seen,
+                        &mut script_seen,
+                        &mut paths,
+                    )
                 })
             {
                 debug!(
@@ -3110,6 +3153,7 @@ fn add_outer_exec_file_with_deps(
     path: &Path,
     outer_caps: &CapabilitySet,
     seen: &mut HashSet<FileId>,
+    script_seen: &mut HashSet<FileId>,
     paths: &mut Vec<PathBuf>,
 ) -> Result<()> {
     // A script needs its shebang interpreter in Landlock's execute allowlist.
@@ -3119,6 +3163,14 @@ fn add_outer_exec_file_with_deps(
     let shape = classify_executable_shape(path, &header)?;
     if shape.kind != ResolvedExecutableKind::ShebangScript {
         return add_outer_exec_elf_closure(path, seen, paths);
+    }
+    let metadata = fs::metadata(path).map_err(|source| NonoError::ConfigRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let script_id = file_id(&metadata);
+    if !script_seen.insert(script_id) {
+        return Ok(());
     }
     let interpreter = shape.interpreter.ok_or_else(|| {
         NonoError::SandboxInit(format!(
@@ -3132,6 +3184,9 @@ fn add_outer_exec_file_with_deps(
     let target = env_shebang_target_interpreter(&interpreter, &shape.interpreter_args)
         .map(|target| trusted_outer_exec_interpreter(&target, outer_caps))
         .transpose()?;
+    let wrapper_target = wrapper_exec_target(path)?
+        .map(|target| trusted_outer_exec_interpreter(&target, outer_caps))
+        .transpose()?;
 
     // Avoid partial grants when rejecting a wrapper.
     add_outer_exec_elf_closure(path, seen, paths)?;
@@ -3139,7 +3194,46 @@ fn add_outer_exec_file_with_deps(
     if let Some(target) = target {
         add_outer_exec_elf_closure(&target, seen, paths)?;
     }
+    if let Some(target) = wrapper_target {
+        add_outer_exec_file_with_deps(&target, outer_caps, seen, script_seen, paths)?;
+    }
+    script_seen.remove(&script_id);
     Ok(())
+}
+
+fn wrapper_exec_target(path: &Path) -> Result<Option<PathBuf>> {
+    const MAX_WRAPPER_BYTES: u64 = 64 * 1024;
+    let mut contents = Vec::new();
+    File::open(path)
+        .map_err(|source| NonoError::ConfigRead {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .take(MAX_WRAPPER_BYTES)
+        .read_to_end(&mut contents)
+        .map_err(|source| NonoError::ConfigRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let Ok(contents) = std::str::from_utf8(&contents) else {
+        return Ok(None);
+    };
+    for line in contents.lines().skip(1) {
+        let mut tokens = line.split_whitespace();
+        let Some(first) = tokens.next() else {
+            continue;
+        };
+        if first != "exec" {
+            continue;
+        }
+        for token in tokens {
+            let token = token.trim_matches(|c: char| matches!(c, '\'' | '"' | ';' | '(' | ')'));
+            if token.starts_with('/') {
+                return Ok(Some(PathBuf::from(token)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Reject mutable interpreters, including targets selected by `env`.
@@ -7345,8 +7439,15 @@ mod tests {
 
         reset_elf_resolution_cache();
         let mut seen = HashSet::new();
+        let mut script_seen = HashSet::new();
         let mut paths = Vec::new();
-        add_outer_exec_file_with_deps(&script, &CapabilitySet::new(), &mut seen, &mut paths)?;
+        add_outer_exec_file_with_deps(
+            &script,
+            &CapabilitySet::new(),
+            &mut seen,
+            &mut script_seen,
+            &mut paths,
+        )?;
 
         let script = script
             .canonicalize()
@@ -7391,8 +7492,15 @@ mod tests {
 
         reset_elf_resolution_cache();
         let mut seen = HashSet::new();
+        let mut script_seen = HashSet::new();
         let mut paths = Vec::new();
-        add_outer_exec_file_with_deps(&script, &CapabilitySet::new(), &mut seen, &mut paths)?;
+        add_outer_exec_file_with_deps(
+            &script,
+            &CapabilitySet::new(),
+            &mut seen,
+            &mut script_seen,
+            &mut paths,
+        )?;
 
         let env = env
             .canonicalize()
@@ -7455,9 +7563,16 @@ mod tests {
         let mut outer_caps = CapabilitySet::new();
         outer_caps.add_fs(FsCapability::new_file(&interpreter, AccessMode::ReadWrite)?);
         let mut seen = HashSet::new();
+        let mut script_seen = HashSet::new();
         let mut paths = Vec::new();
-        let err = add_outer_exec_file_with_deps(&script, &outer_caps, &mut seen, &mut paths)
-            .expect_err("an env target mutable to the outer session must not enter the allowlist");
+        let err = add_outer_exec_file_with_deps(
+            &script,
+            &outer_caps,
+            &mut seen,
+            &mut script_seen,
+            &mut paths,
+        )
+        .expect_err("an env target mutable to the outer session must not enter the allowlist");
         assert!(
             err.to_string().contains("writable by the outer session"),
             "unexpected rejection: {err}"

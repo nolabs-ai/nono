@@ -1,5 +1,81 @@
 # Changelog
 
+## [0.78.0] - 2026-09-16
+
+### Security Advisories
+
+- [GHSA-6542-g6qc-gj95](https://github.com/nolabs-ai/nono/security/advisories/GHSA-6542-g6qc-gj95)
+- [GHSA-7cwr-ghvv-24jf](https://github.com/nolabs-ai/nono/security/advisories/GHSA-7cwr-ghvv-24jf)
+- [GHSA-222m-44fg-jx8g](https://github.com/nolabs-ai/nono/security/advisories/GHSA-222m-44fg-jx8g)
+- [GHSA-8r33-hr9m-69wh](https://github.com/nolabs-ai/nono/security/advisories/GHSA-8r33-hr9m-69wh)
+- [GHSA-wjv5-93q3-xm73](https://github.com/nolabs-ai/nono/security/advisories/GHSA-wjv5-93q3-xm73)
+
+### Bug Fixes
+
+- *(tool-sandbox)* Fall back to the interpreter's directory for RPATH-less ELF dependencies (#1650) ([#1650](https://github.com/nolabs-ai/nono/pull/1650))
+
+- *(proxy)* Preserve query string on jwt-bearer token_url (#1913) ([#1913](https://github.com/nolabs-ai/nono/pull/1913))
+
+- *(cli)* Pass through AF_UNIX traffic in proxy-only mode (#1902) ([#1902](https://github.com/nolabs-ai/nono/pull/1902))
+
+- *(why)* Tolerate volatile process-relative aliases in --self reload (#1873) ([#1873](https://github.com/nolabs-ai/nono/pull/1873))
+
+- *(cli)* Stop save-prompt failures from overriding the child exit code (#1804) ([#1804](https://github.com/nolabs-ai/nono/pull/1804))
+
+- *(cli)* Harden calculate_dir_size against silent errors and symlink cycles (#1862) ([#1862](https://github.com/nolabs-ai/nono/pull/1862))
+
+- *(cli)* Reject . and .. in pack namespace and name (#1896) ([#1896](https://github.com/nolabs-ai/nono/pull/1896))
+
+- *(proxy)* Fail closed when upstream DNS returns no addresses (#1894) ([#1894](https://github.com/nolabs-ai/nono/pull/1894))
+
+
+### Build
+
+- Update rustls and chacha20 (#1915) ([#1915](https://github.com/nolabs-ai/nono/pull/1915))
+
+
+### CI/CD
+
+- Add release runbook and preflight checks (#1914) ([#1914](https://github.com/nolabs-ai/nono/pull/1914))
+
+
+### Dependencies
+
+- *(deps)* Bump landlock from 0.4.5 to 0.4.7 (#1910) ([#1910](https://github.com/nolabs-ai/nono/pull/1910))
+
+- *(deps)* Bump ureq from 3.4.0 to 3.4.1 (#1905) ([#1905](https://github.com/nolabs-ai/nono/pull/1905))
+
+- *(deps)* Bump jsonschema from 0.48.0 to 0.56.0 (#1908) ([#1908](https://github.com/nolabs-ai/nono/pull/1908))
+
+- *(deps)* Bump aws-config from 1.10.1 to 1.12.0 (#1909) ([#1909](https://github.com/nolabs-ai/nono/pull/1909))
+
+- *(deps)* Bump aws-lc-rs from 1.18.0 to 1.18.1 (#1907) ([#1907](https://github.com/nolabs-ai/nono/pull/1907))
+
+- *(deps)* Bump DeterminateSystems/magic-nix-cache-action (#1906) ([#1906](https://github.com/nolabs-ai/nono/pull/1906))
+
+- *(deps)* Bump DeterminateSystems/nix-installer-action from 22 to 23 (#1904) ([#1904](https://github.com/nolabs-ai/nono/pull/1904))
+
+
+### Features
+
+- *(nix)* Add #prebuilt output for release tarball installs (#1823) ([#1823](https://github.com/nolabs-ai/nono/pull/1823))
+
+- *(cleanup)* Remove remaining deprecated surfaces (#1871) ([#1871](https://github.com/nolabs-ai/nono/pull/1871))
+
+- *(cli)* Backend-signed approval webhooks with submit-and-poll (#1879) ([#1879](https://github.com/nolabs-ai/nono/pull/1879))
+
+- *(macos)* Allow opting out of implicit DNS grants (#1876) ([#1876](https://github.com/nolabs-ai/nono/pull/1876))
+
+
+### Miscellaneous
+
+- Refresh maintainer guidance and remove stale references (#1922) ([#1922](https://github.com/nolabs-ai/nono/pull/1922))
+
+
+### Testing
+
+- Isolate integration suite XDG state (#1911) ([#1911](https://github.com/nolabs-ai/nono/pull/1911))
+
 ## [0.77.0] - 2026-09-11
 
 ### Bug Fixes

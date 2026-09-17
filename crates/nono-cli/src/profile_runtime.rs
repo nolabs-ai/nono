@@ -44,7 +44,6 @@ pub(crate) struct PreparedProfile {
     pub(crate) allow_launch_services: bool,
     pub(crate) allow_gpu: bool,
     pub(crate) allow_parent_of_protected: bool,
-    pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
@@ -414,52 +413,6 @@ fn validate_bundle_relative_path<'a>(
         }
     }
     Ok(path)
-}
-
-fn expand_bypass_protection_path(path: &Path, workdir: &Path) -> PathBuf {
-    let path_str = path.to_string_lossy();
-    let expanded = profile::expand_vars(&path_str, workdir).unwrap_or_else(|_| path.to_path_buf());
-    if expanded.exists() {
-        expanded.canonicalize().unwrap_or(expanded)
-    } else {
-        expanded
-    }
-}
-
-fn collect_bypass_protection_paths(
-    loaded_profile: Option<&profile::Profile>,
-    cli_bypass_protection: &[PathBuf],
-    workdir: &Path,
-) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = loaded_profile
-        .map(|profile| {
-            profile
-                .filesystem
-                .bypass_protection
-                .iter()
-                .filter_map(|template| {
-                    profile::expand_vars(template, workdir)
-                        .ok()
-                        .map(|expanded| {
-                            if expanded.exists() {
-                                expanded.canonicalize().unwrap_or(expanded)
-                            } else {
-                                expanded
-                            }
-                        })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    for path in cli_bypass_protection {
-        let canonical = expand_bypass_protection_path(path, workdir);
-        if !paths.contains(&canonical) {
-            paths.push(canonical);
-        }
-    }
-
-    paths
 }
 
 fn expand_ignored_denial_path(path: &Path, workdir: &Path) -> PathBuf {
@@ -963,11 +916,6 @@ fn prepare_profile_with_options(
             .as_ref()
             .and_then(|profile| profile.allow_parent_of_protected)
             .unwrap_or(false),
-        bypass_protection_paths: collect_bypass_protection_paths(
-            loaded_profile.as_ref(),
-            &args.bypass_protection,
-            workdir,
-        ),
         ignored_denial_paths: collect_ignored_denial_paths(
             loaded_profile.as_ref(),
             &args.suppress_save_prompt,
@@ -1896,10 +1844,6 @@ echo hi
             preflight.allow_launch_services
         );
         assert_eq!(runtime.allow_gpu, preflight.allow_gpu);
-        assert_eq!(
-            runtime.bypass_protection_paths,
-            preflight.bypass_protection_paths
-        );
         assert_eq!(runtime.ignored_denial_paths, preflight.ignored_denial_paths);
         assert!(
             runtime

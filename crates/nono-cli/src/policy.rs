@@ -1219,6 +1219,12 @@ impl EffectiveDenyPolicy {
         }
     }
 
+    /// The bypass paths, in both their given and their resolved forms.
+    #[must_use]
+    pub fn bypass_paths(&self) -> &[PathBuf] {
+        &self.bypass_paths
+    }
+
     /// Whether `path` sits under a deny rule that no bypass reopens.
     #[must_use]
     pub fn is_effectively_denied(&self, path: &Path) -> bool {

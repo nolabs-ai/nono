@@ -1583,7 +1583,6 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allow_launch_services: profile_allow_launch_services,
         allow_gpu: profile_allow_gpu,
         allow_parent_of_protected: profile_allow_parent_of_protected,
-        bypass_protection_paths,
         ignored_denial_paths,
         suppressed_system_service_operations,
         allowed_env_vars: profile_allowed_env_vars,
@@ -1703,6 +1702,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     // User grants silently blocked by deny groups (macOS); folded into the
     // capability summary instead of emitting one warning per path.
     let blocked_grants = prepared.blocked_grants;
+    // SECURITY: the bypasses `apply_deny_overrides` actually applied, not the
+    // profile's raw list — a bypass naming a path absent from this host is
+    // dropped there, and must not reappear as authority downstream.
+    let bypass_protection_paths = prepared.applied_bypass_paths;
 
     // Apply raw Seatbelt rules from the profile (macOS only).
     #[cfg(target_os = "macos")]

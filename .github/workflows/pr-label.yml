@@ -4,10 +4,10 @@ on:
   pull_request_target:
     types: [opened, edited]
 
-# Label changes and PR metadata reads do not need PR creation/review authority.
+# Labels on pull requests are mutated through GitHub's PullRequest GraphQL
+# resource, even when accessed with `gh issue edit`.
 permissions:
-  issues: write
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   label:

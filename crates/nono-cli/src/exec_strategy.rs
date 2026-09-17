@@ -780,6 +780,29 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _keep_browser_shim_alive = browser_shim;
 
+    // Resolve the keepalive tree to stable descriptors before the child can
+    // execute. This does not spawn a thread; the timer starts in the parent
+    // arm after fork().
+    let prepared_temp_keepalive = {
+        let mut keepalive_paths: Vec<PathBuf> = Vec::new();
+        if config.cap_file != Path::new("/dev/null") {
+            keepalive_paths.push(config.cap_file.to_path_buf());
+        }
+        if let Some((_, dir)) = url_listener.as_ref() {
+            keepalive_paths.push(dir.path().to_path_buf());
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(shim) = _keep_browser_shim_alive.as_ref() {
+            keepalive_paths.push(shim.dir.path().to_path_buf());
+        }
+        if let Some(runtime) = config.tool_sandbox_runtime
+            && let Some(dir) = runtime.runtime_dir()
+        {
+            keepalive_paths.push(dir.to_path_buf());
+        }
+        crate::temp_keepalive::TempKeepalive::prepare(keepalive_paths)
+    };
+
     // Diagnostic-only: stamp the parent's CLOCK_MONOTONIC nanos into the child's
     // env when TOOL_SANDBOX_PROFILE_HOTPATH is active. The shim reads it at run_shim() entry
     // to measure shim Rust-runtime startup (execve + linker + Rust init).
@@ -1458,6 +1481,11 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             };
 
             let mut killed_by_timeout = false;
+
+            // Start the timer only in the parent after fork(), then stop and
+            // join it before the session's temp artifacts are torn down.
+            let _temp_keepalive = prepared_temp_keepalive.start();
+
             let (status, denials, ipc_denials, url_denials) =
                 if let (Some(sup_cfg), Some(mut sup_sock)) = (supervisor, supervisor_sock) {
                     #[cfg(target_os = "linux")]

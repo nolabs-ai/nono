@@ -98,7 +98,7 @@ shlex = "2"
 jsonc-parser = { version = "0.33", features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { workspace = true, features = ["process", "signal", "fs", "user", "term"] }
+nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }
 landlock.workspace = true
 dns-lookup = "2"
 # Pure-Rust Secret Service backend (zbus) — no libdbus link. Keep in sync with
@@ -106,7 +106,7 @@ dns-lookup = "2"
 keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"], optional = true, default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nix = { workspace = true, features = ["process", "signal", "fs", "user", "term"] }
+nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }
 dns-lookup = "2"
 keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
 security-framework = "3"

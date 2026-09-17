@@ -14,6 +14,10 @@ impl PreparedToolSandboxRuntime {
     }
 
     pub(crate) fn cleanup_runtime_dir(&self) {}
+
+    pub(crate) fn runtime_dir(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

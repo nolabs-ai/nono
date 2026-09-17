@@ -76,6 +76,7 @@ mod startup_prompt;
 mod startup_runtime;
 mod state_paths;
 mod supervised_runtime;
+mod temp_keepalive;
 mod terminal_approval;
 mod terminal_prompt;
 mod theme;

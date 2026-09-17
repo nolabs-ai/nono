@@ -18,15 +18,12 @@ pub(crate) fn prepare_launcher_command(spec_path: &Path) -> Result<Command> {
         .env(TOOL_SANDBOX_LAUNCH_SPEC_ENV, spec_path);
     // Forward HOME to the launcher process (NOT the sandboxed child — the child
     // is execve'd with the filtered `spec.env`, so this HOME never reaches it).
-    // SECURITY-CRITICAL: the launcher is what calls `Sandbox::apply`, and the
-    // library's macOS profile generation reads HOME to recognize user keychain
-    // DBs (`$HOME/Library/Keychains/{login,metadata}.keychain-db`) via
-    // `has_explicit_keychain_db_access`. That check decides whether to skip the
-    // securityd/secd/keychaind mach-lookup denies. With HOME cleared the user
-    // keychains go unrecognized, the mach denies stay in, and keychain access
-    // over Mach IPC is blocked even when the DB files are explicitly granted —
-    // breaking parity with the directly-launched (supervisor) path, which always
-    // has HOME set. See has_explicit_keychain_db_access in nono/src/sandbox/macos.rs.
+    // The launcher is what calls `Sandbox::apply`, so the profile it generates
+    // is built in an environment that must match the runtime's. Keychain
+    // authorization itself no longer depends on this: the mach-lookup allows are
+    // decided in the runtime by `apply_macos_keychain_db_exception` (grant plus
+    // a matching bypass_protection) and travel to the launcher as platform rules
+    // in the launch spec.
     if let Some(value) = std::env::var_os("HOME") {
         command.env("HOME", value);
     }

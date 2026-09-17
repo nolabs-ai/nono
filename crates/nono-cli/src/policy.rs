@@ -1189,7 +1189,10 @@ pub(crate) fn add_deny_access_rules(
 /// leaves a broader parent deny standing when only a child was bypassed, so the
 /// surviving deny list read alone reports a bypassed path as denied while the
 /// sandbox allows it.
-#[derive(Debug, Clone, Default)]
+// No `Default`: an empty policy answers "not denied" for every path, which
+// authorizes every keychain grant. Construct with `new` so the absence of denies
+// is something a caller stated.
+#[derive(Debug, Clone)]
 pub struct EffectiveDenyPolicy {
     deny_paths: Vec<PathBuf>,
     bypass_paths: Vec<PathBuf>,

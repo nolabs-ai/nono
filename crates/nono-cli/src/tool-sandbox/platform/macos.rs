@@ -163,6 +163,10 @@ struct ToolSandboxState {
     /// Agent's resolved filesystem deny paths; a command's live cwd under any of
     /// these is rejected (the agent's broad allow may otherwise cover them).
     deny_paths: Vec<PathBuf>,
+    /// The agent's deny paths paired with the bypass_protection paths that lift
+    /// them. A command policy's own keychain grant is authorized against this,
+    /// so a mediated command can never exceed the agent's keychain authority.
+    deny_policy: crate::policy::EffectiveDenyPolicy,
     plan: ResolvedToolSandboxPlan,
     shims_by_command: BTreeMap<String, ShimIdentity>,
     shims_by_path: BTreeMap<PathBuf, String>,
@@ -267,6 +271,7 @@ impl PreparedToolSandboxRuntime {
             blocked_commands,
             outer_caps,
             deny_paths,
+            bypass_protection_paths,
             policy_root,
             proxy_credential_env_vars,
             proxy_trust_bundle_paths,
@@ -342,6 +347,10 @@ impl PreparedToolSandboxRuntime {
                 policy_root: policy_root.to_path_buf(),
                 outer_caps: outer_caps.clone(),
                 deny_paths: deny_paths.to_vec(),
+                deny_policy: crate::policy::EffectiveDenyPolicy::new(
+                    deny_paths,
+                    bypass_protection_paths,
+                ),
                 plan,
                 shims_by_command,
                 shims_by_path,
@@ -3137,15 +3146,12 @@ fn build_child_caps(
     )?;
     // When the command was granted a keychain DB file (e.g. login.keychain-db),
     // reuse the main-path keychain mechanism: add the WAL/SHM/`.fl`/`user.kb`
-    // sibling-file exceptions the Security framework touches.
-    // SECURITY: authorized against the agent's deny paths with no bypass, so a
-    // command policy can only reach a keychain the agent was never denied. The
-    // bypasses the agent applied are not threaded here yet, which leaves this
-    // path strictly more restrictive than the agent's own.
-    crate::policy::apply_macos_keychain_db_exception(
-        &mut caps,
-        &crate::policy::EffectiveDenyPolicy::new(&state.deny_paths, &[]),
-    );
+    // sibling-file exceptions the Security framework touches, plus the keychain
+    // mach-lookup allows that override the library's unconditional denies.
+    // SECURITY: authorized against the *agent's* deny/bypass policy, so a
+    // command policy granting login.keychain-db cannot reach a keychain the
+    // outer sandbox is denied. No-op without an authorized keychain DB grant.
+    crate::policy::apply_macos_keychain_db_exception(&mut caps, &state.deny_policy);
     add_policy_network(&mut caps, policy)?;
     add_policy_proxy_network(&mut caps, state, request, policy)?;
     add_proxy_trust_bundle_caps(&mut caps, state, policy)?;
@@ -5607,6 +5613,7 @@ mod tests {
             policy_root: PathBuf::from("/tmp"),
             outer_caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
+            deny_policy: crate::policy::EffectiveDenyPolicy::new(&[], &[]),
             plan: ResolvedToolSandboxPlan {
                 config: CommandPoliciesConfig::default(),
                 resolved: ResolvedCommandBinaries {
@@ -9106,5 +9113,92 @@ mod tests {
         let (argv, env) = parse_procargs2(&buf).expect("buffer is well-formed enough to parse");
         assert_eq!(argv, vec!["one".to_string(), "two".to_string()]);
         assert!(env.is_empty());
+    }
+
+    /// Reproduces the keychain step of `build_child_caps`: a command policy's
+    /// keychain grant, authorized against the agent's own deny/bypass policy.
+    fn child_keychain_rules(state: &ToolSandboxState, grant: nono::FsCapability) -> String {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(grant);
+        crate::policy::apply_macos_keychain_db_exception(&mut caps, &state.deny_policy);
+        caps.platform_rules().join("\n")
+    }
+
+    #[test]
+    fn command_policy_keychain_grant_cannot_bypass_outer_deny() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut state = test_state();
+        state.deny_policy =
+            crate::policy::EffectiveDenyPolicy::new(&fixture.keychain_denies(), &[]);
+
+        let rules = child_keychain_rules(
+            &state,
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                nono::CapabilitySource::User,
+            ),
+        );
+
+        assert!(
+            rules.is_empty(),
+            "a command policy must not reach a keychain the agent is denied, got: {rules}"
+        );
+    }
+
+    #[test]
+    fn command_policy_keychain_grant_with_outer_bypass_grants_only_requested_access() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut state = test_state();
+        state.deny_policy = crate::policy::EffectiveDenyPolicy::new(
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.login_db),
+        );
+
+        let rules = child_keychain_rules(
+            &state,
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                nono::CapabilitySource::User,
+            ),
+        );
+
+        assert!(
+            rules.contains("file-read-data"),
+            "expected the bypassed read grant to be honored, got: {rules}"
+        );
+        assert!(
+            rules.contains("(allow mach-lookup (global-name \"com.apple.securityd\"))"),
+            "expected the keychain mach services to be unlocked, got: {rules}"
+        );
+        assert!(
+            !rules.contains("file-write"),
+            "a read grant must not gain write access, got: {rules}"
+        );
+    }
+
+    #[test]
+    fn command_policy_keychain_grant_with_unrelated_outer_bypass_is_ineffective() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut state = test_state();
+        state.deny_policy = crate::policy::EffectiveDenyPolicy::new(
+            &fixture.keychain_denies(),
+            &[fixture.home.join("Documents")],
+        );
+
+        let rules = child_keychain_rules(
+            &state,
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                nono::CapabilitySource::User,
+            ),
+        );
+
+        assert!(
+            rules.is_empty(),
+            "an unrelated outer bypass must not authorize the keychain, got: {rules}"
+        );
     }
 }

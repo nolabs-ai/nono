@@ -4,13 +4,14 @@ use crate::command_policy::{
     CommandFromConfig, CommandPoliciesConfig, CommandSandboxConfig, InvocationPolicyConfig,
 };
 use crate::query_ext::ScopeQuery;
-use crate::{network_policy, policy, profile, query_ext, sandbox_state};
+use crate::{network_policy, policy, profile, profile_runtime, query_ext, sandbox_state};
 use nono::{AccessMode, CapabilitySet, NonoError, Result};
 
 struct WhyContext {
     caps: CapabilitySet,
-    deny_paths: Vec<std::path::PathBuf>,
-    overridden_paths: Vec<std::path::PathBuf>,
+    /// Answers "is this path still denied?" exactly as `nono run` does, so a
+    /// bypassed deny is not reported as blocking a path the sandbox allows.
+    deny_policy: policy::EffectiveDenyPolicy,
     allowed_domains: Vec<String>,
     denied_domains: Vec<String>,
     domain_endpoints: Vec<sandbox_state::DomainEndpointState>,
@@ -143,12 +144,13 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
     let ctx: WhyContext = if args.self_query {
         match sandbox_state {
             Some(state) => {
-                let paths = state.bypass_protection_as_paths();
                 let domain_endpoints = state.domain_endpoints.clone();
                 WhyContext {
                     caps: state.to_caps()?,
-                    deny_paths: state.deny_paths_as_paths(),
-                    overridden_paths: paths,
+                    deny_policy: policy::EffectiveDenyPolicy::new(
+                        &state.deny_paths_as_paths(),
+                        &state.bypass_protection_as_paths(),
+                    ),
                     allowed_domains: state.allowed_domains.clone(),
                     denied_domains: state.denied_domains.clone(),
                     domain_endpoints,
@@ -190,17 +192,8 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             ..SandboxArgs::default()
         };
 
-        let mut override_paths = Vec::new();
-        for tmpl in &profile.filesystem.bypass_protection {
-            let expanded = profile::expand_vars(tmpl, &workdir)?;
-            if expanded.exists() {
-                if let Ok(canonical) = expanded.canonicalize() {
-                    override_paths.push(canonical);
-                }
-            } else {
-                override_paths.push(expanded);
-            }
-        }
+        let override_paths =
+            profile_runtime::collect_bypass_protection_paths(Some(&profile), &[], &workdir);
 
         let allowed_domains =
             merge_cli_allow_domains(resolve_allowed_domains(&profile)?, &args.allow_proxy)?;
@@ -216,8 +209,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         }
         WhyContext {
             caps,
-            deny_paths: prepared.deny_paths,
-            overridden_paths: override_paths,
+            deny_policy: policy::EffectiveDenyPolicy::new(&prepared.deny_paths, &override_paths),
             allowed_domains,
             denied_domains,
             domain_endpoints,
@@ -243,8 +235,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         }
         WhyContext {
             caps,
-            deny_paths: prepared.deny_paths,
-            overridden_paths: vec![],
+            deny_policy: policy::EffectiveDenyPolicy::new(&prepared.deny_paths, &[]),
             allowed_domains: merge_cli_allow_domains(Vec::new(), &args.allow_proxy)?,
             denied_domains: merge_cli_deny_domains(Vec::new(), &args.deny_proxy)?,
             domain_endpoints: vec![],
@@ -266,7 +257,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             Some(WhyOp::ReadWrite) => AccessMode::ReadWrite,
             None => AccessMode::Read,
         };
-        let result = match matching_deny_path(path, &ctx.deny_paths) {
+        let result = match ctx.deny_policy.matching_deny(path) {
             Some(deny_path) => QueryResult::Denied {
                 reason: "filesystem_deny".to_string(),
                 details: Some(format!(
@@ -278,14 +269,14 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
                 suggested_flag: None,
                 endpoint_rules: None,
             },
-            None => query_path(path, op, &ctx.caps, &ctx.overridden_paths)?,
+            None => query_path(path, op, &ctx.caps, ctx.deny_policy.bypass_paths())?,
         };
         apply_file_grant_staleness(
             result,
             path,
             op,
             &ctx.caps,
-            &ctx.overridden_paths,
+            ctx.deny_policy.bypass_paths(),
             &stale_file_grants,
         )?
     } else if let Some(ref host) = args.host {
@@ -314,26 +305,6 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Return the most specific deny path that covers a query path.
-///
-/// Deny paths are retained separately from allow capabilities because macOS
-/// Seatbelt deny rules take precedence over a broader allow rule. Resolve the
-/// query through existing ancestors so missing leaf paths (the common
-/// create-file case) compare the same way as the rules installed at launch.
-fn matching_deny_path<'a>(
-    path: &std::path::Path,
-    deny_paths: &'a [std::path::PathBuf],
-) -> Option<&'a std::path::PathBuf> {
-    let resolved = nono::try_canonicalize(path);
-    deny_paths
-        .iter()
-        .filter(|deny| {
-            let resolved_deny = nono::try_canonicalize(deny);
-            resolved.starts_with(&resolved_deny)
-        })
-        .max_by_key(|deny| deny.as_os_str().len())
 }
 
 /// A file-level grant whose Landlock rule no longer matches the file at the
@@ -791,10 +762,32 @@ mod tests {
         let denied = dir.path().join("blocked");
         let query = denied.join("future.txt");
 
-        assert_eq!(
-            matching_deny_path(&query, std::slice::from_ref(&denied)),
-            Some(&denied)
-        );
+        let policy = policy::EffectiveDenyPolicy::new(std::slice::from_ref(&denied), &[]);
+
+        assert_eq!(policy.matching_deny(&query), Some(&denied));
+    }
+
+    /// `nono why --profile` must expand bypass_protection through the same
+    /// collector `nono run` uses; a form only one of them produces makes why
+    /// report a path as denied that the sandbox actually allows.
+    #[test]
+    fn profile_bypass_reopens_deny_for_path_query() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let denied = dir.path().join("blocked");
+        std::fs::create_dir_all(&denied).expect("mkdir");
+        let bypassed = denied.join("secret");
+        std::fs::write(&bypassed, b"x").expect("write");
+
+        let profile = profile_from_json(&format!(
+            r#"{{"filesystem":{{"bypass_protection":["{}"]}}}}"#,
+            bypassed.display()
+        ));
+        let bypasses =
+            profile_runtime::collect_bypass_protection_paths(Some(&profile), &[], dir.path());
+        let policy = policy::EffectiveDenyPolicy::new(std::slice::from_ref(&denied), &bypasses);
+
+        assert!(policy.matching_deny(&bypassed).is_none());
+        assert_eq!(policy.matching_deny(&denied.join("other")), Some(&denied));
     }
 
     #[test]
@@ -878,7 +871,9 @@ mod tests {
         let denied = dir.path().join("blocked");
         let sibling = dir.path().join("blocked-backup");
 
-        assert!(matching_deny_path(&sibling, &[denied]).is_none());
+        let policy = policy::EffectiveDenyPolicy::new(&[denied], &[]);
+
+        assert!(policy.matching_deny(&sibling).is_none());
     }
 
     fn gh_policy() -> CommandPoliciesConfig {

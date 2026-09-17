@@ -1231,6 +1231,14 @@ impl EffectiveDenyPolicy {
         }
     }
 
+    /// The bypass paths in both forms, for the consumers that must additionally
+    /// answer "is this path exempt?" against policy that is not a deny path
+    /// (`query_ext::query_path`'s sensitive-path groups).
+    #[must_use]
+    pub fn bypass_paths(&self) -> &[PathBuf] {
+        &self.bypass_paths
+    }
+
     /// Whether `path` sits under a deny rule that no bypass reopens.
     #[must_use]
     pub fn is_effectively_denied(&self, path: &Path) -> bool {

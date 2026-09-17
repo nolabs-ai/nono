@@ -421,7 +421,12 @@ fn expand_bypass_protection_path(path: &Path, workdir: &Path) -> PathBuf {
     }
 }
 
-fn collect_bypass_protection_paths(
+/// Expand every `filesystem.bypass_protection` entry into the forms a later
+/// path comparison can meet it in.
+///
+/// Shared with `nono why` so both answer from the same list: a bypass expanded
+/// differently there reports a path as denied that `nono run` allows.
+pub(crate) fn collect_bypass_protection_paths(
     loaded_profile: Option<&profile::Profile>,
     cli_bypass_protection: &[PathBuf],
     workdir: &Path,

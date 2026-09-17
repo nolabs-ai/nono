@@ -271,6 +271,9 @@ impl PreparedToolSandboxRuntime {
             blocked_commands,
             outer_caps,
             deny_paths,
+            // macOS-only: Landlock has no deny-within-allow, so a Linux child
+            // sandbox has no deny for a bypass to lift.
+            bypass_protection_paths: _,
             policy_root,
             proxy_credential_env_vars,
             proxy_trust_bundle_paths,

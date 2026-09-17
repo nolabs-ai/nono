@@ -1180,7 +1180,7 @@ pub(crate) fn add_deny_access_rules(
 /// deny; only a bypass covering the same path does. The surviving deny list
 /// read without these bypasses reports a bypassed path as denied while the
 /// sandbox allows it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EffectiveDenyPolicy {
     deny_paths: Vec<PathBuf>,
     bypass_paths: Vec<PathBuf>,

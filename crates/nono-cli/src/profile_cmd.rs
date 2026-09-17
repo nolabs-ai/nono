@@ -975,6 +975,27 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         );
     }
 
+    // Session lifecycle hooks. These are merged through `extends`, so show
+    // the resolved before/after values rather than the profile's raw input.
+    if profile.session_hooks.before.is_some() || profile.session_hooks.after.is_some() {
+        println!();
+        println!("  {}", theme::fg("Session hooks:", t.subtext).bold());
+        for (name, hook) in [
+            ("before", profile.session_hooks.before.as_ref()),
+            ("after", profile.session_hooks.after.as_ref()),
+        ] {
+            if let Some(hook) = hook {
+                println!(
+                    "    {}: {}{}",
+                    theme::fg(name, t.subtext),
+                    theme::fg(&hook.script.display().to_string(), t.text),
+                    hook.timeout_secs
+                        .map_or_else(String::new, |timeout| { format!(" (timeout: {timeout}s)") })
+                );
+            }
+        }
+    }
+
     // Filesystem
     let fs = &profile.filesystem;
     let has_fs = !fs.allow.is_empty()
@@ -1356,6 +1377,10 @@ fn profile_to_json(
             })
             .collect();
         val["hooks"] = serde_json::Value::Object(hooks);
+    }
+
+    if profile.session_hooks.before.is_some() || profile.session_hooks.after.is_some() {
+        val["session_hooks"] = serde_json::json!(profile.session_hooks);
     }
 
     // Open URLs

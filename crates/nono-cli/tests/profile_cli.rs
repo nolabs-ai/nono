@@ -574,3 +574,92 @@ fn test_show_profile_includes_merged_command_policies() {
         "JSON should include merged command_policies.commands keys, got: {val}"
     );
 }
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn test_show_profile_includes_resolved_session_hooks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("base.json"),
+        r#"{
+            "meta": { "name": "base" },
+            "session_hooks": {
+                "before": { "script": "/base/before.sh", "timeout_secs": 10 },
+                "after": { "script": "/base/after.sh" }
+            }
+        }"#,
+    )
+    .expect("write base");
+
+    let child_path = dir.path().join("child.json");
+    std::fs::write(
+        &child_path,
+        r#"{
+            "extends": "base",
+            "meta": { "name": "child" },
+            "session_hooks": {
+                "before": { "script": "/child/before.sh", "timeout_secs": 15 }
+            }
+        }"#,
+    )
+    .expect("write child");
+
+    let child = child_path.to_str().expect("path");
+    let human = nono_bin()
+        .args(["profile", "show", child])
+        .output()
+        .expect("failed to run nono profile show");
+    assert!(
+        human.status.success(),
+        "expected exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human_out = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_out.contains("Session hooks:"),
+        "expected Session hooks section, got:\n{human_out}"
+    );
+    assert!(
+        human_out.contains("before: /child/before.sh"),
+        "expected child before hook, got:\n{human_out}"
+    );
+    assert!(
+        human_out.contains("timeout: 15s"),
+        "expected child before timeout, got:\n{human_out}"
+    );
+    assert!(
+        human_out.contains("after: /base/after.sh"),
+        "expected inherited after hook, got:\n{human_out}"
+    );
+
+    let json = nono_bin()
+        .args(["profile", "show", child, "--json"])
+        .output()
+        .expect("failed to run nono profile show --json");
+    assert!(
+        json.status.success(),
+        "expected exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let json_out = String::from_utf8_lossy(&json.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&json_out).expect("expected valid JSON output");
+    assert_eq!(
+        value["session_hooks"]["before"]["script"], "/child/before.sh",
+        "JSON should include child-overridden before hook"
+    );
+    assert_eq!(
+        value["session_hooks"]["before"]["timeout_secs"], 15,
+        "JSON should include configured timeout"
+    );
+    assert_eq!(
+        value["session_hooks"]["after"]["script"], "/base/after.sh",
+        "JSON should include inherited after hook"
+    );
+    assert!(
+        value["session_hooks"]["after"]
+            .get("timeout_secs")
+            .is_none(),
+        "unset timeout must remain absent from JSON"
+    );
+}

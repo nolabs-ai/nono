@@ -103,7 +103,7 @@ pub(crate) struct ToolSandboxPrepare<'a> {
     /// sandbox was refused. Landlock has no deny-within-allow, so a Linux
     /// child sandbox has no deny for a bypass to lift.
     #[cfg(target_os = "macos")]
-    pub(crate) bypass_protection_paths: &'a [std::path::PathBuf],
+    pub(crate) bypass_protection_paths: &'a [crate::policy::AppliedBypass],
     pub(crate) policy_root: &'a std::path::Path,
     pub(crate) proxy_credentials: &'a std::collections::BTreeSet<String>,
     pub(crate) reserved_proxy_ports: &'a std::collections::BTreeSet<u16>,

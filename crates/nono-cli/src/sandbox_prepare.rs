@@ -555,7 +555,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) proc_comm_notify: bool,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
-    pub(crate) bypass_protection_paths: Vec<PathBuf>,
+    pub(crate) bypass_protection_paths: Vec<crate::policy::AppliedBypass>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
     /// `diagnostics.redaction.extra_env_vars` from the profile: extra
@@ -1597,7 +1597,6 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allow_launch_services: profile_allow_launch_services,
         allow_gpu: profile_allow_gpu,
         allow_parent_of_protected: profile_allow_parent_of_protected,
-        bypass_protection_paths,
         ignored_denial_paths,
         suppressed_system_service_operations,
         redaction_extra_env_vars,
@@ -1719,6 +1718,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     // User grants silently blocked by deny groups (macOS); folded into the
     // capability summary instead of emitting one warning per path.
     let blocked_grants = prepared.blocked_grants;
+    // SECURITY: the bypasses `apply_deny_overrides` actually applied, with
+    // their access modes, not the profile's raw list. A bypass naming a path
+    // absent from this host is dropped and must not reappear as authority.
+    let bypass_protection_paths = prepared.applied_bypass_paths;
 
     // Apply raw Seatbelt rules from the profile (macOS only).
     #[cfg(target_os = "macos")]

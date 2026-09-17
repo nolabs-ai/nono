@@ -562,6 +562,15 @@ pub struct PreparedCaps {
     /// with the deny group that blocks each. Surfaced as a single folded line
     /// in the capability summary; `(path, Some(group_name))`.
     pub blocked_grants: Vec<(PathBuf, Option<String>)>,
+    /// The `filesystem.bypass_protection` entries `apply_deny_overrides`
+    /// actually applied, with their path forms and access modes.
+    ///
+    /// SECURITY: this is the authoritative bypass list. Entries that named a
+    /// path absent from this host were warned about and dropped, so recomputing
+    /// the list from the profile yields bypasses the sandbox never honored —
+    /// which would let `nono why` and a mediated command's keychain
+    /// authorization disagree with the sandbox that is actually running.
+    pub applied_bypass_paths: Vec<policy::AppliedBypass>,
 }
 
 /// Extension trait for CapabilitySet to add CLI-specific construction methods.
@@ -669,13 +678,14 @@ impl CapabilitySetExt for CapabilitySet {
             caps.add_blocked_command(cmd);
         }
 
-        let blocked_grants = finalize_caps(&mut caps, &mut resolved, &loaded_policy, args, &[])?;
+        let finalized = finalize_caps(&mut caps, &mut resolved, &loaded_policy, args, &[])?;
 
         Ok(PreparedCaps {
             caps,
             needs_unlink_overrides: resolved.needs_unlink_overrides,
             deny_paths: resolved.deny_paths,
-            blocked_grants,
+            blocked_grants: finalized.blocked_grants,
+            applied_bypass_paths: finalized.applied_bypass_paths,
         })
     }
 
@@ -1122,7 +1132,7 @@ impl CapabilitySetExt for CapabilitySet {
             }
         }
 
-        let blocked_grants = finalize_caps(
+        let finalized = finalize_caps(
             &mut caps,
             &mut resolved,
             &loaded_policy,
@@ -1134,9 +1144,15 @@ impl CapabilitySetExt for CapabilitySet {
             caps,
             needs_unlink_overrides: resolved.needs_unlink_overrides,
             deny_paths: resolved.deny_paths,
-            blocked_grants,
+            blocked_grants: finalized.blocked_grants,
+            applied_bypass_paths: finalized.applied_bypass_paths,
         })
     }
+}
+
+struct FinalizedCaps {
+    blocked_grants: Vec<(PathBuf, Option<String>)>,
+    applied_bypass_paths: Vec<policy::AppliedBypass>,
 }
 
 /// Shared finalization: deny overrides, overlap validation, keychain exception, dedup.
@@ -1150,7 +1166,7 @@ fn finalize_caps(
     loaded_policy: &policy::Policy,
     args: &SandboxArgs,
     profile_bypass_protection: &[PathBuf],
-) -> Result<Vec<(PathBuf, Option<String>)>> {
+) -> Result<FinalizedCaps> {
     // Apply profile-level deny overrides first, then CLI overrides.
     // Profile overrides come from `filesystem.bypass_protection` in the
     // profile JSON. CLI `--bypass-protection` flags are applied on top.
@@ -1183,13 +1199,17 @@ fn finalize_caps(
 
     // Keep broad keychain deny groups active, but allow keychain DB grants
     // whose deny a matching bypass_protection has lifted.
-    let deny_policy = policy::EffectiveDenyPolicy::new(&resolved.deny_paths, &bypass_paths);
+    let deny_policy =
+        policy::EffectiveDenyPolicy::from_applied_bypasses(&resolved.deny_paths, &bypass_paths);
     policy::apply_macos_keychain_db_exception(caps, &deny_policy);
 
     // Deduplicate capabilities
     caps.deduplicate();
 
-    Ok(blocked_grants)
+    Ok(FinalizedCaps {
+        blocked_grants,
+        applied_bypass_paths: bypass_paths,
+    })
 }
 
 fn apply_cli_network_mode(caps: &mut CapabilitySet, args: &SandboxArgs) {

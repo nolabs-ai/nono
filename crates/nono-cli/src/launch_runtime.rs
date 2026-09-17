@@ -243,7 +243,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) proc_comm_notify: bool,
-    pub(crate) bypass_protection_paths: Vec<PathBuf>,
+    pub(crate) bypass_protection_paths: Vec<crate::policy::AppliedBypass>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) profile_display_name: Option<String>,

@@ -167,6 +167,8 @@ struct ToolSandboxState {
     /// them. A command policy's own keychain grant is authorized against this,
     /// so a mediated command can never exceed the agent's keychain authority.
     deny_policy: crate::policy::EffectiveDenyPolicy,
+    /// Snapshot of keychain filesystem denies, including mode-scoped bypasses.
+    keychain_deny_rules: Vec<String>,
     plan: ResolvedToolSandboxPlan,
     shims_by_command: BTreeMap<String, ShimIdentity>,
     shims_by_path: BTreeMap<PathBuf, String>,
@@ -290,6 +292,11 @@ impl PreparedToolSandboxRuntime {
         } = input;
 
         validate_platform_requirements(config)?;
+        let deny_policy = crate::policy::EffectiveDenyPolicy::from_applied_bypasses(
+            deny_paths,
+            bypass_protection_paths,
+        );
+        let keychain_deny_rules = deny_policy.keychain_child_deny_rules()?;
 
         let plan = ResolvedToolSandboxPlan::build(
             config,
@@ -357,10 +364,8 @@ impl PreparedToolSandboxRuntime {
                 policy_root: policy_root.to_path_buf(),
                 outer_caps: outer_caps.clone(),
                 deny_paths: deny_paths.to_vec(),
-                deny_policy: crate::policy::EffectiveDenyPolicy::new(
-                    deny_paths,
-                    bypass_protection_paths,
-                ),
+                deny_policy,
+                keychain_deny_rules,
                 plan,
                 shims_by_command,
                 shims_by_path,
@@ -3171,6 +3176,9 @@ fn build_child_caps(
     // SECURITY: authorized against the *agent's* deny/bypass policy, so a
     // command policy granting login.keychain-db cannot reach a keychain the
     // outer sandbox is denied.
+    for rule in &state.keychain_deny_rules {
+        caps.add_platform_rule(rule.clone())?;
+    }
     crate::policy::apply_macos_keychain_db_exception(&mut caps, &state.deny_policy);
     add_policy_network(&mut caps, policy)?;
     add_policy_proxy_network(&mut caps, state, request, policy, proxy_scope)?;
@@ -5686,6 +5694,7 @@ mod tests {
             outer_caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             deny_policy: crate::policy::EffectiveDenyPolicy::new(&[], &[]),
+            keychain_deny_rules: Vec::new(),
             plan: ResolvedToolSandboxPlan {
                 config: CommandPoliciesConfig::default(),
                 resolved: ResolvedCommandBinaries {
@@ -9261,6 +9270,35 @@ mod tests {
     }
 
     #[test]
+    fn command_policy_write_grant_cannot_expand_outer_read_only_bypass() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut state = test_state();
+        state.deny_policy = crate::policy::EffectiveDenyPolicy::from_applied_bypasses(
+            &fixture.keychain_denies(),
+            &[crate::policy::AppliedBypass {
+                path: fixture.login_db.clone(),
+                access: AccessMode::Read,
+                is_file: true,
+                removed_denies: Vec::new(),
+            }],
+        );
+
+        let rules = child_keychain_rules(
+            &state,
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                nono::CapabilitySource::User,
+            ),
+        );
+
+        assert!(
+            rules.is_empty(),
+            "a command policy must not widen the agent's read-only bypass: {rules}"
+        );
+    }
+
+    #[test]
     fn command_policy_keychain_grant_with_unrelated_outer_bypass_is_ineffective() {
         let fixture = crate::test_env::KeychainFixture::new();
         let mut state = test_state();
@@ -9282,5 +9320,58 @@ mod tests {
             rules.is_empty(),
             "an unrelated outer bypass must not authorize the keychain, got: {rules}"
         );
+    }
+
+    #[test]
+    fn child_caps_enforce_keychain_denies_for_file_and_directory_grants() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut state = test_state();
+        state.shim_dir = fixture.home.join("shims");
+        fs::create_dir(&state.shim_dir).expect("shims");
+        state.socket_path = fixture.home.join("broker.sock");
+        let _listener = UnixListener::bind(&state.socket_path).expect("socket");
+        state.deny_policy = crate::policy::EffectiveDenyPolicy::from_applied_bypasses(
+            &fixture.keychain_denies(),
+            &[],
+        );
+        state.keychain_deny_rules = state
+            .deny_policy
+            .keychain_child_deny_rules()
+            .expect("rules");
+        let binary = test_binary("sh", Path::new("/bin/sh")).expect("binary");
+        let request = request_with_env(Vec::new());
+        for directory in [false, true] {
+            let policy: CommandSandboxConfig = serde_json::from_value(if directory {
+                serde_json::json!({"fs_write": [fixture.keychains]})
+            } else {
+                serde_json::json!({"fs_write_file": [fixture.login_db]})
+            })
+            .expect("policy");
+            let caps = build_child_caps(
+                &state,
+                &binary,
+                &policy,
+                &request,
+                &state.shim_dir,
+                "review",
+            )
+            .expect("child caps");
+            assert!(
+                caps.fs_capabilities().iter().any(|cap| {
+                    cap.resolved == fixture.login_db.canonicalize().expect("canonical db")
+                        || cap.resolved == fixture.keychains.canonicalize().expect("canonical root")
+                }),
+                "exercise a real child filesystem grant"
+            );
+            for rule in &state.keychain_deny_rules {
+                assert!(
+                    caps.platform_rules().contains(rule),
+                    "missing restriction: {rule}"
+                );
+            }
+            assert!(!caps.platform_rules().iter().any(|rule| {
+                rule.contains("(allow mach-lookup") && rule.contains("com.apple.securityd")
+            }));
+        }
     }
 }

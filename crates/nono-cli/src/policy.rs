@@ -6,7 +6,7 @@
 use crate::package;
 use crate::profile;
 use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -1180,19 +1180,123 @@ pub(crate) fn add_deny_access_rules(
 /// deny; only a bypass covering the same path does. The surviving deny list
 /// read without these bypasses reports a bypassed path as denied while the
 /// sandbox allows it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppliedBypass {
+    pub path: PathBuf,
+    pub access: AccessMode,
+    /// Whether Seatbelt reopened a literal file rather than a subtree.
+    #[serde(default = "AppliedBypass::literal_by_default")]
+    pub is_file: bool,
+    /// Deny rules removed from bookkeeping by this bypass. Seatbelt still
+    /// enforces them for access modes the bypass did not reopen.
+    pub removed_denies: Vec<PathBuf>,
+}
+
+impl AppliedBypass {
+    // Older state files do not record filter shape. Never infer a subtree
+    // exception from the filesystem's current (potentially changed) type.
+    fn literal_by_default() -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EffectiveDenyPolicy {
     deny_paths: Vec<PathBuf>,
     bypass_paths: Vec<PathBuf>,
+    bypasses: Vec<AppliedBypass>,
 }
 
 impl EffectiveDenyPolicy {
+    /// Snapshot the outer keychain filesystem restrictions for mediated children.
+    ///
+    /// These are denies with mode-specific holes, never new grants. Consequently
+    /// a broad command grant cannot defeat them, and a bypass cannot give a
+    /// command access it did not request. Unrelated delegated credentials remain
+    /// governed by the command policy. Build once at runtime preparation, not
+    /// after an untrusted child has had an opportunity to change symlinks.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn keychain_child_deny_rules(&self) -> Result<Vec<String>> {
+        let mut roots = Vec::new();
+        for root in [
+            expand_path("~/Library/Keychains")?,
+            PathBuf::from("/Library/Keychains"),
+        ] {
+            if let Some(resolved) = resolve_parent_symlinks(&root)? {
+                roots.push(resolved);
+            }
+            roots.push(root);
+        }
+
+        let filter = |path: &Path, is_file: bool| -> Result<String> {
+            let kind = if is_file { "literal" } else { "subpath" };
+            Ok(format!(
+                "({kind} \"{}\")",
+                escape_seatbelt_path(path_to_utf8(path)?)?
+            ))
+        };
+
+        let mut protected_paths = Vec::new();
+        for deny in &self.deny_paths {
+            for root in &roots {
+                // Intersect an outer deny with the keychain subtree, so a deny
+                // on HOME does not suppress unrelated command-only grants.
+                let path = if deny.starts_with(root) {
+                    deny
+                } else if root.starts_with(deny) {
+                    root
+                } else {
+                    continue;
+                };
+                protected_paths.push(path.clone());
+                // An explicitly denied DB may itself be a symlink outside the
+                // keychain directory. Carry its already-denied target too.
+                if let Some(resolved) = resolve_parent_symlinks(path)?
+                    && self
+                        .deny_paths
+                        .iter()
+                        .any(|deny| resolved.starts_with(deny))
+                {
+                    protected_paths.push(resolved);
+                }
+            }
+        }
+        protected_paths.sort_unstable();
+        protected_paths.dedup();
+        let mut rules = Vec::new();
+        for path in &protected_paths {
+            for (access, operation) in [
+                (AccessMode::Read, "file-read-data"),
+                (AccessMode::Write, "file-write*"),
+            ] {
+                let mut conditions = vec![filter(path, false)?];
+                for bypass in &self.bypasses {
+                    if bypass.access.contains(access)
+                        && (bypass.path.starts_with(path) || path.starts_with(&bypass.path))
+                    {
+                        conditions.push(format!(
+                            "(require-not {})",
+                            filter(&bypass.path, bypass.is_file)?
+                        ));
+                    }
+                }
+                rules.push(format!(
+                    "(deny {operation} (require-all {}))",
+                    conditions.join(" ")
+                ));
+            }
+        }
+        rules.sort_unstable();
+        rules.dedup();
+        Ok(rules)
+    }
+
     /// Build from deny paths left standing after `apply_deny_overrides` and the
     /// bypass paths that were applied to them.
     ///
-    /// Each bypass is recorded in both its given and its resolved form so a deny
-    /// recorded against a symlink still matches a bypass recorded against its
-    /// target (and the reverse).
+    /// `apply_deny_overrides` already records both the given and resolved forms
+    /// of each bypass. Do not resolve them again: a symlink may have changed
+    /// since launch, and that must not create new bypass authority.
     ///
     /// Deny paths are stored exactly as given, never resolved here: the caller's
     /// list is authoritative. `add_deny_access_rules` already pushes every form
@@ -1200,26 +1304,56 @@ impl EffectiveDenyPolicy {
     /// store target, so resolving here would report denies the sandbox does not
     /// enforce.
     #[must_use]
-    pub fn new(deny_paths: &[PathBuf], bypass_paths: &[PathBuf]) -> Self {
+    pub fn from_applied_bypasses(deny_paths: &[PathBuf], bypasses: &[AppliedBypass]) -> Self {
         let mut deny_paths = deny_paths.to_vec();
+        if cfg!(target_os = "macos") {
+            deny_paths.extend(
+                bypasses
+                    .iter()
+                    .flat_map(|bypass| bypass.removed_denies.iter().cloned()),
+            );
+        }
         deny_paths.sort_unstable();
         deny_paths.dedup();
 
-        let mut bypasses = Vec::with_capacity(bypass_paths.len().saturating_mul(2));
-        for bypass in bypass_paths {
-            bypasses.push(bypass.clone());
-            bypasses.push(nono::try_canonicalize(bypass));
-        }
-        bypasses.sort_unstable();
-        bypasses.dedup();
+        let mut bypass_paths: Vec<PathBuf> =
+            bypasses.iter().map(|bypass| bypass.path.clone()).collect();
+        bypass_paths.sort_unstable();
+        bypass_paths.dedup();
 
         Self {
             deny_paths,
-            bypass_paths: bypasses,
+            bypass_paths,
+            bypasses: bypasses.to_vec(),
         }
     }
 
+    #[cfg(test)]
+    pub fn new(deny_paths: &[PathBuf], bypass_paths: &[PathBuf]) -> Self {
+        let bypasses: Vec<AppliedBypass> = bypass_paths
+            .iter()
+            .flat_map(|path| {
+                [path.clone(), nono::try_canonicalize(path)]
+                    .into_iter()
+                    .map(|path| AppliedBypass {
+                        path: path.clone(),
+                        access: AccessMode::ReadWrite,
+                        is_file: path.is_file(),
+                        removed_denies: Vec::new(),
+                    })
+            })
+            .collect();
+        Self::from_applied_bypasses(deny_paths, &bypasses)
+    }
+
+    /// The bypass paths, in both their given and their resolved forms.
+    #[must_use]
+    pub fn bypass_paths(&self) -> &[PathBuf] {
+        &self.bypass_paths
+    }
+
     /// Whether `path` sits under a deny rule that no bypass reopens.
+    #[cfg(test)]
     #[must_use]
     pub fn is_effectively_denied(&self, path: &Path) -> bool {
         self.matching_deny(path).is_some()
@@ -1234,12 +1368,29 @@ impl EffectiveDenyPolicy {
     /// (the create-file case) compares like the rules installed at launch.
     /// Comparison is by path component (`Path::starts_with`), never by string
     /// prefix, so a deny on `/home/user` does not cover `/home/username`.
+    #[cfg(test)]
     #[must_use]
     pub fn matching_deny(&self, path: &Path) -> Option<&PathBuf> {
+        self.matching_deny_for_access(path, AccessMode::ReadWrite)
+    }
+
+    /// Match a deny unless the applied bypass grants every requested mode.
+    #[must_use]
+    pub fn matching_deny_for_access(&self, path: &Path, requested: AccessMode) -> Option<&PathBuf> {
         let resolved = nono::try_canonicalize(path);
         let covers = |rule: &Path| path.starts_with(rule) || resolved.starts_with(rule);
 
-        if self.bypass_paths.iter().any(|bypass| covers(bypass)) {
+        let bypass_has_read = self
+            .bypasses
+            .iter()
+            .any(|bypass| covers(&bypass.path) && bypass.access.contains(AccessMode::Read));
+        let bypass_has_write = self
+            .bypasses
+            .iter()
+            .any(|bypass| covers(&bypass.path) && bypass.access.contains(AccessMode::Write));
+        if (requested == AccessMode::Read || bypass_has_write)
+            && (requested == AccessMode::Write || bypass_has_read)
+        {
             return None;
         }
         self.deny_paths
@@ -1332,8 +1483,12 @@ pub fn apply_macos_keychain_db_exception(
     // the original and the resolved form must clear the check, so a symlink
     // pointing at a denied keychain cannot launder the grant.
     let authorized = |cap: &FsCapability| -> bool {
-        !deny_policy.is_effectively_denied(&cap.resolved)
-            && !deny_policy.is_effectively_denied(&cap.original)
+        deny_policy
+            .matching_deny_for_access(&cap.resolved, cap.access)
+            .is_none()
+            && deny_policy
+                .matching_deny_for_access(&cap.original, cap.access)
+                .is_none()
     };
 
     let mut explicit_paths: HashMap<PathBuf, AccessMode> = HashMap::new();
@@ -1354,7 +1509,9 @@ pub fn apply_macos_keychain_db_exception(
             // to be recognized here so the Mach services can be unlocked.
             if all_keychain_dbs.iter().any(|db| {
                 (db.starts_with(&cap.resolved) || db.starts_with(&cap.original))
-                    && !deny_policy.is_effectively_denied(db)
+                    && deny_policy
+                        .matching_deny_for_access(db, cap.access)
+                        .is_none()
             }) {
                 mach_authorized = true;
             }
@@ -1516,16 +1673,17 @@ pub fn apply_macos_keychain_db_exception(
 /// The override path must also be explicitly granted via `--allow`, `--read`, or `--write`.
 /// `--bypass-protection` only removes the deny; it does not implicitly grant access.
 ///
-/// Returns every resolved form of the applied overrides (canonical and, when it
-/// differs, the expanded symlink path). Callers that must decide whether a path
-/// is still denied need these alongside the surviving `deny_paths`, because a
-/// narrow child bypass leaves a broader parent deny standing — see
-/// [`EffectiveDenyPolicy`].
+/// Returns every applied path form (canonical and, when it differs, the
+/// expanded symlink path), its permitted access mode, and any deny entries
+/// removed from bookkeeping. Callers need these alongside the surviving
+/// `deny_paths`: a child bypass leaves a parent deny standing, while an exact
+/// bypass removes its deny entry even though Seatbelt still enforces the
+/// unbypassed access modes — see [`EffectiveDenyPolicy`].
 pub fn apply_deny_overrides(
     overrides: &[std::path::PathBuf],
     deny_paths: &mut Vec<PathBuf>,
     caps: &mut CapabilitySet,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<AppliedBypass>> {
     let mut resolved_overrides = Vec::with_capacity(overrides.len());
     if overrides.is_empty() {
         return Ok(resolved_overrides);
@@ -1601,6 +1759,8 @@ pub fn apply_deny_overrides(
             canonical.display()
         );
 
+        let is_file = canonical.is_file();
+
         // On macOS: emit Seatbelt allow rules to punch through deny.
         // Only emit rules matching the effective access mode from the union
         // of all covering grants to preserve least-privilege.
@@ -1617,7 +1777,7 @@ pub fn apply_deny_overrides(
                 let path_utf8 = path_to_utf8(op)?;
                 let escaped = escape_seatbelt_path(path_utf8)?;
 
-                let filter = if op.exists() && op.is_file() {
+                let filter = if is_file {
                     format!("literal \"{}\"", escaped)
                 } else {
                     format!("subpath \"{}\"", escaped)
@@ -1637,11 +1797,36 @@ pub fn apply_deny_overrides(
         // recorded for either the symlink or its target are removed.
         // Do NOT remove broader deny entries when the override is a child — e.g.,
         // overriding ~/.aws must not remove a deny on the entire home directory.
-        deny_paths.retain(|dp| !dp.starts_with(&canonical) && !dp.starts_with(&expanded));
+        let mut removed_denies = Vec::new();
+        deny_paths.retain(|dp| {
+            if dp.starts_with(&canonical) || dp.starts_with(&expanded) {
+                removed_denies.push(dp.clone());
+                false
+            } else {
+                true
+            }
+        });
 
-        resolved_overrides.push(canonical.clone());
+        let access = if grant_has_read && grant_has_write {
+            AccessMode::ReadWrite
+        } else if grant_has_read {
+            AccessMode::Read
+        } else {
+            AccessMode::Write
+        };
+        resolved_overrides.push(AppliedBypass {
+            path: canonical.clone(),
+            access,
+            is_file,
+            removed_denies,
+        });
         if expanded != canonical {
-            resolved_overrides.push(expanded);
+            resolved_overrides.push(AppliedBypass {
+                path: expanded,
+                access,
+                is_file,
+                removed_denies: Vec::new(),
+            });
         }
     }
 
@@ -4169,6 +4354,42 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_only_bypass_keeps_removed_deny_for_write_queries() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(crate::test_env::keychain_file_cap(
+            &fixture.login_db,
+            AccessMode::Read,
+            CapabilitySource::Profile,
+        ));
+        let mut denies = vec![fixture.login_db.clone()];
+        let bypasses = apply_deny_overrides(
+            std::slice::from_ref(&fixture.login_db),
+            &mut denies,
+            &mut caps,
+        )
+        .expect("apply bypass");
+        assert!(denies.is_empty(), "the bookkeeping deny is removed");
+
+        let policy = EffectiveDenyPolicy::from_applied_bypasses(&denies, &bypasses);
+        assert!(
+            policy
+                .matching_deny_for_access(&fixture.login_db, AccessMode::Read)
+                .is_none()
+        );
+        assert!(
+            policy
+                .matching_deny_for_access(&fixture.login_db, AccessMode::Write)
+                .is_some(),
+            "Seatbelt's write deny remains active"
+        );
+        let rules = caps.platform_rules().join("\n");
+        assert!(rules.contains("(allow file-read-data"));
+        assert!(!rules.contains("(allow file-write"));
+    }
+
     #[test]
     fn test_effective_deny_policy_uses_path_components_not_string_prefix() {
         let policy = EffectiveDenyPolicy::new(&[PathBuf::from("/home/user")], &[]);
@@ -4901,5 +5122,112 @@ mod tests {
             read_paths.iter().any(|p| p == "/System/Volumes"),
             "system_read_macos should still grant /System/Volumes for firmlink resolution: {read_paths:?}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_keychain_denies_preserve_bypass_modes_and_filter_shape() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(crate::test_env::keychain_file_cap(
+            &fixture.login_db,
+            AccessMode::Read,
+            CapabilitySource::User,
+        ));
+        let mut denies = fixture.keychain_denies();
+        let bypasses = apply_deny_overrides(
+            std::slice::from_ref(&fixture.login_db),
+            &mut denies,
+            &mut caps,
+        )
+        .expect("bypass");
+        let policy = EffectiveDenyPolicy::from_applied_bypasses(&denies, &bypasses);
+        // A file-to-directory replacement must not widen the recorded bypass.
+        std::fs::remove_file(&fixture.login_db).expect("remove file");
+        std::fs::create_dir(&fixture.login_db).expect("replace with directory");
+        let rules = policy.keychain_child_deny_rules().expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.starts_with("(deny file-read-data")
+                    && rule.contains("(require-not (literal ")
+                    && rule.contains("login.keychain-db"))
+        );
+        assert!(
+            rules
+                .iter()
+                .filter(|rule| rule.starts_with("(deny file-write*"))
+                .all(|rule| !rule.contains("require-not"))
+        );
+        for rule in rules {
+            caps.add_platform_rule(rule).expect("valid platform rule");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_keychain_denies_limit_parent_denies_to_keychains() {
+        let fixture = crate::test_env::KeychainFixture::with_home(|root| {
+            let link = root.join("linked-home");
+            std::os::unix::fs::symlink(root.join("home"), &link).expect("symlink");
+            link
+        });
+        let policy = EffectiveDenyPolicy::from_applied_bypasses(
+            &[
+                fixture.home.clone(),
+                fixture.home.canonicalize().expect("canonical home"),
+            ],
+            &[],
+        );
+        let rules = policy.keychain_child_deny_rules().expect("rules");
+        assert!(!rules.is_empty());
+        assert!(rules.iter().all(|rule| rule.contains("/Library/Keychains")));
+        let canonical = fixture
+            .keychains
+            .canonicalize()
+            .expect("canonical keychains");
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.contains(canonical.to_str().expect("utf8")))
+        );
+        let unrelated =
+            EffectiveDenyPolicy::from_applied_bypasses(&[fixture.home.join(".aws")], &[]);
+        assert!(
+            unrelated
+                .keychain_child_deny_rules()
+                .expect("rules")
+                .is_empty()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_keychain_denies_include_explicitly_denied_symlink_targets() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let target = fixture.home.join("external-db");
+        std::fs::write(&target, "synthetic").expect("target");
+        std::fs::remove_file(&fixture.login_db).expect("remove db");
+        std::os::unix::fs::symlink(&target, &fixture.login_db).expect("symlink db");
+        let mut caps = CapabilitySet::new();
+        let mut denies = Vec::new();
+        add_deny_access_rules(
+            fixture.login_db.to_str().expect("utf8"),
+            &mut caps,
+            &mut denies,
+        )
+        .expect("outer deny");
+        let rules = EffectiveDenyPolicy::from_applied_bypasses(&denies, &[])
+            .keychain_child_deny_rules()
+            .expect("child rules");
+        let target = target.canonicalize().expect("canonical target");
+        for operation in ["file-read-data", "file-write*"] {
+            assert!(
+                rules
+                    .iter()
+                    .any(|rule| rule.starts_with(&format!("(deny {operation}"))
+                        && rule.contains(target.to_str().expect("utf8 target")))
+            );
+        }
     }
 }

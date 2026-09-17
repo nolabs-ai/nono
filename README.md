@@ -1,4 +1,4 @@
-<div align="center">
+iv align="center">
 
 <img src="assets/logo.gif" alt="nono logo" width="600"/>
 

@@ -1213,6 +1213,11 @@ impl<'a> DiagnosticFormatter<'a> {
         let has_path_findings =
             !path_diagnostics.is_empty() || !pathname_unix_diagnostics.is_empty();
         let has_observed_path_evidence = self.has_observed_path_evidence(diagnostics);
+        let primary_protected_root_attempt = matches!(
+            primary_verdict.as_ref(),
+            Some(ErrorVerdict::LikelySandbox(hint))
+                if self.is_path_suggestion_protected(&hint.path, hint.access)
+        );
 
         if !has_path_findings
             && ipc_diagnostics.is_empty()
@@ -1251,12 +1256,16 @@ impl<'a> DiagnosticFormatter<'a> {
                     self.format_primary_verdict_guidance(&mut lines, verdict);
                     lines.push("[nono]".to_string());
                 }
-                lines.push("[nono] No path denials were observed during this session.".to_string());
-                lines.push(
-                    "[nono] The failure may be unrelated to sandbox restrictions.".to_string(),
-                );
+                if !has_observed_path_evidence {
+                    lines.push(
+                        "[nono] No path denials were observed during this session.".to_string(),
+                    );
+                    lines.push(
+                        "[nono] The failure may be unrelated to sandbox restrictions.".to_string(),
+                    );
+                }
             }
-            if has_observed_path_evidence {
+            if has_observed_path_evidence && !primary_protected_root_attempt {
                 lines.push("[nono]".to_string());
                 self.format_grant_help(&mut lines, diagnostics);
                 self.format_follow_up_from_diagnostics(&mut lines, diagnostics);
@@ -1478,7 +1487,12 @@ impl<'a> DiagnosticFormatter<'a> {
             path.display(),
             access_str(access),
         ));
-        if let Some(ref remediation) = diagnostic.remediation
+        if self.is_diagnostic_protected_root_blocked(diagnostic) {
+            lines.push(
+                "[nono]   This path overlaps protected nono state and cannot be granted or saved to a profile."
+                    .to_string(),
+            );
+        } else if let Some(ref remediation) = diagnostic.remediation
             && let Some(flag) = crate::query_ext::suggested_flag_for_remediation(remediation)
         {
             lines.push(format!("[nono]   Try: {flag}"));
@@ -1559,10 +1573,17 @@ impl<'a> DiagnosticFormatter<'a> {
             hint.path.display(),
             access_str(hint.access),
         ));
-        lines.push(format!(
-            "[nono]   Try: {}",
-            self.suggested_flag_for_hint(&hint.path, hint.access)
-        ));
+        if self.is_path_suggestion_protected(&hint.path, hint.access) {
+            lines.push(
+                "[nono]   This path overlaps protected nono state and cannot be granted or saved to a profile."
+                    .to_string(),
+            );
+        } else {
+            lines.push(format!(
+                "[nono]   Try: {}",
+                self.suggested_flag_for_hint(&hint.path, hint.access)
+            ));
+        }
     }
 
     fn format_primary_verdict_guidance(&self, lines: &mut Vec<String>, verdict: &ErrorVerdict) {
@@ -1653,9 +1674,12 @@ impl<'a> DiagnosticFormatter<'a> {
         let total = path_diagnostics.len();
         let mut actionable = 0usize;
         let mut policy_blocked = 0usize;
+        let mut protected_root_blocked = 0usize;
 
         for diagnostic in path_diagnostics {
-            if self.is_diagnostic_policy_blocked(diagnostic) {
+            if self.is_diagnostic_protected_root_blocked(diagnostic) {
+                protected_root_blocked += 1;
+            } else if self.is_diagnostic_policy_blocked(diagnostic) {
                 policy_blocked += 1;
             } else {
                 actionable += 1;
@@ -1674,7 +1698,9 @@ impl<'a> DiagnosticFormatter<'a> {
                 break;
             }
             let mut labels: Vec<&str> = Vec::new();
-            if self.is_diagnostic_policy_blocked(diagnostic) {
+            if self.is_diagnostic_protected_root_blocked(diagnostic) {
+                labels.push("protected nono state");
+            } else if self.is_diagnostic_policy_blocked(diagnostic) {
                 labels.push("permanently restricted");
             }
             if self.is_diagnostic_suppressed(diagnostic) {
@@ -1716,6 +1742,18 @@ impl<'a> DiagnosticFormatter<'a> {
             lines.push(format!(
                 "[nono] {}{} permanently restricted — override via a user profile with filesystem.bypass_protection.",
                 count_prefix, verb,
+            ));
+        }
+
+        if protected_root_blocked > 0 {
+            lines.push("[nono]".to_string());
+            lines.push(format!(
+                "[nono] {} protected nono state and cannot be granted or saved to a profile.",
+                if protected_root_blocked == 1 {
+                    "This path overlaps"
+                } else {
+                    "These paths overlap"
+                },
             ));
         }
     }
@@ -1907,7 +1945,8 @@ impl<'a> DiagnosticFormatter<'a> {
             }
             if diagnostic.code == NonoDiagnosticCode::SandboxDeniedPath
                 && let Some(path) = &diagnostic.path
-                && self.is_path_policy_blocked(path)
+                && (self.is_path_policy_blocked(path)
+                    || self.is_diagnostic_protected_root_blocked(diagnostic))
             {
                 continue;
             }
@@ -1933,6 +1972,35 @@ impl<'a> DiagnosticFormatter<'a> {
             .iter()
             .find(|d| d.path == path)
             .is_some_and(|d| d.reason == DenialReason::PolicyBlocked)
+    }
+
+    /// Whether the suggested grant target would overlap nono's own state.
+    /// Fail closed: if the active protected roots cannot be resolved, do not
+    /// emit a grant suggestion.
+    fn is_diagnostic_protected_root_blocked(&self, diagnostic: &NonoDiagnostic) -> bool {
+        let Some(path) = diagnostic.path.as_deref() else {
+            return false;
+        };
+        let access = diagnostic.access.unwrap_or(AccessMode::Read);
+        self.is_path_suggestion_protected(path, access)
+    }
+
+    fn is_path_suggestion_protected(&self, path: &Path, access: AccessMode) -> bool {
+        let (flag, target) = crate::query_ext::suggested_flag_parts(path, access);
+        let is_file = matches!(flag, "--read-file" | "--write-file" | "--allow-file");
+        let Ok(roots) = crate::protected_paths::ProtectedRoots::from_defaults() else {
+            return true;
+        };
+        let Ok(target) = crate::profile::expand_vars(&target.to_string_lossy(), Path::new("."))
+        else {
+            return true;
+        };
+
+        crate::protected_paths::profile_save_target_overlaps_protected_root(
+            &target,
+            is_file,
+            roots.as_paths(),
+        )
     }
 
     /// Path grant help, plus `--allow-net` only when this session observed a
@@ -2532,6 +2600,7 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use nono::capability::FsCapability;
     use tempfile::tempdir;
 
@@ -3427,7 +3496,7 @@ mod tests {
 
         assert!(output.contains("Sandbox denial:"));
         assert!(output.contains(&format!("Try: --read-file {}", denied.display())));
-        assert!(output.contains("No path denials were observed during this session."));
+        assert!(!output.contains("No path denials were observed during this session."));
         assert!(output.contains("Add permissions: nono run --allow <path> -- <your command>"));
         assert!(!output.contains("Sandbox policy:"));
         // Path evidence earns the path flags; network is blocked by
@@ -3943,6 +4012,34 @@ mod tests {
         assert!(output.contains(&format!("Fix flags: --read-file {}", denied_path.display())));
         // User-denied paths are actionable, not policy-blocked.
         assert!(!output.contains("[permanently restricted]"));
+    }
+
+    #[test]
+    fn test_supervised_protected_root_parent_has_no_fix_flag() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let home = tempdir().expect("home");
+        let state = home.path().join(".local/state");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", home.path().to_str().expect("home path")),
+            ("XDG_STATE_HOME", state.to_str().expect("state path")),
+        ]);
+        std::fs::create_dir_all(state.join("nono")).expect("state root");
+
+        let denials = vec![DenialRecord {
+            path: state.clone(),
+            access: AccessMode::ReadWrite,
+            reason: DenialReason::UserDenied,
+        }];
+        let caps = make_test_caps();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_denials(&denials);
+        let output = format_footer_with_session_report(formatter, 1);
+
+        assert!(output.contains(&state.display().to_string()));
+        assert!(output.contains("[protected nono state]"));
+        assert!(output.contains("cannot be granted or saved to a profile"));
+        assert!(!output.contains(&format!("Fix flags: --allow {}", state.display())));
     }
 
     #[test]

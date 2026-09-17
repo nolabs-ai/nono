@@ -146,6 +146,27 @@ pub fn overlapping_protected_root(
     None
 }
 
+/// Return whether a proposed profile-save target overlaps a protected root.
+///
+/// This is intentionally stricter than [`overlapping_protected_root`] on
+/// macOS: the profile-save UI must never offer a grant that is equal to,
+/// inside, or a directory ancestor of nono's own state. Runtime Seatbelt
+/// mediation can safely permit some parent grants after deny rules are
+/// installed, but saving one from an automatic suggestion is not appropriate.
+#[must_use]
+pub fn profile_save_target_overlaps_protected_root(
+    path: &Path,
+    is_file: bool,
+    protected_roots: &[PathBuf],
+) -> bool {
+    let target = try_canonicalize(path);
+
+    protected_roots.iter().any(|protected_root| {
+        let root = try_canonicalize(protected_root);
+        target.starts_with(&root) || (!is_file && root.starts_with(&target))
+    })
+}
+
 /// Emit Seatbelt deny rules for all protected roots.
 ///
 /// On macOS, this adds `(deny file-read-data ...)` and `(deny file-write* ...)`
@@ -347,6 +368,35 @@ mod tests {
                 .contains("overlaps protected nono state root"),
             "unexpected error: {err}",
         );
+    }
+
+    #[test]
+    fn profile_save_target_rejects_exact_descendant_and_parent_paths() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let protected = tmp.path().join(".nono");
+        let descendant = protected.join("sessions");
+        let unrelated = tmp.path().join("project");
+
+        assert!(profile_save_target_overlaps_protected_root(
+            &protected,
+            false,
+            std::slice::from_ref(&protected),
+        ));
+        assert!(profile_save_target_overlaps_protected_root(
+            &descendant,
+            false,
+            std::slice::from_ref(&protected),
+        ));
+        assert!(profile_save_target_overlaps_protected_root(
+            tmp.path(),
+            false,
+            std::slice::from_ref(&protected),
+        ));
+        assert!(!profile_save_target_overlaps_protected_root(
+            &unrelated,
+            false,
+            std::slice::from_ref(&protected),
+        ));
     }
 
     #[test]

@@ -970,6 +970,25 @@ The sandbox still denies these paths. `filesystem.suppress_save_prompt` only
 filters the save-profile suggestion; the explicit suppress name makes clear
 it is not an access grant.
 
+### Protected nono state roots
+
+nono always protects its own state from sandboxed children. The protected roots
+are:
+
+- `$HOME/.nono`, the legacy state location retained for compatibility.
+- `$XDG_STATE_HOME/nono`, the current state location. When
+  `XDG_STATE_HOME` is unset, this is `$HOME/.local/state/nono`.
+
+Neither root, nor any path below either root, can be granted in a profile or
+through CLI filesystem flags. A directory grant that contains a protected root
+(for example `$HOME` or `$HOME/.local`) is also rejected by default, because
+it would expose nono state.
+
+Protected-root denials remain visible in post-run diagnostics and audit output,
+but nono does not offer them in the post-run save-profile prompt. They cannot
+be saved as filesystem grants, `filesystem.bypass_protection`, or
+`filesystem.suppress_save_prompt` entries.
+
 ### Denying specific project files
 
 Block access to a file in the working directory while keeping the rest accessible. Use `$WORKDIR` to reference the current working directory — relative paths like `./` are not expanded:
@@ -1064,7 +1083,11 @@ With no `filesystem.unix_socket` entries, every AF_UNIX pathname connect and bin
 
 ### Allowing parent-of-protected-root grants (macOS only)
 
-By default, granting a parent directory of `~/.nono` (e.g. `--allow ~`) is rejected because it would expose nono's internal state. On macOS, Seatbelt can express deny-within-allow rules, so this restriction can be relaxed when the profile opts in with `allow_parent_of_protected`:
+By default, granting a parent directory of a protected root (for example
+`--allow ~` or `--read ~/.local`) is rejected because it would expose nono's
+internal state. On macOS, Seatbelt can express deny-within-allow rules, so this
+restriction can be relaxed when the profile opts in with
+`allow_parent_of_protected`:
 
 ```json
 {
@@ -1077,7 +1100,15 @@ By default, granting a parent directory of `~/.nono` (e.g. `--allow ~`) is rejec
 }
 ```
 
-When `allow_parent_of_protected` is `true` and the platform is macOS, nono permits the parent grant and emits Seatbelt deny rules that protect `~/.nono` from reads and writes. On Linux this field is ignored — Landlock cannot deny a child of an allowed parent, so the pre-flight check always rejects parent-of-protected grants.
+When `allow_parent_of_protected` is `true` and the platform is macOS, nono
+permits the parent grant and emits Seatbelt deny rules that continue to protect
+both `$HOME/.nono` and `$XDG_STATE_HOME/nono` from reads and writes. For
+example, this can permit access to ordinary files under `$HOME/.local` while
+still denying `$HOME/.local/state/nono` when the default XDG state location is
+used. This setting does not grant access to either protected root itself.
+
+On Linux this field is ignored — Landlock cannot deny a child of an allowed
+parent, so the pre-flight check always rejects parent-of-protected grants.
 
 ### Profile with group exclusion
 
@@ -1265,4 +1296,3 @@ Supported predicate forms include `linux`, `macos`, `linux:fedora`, `linux:rhel-
 - Prefer `when` predicates for package-specific platform differences. Put shared OS baseline paths in built-in policy groups instead.
 - `network.block: true` blocks all network access. It cannot be combined with proxy settings.
 - `custom_credentials` upstream URLs must use HTTPS. HTTP is only accepted for loopback addresses (localhost, 127.0.0.1, ::1).
-

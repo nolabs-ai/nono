@@ -2,7 +2,7 @@ use crate::command_display::format_command_line;
 use crate::diagnostic::{ErrorObservation, PolicyExplanation};
 use crate::exec_strategy::ProfileSaveOffer;
 use crate::theme;
-use crate::{profile, query_ext};
+use crate::{profile, protected_paths, query_ext};
 use colored::Colorize;
 use nono::SandboxViolation;
 use nono::{AccessMode, CapabilitySet, NonoError, Result, UrlDenialReason, UrlDenialRecord};
@@ -160,6 +160,7 @@ fn denial_selector_visible_range(
 fn extract_denial_items(patch: &profile::Profile) -> Vec<DenialItem> {
     let mut items = Vec::new();
     let fs = &patch.filesystem;
+    let protected_roots = protected_paths::ProtectedRoots::from_defaults().ok();
 
     let sections: &[(&[String], ProfileSection)] = &[
         (&fs.allow, ProfileSection::Allow),
@@ -172,6 +173,24 @@ fn extract_denial_items(patch: &profile::Profile) -> Vec<DenialItem> {
 
     for (paths, section) in sections {
         for path in *paths {
+            let is_file = matches!(
+                section,
+                ProfileSection::AllowFile | ProfileSection::ReadFile | ProfileSection::WriteFile
+            );
+            let overlaps_protected_root = protected_roots.as_ref().is_none_or(|roots| {
+                profile::expand_vars(path, Path::new("."))
+                    .ok()
+                    .is_none_or(|expanded| {
+                        protected_paths::profile_save_target_overlaps_protected_root(
+                            &expanded,
+                            is_file,
+                            roots.as_paths(),
+                        )
+                    })
+            });
+            if overlaps_protected_root {
+                continue;
+            }
             let is_bypass = fs.bypass_protection.contains(path);
             items.push(DenialItem::Fs {
                 path: path.clone(),
@@ -1724,6 +1743,7 @@ fn build_run_profile_patch(
     ignored_denial_paths: &[PathBuf],
 ) -> Result<Option<profile::Profile>> {
     let mut grants: BTreeMap<PathBuf, PatchGrant> = BTreeMap::new();
+    let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
 
     for explanation in policy_explanations {
         add_patch_grant(
@@ -1732,6 +1752,7 @@ fn build_run_profile_patch(
             explanation.access,
             &explanation.reason,
             ignored_denial_paths,
+            protected_roots.as_paths(),
         );
     }
 
@@ -1749,6 +1770,7 @@ fn build_run_profile_patch(
                     hint.access,
                     &reason,
                     ignored_denial_paths,
+                    protected_roots.as_paths(),
                 );
             }
             _ => {}
@@ -1885,6 +1907,7 @@ fn add_patch_grant(
     access: AccessMode,
     reason: &str,
     ignored_denial_paths: &[PathBuf],
+    protected_roots: &[PathBuf],
 ) {
     let (flag, target) = query_ext::suggested_flag_parts(path, access);
     if !ignored_denial_paths.is_empty()
@@ -1895,6 +1918,13 @@ fn add_patch_grant(
     }
 
     let is_file = matches!(flag, "--read-file" | "--write-file" | "--allow-file");
+    if protected_paths::profile_save_target_overlaps_protected_root(
+        &target,
+        is_file,
+        protected_roots,
+    ) {
+        return;
+    }
 
     match grants.get_mut(&target) {
         Some(existing) => {
@@ -2162,6 +2192,106 @@ mod tests {
         .expect("build patch");
 
         assert!(patch.is_none());
+    }
+
+    #[test]
+    fn build_run_profile_patch_omits_protected_root_denial() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let state_home = temp_home.path().join("state");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            ("XDG_STATE_HOME", state_home.to_str().expect("state path")),
+        ]);
+
+        let protected = temp_home.path().join(".nono");
+        std::fs::create_dir_all(&protected).expect("mkdir");
+        let explanation = PolicyExplanation {
+            path: protected,
+            access: AccessMode::Read,
+            reason: "path_not_granted".to_string(),
+        };
+
+        let patch = build_run_profile_patch(
+            &[explanation],
+            &ErrorObservation::default(),
+            &CapabilitySet::new(),
+            &[],
+            &[],
+        )
+        .expect("build patch");
+
+        assert!(patch.is_none());
+    }
+
+    #[test]
+    fn build_run_profile_patch_omits_xdg_protected_root_denial() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let state_home = temp_home.path().join("state");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            ("XDG_STATE_HOME", state_home.to_str().expect("state path")),
+        ]);
+
+        let protected = state_home.join("nono");
+        std::fs::create_dir_all(&protected).expect("mkdir");
+        let explanation = PolicyExplanation {
+            path: protected,
+            access: AccessMode::Read,
+            reason: "path_not_granted".to_string(),
+        };
+
+        let patch = build_run_profile_patch(
+            &[explanation],
+            &ErrorObservation::default(),
+            &CapabilitySet::new(),
+            &[],
+            &[],
+        )
+        .expect("build patch");
+
+        assert!(patch.is_none());
+    }
+
+    #[test]
+    fn build_run_profile_patch_omits_protected_root_ancestor_but_keeps_valid_denial() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let state_home = temp_home.path().join("state");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            ("XDG_STATE_HOME", state_home.to_str().expect("state path")),
+        ]);
+
+        let valid = temp_home.path().join("project");
+        std::fs::create_dir_all(&valid).expect("mkdir");
+        let denials = vec![
+            PolicyExplanation {
+                path: temp_home.path().to_path_buf(),
+                access: AccessMode::Read,
+                reason: "path_not_granted".to_string(),
+            },
+            PolicyExplanation {
+                path: valid,
+                access: AccessMode::Read,
+                reason: "path_not_granted".to_string(),
+            },
+        ];
+
+        let patch = build_run_profile_patch(
+            &denials,
+            &ErrorObservation::default(),
+            &CapabilitySet::new(),
+            &[],
+            &[],
+        )
+        .expect("build patch")
+        .expect("valid denial remains");
+
+        assert_eq!(patch.filesystem.read, vec!["~/project"]);
+        assert!(patch.filesystem.bypass_protection.is_empty());
+        assert!(patch.filesystem.suppress_save_prompt.is_empty());
     }
 
     #[test]

@@ -127,6 +127,11 @@ run_test "session created under nonexistent dest after creation" 0 \
 
 # 6. Session is isolated to custom dest (not written to default rollback root)
 count_session_dirs() {
+    if [[ ! -d "$1" ]]; then
+        echo 0
+        return 0
+    fi
+
     find "$1" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null \
         | awk -F/ '$NF ~ /^[0-9a-f]{16}$/ { count++ } END { print count + 0 }'
 }

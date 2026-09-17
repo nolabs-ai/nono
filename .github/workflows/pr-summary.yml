@@ -4,8 +4,10 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened]
 
+# The workflow reads PR files and updates issue-backed PR comments/labels.
 permissions:
-  pull-requests: write
+  issues: write
+  pull-requests: read
 
 jobs:
   summarize:

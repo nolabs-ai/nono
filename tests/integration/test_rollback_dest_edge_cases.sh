@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
 
 echo ""
-echo -e "${BLUE}=== --rollback-dest Edge Case Tests ===${NC}"
+echo -e "${BLUE}--rollback-dest Edge Case Tests${NC}"
 
 verify_nono_binary
 if ! require_working_sandbox "--rollback-dest edge cases"; then
@@ -22,10 +22,8 @@ echo "original" > "$TMPDIR/workdir/file.txt"
 
 echo ""
 
-# =============================================================================
 # 1. Flag validation: --rollback-dest requires --rollback
-# =============================================================================
-echo "--- Flag Validation ---"
+echo "Flag Validation"
 
 expect_failure "--rollback-dest without --rollback is rejected by clap" \
     "$NONO_BIN" run \
@@ -33,11 +31,9 @@ expect_failure "--rollback-dest without --rollback is rejected by clap" \
     --rollback-dest "$TMPDIR/custom" -- \
     echo test
 
-# =============================================================================
 # 2. Precheck: destination covered by explicit --allow passes
-# =============================================================================
 echo ""
-echo "--- Precheck: Explicit Allow ---"
+echo "Precheck: Explicit Allow"
 
 EXPLICIT_DEST="$TMPDIR/explicit_dest"
 mkdir -p "$EXPLICIT_DEST"
@@ -51,11 +47,9 @@ expect_success "rollback-dest with explicit --allow passes precheck" \
 run_test "session created inside explicit --allow dest" 0 \
     bash -c "ls '$EXPLICIT_DEST' | grep -qE '[0-9a-f]{16}'"
 
-# =============================================================================
 # 3. Precheck: destination NOT covered by --allow fails
-# =============================================================================
 echo ""
-echo "--- Precheck: No Write Permission ---"
+echo "Precheck: No Write Permission"
 
 RESTRICTED_DEST="$HOME/nono_edge_restricted_$$"
 mkdir -p "$RESTRICTED_DEST"
@@ -96,11 +90,9 @@ TESTS_RUN=$((TESTS_RUN + 1))
 
 rm -rf "$RESTRICTED_DEST"
 
-# =============================================================================
 # 4. Nested path: --rollback-dest covered by parent --allow
-# =============================================================================
 echo ""
-echo "--- Nested Path Coverage ---"
+echo "Nested Path Coverage"
 
 PARENT_DEST="$TMPDIR/storage"
 NESTED_DEST="$PARENT_DEST/rollbacks/sessions"
@@ -115,11 +107,9 @@ expect_success "rollback-dest nested under --allow parent passes precheck" \
 run_test "session created inside nested dest" 0 \
     bash -c "ls '$NESTED_DEST' | grep -qE '[0-9a-f]{16}'"
 
-# =============================================================================
 # 5. Nonexistent destination dir — nono should create it via create_dir_all
-# =============================================================================
 echo ""
-echo "--- Nonexistent Destination ---"
+echo "Nonexistent Destination"
 
 # TMPDIR itself is covered by system_write_macos, so a nested nonexistent
 # subdir should resolve via ancestor canonicalization in the precheck.
@@ -135,18 +125,21 @@ expect_success "rollback-dest nonexistent path (create_dir_all)" \
 run_test "session created under nonexistent dest after creation" 0 \
     bash -c "ls '$NONEXISTENT_DEST' | grep -qE '[0-9a-f]{16}'"
 
-# =============================================================================
 # 6. Session is isolated to custom dest (not written to default rollback root)
-# =============================================================================
+count_session_dirs() {
+    find "$1" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null \
+        | awk -F/ '$NF ~ /^[0-9a-f]{16}$/ { count++ } END { print count + 0 }'
+}
+
 echo ""
-echo "--- Isolation: Custom Dest Does Not Pollute Default ---"
+echo "Isolation: Custom Dest Does Not Pollute Default"
 
 ISOLATED_DEST="$TMPDIR/isolated_rollbacks"
 mkdir -p "$ISOLATED_DEST"
 
 # Count sessions in default rollback root before
 default_root="${XDG_STATE_HOME:-$HOME/.local/state}/nono/rollbacks"
-before_count=$(ls "$default_root" 2>/dev/null | grep -cE '[0-9a-f]{16}' || true)
+before_count=$(count_session_dirs "$default_root")
 
 expect_success "rollback with --rollback-dest runs successfully" \
     "$NONO_BIN" run --rollback --no-rollback-prompt \
@@ -154,7 +147,7 @@ expect_success "rollback with --rollback-dest runs successfully" \
     --rollback-dest "$ISOLATED_DEST" -- \
     sh -c "echo custom_dest > '$TMPDIR/workdir/file.txt'"
 
-after_count=$(ls "$default_root" 2>/dev/null | grep -cE '[0-9a-f]{16}' || true)
+after_count=$(count_session_dirs "$default_root")
 
 if [ "$before_count" -eq "$after_count" ]; then
     echo -e "  ${GREEN}PASS${NC}: default rollback root not polluted"
@@ -165,7 +158,7 @@ else
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 
-isolated_count=$(ls "$ISOLATED_DEST" 2>/dev/null | grep -cE '[0-9a-f]{16}' || true)
+isolated_count=$(count_session_dirs "$ISOLATED_DEST")
 if [ "$isolated_count" -gt 0 ]; then
     echo -e "  ${GREEN}PASS${NC}: session correctly placed in --rollback-dest"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -175,11 +168,9 @@ else
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 
-# =============================================================================
 # 7. --rollback-dest is a file (not a dir) — should fail when creating session subdir
-# =============================================================================
 echo ""
-echo "--- Destination Is A File (Not A Dir) ---"
+echo "Destination Is A File (Not A Dir)"
 
 FILE_AS_DEST="$TMPDIR/iam_a_file"
 echo "i am not a directory" > "$FILE_AS_DEST"
@@ -191,11 +182,9 @@ expect_failure "rollback-dest pointing to a file fails" \
     --rollback-dest "$FILE_AS_DEST" -- \
     sh -c "echo modified > '$TMPDIR/workdir/file.txt'"
 
-# =============================================================================
 # 8. Multiple runs to same dest — sessions accumulate
-# =============================================================================
 echo ""
-echo "--- Multiple Runs Accumulate Sessions ---"
+echo "Multiple Runs Accumulate Sessions"
 
 MULTI_DEST="$TMPDIR/multi_rollbacks"
 mkdir -p "$MULTI_DEST"
@@ -212,7 +201,7 @@ sleep 1  # ensure different session timestamp
     --rollback-dest "$MULTI_DEST" -- \
     sh -c "echo run2 > '$TMPDIR/workdir/file.txt'" </dev/null 2>&1 >/dev/null || true
 
-multi_count=$(ls "$MULTI_DEST" 2>/dev/null | grep -cE '[0-9a-f]{16}' || true)
+multi_count=$(count_session_dirs "$MULTI_DEST")
 if [ "$multi_count" -ge 2 ]; then
     echo -e "  ${GREEN}PASS${NC}: multiple sessions accumulate in custom dest ($multi_count sessions)"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -222,11 +211,9 @@ else
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 
-# =============================================================================
 # 9. Destination same as workdir (edge case: dest and tracked path overlap)
-# =============================================================================
 echo ""
-echo "--- Dest Same As Workdir ---"
+echo "Dest Same As Workdir"
 
 OVERLAP_DIR="$TMPDIR/overlap"
 mkdir -p "$OVERLAP_DIR"
@@ -239,8 +226,6 @@ expect_success "rollback-dest same as tracked workdir" \
     --rollback-dest "$OVERLAP_DIR" -- \
     sh -c "echo modified > '$OVERLAP_DIR/file.txt'"
 
-# =============================================================================
 # Summary
-# =============================================================================
 
 print_summary

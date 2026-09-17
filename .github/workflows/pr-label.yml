@@ -4,8 +4,10 @@ on:
   pull_request_target:
     types: [opened, edited]
 
+# Label changes and PR metadata reads do not need PR creation/review authority.
 permissions:
-  pull-requests: write
+  issues: write
+  pull-requests: read
 
 jobs:
   label:

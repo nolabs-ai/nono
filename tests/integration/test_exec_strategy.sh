@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2088 # User-facing test descriptions intentionally use ~ notation.
 # Execution Strategy Tests
 # Tests Supervised (default), Direct (nono wrap), signal forwarding, and diagnostic footer
 
@@ -6,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
 
 echo ""
-echo -e "${BLUE}=== Execution Strategy Tests ===${NC}"
+echo -e "${BLUE}Execution Strategy Tests${NC}"
 
 verify_nono_binary
 if ! require_working_sandbox "exec strategy suite"; then
@@ -22,11 +23,9 @@ echo ""
 echo "Test directory: $TMPDIR"
 echo ""
 
-# =============================================================================
 # Supervised Mode (default)
-# =============================================================================
 
-echo "--- Supervised Mode (default) ---"
+echo "Supervised Mode (default)"
 
 expect_success "default mode runs command successfully" \
     "$NONO_BIN" run --allow "$TMPDIR" -- echo "supervised mode works"
@@ -50,12 +49,10 @@ expect_output_contains "default mode preserves ENOENT for missing absolute paths
 expect_output_not_contains "missing absolute path is not reported as supervisor denial" "Denied paths during this session" \
     "$NONO_BIN" run --allow "$TMPDIR" -- cat /definitely-missing-nono-regression-path
 
-# =============================================================================
 # Direct Mode (nono wrap)
-# =============================================================================
 
 echo ""
-echo "--- Direct Mode (nono wrap) ---"
+echo "Direct Mode (nono wrap)"
 
 expect_success "direct mode runs command successfully" \
     "$NONO_BIN" wrap --allow "$TMPDIR" -- echo "direct mode works"
@@ -69,12 +66,10 @@ run_test "direct mode preserves exit code 0" 0 \
 run_test "direct mode preserves exit code 1" 1 \
     "$NONO_BIN" wrap --allow "$TMPDIR" -- false
 
-# =============================================================================
 # Signal Forwarding
-# =============================================================================
 
 echo ""
-echo "--- Signal Forwarding ---"
+echo "Signal Forwarding"
 
 # Test SIGTERM forwarding: supervised mode (default) keeps an unsandboxed parent
 # that can forward signals to the sandboxed child.
@@ -124,12 +119,10 @@ case "$SIGNAL_RESULT" in
         ;;
 esac
 
-# =============================================================================
 # Diagnostic Footer
-# =============================================================================
 
 echo ""
-echo "--- Diagnostic Footer ---"
+echo "Diagnostic Footer"
 
 # Attempt to read a sensitive path to trigger a sandbox denial
 # The diagnostic footer should mention the denied path or nono
@@ -167,8 +160,6 @@ else
     skip_test "no-diagnostics suppresses footer" "~/.ssh not found"
 fi
 
-# =============================================================================
 # Summary
-# =============================================================================
 
 print_summary

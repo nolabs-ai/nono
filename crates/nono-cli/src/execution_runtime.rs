@@ -480,6 +480,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 blocked_commands: caps.blocked_commands(),
                 outer_caps: &caps,
                 deny_paths: &deny_paths,
+                bypass_protection_paths: &flags.bypass_protection_paths,
                 policy_root: &requested_workdir,
                 proxy_credentials: &tool_sandbox_proxy_credentials,
                 reserved_proxy_ports: &reserved_proxy_ports,

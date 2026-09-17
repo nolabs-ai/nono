@@ -258,6 +258,13 @@ impl ResolvedToolSandboxPlan {
 }
 
 impl PreparedToolSandboxRuntime {
+    /// Path of the tool-sandbox runtime directory (mediation sockets and shim
+    /// binaries). Exposed so the session keepalive can refresh its timestamps
+    /// and stop the OS temp cleaner from reaping it mid-session.
+    pub(crate) fn runtime_dir(&self) -> Option<&Path> {
+        Some(self.inner.runtime_dir.as_path())
+    }
+
     pub(crate) fn prepare(input: super::ToolSandboxPrepare<'_>) -> Result<Self> {
         let super::ToolSandboxPrepare {
             config,

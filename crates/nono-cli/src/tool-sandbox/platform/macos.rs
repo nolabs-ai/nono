@@ -3188,11 +3188,15 @@ fn build_child_caps(
     )?;
     // When the command was granted a keychain DB file (e.g. login.keychain-db),
     // reuse the main-path keychain mechanism: add the WAL/SHM/`.fl`/`user.kb`
-    // sibling-file exceptions the Security framework touches. The library
-    // profile separately auto-unlocks the securityd/SecurityServer mach-lookups
-    // when a keychain DB cap is present (see has_explicit_keychain_db_access).
-    // No-op when no keychain DB grant exists.
-    crate::policy::apply_macos_keychain_db_exception(&mut caps);
+    // sibling-file exceptions the Security framework touches.
+    // SECURITY: authorized against the agent's deny paths with no bypass, so a
+    // command policy can only reach a keychain the agent was never denied. The
+    // bypasses the agent applied are not threaded here yet, which leaves this
+    // path strictly more restrictive than the agent's own.
+    crate::policy::apply_macos_keychain_db_exception(
+        &mut caps,
+        &crate::policy::EffectiveDenyPolicy::new(&state.deny_paths, &[]),
+    );
     add_policy_network(&mut caps, policy)?;
     add_policy_proxy_network(&mut caps, state, request, policy)?;
     add_proxy_trust_bundle_caps(&mut caps, state, policy)?;

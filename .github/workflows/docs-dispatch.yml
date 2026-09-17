@@ -6,8 +6,8 @@ on:
     paths:
       - 'docs/**'
 
-permissions:
-  contents: read
+# This workflow uses DOCS_PAT for its only GitHub API call.
+permissions: {}
 
 jobs:
   dispatch:

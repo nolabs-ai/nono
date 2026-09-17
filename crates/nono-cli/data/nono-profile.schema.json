@@ -1068,7 +1068,7 @@
             { "type": "string" },
             { "type": "null" }
           ],
-          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, Bitwarden bw:// URI, apple-password:// URI, file:// URI, env:// URI (e.g., \"env://MY_TOKEN\"), or cmd:// URI backed by credential_capture. Mutually exclusive with auth and aws_auth; may combine with redeem_phantoms."
+          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, Bitwarden bw:// URI, apple-password:// URI, keyring:// URI for a custom keyring service, file:// URI, env:// URI (e.g., \"env://MY_TOKEN\"), or cmd:// URI backed by credential_capture. Mutually exclusive with auth and aws_auth; may combine with redeem_phantoms."
         },
         "redeem_phantoms": {
           "type": "array",

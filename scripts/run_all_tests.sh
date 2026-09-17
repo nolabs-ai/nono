@@ -26,20 +26,14 @@ esac
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-echo ""
-echo -e "${BOLD}======================================${NC}"
-echo -e "${BOLD}  nono Integration Test Suite${NC}"
-echo -e "${BOLD}======================================${NC}"
+echo -e "${BOLD}nono integration tests${NC}"
 echo ""
 
-# =============================================================================
 # Build
-# =============================================================================
 
 echo -e "${BLUE}Building nono with test trust overrides enabled...${NC}"
 cd "$PROJECT_ROOT"
@@ -71,9 +65,7 @@ echo ""
 chmod +x "$TESTS_DIR"/integration/*.sh 2>/dev/null || true
 chmod +x "$TESTS_DIR"/lib/*.sh 2>/dev/null || true
 
-# =============================================================================
 # Run Test Suites in Parallel (with concurrency limit)
-# =============================================================================
 
 # Temp directory for suite output files
 RESULTS_DIR=$(mktemp -d)
@@ -224,9 +216,7 @@ for pid in "${PIDS[@]}"; do
     wait "$pid" 2>/dev/null || true
 done
 
-# =============================================================================
 # Print Results in Order
-# =============================================================================
 
 PASSED_SUITES=0
 FAILED_SUITES=0
@@ -257,14 +247,9 @@ for i in "${!SUITE_NAMES[@]}"; do
     fi
 done
 
-# =============================================================================
 # Final Summary
-# =============================================================================
 
-echo ""
-echo -e "${BOLD}======================================${NC}"
-echo -e "${BOLD}  Final Results${NC}"
-echo -e "${BOLD}======================================${NC}"
+echo -e "${BOLD}Test summary${NC}"
 echo ""
 echo "Test suites run: $TOTAL_SUITES"
 echo -e "Suites passed:   ${GREEN}$PASSED_SUITES${NC}"

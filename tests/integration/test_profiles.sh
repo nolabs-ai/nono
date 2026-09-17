@@ -18,14 +18,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
 
 echo ""
-echo -e "${BLUE}=== Profile Tests ===${NC}"
+echo -e "${BLUE}Profile Tests${NC}"
 
 verify_nono_binary
 if ! require_working_sandbox "profiles suite"; then
     print_summary
     exit 0
 fi
-NONO_BIN_ABS="$(cd "$(dirname "$NONO_BIN")" && pwd)/$(basename "$NONO_BIN")"
 
 # Create test fixtures
 TMPDIR=$(setup_test_dir)
@@ -38,11 +37,9 @@ echo ""
 echo "Test directory: $TMPDIR"
 echo ""
 
-# =============================================================================
 # Profile Dry Run
-# =============================================================================
 
-echo "--- Profile Dry Run ---"
+echo "Profile Dry Run"
 
 expect_success "default profile dry-run exits 0" \
     "$NONO_BIN" run --profile default --dry-run -- echo "test"
@@ -71,12 +68,10 @@ else
         "$NONO_BIN" run -v --profile node-dev --dry-run -- echo "test"
 fi
 
-# =============================================================================
 # Profile Enforcement
-# =============================================================================
 
 echo ""
-echo "--- Profile Enforcement ---"
+echo "Profile Enforcement"
 
 # default profile blocks rm of files outside the granted area.
 # Even with --allow on the parent dir, default doesn't grant
@@ -98,12 +93,10 @@ expect_success "default profile allows cat on granted path" \
 # language tooling paths. Pack-specific allow-list assertions belong
 # in the pack repo's CI now (see nono-packs/.github/workflows/).
 
-# =============================================================================
 # Profile with Workdir
-# =============================================================================
 
 echo ""
-echo "--- Profile with Workdir ---"
+echo "Profile with Workdir"
 
 expect_success "profile with --workdir flag accepted" \
     "$NONO_BIN" run --profile default --workdir "$TMPDIR/workdir" --dry-run -- echo "workdir test"
@@ -112,8 +105,6 @@ expect_success "profile with --workdir flag accepted" \
 expect_success "profile with --workdir and --allow-cwd accepted" \
     "$NONO_BIN" run --profile default --workdir "$TMPDIR/workdir" --allow-cwd --dry-run -- echo "workdir test"
 
-# =============================================================================
 # Summary
-# =============================================================================
 
 print_summary

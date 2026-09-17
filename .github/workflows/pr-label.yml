@@ -4,8 +4,10 @@ on:
   pull_request_target:
     types: [opened, edited]
 
+# Label changes and PR metadata reads do not need PR creation/review authority.
 permissions:
-  pull-requests: write
+  issues: write
+  pull-requests: read
 
 jobs:
   label:
@@ -52,16 +54,17 @@ jobs:
           echo "Detected type: $TYPE -> label: $LABEL"
 
           # Remove any existing type labels that don't match
-          CURRENT_LABELS=$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json labels --jq '.labels[].name')
+          # Pull requests are issue-backed resources for labels.
+          CURRENT_LABELS=$(gh issue view "$PR_NUMBER" --repo "$GH_REPO" --json labels --jq '.labels[].name')
           for existing in $CURRENT_LABELS; do
             for type_label in $ALL_TYPE_LABELS; do
               if [[ "$existing" == "$type_label" && "$existing" != "$LABEL" ]]; then
                 echo "Removing stale label: $existing"
-                gh pr edit "$PR_NUMBER" --repo "$GH_REPO" --remove-label "$existing"
+                gh issue edit "$PR_NUMBER" --repo "$GH_REPO" --remove-label "$existing"
               fi
             done
           done
 
           # Add the correct label
           echo "Adding label: $LABEL"
-          gh pr edit "$PR_NUMBER" --repo "$GH_REPO" --add-label "$LABEL"
+          gh issue edit "$PR_NUMBER" --repo "$GH_REPO" --add-label "$LABEL"

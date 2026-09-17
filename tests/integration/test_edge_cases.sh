@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2088 # User-facing test descriptions intentionally use ~ notation.
 # Edge Case Tests
 # Tests symlinks, path variations, environment variables, and other edge cases
 
@@ -6,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
 
 echo ""
-echo -e "${BLUE}=== Edge Case Tests ===${NC}"
+echo -e "${BLUE}Edge Case Tests${NC}"
 
 verify_nono_binary
 if ! require_working_sandbox "edge cases suite"; then
@@ -22,11 +23,9 @@ echo ""
 echo "Test directory: $TMPDIR"
 echo ""
 
-# =============================================================================
 # Symlink Tests
-# =============================================================================
 
-echo "--- Symlink Tests ---"
+echo "Symlink Tests"
 
 # Note: On macOS, TMPDIR (/var/folders) is a system-accessible path,
 # so symlink tests within TMPDIR won't show denial behavior.
@@ -67,12 +66,10 @@ ln -s "$TMPDIR/file_symlink.txt" "$TMPDIR/chain_symlink.txt"
 expect_success "symlink chain works within allowed paths" \
     "$NONO_BIN" run --allow "$TMPDIR" -- cat "$TMPDIR/chain_symlink.txt"
 
-# =============================================================================
 # Path Variations
-# =============================================================================
 
 echo ""
-echo "--- Path Variations ---"
+echo "Path Variations"
 
 # Create subdirectory for path tests
 mkdir -p "$TMPDIR/subdir/nested"
@@ -80,20 +77,20 @@ echo "nested content" > "$TMPDIR/subdir/nested/file.txt"
 
 # Relative path grant
 ORIGINAL_DIR=$(pwd)
-cd "$TMPDIR"
+cd "$TMPDIR" || exit
 
 expect_success "relative path grant (./subdir)" \
     "$NONO_BIN" run --allow ./subdir -- cat ./subdir/nested/file.txt
 
-cd "$ORIGINAL_DIR"
+cd "$ORIGINAL_DIR" || exit
 
 # Path with .. (parent references)
-cd "$TMPDIR/subdir"
+cd "$TMPDIR/subdir" || exit
 
 expect_success "path with .. references" \
     "$NONO_BIN" run --allow ../subdir -- cat ../subdir/nested/file.txt
 
-cd "$ORIGINAL_DIR"
+cd "$ORIGINAL_DIR" || exit
 
 # Paths with spaces
 mkdir -p "$TMPDIR/path with spaces/nested dir"
@@ -109,23 +106,19 @@ echo "special" > "$TMPDIR/path-with-dashes_and_underscores/file.txt"
 expect_success "path with dashes and underscores" \
     "$NONO_BIN" run --allow "$TMPDIR/path-with-dashes_and_underscores" -- cat "$TMPDIR/path-with-dashes_and_underscores/file.txt"
 
-# =============================================================================
 # Sandbox Introspection (nono why --self)
-# =============================================================================
 
 echo ""
-echo "--- Sandbox Introspection ---"
+echo "Sandbox Introspection"
 
 # NONO_CAP_FILE should be set for sandbox state
 expect_output_contains "NONO_CAP_FILE is set" "NONO_CAP_FILE=" \
     "$NONO_BIN" run --allow "$TMPDIR" -- env
 
-# =============================================================================
 # Non-existent Paths
-# =============================================================================
 
 echo ""
-echo "--- Non-existent Paths ---"
+echo "Non-existent Paths"
 
 expect_output_contains "grant non-existent directory is skipped with warning" \
     "some requested sandbox grants were skipped because the path does not exist" \
@@ -145,12 +138,10 @@ fi
 expect_failure "read non-existent file in allowed dir gives file error" \
     "$NONO_BIN" run --allow "$TMPDIR" -- cat "$TMPDIR/this_file_does_not_exist.txt"
 
-# =============================================================================
 # Dry Run Mode
-# =============================================================================
 
 echo ""
-echo "--- Dry Run Mode ---"
+echo "Dry Run Mode"
 
 # Use echo instead of rm since rm is blocked even in dry-run
 expect_success "dry-run shows sandbox info" \
@@ -165,24 +156,20 @@ expect_success "dry-run with touch doesn't create file" \
 
 run_test "dry-run did not execute command" 1 test -f "$TMPDIR/should_not_exist.txt"
 
-# =============================================================================
 # Profile Workdir (for variable expansion)
-# =============================================================================
 
 echo ""
-echo "--- Profile Workdir ---"
+echo "Profile Workdir"
 
 # Note: --workdir is for $WORKDIR expansion in profiles, not for setting cwd
 # It's tested here to ensure the flag doesn't cause errors
 expect_success "--workdir flag accepted (for profile variable expansion)" \
     "$NONO_BIN" run --allow "$TMPDIR" --workdir "$TMPDIR" -- echo "workdir test"
 
-# =============================================================================
 # Multiple Permission Types
-# =============================================================================
 
 echo ""
-echo "--- Multiple Permission Types ---"
+echo "Multiple Permission Types"
 
 mkdir -p "$TMPDIR/mixed_read" "$TMPDIR/mixed_write"
 echo "can read" > "$TMPDIR/mixed_read/file.txt"
@@ -201,8 +188,6 @@ else
     run_test "write to write-only directory succeeded" 0 test -f "$TMPDIR/mixed_write/output.txt"
 fi
 
-# =============================================================================
 # Summary
-# =============================================================================
 
 print_summary

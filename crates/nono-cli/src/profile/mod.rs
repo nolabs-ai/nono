@@ -516,7 +516,9 @@ fn is_http_token_char(c: char) -> bool {
 /// - A 1Password `op://` URI (validated by `nono::keystore::validate_op_uri`)
 /// - A Bitwarden `bw://` URI (validated by `nono::keystore::validate_bw_uri`)
 /// - An Apple Passwords `apple-password://` URI
+/// - A `keyring://service/account` URI (validated by `nono::keystore::validate_keyring_uri`)
 /// - A `file://` URI pointing to an absolute path (validated by `nono::keystore::validate_file_uri`)
+/// - A `cmd://name` URI backed by a `credential_capture` entry (validated by `nono::keystore::validate_cmd_uri`)
 /// - An `env://` URI referencing a host environment variable (validated by `nono::keystore::validate_env_uri`)
 fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
     if key.is_empty() {
@@ -548,6 +550,13 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
                 context_name, e
             ))
         })
+    } else if nono::keystore::is_keyring_uri(key) {
+        nono::keystore::validate_keyring_uri(key).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "invalid keyring URI for custom credential '{}': {}",
+                context_name, e
+            ))
+        })
     } else if nono::keystore::is_file_uri(key) {
         nono::keystore::validate_file_uri(key).map_err(|e| {
             NonoError::ProfileParse(format!(
@@ -574,7 +583,8 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
         if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(NonoError::ProfileParse(format!(
                 "credential_key '{}' for custom credential '{}' must contain only \
-                 alphanumeric characters and underscores (or use op:// / bw:// / apple-password:// / file:// / env:// / cmd:// URI)",
+                 alphanumeric characters and underscores (or use op:// / bw:// / \
+                 apple-password:// / keyring:// / file:// / env:// / cmd:// URI)",
                 key, context_name
             )));
         }
@@ -586,7 +596,8 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///
 /// Checks:
 /// - `credential_key` must be alphanumeric + underscores only, or a valid
-///   `op://` / `bw://` / `apple-password://` / `file://` / `env://` / `cmd://` URI
+///   `op://` / `bw://` / `apple-password://` / `keyring://` / `file://` / `env://`
+///   / `cmd://` URI
 /// - `upstream` must be HTTPS (or HTTP for loopback only)
 /// - Mode-specific validation:
 ///   - `header`: inject_header must be valid HTTP token; effective format (see field doc) must not contain CR/LF
@@ -690,14 +701,15 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         if (nono::keystore::is_op_uri(key)
             || nono::keystore::is_bw_uri(key)
             || nono::keystore::is_apple_password_uri(key)
+            || nono::keystore::is_keyring_uri(key)
             || nono::keystore::is_file_uri(key)
             || nono::keystore::is_cmd_uri(key))
             && cred.env_var.is_none()
         {
             return Err(NonoError::ProfileParse(format!(
                 "env_var is required for custom credential '{}' when credential_key is a URI \
-                 manager reference (op://, bw://, apple-password://, file://, or cmd://); \
-                 set it to the SDK API key env var name (e.g., \"OPENAI_API_KEY\")",
+                 manager reference (op://, bw://, apple-password://, keyring://, file://, or \
+                 cmd://); set it to the SDK API key env var name (e.g., \"OPENAI_API_KEY\")",
                 name
             )));
         }
@@ -9371,6 +9383,129 @@ mod tests {
                 result.expect_err("already checked is_ok")
             );
         }
+    }
+
+    // ============================================================================
+    // keyring:// credential key validation tests
+    //
+    // Regression coverage for issue #1759: the docs advertise `keyring://` for
+    // custom credentials, but `validate_credential_key` had no branch for it,
+    // so the key fell through to the bare-account-name rule and was rejected.
+    // Structural validation is delegated to `nono::keystore::validate_keyring_uri`.
+    // ============================================================================
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_accepted() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://my_service/my_account".to_string());
+        cred.env_var = Some("EXAMPLE_TOKEN".to_string());
+        assert!(
+            validate_custom_credential("krtest", &cred).is_ok(),
+            "keyring:// URI with env_var should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_with_decode_accepted() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://gh:github.com/alice?decode=go-keyring".to_string());
+        cred.env_var = Some("GH_TOKEN".to_string());
+        assert!(
+            validate_custom_credential("github", &cred).is_ok(),
+            "keyring:// URI with ?decode=go-keyring should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_requires_env_var() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://my_service/my_account".to_string());
+        cred.env_var = None;
+        let err = validate_custom_credential("krtest", &cred)
+            .expect_err("keyring:// URI without env_var should be rejected");
+        assert!(
+            err.to_string().contains("env_var is required"),
+            "expected env_var requirement error, got: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("keyring://"),
+            "error should list keyring:// among URI manager references, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_missing_account_rejected() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://my_service".to_string());
+        cred.env_var = Some("EXAMPLE_TOKEN".to_string());
+        let err = validate_custom_credential("krtest", &cred)
+            .expect_err("keyring:// URI without an account segment should be rejected");
+        assert!(
+            err.to_string().contains("keyring URI"),
+            "expected keyring-specific error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_injection_rejected() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://my_service/alice;rm -rf".to_string());
+        cred.env_var = Some("EXAMPLE_TOKEN".to_string());
+        let err = validate_custom_credential("krtest", &cred)
+            .expect_err("keyring:// URI with a shell metacharacter should be rejected");
+        assert!(
+            err.to_string().contains("forbidden character"),
+            "expected forbidden-character error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_unknown_query_rejected() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://my_service/alice?foo=bar".to_string());
+        cred.env_var = Some("EXAMPLE_TOKEN".to_string());
+        let err = validate_custom_credential("krtest", &cred)
+            .expect_err("keyring:// URI with an unknown query parameter should be rejected");
+        assert!(
+            err.to_string().contains("unknown query parameter"),
+            "expected unknown-query-parameter error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_profile_with_keyring_credential_key_accepted() {
+        // The exact profile from issue #1759.
+        let json = br#"{
+            "meta": { "name": "krtest" },
+            "network": {
+                "credentials": ["krtest"],
+                "custom_credentials": {
+                    "krtest": {
+                        "upstream": "https://example.com",
+                        "credential_key": "keyring://my_service/my_account",
+                        "inject_header": "Authorization",
+                        "credential_format": "{}",
+                        "env_var": "EXAMPLE_TOKEN"
+                    }
+                }
+            }
+        }"#;
+
+        let profile = parse_profile_bytes(json).expect("keyring:// credential_key should parse");
+        let cred = profile
+            .network
+            .custom_credentials
+            .get("krtest")
+            .expect("custom credential 'krtest' should be present");
+        assert_eq!(
+            cred.credential_key.as_deref(),
+            Some("keyring://my_service/my_account")
+        );
     }
 
     // ============================================================================

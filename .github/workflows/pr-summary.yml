@@ -4,8 +4,10 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened]
 
+# The workflow reads PR files and updates issue-backed PR comments/labels.
 permissions:
-  pull-requests: write
+  issues: write
+  pull-requests: read
 
 jobs:
   summarize:
@@ -160,7 +162,7 @@ jobs:
           # Size labels — remove any stale size label first, then add the current one
           SIZE_LABELS="size/small size/medium size/large"
           for sl in $SIZE_LABELS; do
-            gh pr edit "$PR_NUMBER" --repo "$GH_REPO" --remove-label "$sl" 2>/dev/null || true
+            gh issue edit "$PR_NUMBER" --repo "$GH_REPO" --remove-label "$sl" 2>/dev/null || true
           done
 
           if   [ "$TOTAL_LOC" -lt 50  ]; then LABELS_TO_ADD+=("size/small")
@@ -169,12 +171,9 @@ jobs:
           fi
 
           if [ ${#LABELS_TO_ADD[@]} -gt 0 ]; then
-            ADD_ARGS=""
             for lbl in "${LABELS_TO_ADD[@]}"; do
-              ADD_ARGS="$ADD_ARGS --add-label $lbl"
+              gh issue edit "$PR_NUMBER" --repo "$GH_REPO" --add-label "$lbl"
             done
-            # shellcheck disable=SC2086
-            gh pr edit "$PR_NUMBER" --repo "$GH_REPO" $ADD_ARGS
             echo "Applied labels: ${LABELS_TO_ADD[*]}"
           fi
 
@@ -190,6 +189,6 @@ jobs:
               -f body="$BODY"
             echo "Updated existing comment $EXISTING_ID"
           else
-            gh pr comment "$PR_NUMBER" --repo "$GH_REPO" --body "$BODY"
+            gh issue comment "$PR_NUMBER" --repo "$GH_REPO" --body "$BODY"
             echo "Posted new summary comment"
           fi

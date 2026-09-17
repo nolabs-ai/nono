@@ -9,7 +9,7 @@
 pub mod cli;
 
 pub use cli::{
-    Argv, Completed, KeyRef, Profile, Rollback, RunMode, Sandboxed, Sandboxing, WrapMode,
+    Argv, Completed, KeyRef, Profile, Rollback, RunMode, Sandboxed, Sandboxing, Why, WrapMode,
 };
 
 use std::ffi::OsStr;
@@ -103,6 +103,11 @@ impl NonoTest {
 
     pub fn rollback(&self) -> cli::RollbackCmd<'_> {
         cli::RollbackCmd::new(self)
+    }
+
+    /// `nono why --op <op> --path <path>`
+    pub fn why(&self, op: &str, path: impl AsRef<OsStr>) -> cli::Why<'_> {
+        cli::Why::new(self, op, path)
     }
 
     /// A `nono` invocation with a hermetic environment and no arguments.

@@ -1358,7 +1358,7 @@ pub fn apply_macos_keychain_db_exception(
 
     let mut explicit_paths: HashMap<PathBuf, AccessMode> = HashMap::new();
     let mut keychain_roots: HashMap<PathBuf, AccessMode> = HashMap::new();
-    let mut mach_authorized = false;
+    let mut mach_read_authorized = false;
 
     // Only user-intent grants trigger the exception. Group-sourced caps must not
     // emit specific-op allows — they land after the deny_keychains_macos rules
@@ -1372,11 +1372,13 @@ pub fn apply_macos_keychain_db_exception(
             // A directory grant covering a keychain DB (e.g. ~/Library/Keychains)
             // gets its file rules from the ordinary allow emission; it only needs
             // to be recognized here so the Mach services can be unlocked.
-            if all_keychain_dbs.iter().any(|db| {
-                (db.starts_with(&cap.resolved) || db.starts_with(&cap.original))
-                    && !deny_policy.is_effectively_denied(db)
-            }) {
-                mach_authorized = true;
+            if matches!(cap.access, AccessMode::Read | AccessMode::ReadWrite)
+                && all_keychain_dbs.iter().any(|db| {
+                    (db.starts_with(&cap.resolved) || db.starts_with(&cap.original))
+                        && !deny_policy.is_effectively_denied(db)
+                })
+            {
+                mach_read_authorized = true;
             }
             continue;
         }
@@ -1389,7 +1391,9 @@ pub fn apply_macos_keychain_db_exception(
             continue;
         }
 
-        mach_authorized = true;
+        if matches!(cap.access, AccessMode::Read | AccessMode::ReadWrite) {
+            mach_read_authorized = true;
+        }
 
         explicit_paths
             .entry(cap.resolved.clone())
@@ -1406,11 +1410,17 @@ pub fn apply_macos_keychain_db_exception(
 
     let mut allow_rules = Vec::new();
 
-    // Mach IPC to the keychain daemons cannot be split by access mode — securityd
-    // brokers the whole keychain over one service — so an authorized grant unlocks
-    // the services regardless of the mode it requested. Without an authorized
-    // grant the library's unconditional denies stand.
-    if mach_authorized {
+    // Mach IPC to the keychain daemons cannot be split by access mode: once a
+    // process can look up securityd it can ask the daemon to return credentials.
+    // Therefore only a read-capable grant may unlock these services. A write-only
+    // filesystem grant must not become a Keychain read capability through IPC.
+    //
+    // SECURITY: nor can it be split by keychain. These are the same services for
+    // every keychain and for SecItem classes backed by no file above, so an
+    // authorized grant on one DB reaches items the file grant does not name. The
+    // narrow file rules below bound the filesystem reach, not the IPC reach —
+    // requiring an explicit bypass_protection is what bounds this.
+    if mach_read_authorized {
         for service in KEYCHAIN_MACH_SERVICES {
             allow_rules.push(format!("(allow mach-lookup (global-name \"{service}\"))"));
         }
@@ -3817,6 +3827,10 @@ mod tests {
             !rules.contains("file-read"),
             "write-only grant must not emit read rules, got: {rules}"
         );
+        assert!(
+            !rules.contains("mach-lookup"),
+            "write-only grant must not unlock credential-reading Mach services, got: {rules}"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -4105,6 +4119,32 @@ mod tests {
         assert!(
             !rules.contains("file-read"),
             "directory grant must not emit file exceptions, got: {rules}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_write_only_directory_grant_does_not_unlock_mach() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: fixture.keychains.clone(),
+            resolved: fixture.keychains.clone(),
+            access: AccessMode::Write,
+            is_file: false,
+            source: CapabilitySource::Profile,
+        });
+        let deny_policy = EffectiveDenyPolicy::new(
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.keychains),
+        );
+
+        apply_macos_keychain_db_exception(&mut caps, &deny_policy);
+
+        let rules = caps.platform_rules().join("\n");
+        assert!(
+            !rules.contains("mach-lookup"),
+            "write-only directory grant must not unlock credential-reading Mach services, got: {rules}"
         );
     }
 

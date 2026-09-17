@@ -411,13 +411,17 @@ fn validate_bundle_relative_path<'a>(
     Ok(path)
 }
 
-fn expand_bypass_protection_path(path: &Path, workdir: &Path) -> PathBuf {
-    let path_str = path.to_string_lossy();
-    let expanded = profile::expand_vars(&path_str, workdir).unwrap_or_else(|_| path.to_path_buf());
-    if expanded.exists() {
-        expanded.canonicalize().unwrap_or(expanded)
+fn push_bypass_protection_path_forms(paths: &mut Vec<PathBuf>, expanded: PathBuf) {
+    let canonical = if expanded.exists() {
+        expanded.canonicalize().unwrap_or_else(|_| expanded.clone())
     } else {
-        expanded
+        expanded.clone()
+    };
+
+    for path in [expanded, canonical] {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
     }
 }
 
@@ -431,32 +435,21 @@ pub(crate) fn collect_bypass_protection_paths(
     cli_bypass_protection: &[PathBuf],
     workdir: &Path,
 ) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = loaded_profile
-        .map(|profile| {
-            profile
-                .filesystem
-                .bypass_protection
-                .iter()
-                .filter_map(|template| {
-                    profile::expand_vars(template, workdir)
-                        .ok()
-                        .map(|expanded| {
-                            if expanded.exists() {
-                                expanded.canonicalize().unwrap_or(expanded)
-                            } else {
-                                expanded
-                            }
-                        })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut paths = Vec::new();
+
+    if let Some(profile) = loaded_profile {
+        for template in &profile.filesystem.bypass_protection {
+            if let Ok(expanded) = profile::expand_vars(template, workdir) {
+                push_bypass_protection_path_forms(&mut paths, expanded);
+            }
+        }
+    }
 
     for path in cli_bypass_protection {
-        let canonical = expand_bypass_protection_path(path, workdir);
-        if !paths.contains(&canonical) {
-            paths.push(canonical);
-        }
+        let path_str = path.to_string_lossy();
+        let expanded =
+            profile::expand_vars(&path_str, workdir).unwrap_or_else(|_| path.to_path_buf());
+        push_bypass_protection_path_forms(&mut paths, expanded);
     }
 
     paths
@@ -1227,6 +1220,30 @@ mod tests {
         let result = expand_profile_set_vars(Some(&profile), Path::new("/tmp/work"))
             .expect("expansion should succeed");
         assert!(result.is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bypass_protection_paths_retain_original_and_canonical_forms() {
+        let root = tempdir().expect("tmpdir");
+        let real = root.path().join("real");
+        fs::create_dir(&real).expect("create real directory");
+        let target = real.join("login.keychain-db");
+        fs::write(&target, "").expect("create target");
+        let link = root.path().join("home-link");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+        let original = link.join("login.keychain-db");
+        let canonical = original.canonicalize().expect("canonicalize target");
+
+        let paths =
+            collect_bypass_protection_paths(None, std::slice::from_ref(&original), root.path());
+
+        assert!(paths.contains(&original));
+        assert!(paths.contains(&canonical));
+
+        let deny_policy = crate::policy::EffectiveDenyPolicy::new(&[link, real], &paths);
+        assert!(!deny_policy.is_effectively_denied(&original));
+        assert!(!deny_policy.is_effectively_denied(&canonical));
     }
 
     #[test]

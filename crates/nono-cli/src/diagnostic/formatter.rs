@@ -2375,8 +2375,11 @@ fn format_non_fs_guidance(lines: &mut Vec<String>, violations: &[&SandboxViolati
     };
 
     if has_guidance(SystemServiceGuidance::Keychain) {
-        lines.push("[nono] Keychain access requires granting the login keychain path:".to_string());
-        lines.push(keychain_login_grant_guidance());
+        lines.push(
+            "[nono] Keychain access requires granting the login keychain path and bypassing the deny that covers it:"
+                .to_string(),
+        );
+        lines.extend(keychain_login_grant_guidance());
     }
 
     if has_guidance(SystemServiceGuidance::UserPreferences) {
@@ -2406,21 +2409,30 @@ fn format_non_fs_guidance(lines: &mut Vec<String>, violations: &[&SandboxViolati
     }
 }
 
-fn keychain_login_grant_guidance() -> String {
+fn keychain_login_grant_guidance() -> Vec<String> {
     const DISPLAY_PATH: &str = "~/Library/Keychains/login.keychain-db";
     let Some(home) = std::env::var_os("HOME") else {
-        return format!("[nono]   --read-file {DISPLAY_PATH}");
+        return keychain_guidance_lines("--read-file", DISPLAY_PATH);
     };
     let path = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
     keychain_grant_guidance_for_path(&path, DISPLAY_PATH)
 }
 
-fn keychain_grant_guidance_for_path(path: &Path, display_path: &str) -> String {
+fn keychain_grant_guidance_for_path(path: &Path, display_path: &str) -> Vec<String> {
     let flag = match std::fs::metadata(path).map(|metadata| metadata.file_type()) {
         Ok(file_type) if file_type.is_dir() => "--read",
         _ => "--read-file",
     };
-    format!("[nono]   {flag} {display_path}")
+    keychain_guidance_lines(flag, display_path)
+}
+
+/// The grant and the bypass are both required: `deny_keychains_macos` covers
+/// `~/Library/Keychains`, and a grant alone leaves that deny in force.
+fn keychain_guidance_lines(grant_flag: &str, display_path: &str) -> Vec<String> {
+    vec![
+        format!("[nono]   {grant_flag} {display_path} \\"),
+        format!("[nono]   --bypass-protection {display_path}"),
+    ]
 }
 
 fn access_str(access: AccessMode) -> &'static str {
@@ -3765,7 +3777,10 @@ mod tests {
 
         assert_eq!(
             guidance,
-            "[nono]   --read-file ~/Library/Keychains/login.keychain-db"
+            vec![
+                "[nono]   --read-file ~/Library/Keychains/login.keychain-db \\".to_string(),
+                "[nono]   --bypass-protection ~/Library/Keychains/login.keychain-db".to_string(),
+            ]
         );
     }
 
@@ -3778,7 +3793,10 @@ mod tests {
 
         assert_eq!(
             guidance,
-            "[nono]   --read ~/Library/Keychains/login.keychain-db"
+            vec![
+                "[nono]   --read ~/Library/Keychains/login.keychain-db \\".to_string(),
+                "[nono]   --bypass-protection ~/Library/Keychains/login.keychain-db".to_string(),
+            ]
         );
     }
 
@@ -3794,8 +3812,11 @@ mod tests {
             .with_sandbox_violations(&violations);
         let output = formatter.format_footer(1);
 
-        assert!(output.contains("Keychain access requires granting the login keychain path:"));
+        assert!(output.contains(
+            "Keychain access requires granting the login keychain path and bypassing the deny that covers it:"
+        ));
         assert!(output.contains("--read-file ~/Library/Keychains/login.keychain-db"));
+        assert!(output.contains("--bypass-protection ~/Library/Keychains/login.keychain-db"));
     }
 
     #[test]

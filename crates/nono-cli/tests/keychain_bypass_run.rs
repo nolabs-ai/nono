@@ -7,7 +7,7 @@
 
 #![cfg(target_os = "macos")]
 
-use nono_test_support::{Argv, NonoTest, nono_test};
+use nono_test_support::{Argv, Completed, NonoTest, nono_test};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -46,6 +46,13 @@ fn write_argv(db: &Path) -> Argv {
         .arg(format!("echo rewritten > {}", db.display()))
 }
 
+fn assert_sandbox_denial(output: Completed, why: &str) -> Completed {
+    output
+        .assert_exit_code(1, why)
+        .assert_stderr_lacks("sandbox initialization failed")
+        .assert_stderr_lacks("failed to apply sandbox")
+}
+
 #[test]
 fn why_reports_keychain_grant_denied_without_bypass() {
     let t = nono_test!("keychain-why-no-bypass");
@@ -74,10 +81,9 @@ fn read_file_grant_cannot_read_keychain_without_bypass() {
     let db = fake_login_keychain(&t);
     let profile = t.write_profile("kc", &profile_json(&db, "read_file", false));
 
-    t.run()
-        .profile(&profile)
-        .exec(read_argv(&db))
-        .assert_failure("read_file alone must not defeat the keychain deny");
+    let output = t.run().profile(&profile).exec(read_argv(&db));
+    assert_sandbox_denial(output, "read_file alone must not defeat the keychain deny")
+        .assert_stdout_lacks(CONTENT.trim());
 }
 
 #[test]
@@ -91,10 +97,8 @@ fn read_file_grant_reads_keychain_with_bypass() {
         .exec(read_argv(&db))
         .assert_stdout_contains(CONTENT.trim());
 
-    t.run()
-        .profile(&profile)
-        .exec(write_argv(&db))
-        .assert_failure("a bypassed read grant must stay read-only");
+    let output = t.run().profile(&profile).exec(write_argv(&db));
+    assert_sandbox_denial(output, "a bypassed read grant must stay read-only");
 }
 
 #[test]
@@ -103,10 +107,8 @@ fn write_file_grant_cannot_write_keychain_without_bypass() {
     let db = fake_login_keychain(&t);
     let profile = t.write_profile("kc", &profile_json(&db, "write_file", false));
 
-    t.run()
-        .profile(&profile)
-        .exec(write_argv(&db))
-        .assert_failure("write_file alone must not defeat the keychain deny");
+    let output = t.run().profile(&profile).exec(write_argv(&db));
+    assert_sandbox_denial(output, "write_file alone must not defeat the keychain deny");
     assert_eq!(
         fs::read_to_string(&db).expect("read back"),
         CONTENT,
@@ -126,10 +128,9 @@ fn write_file_grant_writes_keychain_with_bypass() {
         .assert_success("a bypassed write grant must grant write");
     assert_eq!(fs::read_to_string(&db).expect("read back"), "rewritten\n");
 
-    t.run()
-        .profile(&profile)
-        .exec(read_argv(&db))
-        .assert_failure("a bypassed write grant must stay write-only");
+    let output = t.run().profile(&profile).exec(read_argv(&db));
+    assert_sandbox_denial(output, "a bypassed write grant must stay write-only")
+        .assert_stdout_lacks("rewritten");
 }
 
 #[test]
@@ -138,14 +139,19 @@ fn allow_file_grant_cannot_access_keychain_without_bypass() {
     let db = fake_login_keychain(&t);
     let profile = t.write_profile("kc", &profile_json(&db, "allow_file", false));
 
-    t.run()
-        .profile(&profile)
-        .exec(read_argv(&db))
-        .assert_failure("allow_file alone must not defeat the keychain deny");
-    t.run()
-        .profile(&profile)
-        .exec(write_argv(&db))
-        .assert_failure("allow_file alone must not defeat the keychain deny");
+    let read_output = t.run().profile(&profile).exec(read_argv(&db));
+    assert_sandbox_denial(
+        read_output,
+        "allow_file alone must not defeat the keychain deny",
+    )
+    .assert_stdout_lacks(CONTENT.trim());
+
+    let write_output = t.run().profile(&profile).exec(write_argv(&db));
+    assert_sandbox_denial(
+        write_output,
+        "allow_file alone must not defeat the keychain deny",
+    );
+    assert_eq!(fs::read_to_string(&db).expect("read back"), CONTENT);
 }
 
 #[test]

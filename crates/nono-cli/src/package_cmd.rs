@@ -829,11 +829,16 @@ fn install_package(
     let wiring_record = if manifest.wiring.is_empty() {
         Vec::new()
     } else {
-        let ctx = crate::wiring::WiringContext {
+        // Resolve the pack's declared variables before any directive
+        // runs, so an unusable one fails the install up front rather
+        // than part-way through writing files.
+        let mut ctx = crate::wiring::WiringContext {
             pack_dir: final_root.clone(),
             namespace: package_ref.namespace.clone(),
             pack_name: package_ref.name.clone(),
+            vars: BTreeMap::new(),
         };
+        ctx.vars = crate::wiring::resolve_vars(&manifest.wiring_vars, &ctx)?;
         let report = crate::wiring::execute(&manifest.wiring, &ctx, pack_owned_files)?;
         for conflict in &report.conflicts {
             eprintln!("  warning: {conflict}");

@@ -17,6 +17,7 @@ use crate::cli::PullArgs;
 use crate::package::ProfileProvider;
 use crate::package_cmd;
 use crate::registry_client::{PullReason, RegistryClient, resolve_registry_url};
+use crate::terminal_approval::sanitize_for_terminal;
 use colored::Colorize;
 use nono::Result;
 use std::io::{self, IsTerminal, Write};
@@ -194,7 +195,9 @@ fn env_flag(key: &str) -> bool {
 }
 
 fn confirm_pull(profile_name: &str, provider: &ProfileProvider) -> Result<bool> {
-    let pack_ref = provider.pack_ref();
+    // Display only — the pull itself uses the unsanitized ref, which the
+    // registry client validates separately.
+    let pack_ref = sanitize_for_terminal(&provider.pack_ref());
     let mut err = io::stderr().lock();
     let _ = writeln!(err);
     let _ = writeln!(err, "  {}  Install {}?", "⊕".cyan(), pack_ref.bold(),);
@@ -206,10 +209,16 @@ fn confirm_pull(profile_name: &str, provider: &ProfileProvider) -> Result<bool> 
     let _ = writeln!(err);
 
     let label_w = "Provenance".len();
+    // Registry-supplied, and rendered before anything is downloaded or
+    // signature-verified. This is a consent prompt, so injected escapes
+    // could redraw the very lines the user is being asked to approve.
     write_field(
         &mut err,
         "Publisher",
-        &format!("{} GitHub organisation", provider.namespace),
+        &format!(
+            "{} GitHub organisation",
+            sanitize_for_terminal(&provider.namespace)
+        ),
         label_w,
     );
     write_field(
@@ -219,7 +228,12 @@ fn confirm_pull(profile_name: &str, provider: &ProfileProvider) -> Result<bool> 
         label_w,
     );
     if let Some(summary) = provider.installs_summary.as_deref() {
-        write_field(&mut err, "Installs", summary, label_w);
+        write_field(
+            &mut err,
+            "Installs",
+            &sanitize_for_terminal(summary),
+            label_w,
+        );
     }
 
     let _ = writeln!(err);
@@ -252,7 +266,9 @@ enum SkipReason {
 }
 
 fn emit_skipped_hint(provider: &ProfileProvider, reason: SkipReason) {
-    let pack_ref = provider.pack_ref();
+    // Display only, and it is printed as a command for the user to copy —
+    // all the more reason it must not carry escapes.
+    let pack_ref = sanitize_for_terminal(&provider.pack_ref());
     let mut err = io::stderr().lock();
     let _ = writeln!(err);
     match reason {

@@ -422,7 +422,11 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
 
             for change in &changes {
                 let symbol = change_symbol(&change.change_type);
-                eprintln!("        {} {}", symbol, change.path.display());
+                eprintln!(
+                    "        {} {}",
+                    symbol,
+                    crate::terminal_approval::safe_path(&change.path)
+                );
             }
         }
     }

@@ -186,9 +186,12 @@ fn group_by_project<'a>(
     groups
 }
 
-/// Replace the home directory prefix with ~ for display
+/// Replace the home directory prefix with ~ for display.
+///
+/// Display-only by contract, so the result is sanitized: callers render
+/// it to a terminal, and the path may be one a sandboxed agent named.
 fn shorten_home(path: &Path) -> String {
-    let s = path.display().to_string();
+    let s = crate::terminal_approval::safe_path(path).to_string();
     if let Some(home) = dirs::home_dir() {
         let home_str = home.display().to_string();
         if let Some(rest) = s.strip_prefix(&home_str) {
@@ -350,7 +353,7 @@ fn print_change_summary(changes: &[nono::undo::Change], object_store: &ObjectSto
             .path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| change.path.display().to_string());
+            .unwrap_or_else(|| crate::terminal_approval::safe_path(&change.path).to_string());
 
         let line_info = match change.change_type {
             ChangeType::Created => {
@@ -411,7 +414,7 @@ fn print_unified_diff(changes: &[nono::undo::Change], object_store: &ObjectStore
     use similar::{ChangeTag, TextDiff};
 
     for change in changes {
-        let path_str = change.path.display().to_string();
+        let path_str = crate::terminal_approval::safe_path(&change.path).to_string();
 
         let old_content = change
             .old_hash
@@ -469,7 +472,12 @@ fn print_side_by_side_diff(
     for change in changes {
         eprintln!(
             "{}",
-            format!("=== {} ===", change.path.display()).white().bold()
+            format!(
+                "=== {} ===",
+                crate::terminal_approval::safe_path(&change.path)
+            )
+            .white()
+            .bold()
         );
 
         let old_content = change
@@ -527,7 +535,10 @@ fn print_full_content(changes: &[nono::undo::Change], object_store: &ObjectStore
         eprintln!(
             "{} {} {}",
             symbol,
-            change.path.display().to_string().white().bold(),
+            crate::terminal_approval::safe_path(&change.path)
+                .to_string()
+                .white()
+                .bold(),
             format!("({})", change.change_type).truecolor(100, 100, 100)
         );
 
@@ -581,6 +592,9 @@ fn print_show_json(session: &SessionInfo) -> Result<()> {
             "file_count": manifest.files.len(),
             "merkle_root": manifest.merkle_root.to_string(),
             "changes": changes.iter().map(|c| serde_json::json!({
+                // Raw, deliberately: this is machine-readable output.
+                // `serde_json` escapes control characters, so there is no
+                // injection vector here — only a value consumers parse.
                 "path": c.path.display().to_string(),
                 "type": format!("{}", c.change_type),
                 "size_delta": c.size_delta,
@@ -1077,7 +1091,11 @@ fn change_symbol(ct: &nono::undo::ChangeType) -> colored::ColoredString {
 fn print_changes(changes: &[nono::undo::Change]) {
     for change in changes {
         let symbol = change_symbol(&change.change_type);
-        eprintln!("  {} {}", symbol, change.path.display());
+        eprintln!(
+            "  {} {}",
+            symbol,
+            crate::terminal_approval::safe_path(&change.path)
+        );
     }
 }
 

@@ -376,6 +376,31 @@ impl RollbackCleanup<'_> {
     }
 }
 
+/// `nono why --op <op> --path <path>`
+#[must_use = "a dropped builder never spawns nono, so the test asserts nothing"]
+pub struct Why<'t> {
+    inner: Invocation<'t>,
+}
+
+impl<'t> Why<'t> {
+    pub fn profile(mut self, profile: &Profile) -> Self {
+        self.inner.opt("--profile", profile.path());
+        self
+    }
+
+    #[must_use = "a Completed that is dropped asserts nothing about the run"]
+    pub fn output(self) -> Completed {
+        self.inner.finish()
+    }
+
+    pub(crate) fn new(t: &'t NonoTest, op: &str, path: impl AsRef<OsStr>) -> Self {
+        let mut inner = Invocation::new(t, &["why"]);
+        inner.opt("--op", op);
+        inner.opt("--path", path);
+        Self { inner }
+    }
+}
+
 /// Accumulates argv/env for one `nono` invocation.
 struct Invocation<'t> {
     t: &'t NonoTest,

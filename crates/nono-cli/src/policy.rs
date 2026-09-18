@@ -1173,13 +1173,128 @@ pub(crate) fn add_deny_access_rules(
     Ok(())
 }
 
-/// Add a narrow macOS exception for explicit keychain DB file grants.
+/// Resolved deny paths together with the `filesystem.bypass_protection` paths
+/// that punch through them.
+///
+/// SECURITY: a filesystem grant supplies access but never defeats a covering
+/// deny; only a bypass covering the same path does, and a bypass alone grants
+/// nothing (`apply_deny_overrides` rejects one with no matching grant). The two
+/// halves are meaningless apart, so they travel as one value and every consumer
+/// answers "is this path still denied?" the same way. `apply_deny_overrides`
+/// leaves a broader parent deny standing when only a child was bypassed, so the
+/// surviving deny list read alone reports a bypassed path as denied while the
+/// sandbox allows it.
+// No `Default`: an empty policy answers "not denied" for every path, which
+// authorizes every keychain grant. Construct with `new` so the absence of denies
+// is something a caller stated.
+#[derive(Debug, Clone)]
+pub struct EffectiveDenyPolicy {
+    deny_paths: Vec<PathBuf>,
+    bypass_paths: Vec<PathBuf>,
+}
+
+impl EffectiveDenyPolicy {
+    /// Build from deny paths left standing after `apply_deny_overrides` and the
+    /// bypass paths that were applied to them.
+    ///
+    /// Each bypass is recorded in both its given and its resolved form so a deny
+    /// recorded against a symlink still matches a bypass recorded against its
+    /// target (and the reverse).
+    ///
+    /// Deny paths are stored exactly as given, never resolved here: the caller's
+    /// list is authoritative. `add_deny_access_rules` already pushes every form
+    /// it emits a rule for, and deliberately omits the resolved form of a Nix
+    /// store target, so resolving here would report denies the sandbox does not
+    /// enforce.
+    #[must_use]
+    pub fn new(deny_paths: &[PathBuf], bypass_paths: &[PathBuf]) -> Self {
+        let mut deny_paths = deny_paths.to_vec();
+        deny_paths.sort_unstable();
+        deny_paths.dedup();
+
+        let mut bypasses = Vec::with_capacity(bypass_paths.len().saturating_mul(2));
+        for bypass in bypass_paths {
+            bypasses.push(bypass.clone());
+            bypasses.push(nono::try_canonicalize(bypass));
+        }
+        bypasses.sort_unstable();
+        bypasses.dedup();
+
+        Self {
+            deny_paths,
+            bypass_paths: bypasses,
+        }
+    }
+
+    /// The bypass paths in both forms, for the consumers that must additionally
+    /// answer "is this path exempt?" against policy that is not a deny path
+    /// (`query_ext::query_path`'s sensitive-path groups).
+    #[must_use]
+    pub fn bypass_paths(&self) -> &[PathBuf] {
+        &self.bypass_paths
+    }
+
+    /// Whether `path` sits under a deny rule that no bypass reopens.
+    #[must_use]
+    pub fn is_effectively_denied(&self, path: &Path) -> bool {
+        self.matching_deny(path).is_some()
+    }
+
+    /// The most specific deny rule covering `path`, or `None` when no deny
+    /// covers it or a bypass reopens it.
+    ///
+    /// The path is matched in both its given and its resolved form, so a query
+    /// naming one side of a symlink meets the rule installed for the other;
+    /// resolution walks existing ancestors so a leaf that does not exist yet
+    /// (the create-file case) compares like the rules installed at launch.
+    /// Comparison is by path component (`Path::starts_with`), never by string
+    /// prefix, so a deny on `/home/user` does not cover `/home/username`.
+    #[must_use]
+    pub fn matching_deny(&self, path: &Path) -> Option<&PathBuf> {
+        let resolved = nono::try_canonicalize(path);
+        let covers = |rule: &Path| path.starts_with(rule) || resolved.starts_with(rule);
+
+        if self.bypass_paths.iter().any(|bypass| covers(bypass)) {
+            return None;
+        }
+        self.deny_paths
+            .iter()
+            .filter(|deny| covers(deny))
+            .max_by_key(|deny| deny.as_os_str().len())
+    }
+}
+
+/// Mach services that broker Keychain access. The library's macOS profile denies
+/// all of them unconditionally; an authorized grant re-allows them here.
+const KEYCHAIN_MACH_SERVICES: [&str; 5] = [
+    // Legacy keychain daemons (macOS < 13).
+    "com.apple.SecurityServer",
+    "com.apple.securityd",
+    // Modern keychain daemon (macOS 13 Ventura+); legacy SecKeychain APIs route here.
+    "com.apple.security.keychaind",
+    // Modern security daemon: SecItem ("Data Protection") and iCloud Keychain.
+    "com.apple.secd",
+    // Authorization-dialog agent, which can return a credential on the process's behalf.
+    "com.apple.security.agent",
+];
+
+/// Add a narrow macOS exception for authorized keychain DB grants.
 ///
 /// This keeps broad keychain deny groups active while allowing only the exact
 /// file capability intended by a profile or CLI flag, plus the backing
 /// SQLite/WAL/SHM files the Security framework actually touches under
-/// `~/Library/Keychains/<UUID>/...`.
-pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
+/// `~/Library/Keychains/<UUID>/...`, and the Mach services that broker keychain
+/// reads.
+///
+/// SECURITY: a grant alone is not authorization. These rules are emitted after
+/// the `deny_keychains_macos` rules and win under Seatbelt's last-matching-rule
+/// semantics, so emitting them for a bare `--read-file` would let a grant
+/// silently defeat a deny that `nono why` still reports as blocking. A covering
+/// deny must additionally be lifted by `filesystem.bypass_protection`.
+pub fn apply_macos_keychain_db_exception(
+    caps: &mut CapabilitySet,
+    deny_policy: &EffectiveDenyPolicy,
+) {
     if !cfg!(target_os = "macos") {
         return;
     }
@@ -1210,6 +1325,14 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
         false
     };
 
+    let all_keychain_dbs: Vec<PathBuf> = user_keychain_dbs
+        .as_ref()
+        .map(|dbs| dbs.to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(system_keychain_dbs.iter().cloned())
+        .collect();
+
     let merge_access = |existing: &mut AccessMode, next: AccessMode| {
         *existing = match (*existing, next) {
             (AccessMode::ReadWrite, _) | (_, AccessMode::ReadWrite) => AccessMode::ReadWrite,
@@ -1220,8 +1343,17 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
         };
     };
 
+    // A grant only authorizes the exception when no deny still covers it. Both
+    // the original and the resolved form must clear the check, so a symlink
+    // pointing at a denied keychain cannot launder the grant.
+    let authorized = |cap: &FsCapability| -> bool {
+        !deny_policy.is_effectively_denied(&cap.resolved)
+            && !deny_policy.is_effectively_denied(&cap.original)
+    };
+
     let mut explicit_paths: HashMap<PathBuf, AccessMode> = HashMap::new();
     let mut keychain_roots: HashMap<PathBuf, AccessMode> = HashMap::new();
+    let mut mach_read_authorized = false;
 
     // Only user-intent grants trigger the exception. Group-sourced caps must not
     // emit specific-op allows — they land after the deny_keychains_macos rules
@@ -1229,10 +1361,33 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
     for cap in caps
         .fs_capabilities()
         .iter()
-        .filter(|cap| cap.is_file && cap.source.is_user_intent())
+        .filter(|cap| cap.source.is_user_intent())
     {
-        if !is_keychain_db(&cap.resolved) {
+        if !cap.is_file {
+            // A directory grant covering a keychain DB (e.g. ~/Library/Keychains)
+            // gets its file rules from the ordinary allow emission; it only needs
+            // to be recognized here so the Mach services can be unlocked.
+            if matches!(cap.access, AccessMode::Read | AccessMode::ReadWrite)
+                && all_keychain_dbs.iter().any(|db| {
+                    (db.starts_with(&cap.resolved) || db.starts_with(&cap.original))
+                        && !deny_policy.is_effectively_denied(db)
+                })
+            {
+                mach_read_authorized = true;
+            }
             continue;
+        }
+
+        if !is_keychain_db(&cap.resolved) && !is_keychain_db(&cap.original) {
+            continue;
+        }
+
+        if !authorized(cap) {
+            continue;
+        }
+
+        if matches!(cap.access, AccessMode::Read | AccessMode::ReadWrite) {
+            mach_read_authorized = true;
         }
 
         explicit_paths
@@ -1249,6 +1404,22 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
     }
 
     let mut allow_rules = Vec::new();
+
+    // Mach IPC to the keychain daemons cannot be split by access mode: once a
+    // process can look up securityd it can ask the daemon to return credentials.
+    // Therefore only a read-capable grant may unlock these services. A write-only
+    // filesystem grant must not become a Keychain read capability through IPC.
+    //
+    // SECURITY: nor can it be split by keychain. These are the same services for
+    // every keychain and for SecItem classes backed by no file above, so an
+    // authorized grant on one DB reaches items the file grant does not name. The
+    // narrow file rules below bound the filesystem reach, not the IPC reach —
+    // requiring an explicit bypass_protection is what bounds this.
+    if mach_read_authorized {
+        for service in KEYCHAIN_MACH_SERVICES {
+            allow_rules.push(format!("(allow mach-lookup (global-name \"{service}\"))"));
+        }
+    }
 
     for (path, access) in explicit_paths {
         let path_str = match path_to_utf8(&path) {
@@ -1369,13 +1540,20 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
 ///
 /// The override path must also be explicitly granted via `--allow`, `--read`, or `--write`.
 /// `--bypass-protection` only removes the deny; it does not implicitly grant access.
+///
+/// Returns every resolved form of the applied overrides (canonical and, when it
+/// differs, the expanded symlink path). Callers that must decide whether a path
+/// is still denied need these alongside the surviving `deny_paths`, because a
+/// narrow child bypass leaves a broader parent deny standing — see
+/// [`EffectiveDenyPolicy`].
 pub fn apply_deny_overrides(
     overrides: &[std::path::PathBuf],
     deny_paths: &mut Vec<PathBuf>,
     caps: &mut CapabilitySet,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
+    let mut resolved_overrides = Vec::with_capacity(overrides.len());
     if overrides.is_empty() {
-        return Ok(());
+        return Ok(resolved_overrides);
     }
 
     for override_path in overrides {
@@ -1485,9 +1663,14 @@ pub fn apply_deny_overrides(
         // Do NOT remove broader deny entries when the override is a child — e.g.,
         // overriding ~/.aws must not remove a deny on the entire home directory.
         deny_paths.retain(|dp| !dp.starts_with(&canonical) && !dp.starts_with(&expanded));
+
+        resolved_overrides.push(canonical.clone());
+        if expanded != canonical {
+            resolved_overrides.push(expanded);
+        }
     }
 
-    Ok(())
+    Ok(resolved_overrides)
 }
 
 /// Apply unlink override rules for all writable paths in the capability set.
@@ -3507,210 +3690,617 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
-    fn test_apply_macos_keychain_db_exception_adds_login_db_allow_rule() {
+    fn keychain_exception_rules(
+        cap: FsCapability,
+        deny_paths: &[PathBuf],
+        bypass_paths: &[PathBuf],
+    ) -> String {
         let mut caps = CapabilitySet::new();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
-        let login_db = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
-        caps.add_fs(FsCapability {
-            original: login_db.clone(),
-            resolved: login_db.clone(),
-            access: AccessMode::ReadWrite,
-            is_file: true,
-            source: CapabilitySource::Profile,
-        });
-
-        apply_macos_keychain_db_exception(&mut caps);
-
-        let rules = caps.platform_rules().join("\n");
-        assert!(
-            rules.contains(&format!(
-                "(allow file-read* (literal \"{}\"))",
-                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
-            )),
-            "expected login keychain DB exception rule, got: {}",
-            rules
-        );
-        assert!(
-            rules.contains(&format!(
-                "(allow file-write* (literal \"{}\"))",
-                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
-            )),
-            "expected login keychain DB write rule, got: {}",
-            rules
-        );
-        // Specific-op rules must also be emitted so they override the specific-op
-        // deny from deny_keychains_macos: (deny file-read-data (subpath "...Keychains")).
-        // A file-read* wildcard allow does not override a file-read-data specific deny.
-        assert!(
-            rules.contains(&format!(
-                "(allow file-read-data (literal \"{}\"))",
-                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
-            )),
-            "expected login keychain DB file-read-data rule (to override specific deny), got: {}",
-            rules
-        );
-        assert!(
-            rules.contains(&format!(
-                "(allow file-write-data (literal \"{}\"))",
-                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
-            )),
-            "expected login keychain DB file-write-data rule (to override specific deny), got: {}",
-            rules
-        );
+        caps.add_fs(cap);
+        let deny_policy = EffectiveDenyPolicy::new(deny_paths, bypass_paths);
+        apply_macos_keychain_db_exception(&mut caps, &deny_policy);
+        caps.platform_rules().join("\n")
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
-    fn test_apply_macos_keychain_db_exception_adds_metadata_db_allow_rule() {
-        let mut caps = CapabilitySet::new();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
-        let metadata_db = PathBuf::from(home).join("Library/Keychains/metadata.keychain-db");
-        caps.add_fs(FsCapability {
-            original: metadata_db.clone(),
-            resolved: metadata_db.clone(),
-            access: AccessMode::ReadWrite,
-            is_file: true,
-            source: CapabilitySource::Profile,
-        });
-
-        apply_macos_keychain_db_exception(&mut caps);
-
-        let rules = caps.platform_rules().join("\n");
-        assert!(
-            rules.contains(&format!(
-                "(allow file-read* (literal \"{}\"))",
-                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
-                    .expect("escaped path")
-            )),
-            "expected metadata keychain DB exception rule, got: {}",
-            rules
-        );
-        assert!(
-            rules.contains(&format!(
-                "(allow file-write* (literal \"{}\"))",
-                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
-                    .expect("escaped path")
-            )),
-            "expected metadata keychain DB write rule, got: {}",
-            rules
-        );
-        assert!(
-            rules.contains(&format!(
-                "(allow file-read-data (literal \"{}\"))",
-                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
-                    .expect("escaped path")
-            )),
-            "expected metadata keychain DB file-read-data rule (to override specific deny), got: {}",
-            rules
-        );
-        assert!(
-            rules.contains(&format!(
-                "(allow file-write-data (literal \"{}\"))",
-                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
-                    .expect("escaped path")
-            )),
-            "expected metadata keychain DB file-write-data rule (to override specific deny), got: {}",
-            rules
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_apply_macos_keychain_db_exception_ignores_group_sourced_caps() {
-        // Group-sourced keychain caps must not trigger the exception.
-        let mut caps = CapabilitySet::new();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
-        let login_db = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
-        caps.add_fs(FsCapability {
-            original: login_db.clone(),
-            resolved: login_db.clone(),
-            access: AccessMode::ReadWrite,
-            is_file: true,
-            source: CapabilitySource::Group("claude_code_macos".to_string()),
-        });
-
-        apply_macos_keychain_db_exception(&mut caps);
-
-        let rules = caps.platform_rules().join("\n");
-        assert!(
-            !rules.contains("file-read-data"),
-            "group-sourced cap must not generate file-read-data exception rule, got: {rules}"
-        );
-        assert!(
-            !rules.contains("file-write-data"),
-            "group-sourced cap must not generate file-write-data exception rule, got: {rules}"
-        );
+    fn assert_no_keychain_exception(rules: &str, context: &str) {
         assert!(
             rules.is_empty(),
-            "group-sourced cap must not generate any exception rules, got: {rules}"
+            "{context}: expected no keychain exception rules, got: {rules}"
+        );
+    }
+
+    /// Exception rules are keyed on the capability's resolved path, so a fixture
+    /// under a symlinked temp dir must expect the canonical spelling.
+    #[cfg(target_os = "macos")]
+    fn literal_rule(op: &str, path: &Path) -> String {
+        let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        format!(
+            "(allow {op} (literal \"{}\"))",
+            escape_seatbelt_path(resolved.to_str().expect("utf8 path")).expect("escaped path")
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_read_file_grant_without_bypass_emits_no_exception() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            &[],
+        );
+
+        assert_no_keychain_exception(&rules, "read_file grant without bypass");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_write_file_grant_without_bypass_emits_no_exception() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Write,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            &[],
+        );
+
+        assert_no_keychain_exception(&rules, "write_file grant without bypass");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_allow_file_grant_without_bypass_emits_no_exception() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            &[],
+        );
+
+        assert_no_keychain_exception(&rules, "allow_file grant without bypass");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_read_file_grant_with_bypass_emits_only_read() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.login_db),
+        );
+
+        for op in ["file-read-data", "file-read*"] {
+            assert!(
+                rules.contains(&literal_rule(op, &fixture.login_db)),
+                "expected {op} exception for bypassed read grant, got: {rules}"
+            );
+        }
+        assert!(
+            !rules.contains("file-write"),
+            "read-only grant must not emit write rules, got: {rules}"
         );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn test_apply_macos_keychain_db_exception_adds_runtime_keychain_rules() {
-        let dir = tempfile::tempdir().expect("tmpdir");
-        let home = dir.path().join("home");
-        let keychains = home.join("Library/Keychains");
-        std::fs::create_dir_all(&keychains).expect("mkdir keychains");
-        std::fs::write(keychains.join("login.keychain-db"), "").expect("write login db");
-        std::fs::write(keychains.join("metadata.keychain-db"), "").expect("write metadata db");
+    fn test_keychain_write_file_grant_with_bypass_emits_only_write() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Write,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.login_db),
+        );
 
-        let _env = crate::test_env::EnvVarGuard::set_all(&[(
-            "HOME",
-            home.to_str().expect("home path utf8"),
-        )]);
+        for op in ["file-write-data", "file-write*"] {
+            assert!(
+                rules.contains(&literal_rule(op, &fixture.login_db)),
+                "expected {op} exception for bypassed write grant, got: {rules}"
+            );
+        }
+        assert!(
+            !rules.contains("file-read"),
+            "write-only grant must not emit read rules, got: {rules}"
+        );
+        assert!(
+            !rules.contains("mach-lookup"),
+            "write-only grant must not unlock credential-reading Mach services, got: {rules}"
+        );
+    }
 
-        let login_db = keychains.join("login.keychain-db");
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_allow_file_grant_with_bypass_emits_read_and_write() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.login_db),
+        );
+
+        for op in [
+            "file-read-data",
+            "file-read*",
+            "file-write-data",
+            "file-write*",
+        ] {
+            assert!(
+                rules.contains(&literal_rule(op, &fixture.login_db)),
+                "expected {op} exception for bypassed read+write grant, got: {rules}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_metadata_db_grant_with_bypass_is_authorized() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.metadata_db,
+                AccessMode::ReadWrite,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.metadata_db),
+        );
+
+        assert!(
+            rules.contains(&literal_rule("file-read-data", &fixture.metadata_db)),
+            "expected metadata keychain DB exception, got: {rules}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_sibling_bypass_does_not_authorize_grant() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.metadata_db),
+        );
+
+        assert_no_keychain_exception(&rules, "sibling bypass");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_unrelated_bypass_does_not_authorize_grant() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            &[fixture.home.join("Documents")],
+        );
+
+        assert_no_keychain_exception(&rules, "unrelated bypass");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_child_bypass_under_broader_deny_is_authorized() {
+        // The deny covers all of ~/Library; only login.keychain-db is bypassed.
+        // The broader deny survives `apply_deny_overrides`, so the exception has
+        // to consult the bypass list rather than the surviving denies alone.
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                CapabilitySource::Profile,
+            ),
+            &[fixture.home.join("Library")],
+            std::slice::from_ref(&fixture.login_db),
+        );
+
+        assert!(
+            rules.contains(&literal_rule("file-read-data", &fixture.login_db)),
+            "narrow child bypass under a broader deny must authorize, got: {rules}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_symlinked_home_grant_honors_canonical_deny() {
+        // $HOME is a symlink; the deny is recorded against the canonical path
+        // only. Checking just the grant's `original` would miss it.
+        let fixture = crate::test_env::KeychainFixture::with_home(|root| {
+            let link = root.join("home-link");
+            std::os::unix::fs::symlink(root.join("home"), &link).expect("symlink home");
+            link
+        });
+        let canonical_keychains = fixture
+            .keychains
+            .canonicalize()
+            .expect("canonicalize keychains");
+        assert_ne!(canonical_keychains, fixture.keychains);
+
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                CapabilitySource::Profile,
+            ),
+            &[canonical_keychains],
+            &[],
+        );
+
+        assert_no_keychain_exception(&rules, "symlinked home with canonical deny");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_symlinked_home_bypass_matches_canonical_deny() {
+        let fixture = crate::test_env::KeychainFixture::with_home(|root| {
+            let link = root.join("home-link");
+            std::os::unix::fs::symlink(root.join("home"), &link).expect("symlink home");
+            link
+        });
+        let canonical_keychains = fixture
+            .keychains
+            .canonicalize()
+            .expect("canonicalize keychains");
+
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                CapabilitySource::Profile,
+            ),
+            &[canonical_keychains],
+            std::slice::from_ref(&fixture.login_db),
+        );
+
+        assert!(
+            rules.contains("file-read-data"),
+            "a bypass on the symlinked path must lift a deny on its target, got: {rules}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_group_sourced_grant_never_authorizes() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                CapabilitySource::Group("claude_code_macos".to_string()),
+            ),
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.login_db),
+        );
+
+        assert_no_keychain_exception(&rules, "group-sourced grant");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_system_sourced_grant_never_authorizes() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                CapabilitySource::System,
+            ),
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.login_db),
+        );
+
+        assert_no_keychain_exception(&rules, "system-sourced grant");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_mach_services_denied_without_bypass() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            &[],
+        );
+
+        assert!(
+            !rules.contains("mach-lookup"),
+            "a grant alone must not re-allow the keychain mach services, got: {rules}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_mach_services_allowed_when_authorized() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.login_db),
+        );
+
+        for service in KEYCHAIN_MACH_SERVICES {
+            assert!(
+                rules.contains(&format!("(allow mach-lookup (global-name \"{service}\"))")),
+                "expected mach allow for {service}, got: {rules}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_directory_grant_without_bypass_does_not_unlock_mach() {
+        let fixture = crate::test_env::KeychainFixture::new();
         let mut caps = CapabilitySet::new();
         caps.add_fs(FsCapability {
-            original: login_db.clone(),
-            resolved: login_db,
-            access: AccessMode::ReadWrite,
-            is_file: true,
+            original: fixture.keychains.clone(),
+            resolved: fixture.keychains.clone(),
+            access: AccessMode::Read,
+            is_file: false,
             source: CapabilitySource::Profile,
         });
+        let deny_policy = EffectiveDenyPolicy::new(&fixture.keychain_denies(), &[]);
 
-        apply_macos_keychain_db_exception(&mut caps);
+        apply_macos_keychain_db_exception(&mut caps, &deny_policy);
 
-        let escaped_root =
-            escape_seatbelt_regex_path(keychains.to_str().expect("keychains path utf8"))
-                .expect("escaped regex path");
+        assert_no_keychain_exception(&caps.platform_rules().join("\n"), "directory grant");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_directory_grant_with_bypass_unlocks_mach_only() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: fixture.keychains.clone(),
+            resolved: fixture.keychains.clone(),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::Profile,
+        });
+        let deny_policy = EffectiveDenyPolicy::new(
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.keychains),
+        );
+
+        apply_macos_keychain_db_exception(&mut caps, &deny_policy);
+
         let rules = caps.platform_rules().join("\n");
+        assert!(
+            rules.contains("(allow mach-lookup (global-name \"com.apple.securityd\"))"),
+            "a bypassed directory grant must unlock the keychain mach services, got: {rules}"
+        );
+        // The directory's own file rules come from the ordinary allow emission,
+        // so the exception adds nothing beyond the mach allows.
+        assert!(
+            !rules.contains("file-read"),
+            "directory grant must not emit file exceptions, got: {rules}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_write_only_directory_grant_does_not_unlock_mach() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: fixture.keychains.clone(),
+            resolved: fixture.keychains.clone(),
+            access: AccessMode::Write,
+            is_file: false,
+            source: CapabilitySource::Profile,
+        });
+        let deny_policy = EffectiveDenyPolicy::new(
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.keychains),
+        );
+
+        apply_macos_keychain_db_exception(&mut caps, &deny_policy);
+
+        let rules = caps.platform_rules().join("\n");
+        assert!(
+            !rules.contains("mach-lookup"),
+            "write-only directory grant must not unlock credential-reading Mach services, got: {rules}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_runtime_file_rules_require_bypass() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let canonical_keychains = fixture
+            .keychains
+            .canonicalize()
+            .expect("canonicalize keychains");
+        let escaped_root =
+            escape_seatbelt_regex_path(canonical_keychains.to_str().expect("keychains path utf8"))
+                .expect("escaped regex path");
+        let fl_rule = format!(
+            "(allow file-read* (regex #\"^{}/\\.fl[0-9A-Fa-f]+$\"))",
+            escaped_root
+        );
+        let db_rule = format!(
+            "(allow file-read* (regex #\"^{}/[^/]+/(?:[^/]+\\.db(?:-(?:wal|shm))?|user\\.kb)$\"))",
+            escaped_root
+        );
+
+        let denied = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            &[],
+        );
+        assert!(
+            !denied.contains("regex"),
+            "runtime keychain files must stay denied without a bypass, got: {denied}"
+        );
+
+        let authorized = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.login_db),
+        );
+        for rule in [&fl_rule, &db_rule] {
+            assert!(
+                authorized.contains(rule.as_str()),
+                "expected runtime keychain rule {rule}, got: {authorized}"
+            );
+        }
+        for rule in [
+            fl_rule.replace("file-read*", "file-write*"),
+            db_rule.replace("file-read*", "file-write*"),
+        ] {
+            assert!(
+                authorized.contains(rule.as_str()),
+                "expected writable runtime keychain rule {rule}, got: {authorized}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_bypass_without_grant_is_rejected() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths = fixture.keychain_denies();
+
+        let result = apply_deny_overrides(
+            std::slice::from_ref(&fixture.login_db),
+            &mut deny_paths,
+            &mut caps,
+        );
 
         assert!(
-            rules.contains(&format!(
-                "(allow file-read* (regex #\"^{}/\\.fl[0-9A-Fa-f]+$\"))",
-                escaped_root
-            )),
-            "expected root .fl keychain rule, got: {}",
-            rules
+            result.is_err(),
+            "bypass_protection without a matching grant must be rejected"
         );
+    }
+
+    #[test]
+    fn test_effective_deny_policy_uses_path_components_not_string_prefix() {
+        let policy = EffectiveDenyPolicy::new(&[PathBuf::from("/home/user")], &[]);
+
+        assert!(policy.is_effectively_denied(Path::new("/home/user/secret")));
+        assert!(!policy.is_effectively_denied(Path::new("/home/username/secret")));
+    }
+
+    #[test]
+    fn test_effective_deny_policy_child_bypass_survives_parent_deny() {
+        let policy = EffectiveDenyPolicy::new(
+            &[PathBuf::from("/home/user/Library")],
+            &[PathBuf::from(
+                "/home/user/Library/Keychains/login.keychain-db",
+            )],
+        );
+
         assert!(
-            rules.contains(&format!(
-                "(allow file-write* (regex #\"^{}/\\.fl[0-9A-Fa-f]+$\"))",
-                escaped_root
-            )),
-            "expected writable root .fl keychain rule, got: {}",
-            rules
+            !policy
+                .is_effectively_denied(Path::new("/home/user/Library/Keychains/login.keychain-db"))
         );
-        assert!(
-            rules.contains(&format!(
-                "(allow file-read* (regex #\"^{}/[^/]+/(?:[^/]+\\.db(?:-(?:wal|shm))?|user\\.kb)$\"))",
-                escaped_root
-            )),
-            "expected runtime DB read rule, got: {}",
-            rules
+        assert!(policy.is_effectively_denied(Path::new(
+            "/home/user/Library/Keychains/metadata.keychain-db"
+        )));
+    }
+
+    #[test]
+    fn test_effective_deny_policy_without_deny_is_never_denied() {
+        let policy = EffectiveDenyPolicy::new(&[], &[]);
+
+        assert!(!policy.is_effectively_denied(Path::new("/home/user/Library")));
+    }
+
+    #[test]
+    fn test_effective_deny_policy_reports_most_specific_deny() {
+        let policy = EffectiveDenyPolicy::new(
+            &[
+                PathBuf::from("/home/user"),
+                PathBuf::from("/home/user/Library/Keychains"),
+            ],
+            &[],
         );
-        assert!(
-            rules.contains(&format!(
-                "(allow file-write* (regex #\"^{}/[^/]+/(?:[^/]+\\.db(?:-(?:wal|shm))?|user\\.kb)$\"))",
-                escaped_root
-            )),
-            "expected runtime DB write rule, got: {}",
-            rules
+
+        assert_eq!(
+            policy.matching_deny(Path::new("/home/user/Library/Keychains/login.keychain-db")),
+            Some(&PathBuf::from("/home/user/Library/Keychains"))
         );
+    }
+
+    #[test]
+    fn test_effective_deny_policy_matches_query_named_through_symlink() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let resolved_target = target.canonicalize().expect("canonicalize target");
+
+        let policy = EffectiveDenyPolicy::new(std::slice::from_ref(&resolved_target), &[]);
+
+        assert!(policy.is_effectively_denied(&link.join("secret")));
+        assert!(!policy.is_effectively_denied(&dir.path().join("elsewhere")));
+    }
+
+    #[test]
+    fn test_effective_deny_policy_bypass_named_through_symlink_reopens_deny() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let resolved_target = target.canonicalize().expect("canonicalize target");
+
+        let policy = EffectiveDenyPolicy::new(
+            std::slice::from_ref(&resolved_target),
+            std::slice::from_ref(&link),
+        );
+
+        assert!(!policy.is_effectively_denied(&resolved_target.join("secret")));
     }
 
     #[cfg(target_os = "macos")]

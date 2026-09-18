@@ -91,6 +91,11 @@ pub(crate) struct ToolSandboxPrepare<'a> {
     /// command's live working directory is rejected if it falls under any of
     /// these, so a command can't be steered into a directory the agent is denied.
     pub(crate) deny_paths: &'a [std::path::PathBuf],
+    /// Resolved `filesystem.bypass_protection` paths from the agent's sandbox.
+    /// Paired with `deny_paths` these say which denies the agent actually
+    /// lifted, so a command policy cannot claim keychain authority the outer
+    /// sandbox was refused. macOS-only; Linux has no deny-within-allow.
+    pub(crate) bypass_protection_paths: &'a [std::path::PathBuf],
     pub(crate) policy_root: &'a std::path::Path,
     pub(crate) proxy_credential_env_vars:
         &'a std::collections::BTreeMap<String, Vec<(String, String)>>,

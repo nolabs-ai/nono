@@ -1154,8 +1154,13 @@ fn finalize_caps(
     // Apply profile-level deny overrides first, then CLI overrides.
     // Profile overrides come from `filesystem.bypass_protection` in the
     // profile JSON. CLI `--bypass-protection` flags are applied on top.
-    policy::apply_deny_overrides(profile_bypass_protection, &mut resolved.deny_paths, caps)?;
-    policy::apply_deny_overrides(&args.bypass_protection, &mut resolved.deny_paths, caps)?;
+    let mut bypass_paths =
+        policy::apply_deny_overrides(profile_bypass_protection, &mut resolved.deny_paths, caps)?;
+    bypass_paths.extend(policy::apply_deny_overrides(
+        &args.bypass_protection,
+        &mut resolved.deny_paths,
+        caps,
+    )?);
 
     // Remove exact file grants for the deny paths that remain after overrides.
     // This lets profile deny patches override inherited file capabilities while
@@ -1176,9 +1181,12 @@ fn finalize_caps(
         Vec::new()
     };
 
-    // Keep broad keychain deny groups active, but allow explicit
-    // keychain DB read grants (profile/CLI) on macOS.
-    policy::apply_macos_keychain_db_exception(caps);
+    // Keep broad keychain deny groups active, but allow keychain DB grants that
+    // a matching bypass_protection has lifted the deny for. Built from the deny
+    // paths left standing after the overrides above, so a narrow child bypass
+    // still authorizes its own path under a broader parent deny.
+    let deny_policy = policy::EffectiveDenyPolicy::new(&resolved.deny_paths, &bypass_paths);
+    policy::apply_macos_keychain_db_exception(caps, &deny_policy);
 
     // Deduplicate capabilities
     caps.deduplicate();

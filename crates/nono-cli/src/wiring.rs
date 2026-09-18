@@ -248,6 +248,46 @@ pub enum WiringRecord {
     },
 }
 
+/// The directories a pack's wiring actually wrote into, as the smallest
+/// set that covers every touched path.
+///
+/// `nono pull` otherwise only reports where the pack was *stored*, which
+/// is not where its agent files went. Callers use this to say so.
+///
+/// Paths are reduced to their parent directories, then any directory
+/// already covered by a shallower one is dropped — so a pack that writes
+/// a dozen files spread through `~/.claude` reports `~/.claude` once,
+/// while a pack that also touches `~/.config/nono/profile-drafts` reports
+/// both. Sorting first is what makes the single pass correct: an ancestor
+/// always sorts before its descendants.
+#[must_use]
+pub fn written_roots(records: &[WiringRecord]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = records
+        .iter()
+        .filter_map(|r| {
+            let path = match r {
+                WiringRecord::Symlink { link } => link,
+                WiringRecord::WriteFile { dest, .. } => dest,
+                WiringRecord::JsonMerge { file, .. }
+                | WiringRecord::JsonArrayAppend { file, .. }
+                | WiringRecord::TomlBlock { file, .. }
+                | WiringRecord::YamlMerge { file, .. } => file,
+            };
+            Path::new(path).parent().map(Path::to_path_buf)
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        if !roots.iter().any(|kept| dir.starts_with(kept)) {
+            roots.push(dir);
+        }
+    }
+    roots
+}
+
 /// Per-leaf record for `JsonMerge`. `path` is the chain of object
 /// keys from the document root to the leaf (e.g.
 /// `["enabledPlugins", "nono@nolabs-ai"]`). `installed_value` is
@@ -1698,6 +1738,63 @@ mod tests {
             )),
             nono::try_canonicalize(Path::new(&expected_packages))
         );
+    }
+
+    fn wf(dest: &str) -> WiringRecord {
+        WiringRecord::WriteFile {
+            dest: dest.to_string(),
+            sha256: "x".to_string(),
+        }
+    }
+
+    /// The claude pack's real shape: a dozen files spread through one
+    /// tree plus a marker in another. The user wants to see the two
+    /// trees, not twelve directories.
+    #[test]
+    fn written_roots_collapses_nested_dirs_and_keeps_distinct_trees() {
+        let records = vec![
+            wf("/home/u/.claude/plugins/marketplaces/ns/plugins/nono/bin/hook.sh"),
+            wf("/home/u/.claude/plugins/marketplaces/ns/.claude-plugin/marketplace.json"),
+            wf("/home/u/.claude/settings.json"),
+            WiringRecord::Symlink {
+                link: "/home/u/.claude/plugins/cache/ns/nono/1.0.0".to_string(),
+            },
+            WiringRecord::JsonMerge {
+                file: "/home/u/.claude/plugins/known_marketplaces.json".to_string(),
+                leaves: Vec::new(),
+                created_parents: Vec::new(),
+            },
+            wf("/home/u/.config/nono/profile-drafts/.marker"),
+        ];
+        assert_eq!(
+            written_roots(&records),
+            vec![
+                PathBuf::from("/home/u/.claude"),
+                PathBuf::from("/home/u/.config/nono/profile-drafts"),
+            ]
+        );
+    }
+
+    /// Without a file directly in the shared parent there is nothing to
+    /// collapse to, so each distinct directory is reported rather than
+    /// inventing an ancestor the pack never wrote to.
+    #[test]
+    fn written_roots_keeps_siblings_when_no_shared_dir_was_written() {
+        let records = vec![wf("/home/u/.agent/a/one"), wf("/home/u/.agent/b/two")];
+        assert_eq!(
+            written_roots(&records),
+            vec![
+                PathBuf::from("/home/u/.agent/a"),
+                PathBuf::from("/home/u/.agent/b"),
+            ]
+        );
+    }
+
+    /// A pack that ships only a profile runs no directives, and must not
+    /// produce an empty "Wired into" heading.
+    #[test]
+    fn written_roots_is_empty_without_records() {
+        assert!(written_roots(&[]).is_empty());
     }
 
     #[test]

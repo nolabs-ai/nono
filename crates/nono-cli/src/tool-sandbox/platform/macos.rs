@@ -7,7 +7,9 @@ use crate::command_policy::{
     ResolvedCommandBinary, has_explicit_self_invocation_entry,
 };
 use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
-use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
+use crate::tool_sandbox::credentials::{
+    LocalSocketUnavailable, ResolvedCredential, check_local_socket, resolve_credentials,
+};
 use crate::tool_sandbox::env::{
     apply_environment_set_vars, apply_export_env, default_env_allow_patterns,
     effective_argv_for_binary, env_shebang_target_interpreter, inject_chaining_control_env,
@@ -3824,25 +3826,37 @@ fn add_policy_credentials(
             Some(ResolvedCredential::LocalSocket {
                 path: Some(socket_path),
                 ..
-            }) => {
-                caps.add_unix_socket(UnixSocketCapability::new_file(
-                    socket_path,
-                    UnixSocketMode::Connect,
-                )?);
-                caps.add_fs(FsCapability::new_file(socket_path, AccessMode::Read)?);
-            }
+            }) => match check_local_socket(socket_path) {
+                Ok(()) => {
+                    caps.add_unix_socket(UnixSocketCapability::new_file(
+                        socket_path,
+                        UnixSocketMode::Connect,
+                    )?);
+                    caps.add_fs(FsCapability::new_file(socket_path, AccessMode::Read)?);
+                }
+                Err(LocalSocketUnavailable::Absent(_)) => {}
+                Err(unavailable) => {
+                    return Err(local_socket_credential_error(handle, &unavailable));
+                }
+            },
+            // A path that resolves to something other than a socket
+            // contradicts what the profile declared, so it stays fatal — and
+            // fatal here, per command, rather than at session start, so one
+            // contradicted credential cannot take down commands that never
+            // declared it.
             Some(ResolvedCredential::LocalSocket {
-                path: None,
-                unavailable_reason,
+                unavailable: Some(unavailable),
                 ..
-            }) => {
-                let reason = unavailable_reason
-                    .as_deref()
-                    .unwrap_or("local socket unavailable");
-                return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox credential '{handle}' is unavailable: {reason}"
-                )));
+            }) if unavailable.is_fatal() => {
+                return Err(local_socket_credential_error(handle, unavailable));
             }
+            // An unavailable socket grants nothing rather than aborting the
+            // command: either it was absent at session start, or it resolved
+            // then and has since gone away. The command runs with strictly
+            // less authority than the profile requested, and whatever actually
+            // needs the socket fails at the point of use instead of taking
+            // every unrelated invocation of the same command down with it.
+            Some(ResolvedCredential::LocalSocket { .. }) => {}
             Some(ResolvedCredential::RawFile { path }) => {
                 caps.add_fs(FsCapability::new_file(path, AccessMode::Read)?);
             }
@@ -3856,6 +3870,13 @@ fn add_policy_credentials(
         }
     }
     Ok(())
+}
+
+fn local_socket_credential_error(handle: &str, unavailable: &LocalSocketUnavailable) -> NonoError {
+    NonoError::ConfigParse(format!(
+        "tool-sandbox credential '{handle}' is unavailable: {}",
+        unavailable.reason()
+    ))
 }
 
 fn resolve_policy_path(entry: &str, workdir: &Path, cwd: &Path) -> Result<PathBuf> {
@@ -3928,6 +3949,34 @@ fn filter_child_env(
     );
     apply_environment_set_vars(&mut result, policy)?;
 
+    // Strip the environment variable of every unavailable local-socket
+    // credential before injecting the available ones. The command must not
+    // inherit a socket path it holds no capability to reach: on macOS that
+    // produces a misleading "Operation not permitted" from the agent client
+    // instead of a truthful "no agent", and on Linux the inherited value is
+    // the practical control, since AF_UNIX connect is unmediated unless
+    // `af_unix_mediation` is enabled.
+    //
+    // This is a separate pass rather than an arm of the loop below so that an
+    // unavailable credential can never strip a variable that a later proxy
+    // credential in the same policy injects under the same name. It runs after
+    // `apply_environment_set_vars`, so a profile that also sets this variable
+    // by hand loses that value — the same thing an available socket would do.
+    for cred_name in super::policy_credential_names(policy) {
+        if let Some(ResolvedCredential::LocalSocket {
+            path,
+            env_var: Some(env_var),
+            ..
+        }) = state.credential_handles.get(cred_name)
+            && path
+                .as_deref()
+                .is_none_or(|path| check_local_socket(path).is_err())
+        {
+            let prefix = format!("{env_var}=").into_bytes();
+            result.retain(|entry| !entry.starts_with(&prefix));
+        }
+    }
+
     // Inject resolved credentials.
     for cred_name in super::policy_credential_names(policy) {
         match state.credential_handles.get(cred_name) {
@@ -3935,27 +3984,29 @@ fn filter_child_env(
                 path: Some(socket_path),
                 env_var,
                 ..
-            }) => {
-                if let Some(env_var) = env_var {
-                    let prefix = format!("{env_var}=").into_bytes();
-                    result.retain(|entry| !entry.starts_with(&prefix));
-                    let mut entry = format!("{env_var}=").into_bytes();
-                    entry.extend_from_slice(socket_path.as_os_str().as_bytes());
-                    result.push(entry);
+            }) => match check_local_socket(socket_path) {
+                Ok(()) => {
+                    if let Some(env_var) = env_var {
+                        let prefix = format!("{env_var}=").into_bytes();
+                        result.retain(|entry| !entry.starts_with(&prefix));
+                        let mut entry = format!("{env_var}=").into_bytes();
+                        entry.extend_from_slice(socket_path.as_os_str().as_bytes());
+                        result.push(entry);
+                    }
                 }
-            }
+                Err(LocalSocketUnavailable::Absent(_)) => {}
+                Err(unavailable) => {
+                    return Err(local_socket_credential_error(cred_name, &unavailable));
+                }
+            },
             Some(ResolvedCredential::LocalSocket {
-                path: None,
-                unavailable_reason,
+                unavailable: Some(unavailable),
                 ..
-            }) => {
-                let reason = unavailable_reason
-                    .as_deref()
-                    .unwrap_or("local socket unavailable");
-                return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox credential '{cred_name}' is unavailable: {reason}"
-                )));
+            }) if unavailable.is_fatal() => {
+                return Err(local_socket_credential_error(cred_name, unavailable));
             }
+            // Unavailable, and already stripped by the pass above; inject nothing.
+            Some(ResolvedCredential::LocalSocket { .. }) => {}
             Some(ResolvedCredential::RawFile { .. }) => {}
             Some(ResolvedCredential::Proxy { env_vars }) => {
                 for (name, value) in env_vars {
@@ -8996,13 +9047,22 @@ mod tests {
     #[test]
     fn filter_child_env_injects_schema2_local_socket_credential() -> Result<()> {
         let mut state = test_state();
-        let socket_path = PathBuf::from("/tmp/nono-test-ssh-agent.sock");
+        // A real bound socket: the credential is only injected while the socket
+        // is actually live, so a placeholder path would be treated as absent.
+        let tmp = test_tempdir()?;
+        let socket_path = tmp.path().join("agent.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: socket_path.clone(),
+                source,
+            }
+        })?;
         state.credential_handles.insert(
             "agent".to_string(),
             ResolvedCredential::LocalSocket {
                 path: Some(socket_path.clone()),
                 env_var: Some("SSH_AUTH_SOCK".to_string()),
-                unavailable_reason: None,
+                unavailable: None,
             },
         );
         let policy = CommandSandboxConfig {
@@ -9019,6 +9079,253 @@ mod tests {
             &env,
             format!("SSH_AUTH_SOCK={}", socket_path.display()).as_bytes()
         ));
+        Ok(())
+    }
+
+    /// State holding a single `agent` local-socket credential in the given
+    /// unavailable state, plus a policy granting it, as the degrade tests below
+    /// all need.
+    fn state_and_policy_with_socket(
+        path: Option<PathBuf>,
+        unavailable: Option<LocalSocketUnavailable>,
+        environment: Option<CommandEnvironmentConfig>,
+    ) -> (ToolSandboxState, CommandSandboxConfig) {
+        let mut state = test_state();
+        state.credential_handles.insert(
+            "agent".to_string(),
+            ResolvedCredential::LocalSocket {
+                path,
+                env_var: Some("SSH_AUTH_SOCK".to_string()),
+                unavailable,
+            },
+        );
+        let policy = CommandSandboxConfig {
+            credentials: vec![crate::command_policy::CommandCredentialGrantConfig::Name(
+                "agent".to_string(),
+            )],
+            environment,
+            ..CommandSandboxConfig::default()
+        };
+        (state, policy)
+    }
+
+    /// The common case for the degrade tests: absent at session start.
+    fn state_and_policy_with_unavailable_socket(
+        environment: Option<CommandEnvironmentConfig>,
+    ) -> (ToolSandboxState, CommandSandboxConfig) {
+        state_and_policy_with_socket(
+            None,
+            Some(LocalSocketUnavailable::Absent("VAR is unset".to_string())),
+            environment,
+        )
+    }
+
+    /// An unavailable local socket must not leave the command holding an
+    /// inherited socket path it has no capability to reach. The variable is
+    /// explicitly allow-listed here, so this proves the strip beats
+    /// `allow_vars` rather than relying on the default env blocklist.
+    #[test]
+    fn filter_child_env_strips_allowed_env_var_for_unavailable_local_socket() -> Result<()> {
+        let (state, policy) =
+            state_and_policy_with_unavailable_socket(Some(CommandEnvironmentConfig {
+                allow_vars: Some(vec!["SSH_AUTH_SOCK".to_string()]),
+                set_vars: BTreeMap::new(),
+            }));
+        let request = request_with_env(vec![b"SSH_AUTH_SOCK=/host/agent.sock".to_vec()]);
+
+        let env = filter_child_env(&state, &request, &policy, &Caller::Session)?;
+
+        assert!(
+            !contains_prefix(&env, b"SSH_AUTH_SOCK="),
+            "an unavailable local socket must not pass its env var through: {env:?}"
+        );
+        Ok(())
+    }
+
+    /// `allow_vars: None` passes every variable through, so the strip has to
+    /// hold on that path too.
+    #[test]
+    fn filter_child_env_strips_env_var_when_all_vars_pass_through() -> Result<()> {
+        let (state, policy) =
+            state_and_policy_with_unavailable_socket(Some(CommandEnvironmentConfig {
+                allow_vars: None,
+                set_vars: BTreeMap::new(),
+            }));
+        let request = request_with_env(vec![b"SSH_AUTH_SOCK=/host/agent.sock".to_vec()]);
+
+        let env = filter_child_env(&state, &request, &policy, &Caller::Session)?;
+
+        assert!(!contains_prefix(&env, b"SSH_AUTH_SOCK="), "env: {env:?}");
+        Ok(())
+    }
+
+    /// A profile that also sets the variable by hand loses that value when the
+    /// socket is unavailable — the same thing an available socket would do, and
+    /// the strip runs after `apply_environment_set_vars` to guarantee it.
+    #[test]
+    fn filter_child_env_strips_set_var_for_unavailable_local_socket() -> Result<()> {
+        let mut set_vars = BTreeMap::new();
+        set_vars.insert(
+            "SSH_AUTH_SOCK".to_string(),
+            "/profile/agent.sock".to_string(),
+        );
+        let (state, policy) =
+            state_and_policy_with_unavailable_socket(Some(CommandEnvironmentConfig {
+                allow_vars: None,
+                set_vars,
+            }));
+        let request = request_with_env(Vec::new());
+
+        let env = filter_child_env(&state, &request, &policy, &Caller::Session)?;
+
+        assert!(!contains_prefix(&env, b"SSH_AUTH_SOCK="), "env: {env:?}");
+        Ok(())
+    }
+
+    /// The strip is a separate pass that runs before every injection, so an
+    /// unavailable local socket cannot delete a value a proxy credential in the
+    /// same policy injects under the same name.
+    #[test]
+    fn filter_child_env_strip_does_not_clobber_proxy_credential_sharing_env_var() -> Result<()> {
+        let (mut state, mut policy) = state_and_policy_with_unavailable_socket(None);
+        state.credential_handles.insert(
+            "socket-proxy".to_string(),
+            ResolvedCredential::Proxy {
+                env_vars: vec![("SSH_AUTH_SOCK".to_string(), "/proxy/relay.sock".to_string())],
+            },
+        );
+        policy
+            .credentials
+            .push(crate::command_policy::CommandCredentialGrantConfig::Name(
+                "socket-proxy".to_string(),
+            ));
+        let request = request_with_env(Vec::new());
+
+        let env = filter_child_env(&state, &request, &policy, &Caller::Session)?;
+
+        assert!(
+            contains_entry(&env, b"SSH_AUTH_SOCK=/proxy/relay.sock"),
+            "the proxy credential's value must survive the strip: {env:?}"
+        );
+        Ok(())
+    }
+
+    /// `apply_export_env` copies a caller's `export_env` patterns verbatim,
+    /// bypassing `allow_vars` and the dangerous-variable blocklist. The strip
+    /// runs after it, so that route cannot re-admit the variable either.
+    #[test]
+    fn filter_child_env_strips_export_env_for_unavailable_local_socket() -> Result<()> {
+        let (mut state, policy) = state_and_policy_with_unavailable_socket(None);
+        state.plan.config.session_export_env = vec!["SSH_AUTH_SOCK".to_string()];
+        let request = request_with_env(vec![b"SSH_AUTH_SOCK=/host/agent.sock".to_vec()]);
+
+        let env = filter_child_env(&state, &request, &policy, &Caller::Session)?;
+
+        assert!(
+            !contains_prefix(&env, b"SSH_AUTH_SOCK="),
+            "a caller's export_env must not re-admit the variable: {env:?}"
+        );
+        Ok(())
+    }
+
+    /// A socket that resolved at session start but has since gone away degrades
+    /// like an absent one. Without the liveness re-check the capability would be
+    /// rejected at construction and every later invocation would abort — the
+    /// original bug, one race window later.
+    #[test]
+    fn socket_that_disappeared_mid_session_degrades_instead_of_aborting() -> Result<()> {
+        let stale = PathBuf::from("/tmp/nono-test-agent-that-went-away.sock");
+        let (state, policy) = state_and_policy_with_socket(Some(stale), None, None);
+        let request = request_with_env(vec![
+            b"SSH_AUTH_SOCK=/tmp/nono-test-agent-that-went-away.sock".to_vec(),
+        ]);
+
+        let mut caps = CapabilitySet::new();
+        add_policy_credentials(&mut caps, &state, &policy)?;
+        let env = filter_child_env(&state, &request, &policy, &Caller::Session)?;
+
+        assert!(
+            caps.unix_socket_capabilities().is_empty() && caps.fs_capabilities().is_empty(),
+            "a vanished socket must grant nothing"
+        );
+        assert!(
+            !contains_prefix(&env, b"SSH_AUTH_SOCK="),
+            "a vanished socket must not leave its path in the child env: {env:?}"
+        );
+        Ok(())
+    }
+
+    /// A socket path replaced by a regular file is a contradictory declaration,
+    /// not ordinary absence, even when the replacement happens mid-session.
+    #[test]
+    fn socket_replaced_by_regular_file_mid_session_stays_fatal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = tmp.path().join("agent.sock");
+        std::fs::write(&socket_path, b"not a socket").expect("write replacement file");
+        let (state, policy) = state_and_policy_with_socket(Some(socket_path.clone()), None, None);
+        let request = request_with_env(vec![
+            format!("SSH_AUTH_SOCK={}", socket_path.display()).into_bytes(),
+        ]);
+
+        let mut caps = CapabilitySet::new();
+        let caps_err = add_policy_credentials(&mut caps, &state, &policy)
+            .expect_err("a non-socket replacement must fail capability construction");
+        assert!(caps_err.to_string().contains("is not a socket"));
+
+        let env_err = filter_child_env(&state, &request, &policy, &Caller::Session)
+            .expect_err("a non-socket replacement must fail environment construction");
+        assert!(env_err.to_string().contains("is not a socket"));
+    }
+
+    /// A path that contradicts the declaration stays fatal, and fails only the
+    /// command that declared it rather than aborting the whole session.
+    #[test]
+    fn not_a_socket_is_fatal_per_command() {
+        let (state, policy) = state_and_policy_with_socket(
+            None,
+            Some(LocalSocketUnavailable::NotASocket(
+                "/tmp/regular-file is not a socket".to_string(),
+            )),
+            None,
+        );
+        let mut caps = CapabilitySet::new();
+
+        let caps_err = add_policy_credentials(&mut caps, &state, &policy)
+            .expect_err("a contradicted declaration must fail the command");
+        assert!(
+            caps_err.to_string().contains("is not a socket"),
+            "unexpected error: {caps_err}"
+        );
+
+        let request = request_with_env(Vec::new());
+        let env_err = filter_child_env(&state, &request, &policy, &Caller::Session)
+            .expect_err("a contradicted declaration must fail the command");
+        assert!(
+            env_err.to_string().contains("is not a socket"),
+            "unexpected error: {env_err}"
+        );
+    }
+
+    /// An unavailable local socket grants no socket reachability and no
+    /// filesystem read — the authority delta of the degrade is a pure
+    /// reduction, not a substitution.
+    #[test]
+    fn add_policy_credentials_grants_nothing_for_unavailable_local_socket() -> Result<()> {
+        let (state, policy) = state_and_policy_with_unavailable_socket(None);
+        let mut caps = CapabilitySet::new();
+
+        add_policy_credentials(&mut caps, &state, &policy)?;
+
+        assert!(
+            caps.unix_socket_capabilities().is_empty(),
+            "unexpected socket grant: {:?}",
+            caps.unix_socket_capabilities()
+        );
+        assert!(
+            caps.fs_capabilities().is_empty(),
+            "unexpected filesystem grant: {:?}",
+            caps.fs_capabilities()
+        );
         Ok(())
     }
 

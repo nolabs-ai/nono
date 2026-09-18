@@ -420,12 +420,55 @@ mod tests {
     use nono::{CapabilitySet, ResourceLimits};
     use std::path::PathBuf;
 
+    /// Pins `HOME` and the XDG dirs to a fixed test root, mirroring
+    /// `launch_runtime::tests::run_launch_plan_rejects_block_net_with_upstream_proxy`,
+    /// which covers the same flag conflict for `nono run`.
+    ///
+    /// Two reasons, both load-bearing. Taking `ENV_LOCK` keeps a
+    /// concurrent test's temporary `HOME` from being observed here:
+    /// `validate_proxy_conflicts` needs a `&PreparedSandbox`, so the
+    /// sandbox — and its `HOME`-derived state root — is built before the
+    /// conflict check runs, and a foreign `HOME` makes construction fail
+    /// first with an unrelated error. And rooting under `target/` rather
+    /// than a temp dir keeps the state root out of `/private/var`, which
+    /// `system_read_macos` grants and the overlap check then refuses.
     #[test]
     fn shell_dry_run_rejects_block_net_with_upstream_proxy() {
+        let _env_lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-env")
+            .join(format!(
+                "shell-dry-run-block-net-upstream-proxy-{}",
+                std::process::id()
+            ));
+        let home = test_root.join("home");
+        let state = test_root.join("state");
+        let config = test_root.join("config");
+        let workdir = test_root.join("workdir");
+        std::fs::create_dir_all(&home).expect("create test home");
+        std::fs::create_dir_all(&state).expect("create test state");
+        std::fs::create_dir_all(&config).expect("create test config");
+        std::fs::create_dir_all(&workdir).expect("create test workdir");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home.to_str().expect("home path is utf-8")),
+            (
+                "XDG_STATE_HOME",
+                state.to_str().expect("state path is utf-8"),
+            ),
+            (
+                "XDG_CONFIG_HOME",
+                config.to_str().expect("config path is utf-8"),
+            ),
+        ]);
+
         let args = ShellArgs {
             sandbox: SandboxArgs {
                 dry_run: true,
                 allow_cwd: true,
+                workdir: Some(workdir),
                 block_net: true,
                 external_proxy: Some("squid.corp:3128".to_string()),
                 ..SandboxArgs::default()

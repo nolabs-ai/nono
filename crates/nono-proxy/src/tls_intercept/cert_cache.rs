@@ -30,14 +30,16 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
 use tracing::{debug, warn};
 
 /// Per-hostname leaf certificate cache backed by the session's [`EphemeralCa`].
 pub struct CertCache {
-    ca: Arc<EphemeralCa>,
+    /// Swappable so a session can adopt a renewed CA without a restart. Always locked
+    /// *after* `cache`, to keep one lock order.
+    ca: RwLock<Arc<EphemeralCa>>,
     leaf_validity: Option<Duration>,
     /// Hostname → minted leaf. Kept behind a `Mutex` because rustls' cert
     /// resolver is invoked from sync handshake context.
@@ -54,7 +56,7 @@ impl CertCache {
     #[must_use]
     pub fn new_with_leaf_validity(ca: Arc<EphemeralCa>, leaf_validity: Option<Duration>) -> Self {
         Self {
-            ca,
+            ca: RwLock::new(ca),
             leaf_validity,
             cache: Mutex::new(HashMap::new()),
         }
@@ -87,10 +89,37 @@ impl CertCache {
         if let Some(existing) = cache.get(hostname) {
             return Ok(Arc::clone(existing));
         }
-        let minted = mint_leaf(self.ca.as_ref(), hostname, self.leaf_validity)?;
+        let ca = self
+            .ca
+            .read()
+            .map_err(|_| ProxyError::Config("tls_intercept CA lock poisoned".to_string()))?;
+        let minted = mint_leaf(ca.as_ref(), hostname, self.leaf_validity)?;
         cache.insert(hostname.to_string(), Arc::clone(&minted));
         debug!("tls_intercept: minted leaf certificate for {}", hostname);
         Ok(minted)
+    }
+
+    /// Swap in a renewed CA, discarding every cached leaf: leaves embed the previous
+    /// CA's DER and are clamped to its `not_after`, so each host must re-mint.
+    pub fn replace_ca(&self, ca: Arc<EphemeralCa>) -> Result<()> {
+        let mut cache = self.cache.lock().map_err(|_| {
+            ProxyError::Config("tls_intercept cert cache mutex poisoned".to_string())
+        })?;
+        let mut current = self
+            .ca
+            .write()
+            .map_err(|_| ProxyError::Config("tls_intercept CA lock poisoned".to_string()))?;
+        *current = ca;
+        cache.clear();
+        Ok(())
+    }
+
+    /// The CA currently backing this cache.
+    pub fn current_ca(&self) -> Result<Arc<EphemeralCa>> {
+        self.ca
+            .read()
+            .map(|ca| Arc::clone(&ca))
+            .map_err(|_| ProxyError::Config("tls_intercept CA lock poisoned".to_string()))
     }
 }
 
@@ -99,7 +128,7 @@ impl std::fmt::Debug for CertCache {
         let len = self.cache.lock().map(|g| g.len()).unwrap_or(0);
         f.debug_struct("CertCache")
             .field("entries", &len)
-            .field("ca", &self.ca)
+            .field("ca", &self.ca.try_read().ok().map(|ca| format!("{ca:?}")))
             .finish()
     }
 }

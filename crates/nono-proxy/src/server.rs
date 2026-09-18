@@ -302,6 +302,8 @@ pub struct ProxyHandle {
     intercept_ca_path: Option<PathBuf>,
     /// Environment variables that should point at `intercept_ca_path`.
     intercept_ca_env_vars: Vec<String>,
+    /// `None` when interception is not active.
+    intercept_rotator: Option<Arc<tls_intercept::InterceptCaRotator>>,
     /// Credential load warnings collected at startup.
     diagnostics: Vec<crate::diagnostic::ProxyDiagnostic>,
 }
@@ -327,6 +329,21 @@ impl ProxyHandle {
     #[must_use]
     pub fn network_audit_enabled(&self) -> bool {
         self.audit_log.is_some()
+    }
+
+    /// For callers that outlive this handle, i.e. the renewal supervisor. `None` when
+    /// interception is not active.
+    #[must_use]
+    pub fn intercept_rotator(&self) -> Option<Arc<tls_intercept::InterceptCaRotator>> {
+        self.intercept_rotator.as_ref().map(Arc::clone)
+    }
+
+    /// Install a renewed interception CA without restarting the proxy.
+    pub fn rotate_intercept_ca(&self, key_der: &[u8], cert_pem: &str) -> Result<PathBuf> {
+        let rotator = self.intercept_rotator.as_ref().ok_or_else(|| {
+            ProxyError::Config("TLS interception is not active; nothing to rotate".to_string())
+        })?;
+        rotator.rotate(key_der, cert_pem)
     }
 
     /// Path to the TLS-intercept trust bundle, when interception is active.
@@ -1325,6 +1342,16 @@ pub async fn start_with_nonce_resolver(
 
     let enable_h2 = config.enable_h2;
     let intercept_ca_env_vars = config.intercept_ca_env_vars.clone();
+    // Holds its own Arc on the cache so the renewal supervisor can outlive the handle.
+    let intercept_rotator = match (&cert_cache, &config.intercept_ca_dir) {
+        (Some(cache), Some(dir)) => Some(Arc::new(tls_intercept::InterceptCaRotator::new(
+            Arc::clone(cache),
+            dir.clone(),
+            "intercept-ca.pem",
+            config.intercept_parent_ca_pems.clone(),
+        ))),
+        _ => None,
+    };
     let state = Arc::new(ProxyState {
         filter,
         session_token: session_token.clone(),
@@ -1364,6 +1391,7 @@ pub async fn start_with_nonce_resolver(
         canonical_no_proxy_hosts,
         intercept_ca_path,
         intercept_ca_env_vars,
+        intercept_rotator,
         diagnostics: proxy_diagnostics,
     })
 }
@@ -2985,6 +3013,7 @@ mod tests {
                 canonical_no_proxy_hosts: Vec::new(),
                 intercept_ca_path: None,
                 intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+                intercept_rotator: None,
                 diagnostics: vec![],
             };
         }
@@ -3632,6 +3661,7 @@ mod tests {
                 "::1".to_string(),
             ],
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_rotator: None,
             intercept_ca_path: None,
             diagnostics: Vec::new(),
         };
@@ -3705,6 +3735,7 @@ mod tests {
             canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_rotator: None,
             diagnostics: vec![],
         };
         let config = ProxyConfig {
@@ -3770,6 +3801,7 @@ mod tests {
             canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_rotator: None,
             diagnostics: vec![],
         };
         let config = ProxyConfig {
@@ -3840,6 +3872,7 @@ mod tests {
             canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_rotator: None,
             diagnostics: vec![],
         };
         let config = ProxyConfig {
@@ -3932,6 +3965,7 @@ mod tests {
             canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_rotator: None,
             diagnostics: vec![],
         };
         let config = ProxyConfig {
@@ -3995,6 +4029,7 @@ mod tests {
             canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_rotator: None,
             diagnostics: vec![],
         };
 
@@ -4099,6 +4134,7 @@ mod tests {
             canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_rotator: None,
             diagnostics: vec![],
         };
         let config_no_env_var = ProxyConfig {
@@ -4150,6 +4186,7 @@ mod tests {
             canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_rotator: None,
             diagnostics: vec![],
         };
         let config_fixed = ProxyConfig {
@@ -4208,6 +4245,7 @@ mod tests {
             ],
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_rotator: None,
             diagnostics: vec![],
         };
 
@@ -4241,6 +4279,7 @@ mod tests {
             canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_rotator: None,
             diagnostics: vec![],
         };
 
@@ -4266,6 +4305,7 @@ mod tests {
             canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_rotator: None,
             diagnostics: vec![],
         };
 

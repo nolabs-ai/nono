@@ -327,6 +327,12 @@ pub struct OAuthTokenEndpointConfig {
     /// Request body encoding for token refresh/exchange requests.
     #[serde(default)]
     pub request_body: OAuthTokenRequestBodyFormat,
+    /// Response body encoding for token endpoint replies. `Auto` selects JSON
+    /// or form encoding from the response's `Content-Type` header; a body
+    /// whose content type matches neither, or contradicts an explicit
+    /// `Json`/`Form` setting, is rejected rather than guessed at.
+    #[serde(default)]
+    pub response_body: OAuthTokenRequestBodyFormat,
     /// JSON request fields where phantom tokens must be resolved before
     /// forwarding token refresh/exchange requests upstream.
     #[serde(default)]

@@ -606,6 +606,14 @@ struct InstallSummary {
 }
 
 fn validate_pull_response(package_ref: &PackageRef, pull: &PullResponse) -> Result<()> {
+    // The registry supplies these and nothing has validated them yet.
+    // `version` is displayed by the install summary and `namespace`/`name`
+    // are echoed in the mismatch error just below, so both reach a
+    // terminal before any signature has been checked.
+    reject_control_chars(&pull.version, "package version")?;
+    reject_control_chars(&pull.namespace, "package namespace")?;
+    reject_control_chars(&pull.name, "package name")?;
+
     if pull.namespace != package_ref.namespace || pull.name != package_ref.name {
         return Err(NonoError::PackageVerification {
             package: package_ref.key(),
@@ -1218,7 +1226,28 @@ fn installed_artifact_relative_path(artifact: &ArtifactEntry) -> Result<String> 
     Ok(path)
 }
 
+/// Reject control characters in pack-supplied names and paths.
+///
+/// These strings are attacker-influenced: they come from the pull
+/// response and end up on disk, in log lines, and — the reason this
+/// exists — interpolated into `NonoError` messages that `main` prints
+/// straight to stderr. Sanitizing at each display site cannot cover that,
+/// because an error can be raised from anywhere; rejecting at the entry
+/// boundary can. `char::is_control` covers ESC, CR, LF and the rest of
+/// C0/C1, none of which belong in an artifact name.
+///
+/// The offending value is deliberately not echoed in the error.
+fn reject_control_chars(value: &str, field: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        return Err(NonoError::PackageInstall(format!(
+            "{field} contains control characters, which are not allowed"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_safe_name(name: &str, field: &str) -> Result<()> {
+    reject_control_chars(name, field)?;
     if name.is_empty()
         || name.contains('/')
         || name.contains('\\')
@@ -1234,6 +1263,7 @@ fn validate_safe_name(name: &str, field: &str) -> Result<()> {
 }
 
 fn validate_relative_path(path: &str) -> Result<()> {
+    reject_control_chars(path, "artifact path")?;
     let p = Path::new(path);
     if p.is_absolute() {
         return Err(NonoError::PackageInstall(format!(
@@ -1287,6 +1317,70 @@ fn format_timestamp(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Artifact names reach the terminal through paths this crate cannot
+    /// sanitize one by one — notably `NonoError` messages, which `main`
+    /// prints straight to stderr. Reject them at the boundary instead.
+    #[test]
+    fn validators_reject_control_characters() {
+        for bad in [
+            "ev\u{1b}[2Kil.json",
+            "two\nlines.json",
+            "carriage\rreturn.json",
+        ] {
+            assert!(
+                validate_relative_path(bad).is_err(),
+                "artifact path {bad:?} should be rejected"
+            );
+            assert!(
+                validate_safe_name(bad, "install_as").is_err(),
+                "install_as {bad:?} should be rejected"
+            );
+        }
+    }
+
+    /// The rejection must not echo the offending value: an error message
+    /// quoting the escapes would carry them to the terminal anyway, which
+    /// is the thing being prevented.
+    #[test]
+    fn control_character_rejection_does_not_echo_the_value() {
+        let err = validate_relative_path("ev\u{1b}[2Kil.json")
+            .expect_err("expected rejection")
+            .to_string();
+        assert!(!err.contains('\u{1b}'), "error carried the escape: {err:?}");
+        assert!(
+            err.contains("control characters"),
+            "error should say why: {err:?}"
+        );
+    }
+
+    /// The registry's own metadata is untrusted too: `version` reaches the
+    /// install summary, and `namespace`/`name` are echoed in the mismatch
+    /// error — both before anything is signature-verified.
+    #[test]
+    fn pull_response_metadata_rejects_control_characters() {
+        for field in ["package version", "package namespace", "package name"] {
+            assert!(
+                reject_control_chars("1.0\u{1b}[2K.0", field).is_err(),
+                "{field} should reject control characters"
+            );
+        }
+        assert!(reject_control_chars("1.0.0", "package version").is_ok());
+    }
+
+    /// Ordinary names must keep working — this guard sits on the path
+    /// every pull takes.
+    #[test]
+    fn validators_accept_ordinary_names() {
+        for good in [
+            "package.json",
+            "skills/nono-sandbox/SKILL.md",
+            "assets/logo.png",
+        ] {
+            assert!(validate_relative_path(good).is_ok(), "{good:?} should pass");
+        }
+        assert!(validate_safe_name("claude", "install_as").is_ok());
+    }
 
     #[test]
     fn compare_versions_honors_prerelease_ordering() {

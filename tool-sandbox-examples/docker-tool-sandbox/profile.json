@@ -1,0 +1,60 @@
+{
+  "meta": {
+    "name": "docker-tool-sandbox",
+    "version": "0.1.0",
+    "description": "A harmless tool run inside Docker and a nono command sandbox"
+  },
+  "filesystem": {
+    "read": [
+      "/opt/nono-tool/demo-tool",
+      "/opt/nono-tool/profile.json",
+      "/work/allowed.txt",
+      "/usr/lib",
+      "/lib",
+      "/lib64"
+    ],
+    "write": ["/work/output"]
+  },
+  "network": {
+    "block": true
+  },
+  "command_policies": {
+    "commands": {
+      "demo-tool": {
+        "executable": "/opt/nono-tool/demo-tool",
+        "from": {
+          "session": {
+            "sandbox": {
+              "fs_read": [
+                "/usr/lib",
+                "/lib",
+                "/lib64"
+              ],
+              "fs_read_file": [
+                "/opt/nono-tool/demo-tool",
+                "/work/allowed.txt"
+              ],
+              "fs_write": ["/work/output"],
+              "environment": {
+                "allow_vars": ["PATH", "HOME", "LANG"]
+              }
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "allow": [
+                {
+                  "argv": {"prefix": ["read"]},
+                  "reason": "the tool may read explicitly approved input"
+                },
+                {
+                  "argv": {"prefix": ["write"]},
+                  "reason": "the tool may write only to its output directory"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

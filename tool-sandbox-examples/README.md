@@ -56,6 +56,13 @@ respectively.
 The Docker tool-sandbox prototype also needs Docker or a compatible container
 runtime. See [docker-tool-sandbox/README.md](docker-tool-sandbox/README.md).
 
+Run its scripted walkthrough from the example directory:
+
+```bash
+cd docker-tool-sandbox
+demonator -c docker-tool-sandbox.yaml
+```
+
 ## GitHub CLI Demo
 
 Read the full guide:

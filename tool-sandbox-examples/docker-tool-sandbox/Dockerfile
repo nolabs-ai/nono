@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Build from this directory:
-#   docker build -t nono-tool-sandbox .
+#   docker build -t agent-tool .
 
 FROM rust:1-bookworm AS builder
 
@@ -32,6 +32,9 @@ FROM debian:bookworm-slim
 RUN groupadd --system nono \
     && useradd --system --gid nono --create-home --home-dir /home/nono --shell /usr/sbin/nologin nono \
     && mkdir -p /opt/nono-tool /work/output \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl coreutils sed \
+    && rm -rf /var/lib/apt/lists/* \
     && chown -R nono:nono /opt/nono-tool /work
 
 COPY --from=builder /tmp/nono /usr/bin/nono

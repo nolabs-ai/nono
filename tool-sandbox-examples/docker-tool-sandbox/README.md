@@ -8,9 +8,11 @@ Docker container (no extra capabilities)
     └── demo-tool (narrow filesystem and argv permissions)
 ```
 
-The tool is deliberately harmless. It can read one approved file and write
-under `/work/output`. nono denies reads of the fixture secret, denies network
-access, and rejects unsupported tool operations before the tool starts.
+The tools are deliberately constrained. `demo-tool` can read one approved
+file and write under `/work/output`; `cat` and `sed` can inspect that same
+fixture; and `curl` can reach only the explicitly allowed domain and endpoint.
+nono denies reads of the fixture secret and rejects unsupported tool operations
+before they start.
 
 ## Prerequisites
 
@@ -26,12 +28,30 @@ the repository or local build artifacts to Docker.
 From this directory:
 
 ```sh
-docker build -t nono-tool-sandbox .
+docker build -t agent-tool .
 ```
 
 The image downloads and verifies the Linux `v0.78.0` nono release asset for
 the host architecture, then compiles the tiny demo tool. The final image
 contains no source tree or Rust toolchain.
+
+## Permissions
+
+Every docker command uses the `--cap-drop=ALL` and `--security-opt=no-new-privileges:true` flags to minimize privileges, showing that nono requires no privileged capabilities itself to operate.
+
+## Scripted walkthrough
+
+If you prefer to run a single scripted walkthrough of the tool sandbox, you can use the `demonator` tool instead.
+
+Install `demonator` with `cargo install demonator`, then run from this
+directory:
+
+```sh
+demonator -c docker-tool-sandbox.yaml
+```
+
+Use `demonator -c docker-tool-sandbox.yaml --dry-run` to preview the complete
+flow without running Docker commands.
 
 ## Run the allowed operations
 
@@ -39,12 +59,12 @@ contains no source tree or Rust toolchain.
 docker run --rm \
   --cap-drop=ALL \
   --security-opt=no-new-privileges:true \
-  nono-tool-sandbox read /work/allowed.txt
+  agent-tool read /work/allowed.txt
 
 docker run --rm \
   --cap-drop=ALL \
   --security-opt=no-new-privileges:true \
-  nono-tool-sandbox write /work/output/result.txt 'created by the tool'
+  agent-tool write /work/output/result.txt 'created by the tool'
 ```
 
 The first command prints the approved fixture. The second prints a success
@@ -57,7 +77,7 @@ sandbox:
 
 ```sh
 docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true \
-  nono-tool-sandbox read /work/secret.txt
+  agent-tool read /work/secret.txt
 ```
 
 `fetch` is rejected by the command's invocation policy before it can attempt a
@@ -65,12 +85,71 @@ connection:
 
 ```sh
 docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true \
-  nono-tool-sandbox fetch example.com:80
+  agent-tool fetch example.com:80
 ```
+
+Deletion is explicitly denied at the argv layer, even though the demo tool
+contains a `delete` operation:
+
+```sh
+docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true \
+  agent-tool delete /work/allowed.txt
+```
+
+## Real-world command examples
+
+The same profile can mediate ordinary Linux tools. Override the image entrypoint
+so nono runs the selected pinned command through the profile:
+
+```sh
+docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --entrypoint /usr/bin/nono agent-tool \
+  run --no-audit --profile /opt/nono-tool/profile.json -- \
+  cat /work/allowed.txt
+
+docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --entrypoint /usr/bin/nono agent-tool \
+  run --no-audit --profile /opt/nono-tool/profile.json -- \
+  sed -n '1p' /work/allowed.txt
+```
+
+`curl` demonstrates domain and L7 endpoint filtering. `example.com` is allowed,
+but only `GET /` is permitted; `example.org` is denied at the domain layer:
+
+```sh
+docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --entrypoint /usr/bin/nono agent-tool \
+  run --no-audit --profile /opt/nono-tool/profile.json -- \
+  curl https://example.com/
+
+docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --entrypoint /usr/bin/nono agent-tool \
+  run --no-audit --profile /opt/nono-tool/profile.json -- \
+  curl -X POST https://example.com/
+
+docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --entrypoint /usr/bin/nono agent-tool \
+  run --no-audit --profile /opt/nono-tool/profile.json -- \
+  curl https://example.com/private
+
+docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --entrypoint /usr/bin/nono agent-tool \
+  run --no-audit --profile /opt/nono-tool/profile.json -- \
+  curl https://example.org/
+```
+
+The first request is allowed. The POST is denied by method policy, the
+`/private` request by path policy, and `example.org` by domain policy. A command
+such as `cat /work/secret.txt` is denied by its tool-specific filesystem policy.
+
+The `curl` command sandbox explicitly receives nono's local proxy environment
+and generated interception CA variables (`HTTPS_PROXY`, `SSL_CERT_FILE`, and
+related variables). This is what lets the allowed HTTPS request work inside the
+container while keeping the domain and endpoint rules enforced by nono.
 
 The important distinction is that the container is the coarse outer boundary,
 while nono expresses the tool-specific policy: exact executable, allowed
-arguments, filesystem capabilities, and blocked network.
+arguments, filesystem capabilities, and domain/endpoint network policy.
 
 ## Security notes
 

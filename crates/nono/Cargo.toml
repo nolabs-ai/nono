@@ -70,7 +70,7 @@ nix = { workspace = true, features = ["fs", "user"] }
 keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
 
 [build-dependencies]
-typify = "0.7"
+typify = "0.8"
 serde_json.workspace = true
 syn = "3"
 prettyplease = "0.3"

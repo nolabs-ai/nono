@@ -654,8 +654,20 @@ hostname/network enforcement on macOS:
 
 `path` may reference environment variables, optionally followed by a literal suffix,
 such as `"$XDG_RUNTIME_DIR/sccache.sock"`. Variables are expanded anywhere in 
-the string; if a referenced variable is unset, a command that selects the 
-credential fails before launch with a Tool Sandbox error naming the variable.
+the string.
+
+If a referenced variable is unset, or the expanded path does not exist at
+launch, the credential is *unavailable*: nono logs one warning naming
+the variable, and commands that select the credential still run — without the
+socket grant, and with the mapped `env_var` removed from their environment. This
+covers both a host with no agent running and an agent that exits mid-session.
+Grant the credential only where it is needed; a command that cannot work without
+it should fail on its own terms rather than rely on nono to refuse the launch.
+
+If the expanded path exists but is not a socket, or nono cannot safely inspect
+the path, that is a policy error rather than an availability condition, and the
+individual command is denied.
+
 Prefer the agent socket over raw private-key file grants.
 
 ### Shaping an ambient credential's phantom
@@ -820,7 +832,9 @@ nono run --profile my-eti-profile -- "$REAL" --version
 |---|---|
 | `nono: Tool Sandbox denied <cmd>: missing session sandbox` | The outer session invoked a policy command without `commands.<name>.sandbox` or `commands.<name>.from.session`. |
 | `nono: Tool Sandbox denied <cmd>: missing from.<caller>` | A caller was allowed to invoke a callee name, but the callee has no `from.<caller>` policy. |
-| `Tool Sandbox credential '<name>' is unavailable: SSH_AUTH_SOCK is unset` | The selected policy references a local-socket credential backed by `SSH_AUTH_SOCK`, but no agent socket was available at session startup. |
+| `local-socket credential unavailable; commands declaring it run without it` (warning) | The variable backing a local-socket credential is unset, or the path it expands to does not exist. Commands that select it still run, without the socket grant and without the mapped `env_var`. Start an agent if the command needs the credential. |
+| `Tool Sandbox credential '<name>' is unavailable: <path> is not a socket` | A local-socket credential's path exists but is not a socket — a policy error, so the command is denied rather than run without the credential. |
+| `Tool Sandbox credential '<name>' is unavailable: failed to resolve/stat <path>` | nono could not safely determine the local-socket credential's state. The command is denied rather than treating an enforcement or filesystem error as ordinary absence. |
 | `Permission denied (publickey)` | SSH reached the remote server; authentication failed outside nono. |
 | `Host key verification failed` | SSH could not verify the host from the known-hosts files the policy grants. |
 | `Tool Sandbox exec failed for script ... using interpreter ...` | The command resolved to a shebang script. Grant the required interpreter, package, and runtime data paths explicitly. |

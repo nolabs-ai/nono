@@ -2604,6 +2604,30 @@ mod tests {
     use nono::capability::FsCapability;
     use tempfile::tempdir;
 
+    /// Pin `$HOME` outside the platform temp root for the duration of a test.
+    ///
+    /// Protected-root classification resolves `$HOME`, and a suggestion is
+    /// suppressed when its target is a parent of a protected root. Tests that
+    /// assert on path guidance for a target under the temp root therefore
+    /// depend on ambient `$HOME`: a neighbouring test that points `HOME` at a
+    /// tempdir makes the temp root a parent of `$HOME/.nono`, which suppresses
+    /// the guidance. That is invisible where the temp root is `/var/folders`
+    /// but not where it is `/tmp`, so it presents as a platform-specific flake
+    /// whose outcome depends on test scheduling.
+    ///
+    /// Holding [`ENV_LOCK`] keeps this pin from racing the env-mutating tests.
+    fn pinned_home_env() -> (std::sync::MutexGuard<'static, ()>, EnvVarGuard) {
+        let lock = match ENV_LOCK.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let env = EnvVarGuard::set_all(&[
+            ("HOME", "/nono-test-home"),
+            ("XDG_STATE_HOME", "/nono-test-home/.local/state"),
+        ]);
+        (lock, env)
+    }
+
     fn make_test_caps() -> CapabilitySet {
         let mut caps = CapabilitySet::new().block_network();
         caps.add_fs(FsCapability {
@@ -4144,6 +4168,7 @@ mod tests {
 
     #[test]
     fn test_supervised_consolidated_list_truncates_beyond_cap() {
+        let _pinned_home = pinned_home_env();
         // Zero-pad the index so paths sort in numeric order.
         let caps = make_test_caps();
         let denials: Vec<DenialRecord> = (0..15)
@@ -4191,6 +4216,7 @@ mod tests {
 
     #[test]
     fn test_supervised_rate_limited_denial() {
+        let _pinned_home = pinned_home_env();
         let caps = make_test_caps();
         let denials = vec![DenialRecord {
             path: PathBuf::from("/tmp/flood"),
@@ -4451,6 +4477,7 @@ mod tests {
 
     #[test]
     fn suppressed_denial_annotated_with_save_skipped() {
+        let _pinned_home = pinned_home_env();
         let caps = make_test_caps();
         let denied = PathBuf::from("/tmp/suppressed-file");
         let other = PathBuf::from("/tmp/other-file");
@@ -4512,6 +4539,7 @@ mod tests {
 
     #[test]
     fn permanently_restricted_and_suppressed_shows_both_labels() {
+        let _pinned_home = pinned_home_env();
         let caps = make_test_caps();
         let denied = PathBuf::from("/tmp/restricted-and-suppressed");
         let suppressed = nono::try_canonicalize(&denied);
@@ -4551,6 +4579,7 @@ mod tests {
 
     #[test]
     fn suppressed_denial_uses_precomputed_canonical_path() {
+        let _pinned_home = pinned_home_env();
         // Verify that when `with_canonical_denial_paths` is supplied the
         // pre-computed value is used for suppression matching instead of the
         // raw denial path. We supply a canonical path that differs from the

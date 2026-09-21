@@ -6093,6 +6093,11 @@ mod tests {
 
     #[test]
     fn add_policy_unix_sockets_expands_git_fsmonitor_socket_token() -> Result<()> {
+        // Serialize with tests that temporarily replace PATH with a git stub.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let temp = test_tempdir()?;
         let repo = temp.path().join("repo");
         create_dir(&repo)?;
@@ -6148,6 +6153,11 @@ mod tests {
     #[test]
     fn add_policy_unix_sockets_downgrades_to_read_when_cwd_resolves_through_symlink() -> Result<()>
     {
+        // Serialize with tests that temporarily replace PATH with a git stub.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let temp = test_tempdir()?;
         let repo = temp.path().join("repo");
         create_dir(&repo)?;

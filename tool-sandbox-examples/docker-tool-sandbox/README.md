@@ -157,6 +157,8 @@ arguments, filesystem capabilities, and domain/endpoint network policy.
   filesystem mounts.
 - The Docker boundary and nono boundary are complementary; neither should be
   treated as a complete VM boundary for hostile multi-tenant workloads.
+- The image keeps `/opt/nono-tool`, the profile, the tool executable, and input
+  fixtures owned by `root:root`; only `/work/output` is writable by `nono`.
 - The profile intentionally grants only the one input file and one output
   directory. If you change the tool or image layout, update both the outer
   filesystem grants and the nested command sandbox grants.

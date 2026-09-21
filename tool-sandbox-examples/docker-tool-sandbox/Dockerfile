@@ -35,7 +35,7 @@ RUN groupadd --system nono \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl coreutils sed \
     && rm -rf /var/lib/apt/lists/* \
-    && chown -R nono:nono /opt/nono-tool /work
+    && chown nono:nono /work/output
 
 COPY --from=builder /tmp/nono /usr/bin/nono
 COPY --from=builder /tmp/demo-tool /opt/nono-tool/demo-tool
@@ -44,8 +44,7 @@ COPY allowed.txt /work/allowed.txt
 COPY secret.txt /work/secret.txt
 
 RUN chmod 0555 /usr/bin/nono /opt/nono-tool/demo-tool \
-    && chmod 0444 /opt/nono-tool/profile.json /work/allowed.txt /work/secret.txt \
-    && chown -R nono:nono /opt/nono-tool /work
+    && chmod 0444 /opt/nono-tool/profile.json /work/allowed.txt /work/secret.txt
 
 WORKDIR /work
 USER nono

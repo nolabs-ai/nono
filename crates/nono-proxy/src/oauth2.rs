@@ -341,8 +341,17 @@ async fn exchange_token(
         )));
     }
 
-    let json_body = &response_str[body_start..];
-    parse_token_response(json_body)
+    let raw_body = &response_str[body_start..];
+    let is_chunked = response_str[..body_start].lines().any(|line| {
+        line.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+    });
+    if is_chunked {
+        let json_body = Zeroizing::new(decode_chunked(raw_body));
+        parse_token_response(&json_body)
+    } else {
+        parse_token_response(raw_body)
+    }
 }
 
 /// Read a full HTTP response from a stream up to [`MAX_TOKEN_RESPONSE`] bytes.
@@ -706,6 +715,44 @@ fn decode_chunked(body: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    const FAKE_TOKEN_JSON: &str =
+        r#"{"access_token":"fake-token","token_type":"Bearer","expires_in":3600}"#;
+
+    // ── exchange_token response framing ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_exchange_token_chunked_response() {
+        // A numeric first chunk-size line reproduces the reported JSON error
+        // (trailing characters at line 2 column 1) without HTTP decoding.
+        let (first, second) = FAKE_TOKEN_JSON.split_at(16);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+             {:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            first.len(),
+            first,
+            second.len(),
+            second
+        );
+        let (token, expires) = exchange_mock_token_response(response).await.unwrap();
+        assert!(token.as_str() == "fake-token");
+        assert_eq!(expires, Duration::from_secs(3600));
+    }
+
+    #[tokio::test]
+    async fn test_exchange_token_content_length_response() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            FAKE_TOKEN_JSON.len(),
+            FAKE_TOKEN_JSON
+        );
+        let (token, expires) = exchange_mock_token_response(response).await.unwrap();
+        assert!(token.as_str() == "fake-token");
+        assert_eq!(expires, Duration::from_secs(3600));
+    }
 
     // ── parse_token_response ─────────────────────────────────────────────
 
@@ -829,6 +876,51 @@ mod tests {
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
+    /// Exercise the real exchange against a loopback server using only fake
+    /// credentials. Consume the request before responding, without logging it.
+    async fn exchange_mock_token_response(
+        response: String,
+    ) -> Result<(Zeroizing<String>, Duration)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let expected_body =
+                    b"grant_type=client_credentials&client_id=test-client&client_secret=test-secret";
+                let mut body = vec![0; expected_body.len()];
+                reader.read_exact(&mut body).await.unwrap();
+                assert!(body == expected_body);
+                reader.get_mut().write_all(response.as_bytes()).await.unwrap();
+                reader.get_mut().shutdown().await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        let config = OAuth2ExchangeConfig {
+            token_url: format!("http://{addr}/oauth/token"),
+            client_id: Zeroizing::new("test-client".to_string()),
+            client_secret: Zeroizing::new("test-secret".to_string()),
+            scope: String::new(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            exchange_token(&config, &make_test_tls_connector()),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        result
+    }
+
     /// Build a `TokenCache` with a pre-populated token for unit tests.
     /// The `exchange_token` config points to a non-routable address so any
     /// actual exchange attempt will fail (which is fine — we test cache logic).
@@ -840,7 +932,11 @@ mod tests {
             scope: String::new(),
         };
 
-        // Build a minimal TLS connector (never actually used in these tests).
+        TokenCache::new_from_parts(config, make_test_tls_connector(), token, ttl)
+    }
+
+    // The mock endpoint uses loopback HTTP, so this connector never sends secrets.
+    fn make_test_tls_connector() -> TlsConnector {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -850,8 +946,6 @@ mod tests {
         .unwrap()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-        let tls_connector = TlsConnector::from(Arc::new(tls_config));
-
-        TokenCache::new_from_parts(config, tls_connector, token, ttl)
+        TlsConnector::from(Arc::new(tls_config))
     }
 }

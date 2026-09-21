@@ -54,14 +54,6 @@ impl OfficialPackStatusTarget {
     }
 }
 
-/// Namespaces the official claude pack has been published under.
-///
-/// Exposed so `profile` can gate legacy cleanup on the same list this module
-/// matches against, rather than keeping a second copy that can drift.
-pub(crate) fn official_claude_pack_namespaces() -> impl Iterator<Item = &'static str> {
-    CLAUDE_PACK.namespaces()
-}
-
 /// Enforce official-pack status for the profile this run selected.
 ///
 /// `cli_extends` carries `--extends`, which behaves as if those bases were

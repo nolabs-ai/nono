@@ -2918,15 +2918,6 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         if !profile.packs.contains(&pack_key) {
             profile.packs.push(pack_key);
         }
-        // If we just resolved through `nolabs-ai/claude`, also offer
-        // to strip pre-0.43 inbuilt-hook leftovers. Catches the path
-        // where users `nono pull nolabs-ai/claude` directly,
-        // bypassing the post-pull cleanup hook in `migration::check_and_run`.
-        // Idempotent: silent no-op when no legacy artifacts exist, so safe
-        // to fire on every claude resolution.
-        if is_official_claude_pack(&profile_path) {
-            crate::legacy_cleanup::check_and_offer_cleanup()?;
-        }
         return Ok(Some(profile));
     }
     if cli_extends.is_empty() {
@@ -2944,38 +2935,6 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         }
     }
     Ok(None)
-}
-
-/// Returns `true` when `profile_path` lives inside `<package_store>/<ns>/claude/` for one of the
-/// namespaces the official claude pack has been published under. Used to gate legacy-cleanup
-/// invocation on the canonical claude pack rather than any pack that happens to publish a profile
-/// named `claude` or `claude-code`.
-///
-/// The namespace list comes from `package_status` so both modules agree on what counts as the
-/// official pack.
-fn is_official_claude_pack(profile_path: &Path) -> bool {
-    let Ok(store) = crate::package::package_store_dir() else {
-        return false;
-    };
-    crate::package_status::official_claude_pack_namespaces()
-        .any(|ns| profile_path_is_in_pack(profile_path, &store, ns, "claude"))
-}
-
-/// Pure path-component matcher: does `profile_path` live under
-/// `<store>/<ns>/<name>/...`? Split out of `is_always_further_claude_pack`
-/// so it can be tested without touching `XDG_CONFIG_HOME` / `HOME`.
-fn profile_path_is_in_pack(profile_path: &Path, store: &Path, ns: &str, name: &str) -> bool {
-    let Ok(rel) = profile_path.strip_prefix(store) else {
-        return false;
-    };
-    let mut components = rel.components();
-    matches!(
-        (components.next(), components.next()),
-        (
-            Some(std::path::Component::Normal(got_ns)),
-            Some(std::path::Component::Normal(got_name)),
-        ) if got_ns == ns && got_name == name
-    )
 }
 
 /// Scan installed packs for a profile artifact whose `install_as` matches
@@ -4451,76 +4410,6 @@ mod tests {
             merged.env_credentials.mappings.get("b"),
             Some(&"VAR_B".to_string())
         );
-    }
-
-    #[test]
-    fn profile_path_is_in_pack_matches_canonical_layout() {
-        let store = Path::new("/store");
-        let claude_profile = Path::new("/store/always-further/claude/profile/claude.json");
-        assert!(profile_path_is_in_pack(
-            claude_profile,
-            store,
-            "always-further",
-            "claude"
-        ));
-
-        // Different namespace must not match — guards against a third-
-        // party pack that publishes a `claude` profile triggering
-        // legacy cleanup.
-        let third_party = Path::new("/store/some-other/claude/profile/claude.json");
-        assert!(!profile_path_is_in_pack(
-            third_party,
-            store,
-            "always-further",
-            "claude"
-        ));
-
-        // Different pack name in the same namespace must not match.
-        let codex = Path::new("/store/always-further/codex/profile/codex.json");
-        assert!(!profile_path_is_in_pack(
-            codex,
-            store,
-            "always-further",
-            "claude"
-        ));
-
-        // Path outside the store entirely must not match.
-        let outside = Path::new("/elsewhere/always-further/claude/profile.json");
-        assert!(!profile_path_is_in_pack(
-            outside,
-            store,
-            "always-further",
-            "claude"
-        ));
-    }
-
-    /// Wrapped in `with_config_env` so `package_store_dir()` returns the same
-    /// path here and inside `is_official_claude_pack`. It reads
-    /// `XDG_CONFIG_HOME` live on every call, so without holding `ENV_LOCK` a
-    /// parallel test swapping the env between the two reads would make them
-    /// disagree.
-    #[test]
-    fn official_claude_pack_matches_both_published_namespaces() {
-        with_config_env(|_config_dir| {
-            let store = crate::package::package_store_dir().expect("package store dir");
-
-            for ns in ["nolabs-ai", "always-further"] {
-                let path = store.join(ns).join("claude").join("profiles/claude.json");
-                assert!(
-                    is_official_claude_pack(&path),
-                    "{ns}/claude is the official claude pack"
-                );
-            }
-
-            let third_party = store
-                .join("someone-else")
-                .join("claude")
-                .join("profiles/claude.json");
-            assert!(
-                !is_official_claude_pack(&third_party),
-                "a third-party pack publishing a `claude` profile must not trigger legacy cleanup"
-            );
-        });
     }
 
     #[test]

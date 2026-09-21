@@ -153,21 +153,7 @@ pub fn check_and_run(profile_name: &str) -> Result<MigrationOutcome> {
 
     run_pull(&chosen.pack_ref())?;
 
-    // Pack is now installed. If the user is upgrading from <0.43, the
-    // legacy `~/.claude/hooks/*` files and `settings.json::hooks`
-    // entries are still in place and would run alongside the new pack
-    // hooks. Offer cleanup with its own prompt so the user controls
-    // what gets touched. Order matters: cleanup runs after the pull, so
-    // a cleanup failure can't strand the user without a working pack.
-    if is_claude_pack(&chosen) {
-        crate::legacy_cleanup::check_and_offer_cleanup()?;
-    }
-
     Ok(MigrationOutcome::Migrated)
-}
-
-fn is_claude_pack(provider: &ProfileProvider) -> bool {
-    provider.namespace == "nolabs-ai" && provider.name == "claude"
 }
 
 fn official_pack_for(profile_name: &str) -> Option<&'static OfficialPack> {

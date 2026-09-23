@@ -397,9 +397,17 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         None,
     )?;
     let proxy_env_vars = active_proxy.env_vars;
-    let tool_sandbox_proxy_credential_env_vars = active_proxy.tool_sandbox_credential_env_vars;
+    let tool_sandbox_proxy_credentials = active_proxy.tool_sandbox_proxy_credentials;
+    let scoped_proxy_env_vars = active_proxy.scoped_proxy_env_vars;
     let tool_sandbox_trust_bundle_paths = active_proxy.tool_sandbox_trust_bundle_paths;
+    let reserved_proxy_ports: std::collections::BTreeSet<u16> = active_proxy
+        .handle
+        .iter()
+        .chain(active_proxy.scoped_handles.iter())
+        .map(|handle| handle.port)
+        .collect();
     let proxy_handle = active_proxy.handle;
+    let scoped_proxy_handles = active_proxy.scoped_handles;
 
     let requested_workdir =
         flags
@@ -442,7 +450,9 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 outer_caps: &caps,
                 deny_paths: &deny_paths,
                 policy_root: &requested_workdir,
-                proxy_credential_env_vars: &tool_sandbox_proxy_credential_env_vars,
+                proxy_credentials: &tool_sandbox_proxy_credentials,
+                reserved_proxy_ports: &reserved_proxy_ports,
+                scoped_proxy_env_vars: &scoped_proxy_env_vars,
                 proxy_trust_bundle_paths: &tool_sandbox_trust_bundle_paths,
                 shared_broker: Some(shared_broker.clone()),
             },
@@ -471,7 +481,9 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 outer_caps: &caps,
                 deny_paths: &deny_paths,
                 policy_root: &requested_workdir,
-                proxy_credential_env_vars: &tool_sandbox_proxy_credential_env_vars,
+                proxy_credentials: &tool_sandbox_proxy_credentials,
+                reserved_proxy_ports: &reserved_proxy_ports,
+                scoped_proxy_env_vars: &scoped_proxy_env_vars,
                 proxy_trust_bundle_paths: &tool_sandbox_trust_bundle_paths,
                 shared_broker: Some(shared_broker),
             },
@@ -811,6 +823,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             // session directory under `~/.nono/sessions/`. Without this
             // every supervised-mode session leaks a file + directory.
             drop(proxy_handle);
+            drop(scoped_proxy_handles);
             crate::tool_sandbox::log_main_total();
             std::process::exit(exit_code);
         }

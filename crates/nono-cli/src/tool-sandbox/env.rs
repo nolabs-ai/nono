@@ -32,6 +32,20 @@ const DEFAULT_ENV_ALLOW: &[&str] = &[
     "GIT_SSL_CAINFO",
 ];
 
+const PROXY_CONTROL_ENV: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "NONO_NO_PROXY",
+    "NONO_PROXY_TOKEN",
+    "NODE_USE_ENV_PROXY",
+];
+
 pub(crate) fn default_env_allow_patterns() -> Vec<String> {
     DEFAULT_ENV_ALLOW
         .iter()
@@ -156,6 +170,22 @@ pub(crate) fn apply_export_env(
         let mut new_entry = prefix;
         new_entry.extend_from_slice(value);
         env.push(new_entry);
+    }
+}
+
+/// Replace proxy settings with supervisor-owned values immediately before a
+/// mediated command is launched. The child must not retain the session proxy
+/// credential: it has broader authority than a command-scoped domain policy.
+pub(crate) fn override_proxy_env(env: &mut Vec<Vec<u8>>, vars: &[(String, String)]) {
+    env.retain(|entry| {
+        !PROXY_CONTROL_ENV.iter().any(|name| {
+            entry
+                .strip_prefix(name.as_bytes())
+                .is_some_and(|suffix| suffix.starts_with(b"="))
+        })
+    });
+    for (name, value) in vars {
+        env.push(format!("{name}={value}").into_bytes());
     }
 }
 
@@ -733,6 +763,76 @@ mod tests {
                 "{var} must be allowed so tool-sandbox children can verify TLS through the intercept proxy"
             );
         }
+    }
+
+    #[test]
+    fn scoped_proxy_env_replaces_outer_proxy_authority() {
+        let mut env = vec![
+            b"HTTP_PROXY=http://outer-token@127.0.0.1:1000".to_vec(),
+            b"HTTPS_PROXY=http://outer-token@127.0.0.1:1000".to_vec(),
+            b"NO_PROXY=*".to_vec(),
+            b"http_proxy=http://outer-token@127.0.0.1:1000".to_vec(),
+            b"https_proxy=http://outer-token@127.0.0.1:1000".to_vec(),
+            b"no_proxy=*".to_vec(),
+            b"ALL_PROXY=socks5://outer.invalid:1080".to_vec(),
+            b"all_proxy=socks5://outer.invalid:1080".to_vec(),
+            b"NONO_PROXY_TOKEN=outer-token".to_vec(),
+            b"PATH=/usr/bin".to_vec(),
+        ];
+        let scoped = vec![
+            (
+                "HTTP_PROXY".to_string(),
+                "http://scoped-token@127.0.0.1:2000".to_string(),
+            ),
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://scoped-token@127.0.0.1:2000".to_string(),
+            ),
+            ("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string()),
+            (
+                "http_proxy".to_string(),
+                "http://scoped-token@127.0.0.1:2000".to_string(),
+            ),
+            (
+                "https_proxy".to_string(),
+                "http://scoped-token@127.0.0.1:2000".to_string(),
+            ),
+            ("no_proxy".to_string(), "localhost,127.0.0.1".to_string()),
+            ("NONO_PROXY_TOKEN".to_string(), "scoped-token".to_string()),
+        ];
+
+        override_proxy_env(&mut env, &scoped);
+
+        let rendered = rendered(&env);
+        assert!(rendered.contains(&"PATH=/usr/bin".to_string()));
+        assert!(rendered.contains(&"NO_PROXY=localhost,127.0.0.1".to_string()));
+        assert!(
+            rendered
+                .iter()
+                .filter(|entry| entry.starts_with("HTTP_PROXY="))
+                .all(|entry| entry.contains("scoped-token@127.0.0.1:2000"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .filter(|entry| entry.starts_with("HTTPS_PROXY="))
+                .all(|entry| entry.contains("scoped-token@127.0.0.1:2000"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .filter(|entry| entry.starts_with("http_proxy="))
+                .all(|entry| entry.contains("scoped-token@127.0.0.1:2000"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .filter(|entry| entry.starts_with("https_proxy="))
+                .all(|entry| entry.contains("scoped-token@127.0.0.1:2000"))
+        );
+        assert!(!rendered.iter().any(|entry| entry.contains("outer-token")));
+        assert!(!rendered.iter().any(|entry| entry.starts_with("ALL_PROXY=")));
+        assert!(!rendered.iter().any(|entry| entry.starts_with("all_proxy=")));
     }
 
     #[test]

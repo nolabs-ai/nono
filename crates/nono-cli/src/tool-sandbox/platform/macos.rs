@@ -168,6 +168,8 @@ struct ToolSandboxState {
     shims_by_path: BTreeMap<PathBuf, String>,
     credential_handles: BTreeMap<String, ResolvedCredential>,
     proxy_trust_bundle_paths: Vec<PathBuf>,
+    scoped_proxy_env_vars: BTreeMap<String, Vec<(String, String)>>,
+    reserved_proxy_ports: BTreeSet<u16>,
     active_children: Mutex<HashMap<u32, ActiveChild>>,
     /// Attributes severed-ancestry callers to their spawning command. See the
     /// daemon-lineage section below.
@@ -275,7 +277,9 @@ impl PreparedToolSandboxRuntime {
             outer_caps,
             deny_paths,
             policy_root,
-            proxy_credential_env_vars,
+            proxy_credentials,
+            reserved_proxy_ports,
+            scoped_proxy_env_vars,
             proxy_trust_bundle_paths,
             shared_broker,
         } = input;
@@ -306,8 +310,7 @@ impl PreparedToolSandboxRuntime {
         let shim_dir = create_shim_dir(&runtime_dir)?;
         let session_path = build_session_path(&shim_dir);
 
-        let credential_handles =
-            resolve_credentials(&plan.config.credentials, proxy_credential_env_vars)?;
+        let credential_handles = resolve_credentials(&plan.config.credentials, proxy_credentials)?;
 
         let mut shims_by_command = BTreeMap::new();
         let mut shims_by_path = BTreeMap::new();
@@ -354,6 +357,8 @@ impl PreparedToolSandboxRuntime {
                 shims_by_path,
                 credential_handles,
                 proxy_trust_bundle_paths: proxy_trust_bundle_paths.to_vec(),
+                scoped_proxy_env_vars: scoped_proxy_env_vars.clone(),
+                reserved_proxy_ports: reserved_proxy_ports.clone(),
                 active_children: Mutex::new(HashMap::new()),
                 lineage,
                 session_lineage: SessionLineage::default(),
@@ -1117,10 +1122,12 @@ fn handle_shim_stream_inner(
         return Err(err);
     }
 
+    let base_proxy_scope = scoped_proxy_key(&request.command, &caller, None);
     if let Some(invocation_policy) =
         select_invocation_policy(&state.plan.config, &request.command, &caller)
     {
-        let child_env = match filter_child_env(state, &request, policy, &caller) {
+        let child_env = match filter_child_env(state, &request, policy, &caller, &base_proxy_scope)
+        {
             Ok(env) => env,
             Err(err) => {
                 record_command_policy_audit(
@@ -1311,7 +1318,7 @@ fn handle_shim_stream_inner(
         })?;
 
     let intercept = match super::resolve_intercept_action(command_config, &request.argv, || {
-        filter_child_env(state, &request, policy, &caller)
+        filter_child_env(state, &request, policy, &caller, &base_proxy_scope)
     }) {
         Ok(intercept) => intercept,
         Err(err) => {
@@ -1336,6 +1343,15 @@ fn handle_shim_stream_inner(
     // selected sandbox for the process this rule launches (every action except
     // `respond`, which launches nothing). Absent -> the command's selected sandbox.
     let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+    let effective_proxy_scope = scoped_proxy_key(
+        &request.command,
+        &caller,
+        intercept.sandbox.and(intercept.rule_index),
+    );
+    let launch_context = ChildLaunchContext {
+        caller: &caller,
+        proxy_scope: &effective_proxy_scope,
+    };
 
     // ── Respond ──────────────────────────────────────────────────────────
     if let InterceptActionConfig::Respond { stdout } = intercept_action {
@@ -1468,7 +1484,8 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
+            let launch =
+                build_child_launch_spec(state, &request, effective_sandbox, &launch_context)?;
             launch_child_with_capture(
                 state,
                 &request.command,
@@ -1571,7 +1588,8 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
+            let launch =
+                build_child_launch_spec(state, &request, effective_sandbox, &launch_context)?;
             launch_child_with_capture(
                 state,
                 &request.command,
@@ -1656,11 +1674,11 @@ fn handle_shim_stream_inner(
             let launch = build_child_launch_spec_for_binary(
                 state,
                 &request,
-                policy,
+                effective_sandbox,
                 helper,
                 &extra_args,
                 false,
-                &caller,
+                &launch_context,
             )?;
             launch_child(
                 state,
@@ -1747,7 +1765,7 @@ fn handle_shim_stream_inner(
         ));
     }
     let result = (|| {
-        let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
+        let launch = build_child_launch_spec(state, &request, effective_sandbox, &launch_context)?;
         launch_child(
             state,
             &request.command,
@@ -3044,11 +3062,16 @@ fn file_id(metadata: &fs::Metadata) -> FileId {
 
 // ── Child launch spec builder ─────────────────────────────────────────────
 
+struct ChildLaunchContext<'a> {
+    caller: &'a Caller,
+    proxy_scope: &'a str,
+}
+
 fn build_child_launch_spec(
     state: &ToolSandboxState,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
-    caller: &Caller,
+    context: &ChildLaunchContext<'_>,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     let binary = state
         .plan
@@ -3058,7 +3081,7 @@ fn build_child_launch_spec(
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
         })?;
-    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true, caller)
+    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true, context)
 }
 
 /// Build a child launch spec that runs `binary` (which may be the command's
@@ -3076,7 +3099,7 @@ fn build_child_launch_spec_for_binary(
     binary: &ResolvedCommandBinary,
     extra_args: &[Vec<u8>],
     preserve_caller_argv0: bool,
-    caller: &Caller,
+    context: &ChildLaunchContext<'_>,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     verify_binary_identity(binary)?;
     let cwd = PathBuf::from(OsString::from_vec(request.cwd.clone()));
@@ -3096,7 +3119,7 @@ fn build_child_launch_spec_for_binary(
         &state.outer_caps,
         &state.deny_paths,
     )?;
-    let mut caps = build_child_caps(state, binary, policy, request, &cwd)?;
+    let mut caps = build_child_caps(state, binary, policy, request, &cwd, context.proxy_scope)?;
     caps.deduplicate();
 
     Ok(ToolSandboxChildLaunchSpec {
@@ -3115,7 +3138,7 @@ fn build_child_launch_spec_for_binary(
             extra_args,
             preserve_caller_argv0,
         )?,
-        env: filter_child_env(state, request, policy, caller)?,
+        env: filter_child_env(state, request, policy, context.caller, context.proxy_scope)?,
         cwd: cwd.as_os_str().as_bytes().to_vec(),
         stdio_mode: selected_stdio_mode(request).to_string(),
         stdio_limits: stdio_limits_from_policy(policy),
@@ -3160,6 +3183,7 @@ fn build_child_caps(
     policy: &CommandSandboxConfig,
     request: &ToolSandboxShimRequest,
     cwd: &Path,
+    proxy_scope: &str,
 ) -> Result<CapabilitySet> {
     let mut caps = CapabilitySet::new().block_network();
     caps.add_fs(FsCapability::new_file(
@@ -3194,7 +3218,7 @@ fn build_child_caps(
     // No-op when no keychain DB grant exists.
     crate::policy::apply_macos_keychain_db_exception(&mut caps);
     add_policy_network(&mut caps, policy)?;
-    add_policy_proxy_network(&mut caps, state, request, policy)?;
+    add_policy_proxy_network(&mut caps, state, request, policy, proxy_scope)?;
     add_proxy_trust_bundle_caps(&mut caps, state, policy)?;
     add_policy_credentials(&mut caps, state, policy)?;
     add_url_open_caps(&mut caps, state, policy)?;
@@ -3773,14 +3797,23 @@ fn add_policy_proxy_network(
     state: &ToolSandboxState,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
+    proxy_scope: &str,
 ) -> Result<()> {
-    if matches!(caps.network_mode(), NetworkMode::AllowAll) {
+    if !super::policy_uses_proxy_route(policy, &state.credential_handles) {
         return Ok(());
     }
-    if !policy_uses_proxy_route(state, policy) {
-        return Ok(());
-    }
-    let port = super::proxy_port_from_env(&request.env).ok_or_else(|| {
+    super::validate_scoped_proxy_network(
+        caps,
+        policy,
+        &state.reserved_proxy_ports,
+        &request.command,
+    )?;
+    let scoped_env = super::required_scoped_proxy_env(
+        &state.scoped_proxy_env_vars,
+        proxy_scope,
+        &request.command,
+    )?;
+    let port = super::proxy_port_from_vars(scoped_env).ok_or_else(|| {
         NonoError::SandboxInit(
             "tool-sandbox proxy-routed network policy was granted but no loopback proxy env was present"
                 .to_string(),
@@ -3793,18 +3826,12 @@ fn add_policy_proxy_network(
     Ok(())
 }
 
-fn policy_uses_proxy_route(state: &ToolSandboxState, policy: &CommandSandboxConfig) -> bool {
-    let uses_proxy_credential = super::policy_credential_names(policy).iter().any(|handle| {
-        matches!(
-            state.credential_handles.get(*handle),
-            Some(ResolvedCredential::Proxy { .. })
-        )
-    });
-    let uses_proxy_domain = policy
-        .network
-        .as_ref()
-        .is_some_and(|network| !network.allow_domain.is_empty());
-    uses_proxy_credential || uses_proxy_domain
+fn scoped_proxy_key(command: &str, caller: &Caller, intercept_index: Option<usize>) -> String {
+    let caller = match caller {
+        Caller::Session => "session",
+        Caller::Command { name } => name,
+    };
+    super::proxy_scope_key(command, caller, intercept_index)
 }
 
 fn add_proxy_trust_bundle_caps(
@@ -3812,7 +3839,7 @@ fn add_proxy_trust_bundle_caps(
     state: &ToolSandboxState,
     policy: &CommandSandboxConfig,
 ) -> Result<()> {
-    if !policy_uses_proxy_route(state, policy) {
+    if !super::policy_uses_proxy_route(policy, &state.credential_handles) {
         return Ok(());
     }
     for path in &state.proxy_trust_bundle_paths {
@@ -3853,7 +3880,7 @@ fn add_policy_credentials(
             Some(ResolvedCredential::RawFile { path }) => {
                 caps.add_fs(FsCapability::new_file(path, AccessMode::Read)?);
             }
-            Some(ResolvedCredential::Proxy { .. }) => {}
+            Some(ResolvedCredential::Proxy) => {}
             Some(ResolvedCredential::Ambient { .. }) => {}
             None => {
                 return Err(NonoError::SandboxInit(format!(
@@ -3881,6 +3908,7 @@ fn filter_child_env(
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
     caller: &Caller,
+    proxy_scope: &str,
 ) -> Result<Vec<Vec<u8>>> {
     let allowed_patterns: Vec<String> = policy
         .environment
@@ -3934,7 +3962,6 @@ fn filter_child_env(
         state.url_open_shim.as_ref().map(|shim| shim.path.as_path()),
     );
     apply_environment_set_vars(&mut result, policy)?;
-
     // Inject resolved credentials.
     for cred_name in super::policy_credential_names(policy) {
         match state.credential_handles.get(cred_name) {
@@ -3964,13 +3991,7 @@ fn filter_child_env(
                 )));
             }
             Some(ResolvedCredential::RawFile { .. }) => {}
-            Some(ResolvedCredential::Proxy { env_vars }) => {
-                for (name, value) in env_vars {
-                    let prefix = format!("{name}=").into_bytes();
-                    result.retain(|entry| !entry.starts_with(&prefix));
-                    result.push(format!("{name}={value}").into_bytes());
-                }
-            }
+            Some(ResolvedCredential::Proxy) => {}
             Some(ResolvedCredential::Ambient { .. }) => {}
             None => {
                 return Err(NonoError::SandboxInit(format!(
@@ -3978,6 +3999,17 @@ fn filter_child_env(
                 )));
             }
         }
+    }
+
+    // Apply this last so main-proxy transport and credential URLs cannot
+    // overwrite the narrower authority selected for this effective sandbox.
+    if super::policy_uses_proxy_route(policy, &state.credential_handles) {
+        let vars = super::required_scoped_proxy_env(
+            &state.scoped_proxy_env_vars,
+            proxy_scope,
+            &request.command,
+        )?;
+        crate::tool_sandbox::env::override_proxy_env(&mut result, vars);
     }
 
     Ok(result)
@@ -5693,6 +5725,8 @@ mod tests {
             shims_by_path: BTreeMap::new(),
             credential_handles: BTreeMap::new(),
             proxy_trust_bundle_paths: Vec::new(),
+            scoped_proxy_env_vars: BTreeMap::new(),
+            reserved_proxy_ports: BTreeSet::new(),
             active_children: Mutex::new(HashMap::new()),
             lineage: LineageMarker::Disabled,
             session_lineage: SessionLineage::default(),
@@ -8918,6 +8952,7 @@ mod tests {
             &request,
             &CommandSandboxConfig::default(),
             &Caller::Session,
+            "unused",
         )?;
 
         assert!(contains_entry(&env, b"HOME=/Users/test"));
@@ -8962,6 +8997,7 @@ mod tests {
             &request,
             &CommandSandboxConfig::default(),
             &Caller::Session,
+            "unused",
         )?;
 
         assert!(contains_entry(
@@ -9002,7 +9038,7 @@ mod tests {
         let request = request_with_env(vec![nonce_entry.clone()]);
         let policy = policy_with_env(Some(vec!["API_TOKEN".to_string()]), BTreeMap::new());
 
-        let env = filter_child_env(&state, &request, &policy, &Caller::Session)?;
+        let env = filter_child_env(&state, &request, &policy, &Caller::Session, "unused")?;
 
         assert!(contains_entry(&env, b"API_TOKEN=s3cr3t"));
         assert!(!contains_entry(&env, &nonce_entry));
@@ -9030,7 +9066,7 @@ mod tests {
         };
         let request = request_with_env(Vec::new());
 
-        let env = filter_child_env(&state, &request, &policy, &Caller::Session)?;
+        let env = filter_child_env(&state, &request, &policy, &Caller::Session, "unused")?;
 
         assert!(contains_entry(
             &env,
@@ -9155,6 +9191,7 @@ mod tests {
         let with_override = crate::tool_sandbox::ResolvedInterceptAction {
             action: &crate::command_policy::InterceptActionConfig::Passthrough,
             rule_label: Some(crate::tool_sandbox::ResolvedInterceptRuleLabel::Args(&[])),
+            rule_index: Some(0),
             sandbox: Some(&override_sandbox),
         };
         let effective = with_override.sandbox.unwrap_or(&command_sandbox);

@@ -123,6 +123,48 @@ tool-sandbox policies live under `command_policies`. Use `commands.<name>.execut
 
 Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_file`) may use dynamic provider tokens. `@git:config-files` expands to trusted global/system Git config files, Git file settings (attributes, excludes, commit templates), and the declared target of every `include.path` and `includeIf.*.path` directive — including conditional includes that do not currently fire. `@git:hooks-path` expands to trusted global/system `core.hooksPath` directories. `@git:common-dir` expands to the git common directory (`.git` in a regular repo, or the absolute path to the main repo's `.git` in a worktree). `@git:worktree` expands to the main worktree root (empty in a regular repo). `@git:toplevel` expands to the current checkout root. `@git:toplevel-parent` expands to the parent of the current checkout root. These tokens are opt-in per profile and ignore repo-local/worktree Git config so a checkout cannot grant itself extra host filesystem access.
 
+#### Command-scoped domain policy
+
+An effective command sandbox with `network.allow_domain` receives a dedicated loopback proxy and a fresh proxy credential. Its allowlist does not inherit the outer session proxy's broader allowlist: a session may allow `"*"` while a controlled `curl` is limited to `github.com`. Session-level deny rules still apply. The supervisor replaces proxy-control environment variables immediately before execution, and the child sandbox may connect only to its dedicated proxy. Changing those variables, opting out with `NO_PROXY`, or using direct sockets does not grant access to the session-wide proxy or direct network unless the sandbox separately grants raw TCP access.
+
+Proxy credentials granted by the same effective sandbox are served by that dedicated proxy. Their reverse routes may reach their configured upstreams and still enforce `endpoint_policy`, but those upstreams are not added to the command's general domain allowlist: direct or ordinary forward-proxy access remains denied unless `network.allow_domain` also permits it.
+
+A sandbox that grants a proxy credential without `network.allow_domain` also receives a dedicated proxy. Its general domain allowlist is empty, so only its explicitly granted credential routes are usable.
+
+Proxy credentials cannot be combined with `network.allow_all`: unrestricted loopback access would let the command reach a broader proxy and defeat route isolation. On Linux, a raw `tcp_connect_ports` grant that collides with any active nono proxy port also fails closed at launch.
+
+A command-scoped domain policy needs an active nono proxy. A top-level proxy feature such as `network.allow_domain` activates it in the example below; a command-scoped proxy credential also activates the proxy by itself. If the selected command sandbox requires a scoped proxy but none is available, the command fails closed at launch.
+
+```json
+{
+  "network": { "allow_domain": ["*"] },
+  "command_policies": {
+    "commands": {
+      "curl": {
+        "sandbox": {
+          "network": { "allow_domain": ["github.com"] }
+        }
+      }
+    }
+  }
+}
+```
+
+With this profile, `curl https://github.com` is allowed and `curl https://yahoo.co.jp` is denied. Commands that are not mediated by this `curl` policy continue to use the outer session policy.
+
+The effective sandbox is selected as follows:
+
+| Invocation | Selected sandbox |
+|---|---|
+| Direct command with `from.session` | `commands.<name>.from.session.sandbox` |
+| Direct command without `from.session` | `commands.<name>.sandbox` |
+| Command launched by another mediated command | `commands.<name>.from.<caller>.sandbox` |
+| Matching intercept with its own `sandbox` | The intercept sandbox replaces the selection above |
+
+`commands.<name>.sandbox` and `commands.<name>.from.session` are alternative ways to define direct access and cannot both be present. Chained access also requires the caller's `can_use` entry; there is no fallback from a missing `from.<caller>` edge to the direct sandbox.
+
+Each direct, caller-specific, and intercept sandbox with `network.allow_domain` receives a distinct scoped proxy. For example, direct `curl` may allow `github.com`, while `curl` launched by `git` is independently limited by `curl.from.git.sandbox` to `api.github.com`. `git.sandbox` controls Git itself. Domain allowlists are replaced, not merged: neither the caller's sandbox nor the non-intercepted command sandbox contributes domains to the selected child sandbox.
+
 `unix_socket_bind` (command sandbox only) grants `connect(2)`/`bind(2)` on named pathname AF_UNIX sockets, with the same implied filesystem coupling as the agent-level field of the same name. It also accepts the `@git:fsmonitor-socket` dynamic token, which expands to `fsmonitor--daemon.ipc` under the current worktree's private git-dir — resolved by a pure filesystem walk (no `git` process spawn), so an attacker-controlled working directory cannot influence resolution through `.git/config`.
 
 ```json

@@ -845,7 +845,7 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
                 ..Default::default()
             },
         );
-        let credentials = std::collections::BTreeMap::new();
+        let credentials = std::collections::BTreeSet::new();
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: &policy,
@@ -860,7 +860,9 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
                 outer_caps: &caps,
                 deny_paths: &[],
                 policy_root: directory.path(),
-                proxy_credential_env_vars: &credentials,
+                proxy_credentials: &credentials,
+                reserved_proxy_ports: &Default::default(),
+                scoped_proxy_env_vars: &Default::default(),
                 proxy_trust_bundle_paths: &[],
                 shared_broker: None,
             },

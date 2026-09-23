@@ -2901,6 +2901,26 @@ fn validate_sandbox_credentials(
         credential_names.push(credential.name().to_string());
     }
 
+    let uses_proxy_credential = credential_names.iter().any(|name| {
+        config
+            .credentials
+            .get(name)
+            .is_some_and(|credential| credential.credential_type == CommandCredentialType::Proxy)
+    });
+    if uses_proxy_credential
+        && sandbox
+            .network
+            .as_ref()
+            .is_some_and(|network| network.allow_all)
+    {
+        report.error(
+            "proxy_credential_with_allow_all",
+            format!(
+                "command '{command_name}' from.{caller} combines a proxy credential with network.allow_all; unrestricted loopback access would bypass credential-route isolation"
+            ),
+        );
+    }
+
     for credential_name in &credential_names {
         let Some(credential) = config.credentials.get(credential_name) else {
             report.error(
@@ -5901,6 +5921,46 @@ mod tests {
                     && finding.message.contains("does-not-exist")
             }),
             "expected unknown_credential error for the override sandbox: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn proxy_credential_with_allow_all_is_rejected() {
+        let mut config = active_git_config();
+        config.credentials.insert(
+            "api".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://api.example.com".to_string()),
+                credential_key: Some("api-token".to_string()),
+                env_var: Some("API_TOKEN".to_string()),
+                ..Default::default()
+            },
+        );
+        config.commands.get_mut("git").expect("git command").sandbox = Some(CommandSandboxConfig {
+            credentials: vec![CommandCredentialGrantConfig::Policy(
+                CommandCredentialGrantPolicyConfig {
+                    name: "api".to_string(),
+                    endpoint_policy: Some(EndpointPolicyConfig::default()),
+                },
+            )],
+            network: Some(CommandNetworkConfig {
+                allow_all: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "proxy_credential_with_allow_all"),
+            "expected proxy credential isolation error: {:?}",
             report.errors
         );
     }

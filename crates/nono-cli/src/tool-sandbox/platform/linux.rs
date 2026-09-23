@@ -128,6 +128,8 @@ struct ToolSandboxState {
     landlock_abi: nono::DetectedAbi,
     baseline_cache: BaselineCache,
     proxy_trust_bundle_paths: Vec<PathBuf>,
+    scoped_proxy_env_vars: BTreeMap<String, Vec<(String, String)>>,
+    reserved_proxy_ports: BTreeSet<u16>,
     active_children: Mutex<HashMap<u32, ActiveChild>>,
     /// Attributes severed-ancestry callers to their spawning command. See `lineage_cgroup`.
     lineage: LineageMarker,
@@ -272,7 +274,9 @@ impl PreparedToolSandboxRuntime {
             outer_caps,
             deny_paths,
             policy_root,
-            proxy_credential_env_vars,
+            proxy_credentials,
+            reserved_proxy_ports,
+            scoped_proxy_env_vars,
             proxy_trust_bundle_paths,
             shared_broker,
         } = input;
@@ -319,8 +323,7 @@ impl PreparedToolSandboxRuntime {
         );
 
         let start_credentials = std::time::Instant::now();
-        let credential_handles =
-            resolve_credentials(&plan.config.credentials, proxy_credential_env_vars)?;
+        let credential_handles = resolve_credentials(&plan.config.credentials, proxy_credentials)?;
         tool_sandbox_profile_log!(
             "prepare:resolve_credentials: {:?}",
             start_credentials.elapsed()
@@ -408,6 +411,8 @@ impl PreparedToolSandboxRuntime {
                 landlock_abi,
                 baseline_cache,
                 proxy_trust_bundle_paths: proxy_trust_bundle_paths.to_vec(),
+                scoped_proxy_env_vars: scoped_proxy_env_vars.clone(),
+                reserved_proxy_ports: reserved_proxy_ports.clone(),
                 active_children: Mutex::new(HashMap::new()),
                 lineage,
                 active_count: AtomicUsize::new(0),
@@ -1420,10 +1425,12 @@ fn handle_shim_stream_inner(
         return Err(err);
     }
 
+    let base_proxy_scope = scoped_proxy_key(&request.command, &caller, None);
     if let Some(invocation_policy) =
         select_invocation_policy(&state.plan.config, &request.command, &caller)
     {
-        let child_env = match filter_child_env(state, &request, policy, &caller) {
+        let child_env = match filter_child_env(state, &request, policy, &caller, &base_proxy_scope)
+        {
             Ok(env) => env,
             Err(err) => {
                 record_command_policy_audit(
@@ -1610,7 +1617,7 @@ fn handle_shim_stream_inner(
     let intercept = match command_config {
         Some(cc) => {
             match super::resolve_intercept_action(cc, &request.argv, || {
-                filter_child_env(state, &request, policy, &caller)
+                filter_child_env(state, &request, policy, &caller, &base_proxy_scope)
             }) {
                 Ok(intercept) => intercept,
                 Err(err) => {
@@ -1638,6 +1645,15 @@ fn handle_shim_stream_inner(
     // selected sandbox for the process this rule launches (every action except
     // `respond`, which launches nothing). Absent -> the command's selected sandbox.
     let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+    let effective_proxy_scope = scoped_proxy_key(
+        &request.command,
+        &caller,
+        intercept.sandbox.and(intercept.rule_index),
+    );
+    let launch_context = ChildLaunchContext {
+        caller: &caller,
+        proxy_scope: &effective_proxy_scope,
+    };
 
     if let crate::command_policy::InterceptActionConfig::Respond { stdout } = intercept_action {
         // Write the static payload to the shim's stdout fd, then respond.
@@ -1778,7 +1794,8 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
+            let launch =
+                build_child_launch_spec(state, &request, effective_sandbox, &launch_context)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1876,7 +1893,8 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
+            let launch =
+                build_child_launch_spec(state, &request, effective_sandbox, &launch_context)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1953,11 +1971,11 @@ fn handle_shim_stream_inner(
             let launch = build_child_launch_spec_for_binary(
                 state,
                 &request,
-                policy,
+                effective_sandbox,
                 helper,
                 &extra_args,
                 false,
-                &caller,
+                &launch_context,
             )?;
             launch_child(state, &request.command, &caller, launch, stdio)
         })();
@@ -2037,7 +2055,7 @@ fn handle_shim_stream_inner(
     }
 
     let result = (|| {
-        let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
+        let launch = build_child_launch_spec(state, &request, effective_sandbox, &launch_context)?;
         launch_child(state, &request.command, &caller, launch, stdio)
     })();
     state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -3565,11 +3583,16 @@ unsafe fn cmsg_data(cmsg: *mut libc::cmsghdr) -> *mut u8 {
     }
 }
 
+struct ChildLaunchContext<'a> {
+    caller: &'a Caller,
+    proxy_scope: &'a str,
+}
+
 fn build_child_launch_spec(
     state: &ToolSandboxState,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
-    caller: &Caller,
+    context: &ChildLaunchContext<'_>,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     let binary = state
         .plan
@@ -3579,7 +3602,7 @@ fn build_child_launch_spec(
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
         })?;
-    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true, caller)
+    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true, context)
 }
 
 /// Build a child launch spec that runs `binary` (the command's real binary OR
@@ -3598,7 +3621,7 @@ fn build_child_launch_spec_for_binary(
     binary: &ResolvedCommandBinary,
     extra_args: &[Vec<u8>],
     preserve_caller_argv0: bool,
-    caller: &Caller,
+    context: &ChildLaunchContext<'_>,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     let start_vbi = std::time::Instant::now();
     verify_binary_identity(binary)?;
@@ -3627,11 +3650,11 @@ fn build_child_launch_spec_for_binary(
     )?;
 
     let start_caps = std::time::Instant::now();
-    let mut caps = build_child_caps(state, binary, policy, request, &cwd)?;
+    let mut caps = build_child_caps(state, binary, policy, request, &cwd, context.proxy_scope)?;
     tool_sandbox_profile_log!("build_child_caps total: {:?}", start_caps.elapsed());
     caps.deduplicate();
 
-    let env = filter_child_env(state, request, policy, caller)?;
+    let env = filter_child_env(state, request, policy, context.caller, context.proxy_scope)?;
 
     // Build the execute allowlist. AccessMode::Read includes
     // AccessFs::Execute in the Landlock mapping; without an explicit
@@ -3774,6 +3797,7 @@ fn build_child_caps(
     policy: &CommandSandboxConfig,
     request: &ToolSandboxShimRequest,
     cwd: &Path,
+    proxy_scope: &str,
 ) -> Result<CapabilitySet> {
     let mut caps = CapabilitySet::new().block_network();
     caps.add_fs(FsCapability::new_file(
@@ -3801,7 +3825,7 @@ fn build_child_caps(
         &state.deny_paths,
     )?;
     add_policy_network(&mut caps, policy)?;
-    add_policy_proxy_network(&mut caps, state, request, policy)?;
+    add_policy_proxy_network(&mut caps, state, request, policy, proxy_scope)?;
     add_proxy_trust_bundle_caps(&mut caps, state, policy)?;
     add_policy_credentials(&mut caps, state, policy)?;
     add_url_open_caps(&mut caps, state, policy)?;
@@ -4218,14 +4242,23 @@ fn add_policy_proxy_network(
     state: &ToolSandboxState,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
+    proxy_scope: &str,
 ) -> Result<()> {
-    if matches!(caps.network_mode(), NetworkMode::AllowAll) {
+    if !super::policy_uses_proxy_route(policy, &state.credential_handles) {
         return Ok(());
     }
-    if !policy_uses_proxy_route(state, policy) {
-        return Ok(());
-    }
-    let port = super::proxy_port_from_env(&request.env).ok_or_else(|| {
+    super::validate_scoped_proxy_network(
+        caps,
+        policy,
+        &state.reserved_proxy_ports,
+        &request.command,
+    )?;
+    let scoped_env = super::required_scoped_proxy_env(
+        &state.scoped_proxy_env_vars,
+        proxy_scope,
+        &request.command,
+    )?;
+    let port = super::proxy_port_from_vars(scoped_env).ok_or_else(|| {
         NonoError::SandboxInit(
             "tool-sandbox proxy-routed network policy was granted but no loopback proxy env was present"
                 .to_string(),
@@ -4238,18 +4271,14 @@ fn add_policy_proxy_network(
     Ok(())
 }
 
-fn policy_uses_proxy_route(state: &ToolSandboxState, policy: &CommandSandboxConfig) -> bool {
-    let uses_proxy_credential = super::policy_credential_names(policy).iter().any(|handle| {
-        matches!(
-            state.credential_handles.get(*handle),
-            Some(ResolvedCredential::Proxy { .. })
-        )
-    });
-    let uses_proxy_domain = policy
-        .network
-        .as_ref()
-        .is_some_and(|network| !network.allow_domain.is_empty());
-    uses_proxy_credential || uses_proxy_domain
+fn scoped_proxy_key(command: &str, caller: &Caller, intercept_index: Option<usize>) -> String {
+    let caller = match caller {
+        Caller::Session { .. } => "session",
+        Caller::Command {
+            command: parent, ..
+        } => parent,
+    };
+    super::proxy_scope_key(command, caller, intercept_index)
 }
 
 fn add_proxy_trust_bundle_caps(
@@ -4257,7 +4286,7 @@ fn add_proxy_trust_bundle_caps(
     state: &ToolSandboxState,
     policy: &CommandSandboxConfig,
 ) -> Result<()> {
-    if !policy_uses_proxy_route(state, policy) {
+    if !super::policy_uses_proxy_route(policy, &state.credential_handles) {
         return Ok(());
     }
     for path in &state.proxy_trust_bundle_paths {
@@ -4298,7 +4327,7 @@ fn add_policy_credentials(
             Some(ResolvedCredential::RawFile { path }) => {
                 caps.add_fs(FsCapability::new_file(path, AccessMode::Read)?);
             }
-            Some(ResolvedCredential::Proxy { .. }) => {}
+            Some(ResolvedCredential::Proxy) => {}
             Some(ResolvedCredential::Ambient { .. }) => {}
             None => {
                 return Err(NonoError::SandboxInit(format!(
@@ -4445,6 +4474,7 @@ fn filter_child_env(
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
     caller: &Caller,
+    proxy_scope: &str,
 ) -> Result<Vec<Vec<u8>>> {
     let allowed_patterns: Vec<String> = policy
         .environment
@@ -4532,13 +4562,7 @@ fn filter_child_env(
                 )));
             }
             Some(ResolvedCredential::RawFile { .. }) => {}
-            Some(ResolvedCredential::Proxy { env_vars }) => {
-                for (name, value) in env_vars {
-                    let prefix = format!("{name}=").into_bytes();
-                    env.retain(|entry| !entry.starts_with(&prefix));
-                    env.push(format!("{name}={value}").into_bytes());
-                }
-            }
+            Some(ResolvedCredential::Proxy) => {}
             Some(ResolvedCredential::Ambient { .. }) => {}
             None => {
                 return Err(NonoError::SandboxInit(format!(
@@ -4546,6 +4570,16 @@ fn filter_child_env(
                 )));
             }
         }
+    }
+    // Apply this last so main-proxy transport and credential URLs cannot
+    // overwrite the narrower authority selected for this effective sandbox.
+    if super::policy_uses_proxy_route(policy, &state.credential_handles) {
+        let vars = super::required_scoped_proxy_env(
+            &state.scoped_proxy_env_vars,
+            proxy_scope,
+            &request.command,
+        )?;
+        super::env::override_proxy_env(&mut env, vars);
     }
     Ok(env)
 }
@@ -6470,6 +6504,8 @@ mod tests {
                 system_files: Vec::new(),
             },
             proxy_trust_bundle_paths: Vec::new(),
+            scoped_proxy_env_vars: BTreeMap::new(),
+            reserved_proxy_ports: BTreeSet::new(),
             active_children: Mutex::new(HashMap::new()),
             lineage: LineageMarker::disabled_for_test(),
             active_count: AtomicUsize::new(0),

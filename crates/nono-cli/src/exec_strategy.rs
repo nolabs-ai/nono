@@ -2869,7 +2869,7 @@ fn run_supervisor_loop(
     let tool_sandbox_listener_fd = tool_sandbox_runtime.map(|runtime| runtime.listener_fd());
     let tool_sandbox_url_listener_fd =
         tool_sandbox_runtime.and_then(|runtime| runtime.url_listener_fd());
-    let mut rate_limiter = supervisor_linux::RateLimiter::new(10, 5);
+    let mut rate_limiter = supervisor_linux::NotificationRateLimiter::new();
     let mut denials = SupervisorDenials {
         fs: Vec::new(),
         url: Vec::new(),
@@ -3191,7 +3191,7 @@ fn run_supervisor_loop(
 fn drain_pending_network_notifications(
     proxy_notify_raw_fd: Option<std::os::fd::RawFd>,
     config: &SupervisorConfig<'_>,
-    rate_limiter: &mut supervisor_linux::RateLimiter,
+    rate_limiter: &mut supervisor_linux::NotificationRateLimiter,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) {

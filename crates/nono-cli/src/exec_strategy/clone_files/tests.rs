@@ -149,7 +149,7 @@ fn supervise(
             is_file: cap.is_file,
         })
         .collect();
-    let mut limiter = supervisor_linux::RateLimiter::new(10000, 10000);
+    let mut limiter = supervisor_linux::NotificationRateLimiter::unlimited_for_tests();
     let mut denials = vec![];
     let mut ipc_denials = vec![];
     let deadline = Instant::now() + Duration::from_secs(20);

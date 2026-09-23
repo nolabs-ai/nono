@@ -13,7 +13,7 @@ use crate::path::collect_symlink_hops;
 use crate::sandbox::SupportInfo;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 use tracing::{debug, info};
 
@@ -277,67 +277,6 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
     }
 
     Ok(filters)
-}
-
-/// Returns true if the capability set explicitly grants access to a keychain DB.
-///
-/// This is a narrow opt-in for tools that need OAuth/session refresh via macOS Keychain.
-fn has_explicit_keychain_db_access(caps: &CapabilitySet) -> bool {
-    let user_keychain_dbs = std::env::var("HOME").ok().map(|home| {
-        [
-            Path::new(&home).join("Library/Keychains/login.keychain-db"),
-            Path::new(&home).join("Library/Keychains/metadata.keychain-db"),
-        ]
-    });
-    let system_keychain_dbs = [
-        Path::new("/Library/Keychains/login.keychain-db").to_path_buf(),
-        Path::new("/Library/Keychains/metadata.keychain-db").to_path_buf(),
-    ];
-
-    let is_keychain_db = |path: &Path| -> bool {
-        if system_keychain_dbs
-            .iter()
-            .any(|candidate| path == candidate)
-        {
-            return true;
-        }
-        if let Some(ref user_keychain_dbs) = user_keychain_dbs
-            && user_keychain_dbs.iter().any(|candidate| path == candidate)
-        {
-            return true;
-        }
-        false
-    };
-
-    // Collect all known keychain DB paths for coverage checks below.
-    let all_keychain_dbs: Vec<PathBuf> = user_keychain_dbs
-        .as_ref()
-        .map(|dbs| dbs.to_vec())
-        .unwrap_or_default()
-        .into_iter()
-        .chain(system_keychain_dbs.iter().cloned())
-        .collect();
-
-    // Only user-intent grants unlock Mach IPC to keychain daemons. Group grants
-    // must not suppress the secd/securityd denies — Mach IPC bypasses file-level
-    // rules, so a group-sourced keychain cap would reopen access even when
-    // deny_keychains_macos is active.
-    //
-    // A directory grant covering a keychain DB also counts — e.g. a profile that
-    // allows ~/Library/Keychains (directory) covers login.keychain-db within it.
-    caps.fs_capabilities().iter().any(|cap| {
-        if !cap.source.is_user_intent() {
-            return false;
-        }
-        if cap.is_file {
-            is_keychain_db(&cap.original) || is_keychain_db(&cap.resolved)
-        } else {
-            // Directory grant: check if it covers any known keychain DB.
-            all_keychain_dbs
-                .iter()
-                .any(|db| db.starts_with(&cap.resolved) || db.starts_with(&cap.original))
-        }
-    })
 }
 
 /// Escape a path for use in Seatbelt profile strings.
@@ -608,31 +547,31 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // Allow specific system operations
     profile.push_str("(allow sysctl-read)\n");
 
-    // Mach IPC: allow service resolution. Deny Keychain/security services by default.
-    // If a keychain DB is explicitly granted, skip these denies so profiles that
-    // intentionally rely on macOS Keychain OAuth refresh can work.
+    // Mach IPC: allow service resolution. Deny Keychain/security services always.
     //
     // Without these denies, blanket mach-lookup can permit Keychain retrieval via
-    // Mach IPC, bypassing file-level deny rules in profiles that do NOT opt in.
+    // Mach IPC, bypassing file-level deny rules. The library is policy-free and
+    // cannot tell an authorized grant from a bare one: a client that has decided
+    // keychain access is authorized re-allows these services through a platform
+    // rule, which is emitted later in the profile and wins under Seatbelt's
+    // last-matching-rule semantics.
     profile.push_str("(allow mach-lookup)\n");
-    if !has_explicit_keychain_db_access(caps) {
-        // Legacy keychain daemon names (macOS < 13)
-        profile.push_str("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))\n");
-        profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd\"))\n");
-        // Modern keychain daemon (macOS 13 Ventura+). Legacy SecKeychain APIs
-        // route here on Ventura and later, bypassing the legacy service denies above.
-        // Without this deny, FFI/ctypes callers can read keychain entries despite
-        // the file-level deny on ~/Library/Keychains.
-        profile.push_str("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))\n");
-        // Modern security daemon (macOS 10.10+). SecItem APIs ("Data Protection"
-        // keychain) route through secd. Blocking this prevents access to iCloud
-        // Keychain and modern keychain items that bypass the legacy daemon paths.
-        profile.push_str("(deny mach-lookup (global-name \"com.apple.secd\"))\n");
-        // Security agent: shows keychain authorization dialogs. Without this deny, the
-        // agent can act as a proxy — presenting a user prompt and returning the credential
-        // on behalf of the sandboxed process even when the direct daemon paths are blocked.
-        profile.push_str("(deny mach-lookup (global-name \"com.apple.security.agent\"))\n");
-    }
+    // Legacy keychain daemon names (macOS < 13)
+    profile.push_str("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))\n");
+    profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd\"))\n");
+    // Modern keychain daemon (macOS 13 Ventura+). Legacy SecKeychain APIs
+    // route here on Ventura and later, bypassing the legacy service denies above.
+    // Without this deny, FFI/ctypes callers can read keychain entries despite
+    // the file-level deny on ~/Library/Keychains.
+    profile.push_str("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))\n");
+    // Modern security daemon (macOS 10.10+). SecItem APIs ("Data Protection"
+    // keychain) route through secd. Blocking this prevents access to iCloud
+    // Keychain and modern keychain items that bypass the legacy daemon paths.
+    profile.push_str("(deny mach-lookup (global-name \"com.apple.secd\"))\n");
+    // Security agent: shows keychain authorization dialogs. Without this deny, the
+    // agent can act as a proxy — presenting a user prompt and returning the credential
+    // on behalf of the sandboxed process even when the direct daemon paths are blocked.
+    profile.push_str("(deny mach-lookup (global-name \"com.apple.security.agent\"))\n");
     profile.push_str("(allow mach-per-user-lookup)\n");
     profile.push_str("(allow mach-task-name)\n");
     profile.push_str("(deny mach-priv*)\n");
@@ -1711,57 +1650,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_profile_skips_keychain_mach_deny_when_explicitly_granted() {
-        let mut caps = CapabilitySet::new();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
-        let keychain = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
-        caps.add_fs(FsCapability {
-            original: keychain.clone(),
-            resolved: keychain,
-            access: AccessMode::Read,
-            is_file: true,
-            source: CapabilitySource::Profile,
-        });
-
-        let profile = generate_profile(&caps).unwrap();
-
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
-        assert!(
-            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
-        );
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
-    }
-
-    #[test]
-    fn test_generate_profile_skips_keychain_mach_deny_for_metadata_keychain_db() {
-        let mut caps = CapabilitySet::new();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
-        let metadata_keychain_db =
-            PathBuf::from(home).join("Library/Keychains/metadata.keychain-db");
-        caps.add_fs(FsCapability {
-            original: metadata_keychain_db.clone(),
-            resolved: metadata_keychain_db,
-            access: AccessMode::Read,
-            is_file: true,
-            source: CapabilitySource::Profile,
-        });
-
-        let profile = generate_profile(&caps).unwrap();
-
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
-        assert!(
-            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
-        );
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
-    }
-
-    #[test]
     fn test_generate_profile_group_sourced_keychain_does_not_suppress_mach_deny() {
-        // Group-sourced keychain caps must not suppress Mach IPC denies.
         let mut caps = CapabilitySet::new();
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
         let keychain = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
@@ -1775,40 +1664,32 @@ mod tests {
 
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
-        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
-        assert!(
-            profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
-        );
-        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
-        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
+        for deny in KEYCHAIN_MACH_DENIES {
+            assert!(
+                profile.contains(deny),
+                "missing {deny} in profile:\n{profile}"
+            );
+        }
     }
 
     #[test]
-    fn test_generate_profile_directory_grant_covering_keychain_suppresses_mach_deny() {
-        // A profile-level directory grant covering ~/Library/Keychains must suppress
-        // Mach IPC denies, the same as an explicit file grant for login.keychain-db.
-        // Regression: nolabs-ai/claude grants the Keychains directory, not individual files.
+    fn test_generate_profile_keychain_mach_allow_rule_lands_after_deny() {
         let mut caps = CapabilitySet::new();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
-        let keychains_dir = PathBuf::from(home).join("Library/Keychains");
-        caps.add_fs(FsCapability {
-            original: keychains_dir.clone(),
-            resolved: keychains_dir,
-            access: AccessMode::ReadWrite,
-            is_file: false,
-            source: CapabilitySource::Profile,
-        });
+        caps.add_platform_rule("(allow mach-lookup (global-name \"com.apple.securityd\"))")
+            .unwrap();
 
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        let deny = profile
+            .find("(deny mach-lookup (global-name \"com.apple.securityd\"))")
+            .expect("library always denies securityd");
+        let allow = profile
+            .find("(allow mach-lookup (global-name \"com.apple.securityd\"))")
+            .expect("platform rule is emitted");
         assert!(
-            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+            allow > deny,
+            "authorized mach allow must follow the default deny:\n{profile}"
         );
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
     #[test]

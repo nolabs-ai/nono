@@ -1633,6 +1633,83 @@ mod tests {
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
+    const KEYCHAIN_MACH_DENIES: [&str; 5] = [
+        "(deny mach-lookup (global-name \"com.apple.SecurityServer\"))",
+        "(deny mach-lookup (global-name \"com.apple.securityd\"))",
+        "(deny mach-lookup (global-name \"com.apple.security.keychaind\"))",
+        "(deny mach-lookup (global-name \"com.apple.secd\"))",
+        "(deny mach-lookup (global-name \"com.apple.security.agent\"))",
+    ];
+
+    #[test]
+    fn test_generate_profile_keeps_keychain_mach_deny_for_exact_file_grant() {
+        let mut caps = CapabilitySet::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
+        let keychain = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
+        caps.add_fs(FsCapability {
+            original: keychain.clone(),
+            resolved: keychain,
+            access: AccessMode::Read,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        for deny in KEYCHAIN_MACH_DENIES {
+            assert!(
+                profile.contains(deny),
+                "missing {deny} in profile:\n{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_profile_keeps_keychain_mach_deny_for_metadata_db_grant() {
+        let mut caps = CapabilitySet::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
+        let metadata_db = PathBuf::from(home).join("Library/Keychains/metadata.keychain-db");
+        caps.add_fs(FsCapability {
+            original: metadata_db.clone(),
+            resolved: metadata_db,
+            access: AccessMode::Read,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        for deny in KEYCHAIN_MACH_DENIES {
+            assert!(
+                profile.contains(deny),
+                "missing {deny} in profile:\n{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_profile_keeps_keychain_mach_deny_for_directory_grant() {
+        let mut caps = CapabilitySet::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
+        let keychains_dir = PathBuf::from(home).join("Library/Keychains");
+        caps.add_fs(FsCapability {
+            original: keychains_dir.clone(),
+            resolved: keychains_dir,
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::Profile,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        for deny in KEYCHAIN_MACH_DENIES {
+            assert!(
+                profile.contains(deny),
+                "missing {deny} in profile:\n{profile}"
+            );
+        }
+    }
+
     #[test]
     fn test_generate_profile_skips_keychain_mach_deny_when_explicitly_granted() {
         let mut caps = CapabilitySet::new();

@@ -218,26 +218,26 @@ The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's wo
 | `open_port` | port array | Localhost bind ports (e.g. an OAuth/OIDC loopback callback listener). Mirrors the top-level `network.open_port`; enforceable for children on macOS and Linux. |
 | `open_port_range` | `[start, end]` array | Inclusive localhost bind port ranges, e.g. `[[8250, 8255]]`. |
 
-### Command-scoped domain policy
+### Command-scoped proxy policy
 
-An effective command sandbox with `network.allow_domain` receives a dedicated loopback proxy and fresh proxy credential. Its allowlist does not inherit a broader outer-session allowlist, although session-level deny rules still apply. The child sandbox may connect only to its selected proxy, so changing proxy environment variables, setting `NO_PROXY`, or opening a direct socket does not bypass the command policy unless the sandbox separately grants raw TCP access.
+An effective command sandbox whose network policy includes `network.allow_domain` receives a dedicated loopback proxy and fresh proxy credential. Its proxy policy does not inherit the outer session sandbox's broader domain allowlist, although the outer session network policy's domain denials still apply. The command sandbox may connect only to its selected proxy, so changing proxy environment variables, setting `NO_PROXY`, or opening a direct socket does not bypass its network policy unless the command sandbox policy separately grants raw TCP access.
 
-Proxy credentials granted by that effective sandbox remain available through the dedicated proxy. Credential reverse routes may reach their configured upstreams under `endpoint_policy`, without adding those upstreams to the general domain allowlist. Direct and ordinary forward-proxy requests still require `network.allow_domain` permission.
+Proxy credentials granted by that effective command sandbox remain available through the dedicated proxy. Credential reverse routes may reach their configured upstreams under `endpoint_policy`, without adding those upstreams to the command's domain allowlist. Direct and ordinary forward-proxy requests still require `network.allow_domain` permission.
 
-A sandbox that grants a proxy credential without `network.allow_domain` also receives a dedicated proxy with an empty general domain allowlist. Only its explicitly granted credential routes are available.
+A command sandbox policy that grants a proxy credential without `network.allow_domain` also receives a dedicated proxy with an empty domain allowlist. Only its explicitly granted credential routes are available.
 
 Proxy credentials cannot be combined with `network.allow_all`: unrestricted loopback access would let the command reach a broader proxy and defeat route isolation. On Linux, a raw `tcp_connect_ports` grant that collides with any active nono proxy port also fails closed at launch.
 
-A command-scoped domain policy needs an active nono proxy, such as one activated by top-level `network.allow_domain`. A command-scoped proxy credential activates the proxy by itself. If the selected command sandbox requires a scoped proxy but none is available, the command fails closed at launch.
+A command-scoped proxy policy needs an active nono proxy, such as one activated by a top-level network policy with `network.allow_domain`. A command-scoped proxy credential activates the proxy by itself. If the selected command sandbox requires a scoped proxy but none is available, the command fails closed at launch.
 
-| Invocation | Selected sandbox |
+| Invocation | Selected command sandbox |
 |---|---|
 | Direct command with `from.session` | `commands.<name>.from.session.sandbox` |
 | Direct command without `from.session` | `commands.<name>.sandbox` |
 | Command launched by another mediated command | `commands.<name>.from.<caller>.sandbox` |
 | Matching intercept with its own `sandbox` | The intercept sandbox replaces the selection above |
 
-`sandbox` and `from.session` are alternative direct-session forms and cannot both be present. Chained access requires both the caller's `can_use` entry and the callee's `from.<caller>` policy; a missing caller edge does not fall back to the direct sandbox. Direct, caller-specific, and intercept domain allowlists are independent and are never merged. The caller's own sandbox controls the caller, not its child.
+`sandbox` and `from.session` are alternative direct-session forms and cannot both be present. Chained access requires both the caller's `can_use` entry and the callee's `from.<caller>` policy; a missing caller edge does not fall back to the direct command sandbox. Direct, caller-specific, and intercept proxy policies are independent and are never merged. The caller's own command sandbox controls the caller, not its child.
 
 `environment.allow_vars` accepts exact names such as `PATH`, trailing-prefix wildcards such as `AWS_*`, and the bare wildcard `*`. `environment.set_vars` injects static values after filtering; `PATH` and `NONO_*` are reserved.
 

@@ -325,7 +325,7 @@ fn print_list_json(sessions: &[SessionInfo]) -> Result<()> {
                 "disk_size": s.disk_size,
                 "is_alive": s.is_alive,
                 "is_stale": s.is_stale,
-                // Whether the session had a Tool Sandbox at all: mediation was
+                // Whether the session had command mediation at all: mediation was
                 // configured, or a command reached mediation. Deliberately not
                 // the summary's own `mediation_active`, which reports only the
                 // first of those.

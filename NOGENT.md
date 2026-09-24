@@ -34,10 +34,10 @@ The workspace currently contains these crates:
   policy, embedded profiles, policy group resolution, protected path handling,
   execution strategy selection, environment preparation, proxy runtime wiring,
   credential loading, audit, rollback, trust commands, package and registry
-  workflows, and ephemeral tool isolation.
+  workflows, and command mediation.
 - `crates/nono-proxy`: Network proxy used by the supervisor. It runs outside
-  the child sandbox and exposes controlled loopback access to the sandboxed
-  child. It implements CONNECT host filtering, reverse proxy credential
+  the sandboxed workload and exposes controlled loopback access to it. It
+  implements CONNECT host filtering, reverse proxy credential
   injection, external proxy chaining, TLS interception for L7 policy,
   endpoint filtering, OAuth2, optional SPIFFE support, diagnostics, and audit.
 - `bindings/c`: `nono-ffi`, the C ABI wrapper around the core library. Review
@@ -137,7 +137,7 @@ Review files under `crates/nono/src/sandbox`, `crates/nono/src/capability.rs`,
   missing path is intentional and whether later file creation changes the
   grant.
 
-### Tool Sandboxing
+### Command Mediation and Command Sandboxes
 
 Review `crates/nono-cli/src/tool-sandbox`, `command_policy.rs`,
 `terminal_approval.rs`, and related profile schema code.

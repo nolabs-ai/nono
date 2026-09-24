@@ -919,7 +919,7 @@ struct ProxyState {
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     /// Optional supervisor-backed capture backend for command-backed credentials.
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
-    /// Optional resolver for tool-sandbox broker nonces found in request headers.
+    /// Optional resolver for command-mediation broker nonces found in request headers.
     /// Resolves `nono_<hex>` values in `Authorization` and similar headers before
     /// forwarding upstream. Consumer IDs use the form `"proxy.<route_id>"`.
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,

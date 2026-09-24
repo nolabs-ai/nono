@@ -187,12 +187,12 @@ pub(super) fn resolve_exec_command(
     command: &[String],
 ) -> nono::Result<(std::path::PathBuf, Vec<Vec<u8>>)> {
     let helper_raw = command.first().ok_or_else(|| {
-        nono::NonoError::SandboxInit("tool-sandbox exec action has empty command".to_string())
+        nono::NonoError::SandboxInit("command-policy exec action has empty command".to_string())
     })?;
     let helper_path = std::path::PathBuf::from(crate::policy::expand_env_vars_strict(helper_raw)?);
     if !helper_path.is_absolute() {
         return Err(nono::NonoError::SandboxInit(format!(
-            "tool-sandbox exec helper must be an absolute path; got '{}'",
+            "command-policy exec helper must be an absolute path; got '{}'",
             helper_path.display()
         )));
     }
@@ -219,7 +219,7 @@ pub(super) fn resolve_exec_helper<'a>(
     let (helper_path, extra_args) = resolve_exec_command(command)?;
     let helper = exec_helpers.get(&helper_path).ok_or_else(|| {
         nono::NonoError::SandboxInit(format!(
-            "tool-sandbox exec helper not pre-resolved: {}",
+            "command-policy exec helper not pre-resolved: {}",
             helper_path.display()
         ))
     })?;
@@ -350,7 +350,7 @@ fn invocation_args(argv: &[Vec<u8>]) -> nono::Result<Vec<String>> {
         .skip(1)
         .map(|arg| {
             std::str::from_utf8(arg).map(str::to_owned).map_err(|_| {
-                nono::NonoError::SandboxInit("tool-sandbox argv is not UTF-8".to_string())
+                nono::NonoError::SandboxInit("command-policy argv is not UTF-8".to_string())
             })
         })
         .collect()
@@ -364,10 +364,12 @@ fn invocation_env(env: &[Vec<u8>]) -> nono::Result<std::collections::BTreeMap<St
             continue;
         };
         let name = std::str::from_utf8(name).map_err(|_| {
-            nono::NonoError::SandboxInit("tool-sandbox env name is not UTF-8".to_string())
+            nono::NonoError::SandboxInit("command-policy environment name is not UTF-8".to_string())
         })?;
         let value = std::str::from_utf8(value).map_err(|_| {
-            nono::NonoError::SandboxInit("tool-sandbox env value is not UTF-8".to_string())
+            nono::NonoError::SandboxInit(
+                "command-policy environment value is not UTF-8".to_string(),
+            )
         })?;
         result.insert(name.to_string(), value.to_string());
     }
@@ -643,7 +645,7 @@ pub(super) fn reject_unenforced_resources(
         return Err(nono::NonoError::BlockedCommand {
             command: command.to_string(),
             reason:
-                "sandbox.resources is parsed by tool-sandbox Schema 2 but not yet enforced by this runtime"
+                "sandbox.resources is parsed by command-sandbox Schema 2 but not yet enforced by this runtime"
                     .to_string(),
         });
     }
@@ -1358,7 +1360,7 @@ mod intercept_tests {
         assert!(matches!(
             err,
             Some(message)
-                if message.contains("sandbox.resources is parsed by tool-sandbox Schema 2 but not yet enforced")
+                if message.contains("sandbox.resources is parsed by command-sandbox Schema 2 but not yet enforced")
         ));
     }
 

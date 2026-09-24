@@ -16,7 +16,7 @@ pub(crate) fn init_theme(cli: &Cli) {
     theme::init(cli.theme.as_deref(), config_theme.as_deref());
 }
 
-/// Initialize tracing for an internal re-exec entrypoint (e.g. the tool-sandbox
+/// Initialize tracing for an internal re-exec entrypoint (e.g. the command-mediation
 /// child launcher), which returns from `main()` before [`init_tracing`] runs and
 /// therefore has no subscriber of its own.
 ///
@@ -44,7 +44,7 @@ pub(crate) fn init_internal_entrypoint_tracing() {
 
 pub(crate) fn init_tracing(cli: &Cli) {
     // Export the resolved CLI verbosity into RUST_LOG (unless already set) so it
-    // propagates to internal re-exec subprocesses — notably the tool-sandbox
+    // propagates to internal re-exec subprocesses — notably the command-mediation
     // child launcher, which forwards RUST_LOG and inits its own subscriber. This
     // makes `-vv` surface the brokered child's generated Seatbelt profile too,
     // not just the parent's logs.

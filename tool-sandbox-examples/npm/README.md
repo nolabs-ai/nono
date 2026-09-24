@@ -33,7 +33,7 @@ ever reach the real registry.
   install-time code). The top-level `"commands": {"allow": ["npm"]}` override in this profile opts
   back in explicitly.
 - Like `aws-cli` in this repo, this profile does not use `github-cli`'s per-command `command_policies`
-  tool-sandbox model. The version of nono this was built against cannot execute Node's
+  command-sandbox model. The version of nono this was built against cannot execute Node's
   `#!/usr/bin/env node`-shebang chain under that nested exec gate (a nono limitation, not specific
   to this profile), so credential brokering and enforcement happen at the session-level `network`
   block instead, matching the `aws-cli` example.

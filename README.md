@@ -125,7 +125,7 @@ Are you an agent developer and want to publish your own agent package? We would 
 
 nono does not stop at "put the agent in a sandbox". Agents delegate real work to tools: `git`, `gh`, `curl`, `kubectl`, package managers, build scripts, MCP clients / servers, and whatever else is on `PATH`. Those tools are often where secrets, network access, and side effects show up. Most sandboxes just give the agent a blanket policy where a secret is universally available to the entire agent and every tool, but nono is different:
 
-nono can put delegated tools in their own isolated child sandboxes, outside the agent's control. The agent gets its session sandbox; when it calls a controlled tool, nono's broker launches that tool with a separate policy, separate filesystem grants, separate network rules, and separate credentials. The tool does not inherit the agent's broad `--allow` grants, CWD access, raw credential paths, or network access unless its own policy says so.
+nono can put delegated tools in their own isolated command sandboxes, outside the agent's control. The agent gets its session sandbox; when it calls a controlled tool, nono's broker launches that tool under a command policy with its own filesystem policy, network policy, and credentials. The command sandbox does not inherit the session sandbox's broad `--allow` grants, CWD access, raw credential paths, or network access unless its command sandbox policy says so.
 
 That means a profile can express rules like:
 

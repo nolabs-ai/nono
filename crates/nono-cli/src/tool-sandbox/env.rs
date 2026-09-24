@@ -65,7 +65,7 @@ pub(crate) fn effective_argv_for_binary(
 ) -> Result<Vec<Vec<u8>>> {
     if request.argv.is_empty() {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox request had empty argv".to_string(),
+            "command-mediation request had empty argv".to_string(),
         ));
     }
     let mut argv =
@@ -78,7 +78,7 @@ pub(crate) fn effective_argv_for_binary(
     for arg in extra_args {
         if arg.contains(&0) {
             return Err(NonoError::ConfigParse(
-                "tool-sandbox exec helper arg contains NUL".to_string(),
+                "command-policy exec helper argument contains NUL".to_string(),
             ));
         }
         argv.push(arg.clone());
@@ -86,7 +86,7 @@ pub(crate) fn effective_argv_for_binary(
     for arg in &policy.argv_prepend {
         if arg.as_bytes().contains(&0) {
             return Err(NonoError::ConfigParse(
-                "tool-sandbox policy argv_prepend contains NUL".to_string(),
+                "command sandbox policy argv_prepend contains NUL".to_string(),
             ));
         }
         argv.push(arg.as_bytes().to_vec());
@@ -112,12 +112,12 @@ pub(crate) fn apply_environment_set_vars(
             || value.as_bytes().contains(&0)
         {
             return Err(NonoError::ConfigParse(format!(
-                "invalid tool-sandbox environment.set_vars entry '{name}'"
+                "invalid command-mediation environment.set_vars entry '{name}'"
             )));
         }
         if crate::exec_strategy::env_sanitization::is_dangerous_env_var(name) {
             return Err(NonoError::ConfigParse(format!(
-                "tool-sandbox environment.set_vars rejects dangerous key '{name}'"
+                "command-mediation environment.set_vars rejects dangerous key '{name}'"
             )));
         }
         let prefix = format!("{name}=");
@@ -175,7 +175,7 @@ pub(crate) fn apply_export_env(
 
 /// Replace proxy settings with supervisor-owned values immediately before a
 /// mediated command is launched. The child must not retain the session proxy
-/// credential: it has broader authority than a command-scoped domain policy.
+/// credential: it has broader authority than a command-scoped proxy policy.
 pub(crate) fn override_proxy_env(env: &mut Vec<Vec<u8>>, vars: &[(String, String)]) {
     env.retain(|entry| {
         !PROXY_CONTROL_ENV.iter().any(|name| {
@@ -760,7 +760,7 @@ mod tests {
         ] {
             assert!(
                 is_env_var_allowed(var, &patterns),
-                "{var} must be allowed so tool-sandbox children can verify TLS through the intercept proxy"
+                "{var} must be allowed so command sandboxes can verify TLS through the intercept proxy"
             );
         }
     }

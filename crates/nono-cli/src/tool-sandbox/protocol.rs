@@ -166,35 +166,35 @@ pub(crate) enum StdioLimitActionSpec {
 pub(crate) fn validate_ipc_request(request: &ToolSandboxShimRequest) -> Result<()> {
     if request.argv.is_empty() {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox IPC rejected empty argv".to_string(),
+            "command-mediation IPC rejected empty argv".to_string(),
         ));
     }
     if request.argv.len() > MAX_ARGC {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox IPC argc limit exceeded".to_string(),
+            "command-mediation IPC argc limit exceeded".to_string(),
         ));
     }
     if request.env.len() > MAX_ENV {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox IPC env limit exceeded".to_string(),
+            "command-mediation IPC env limit exceeded".to_string(),
         ));
     }
     if request.cwd.len() > MAX_CWD || request.cwd.contains(&0) {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox IPC cwd rejected".to_string(),
+            "command-mediation IPC cwd rejected".to_string(),
         ));
     }
     for arg in &request.argv {
         if arg.len() > MAX_ARG || arg.contains(&0) {
             return Err(NonoError::SandboxInit(
-                "tool-sandbox IPC argv rejected".to_string(),
+                "command-mediation IPC argv rejected".to_string(),
             ));
         }
     }
     for entry in &request.env {
         if entry.len() > MAX_ENV_ENTRY || entry.contains(&0) {
             return Err(NonoError::SandboxInit(
-                "tool-sandbox IPC env rejected".to_string(),
+                "command-mediation IPC env rejected".to_string(),
             ));
         }
     }
@@ -217,40 +217,52 @@ pub(crate) fn write_response(
 
 pub(crate) fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let payload = serde_json::to_vec(value).map_err(|err| {
-        NonoError::SandboxInit(format!("failed to serialize tool-sandbox IPC frame: {err}"))
+        NonoError::SandboxInit(format!(
+            "failed to serialize command-mediation IPC frame: {err}"
+        ))
     })?;
     if payload.len() > MAX_FRAME {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox IPC frame too large".to_string(),
+            "command-mediation IPC frame too large".to_string(),
         ));
     }
     stream
         .write_all(&(payload.len() as u32).to_be_bytes())
         .map_err(|err| {
-            NonoError::SandboxInit(format!("failed to write tool-sandbox IPC length: {err}"))
+            NonoError::SandboxInit(format!(
+                "failed to write command-mediation IPC length: {err}"
+            ))
         })?;
     stream.write_all(&payload).map_err(|err| {
-        NonoError::SandboxInit(format!("failed to write tool-sandbox IPC payload: {err}"))
+        NonoError::SandboxInit(format!(
+            "failed to write command-mediation IPC payload: {err}"
+        ))
     })
 }
 
 pub(crate) fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
     let mut len = [0_u8; 4];
     stream.read_exact(&mut len).map_err(|err| {
-        NonoError::SandboxInit(format!("failed to read tool-sandbox IPC length: {err}"))
+        NonoError::SandboxInit(format!(
+            "failed to read command-mediation IPC length: {err}"
+        ))
     })?;
     let len = u32::from_be_bytes(len) as usize;
     if len > MAX_FRAME {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox IPC frame too large".to_string(),
+            "command-mediation IPC frame too large".to_string(),
         ));
     }
     let mut payload = vec![0_u8; len];
     stream.read_exact(&mut payload).map_err(|err| {
-        NonoError::SandboxInit(format!("failed to read tool-sandbox IPC payload: {err}"))
+        NonoError::SandboxInit(format!(
+            "failed to read command-mediation IPC payload: {err}"
+        ))
     })?;
     serde_json::from_slice(&payload).map_err(|err| {
-        NonoError::SandboxInit(format!("failed to parse tool-sandbox IPC frame: {err}"))
+        NonoError::SandboxInit(format!(
+            "failed to parse command-mediation IPC frame: {err}"
+        ))
     })
 }
 
@@ -263,16 +275,18 @@ pub(crate) fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) 
 /// EMSGSIZE if the peer's receive buffer cannot accommodate the control message
 /// atomically — this ack eliminates that race.
 pub(crate) fn send_frame_ack(stream: &mut UnixStream) -> Result<()> {
-    stream
-        .write_all(&[0u8])
-        .map_err(|e| NonoError::SandboxInit(format!("tool-sandbox: failed to send frame ack: {e}")))
+    stream.write_all(&[0u8]).map_err(|e| {
+        NonoError::SandboxInit(format!("command-mediation: failed to send frame ack: {e}"))
+    })
 }
 
 /// Receive the 1-byte acknowledgement sent by `send_frame_ack`.
 pub(crate) fn recv_frame_ack(stream: &mut UnixStream) -> Result<()> {
     let mut buf = [0u8; 1];
     stream.read_exact(&mut buf).map_err(|e| {
-        NonoError::SandboxInit(format!("tool-sandbox: failed to receive frame ack: {e}"))
+        NonoError::SandboxInit(format!(
+            "command-mediation: failed to receive frame ack: {e}"
+        ))
     })
 }
 

@@ -8,7 +8,7 @@
 //! CONNECT tunnel requests the token is validated via `Proxy-Authorization`.
 //! This prevents other local processes from hijacking the proxy session.
 //!
-//! The `NonceResolver` trait allows the proxy to resolve tool-sandbox broker
+//! The `NonceResolver` trait allows the proxy to resolve command-mediation broker
 //! nonces (`nono_<64hex>`) found in request headers, substituting the real
 //! credential value before forwarding upstream. The consumer ID passed to
 //! `resolve` is `"proxy.<route_id>"`, matching the `grant_to` field of the
@@ -19,7 +19,7 @@ use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
-/// Resolves tool-sandbox broker nonces for L7 header injection.
+/// Resolves command-mediation broker nonces for L7 header injection.
 ///
 /// Implemented by the CLI's `TokenBroker` wrapper and threaded through the
 /// proxy server so that nonces appearing in request headers can be swapped for

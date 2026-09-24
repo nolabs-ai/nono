@@ -2,9 +2,9 @@
 //!
 //! nono writes several files it holds for the whole session into the OS
 //! temporary directory (`std::env::temp_dir()`, and `/private/tmp` for the
-//! macOS tool-sandbox runtime): the capability manifest exposed as
+//! macOS command-mediation runtime): the capability manifest exposed as
 //! `NONO_CAP_FILE`, the URL-open listener socket and its browser shim, and the
-//! tool-sandbox runtime directory (mediation sockets and shim binaries). These
+//! command-mediation runtime directory (mediation sockets and shim binaries). These
 //! are only accessed on demand, so a session that sits idle stops refreshing
 //! their access time.
 //!

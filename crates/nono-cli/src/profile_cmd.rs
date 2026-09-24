@@ -1145,7 +1145,7 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         }
     }
 
-    // Command policies (merged tool-sandbox mediation config).
+    // Command policies (merged command-mediation configuration).
     if let Some(cp) = &profile.command_policies
         && (!cp.commands.is_empty() || cp.has_non_command_fields())
     {
@@ -1404,7 +1404,7 @@ fn profile_to_json(
         val["unsafe_macos_seatbelt_rules"] = serde_json::json!(profile.unsafe_macos_seatbelt_rules);
     }
 
-    // Resolved tool-sandbox mediation config (merged through extends).
+    // Resolved command-mediation configuration (merged through extends).
     if let Some(ref cp) = profile.command_policies
         && let Ok(v) = serde_json::to_value(cp)
     {

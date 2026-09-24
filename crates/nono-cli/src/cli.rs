@@ -197,15 +197,15 @@ pub enum Commands {
   nono why --host api.openai.com --port 443    # Query network access
   nono why --self --path /var --op write       # Inside sandbox, query own capabilities
   nono why --profile gh --command gh -- issue comment 1052
-                                                # Query ETI command argv policy
+                                                # Query command-policy argv rules
 
-\x1b[1mETI TOOL DENIALS\x1b[0m
-  `nono why --command <cmd> -- <args...>` diagnoses tool-sandbox argv policy.
+\x1b[1mCOMMAND-POLICY DENIALS\x1b[0m
+  `nono why --command <cmd> -- <args...>` diagnoses command-policy argv rules.
   A message like:
 
-    nono: tool-sandbox denied gh: Command 'gh' is blocked: agents may read issues but not comment on them
+    nono: command policy denied gh: Command 'gh' is blocked: agents may read issues but not comment on them
 
-  is an ephemeral tool invocation command-policy denial from
+  is a command-policy denial from
   command_policies.commands.<name>.from.<caller>.invocation_policy. If the
   command uses proxy credentials, also check endpoint_policy for HTTP method
   and path rules.
@@ -2120,7 +2120,7 @@ pub struct SetupArgs {
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct WhyArgs {
-    /// Tool-sandbox command name to check (ETI command policy)
+    /// Command name to check against command policy
     #[arg(long, help_heading = "QUERY")]
     pub command: Option<String>,
 
@@ -3943,7 +3943,7 @@ mod tests {
     }
 
     #[test]
-    fn test_why_help_mentions_eti_command_policy_denials() {
+    fn test_why_help_mentions_command_policy_denials() {
         let mut cmd = Cli::command();
         let help = cmd
             .find_subcommand_mut("why")
@@ -3951,7 +3951,7 @@ mod tests {
             .render_long_help()
             .to_string();
 
-        assert!(help.contains("ETI TOOL DENIALS"), "{help}");
+        assert!(help.contains("COMMAND-POLICY DENIALS"), "{help}");
         assert!(
             help.contains("command_policies.commands.<name>.from.<caller>.invocation_policy"),
             "{help}"

@@ -177,8 +177,8 @@ EOF
 nono run --profile my-profile -- rm /tmp/old-file.txt
 ```
 
-Prefer resource-based controls instead: narrower filesystem grants,
-`filesystem.deny`, `unlink_protection`, and network policy.
+Prefer filesystem, network, and command policies instead: narrower filesystem
+grants, `filesystem.deny`, `unlink_protection`, and network policy.
 
 ## Documentation
 

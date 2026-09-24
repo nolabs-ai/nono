@@ -1,4 +1,4 @@
-//! Tool sandbox runtime support.
+//! Command-mediation runtime support.
 //!
 //! The profile resolver lives in `command_policy`; this module owns the
 //! Linux/macOS runtime pieces: private shim materialisation, outer exec gating,
@@ -99,7 +99,7 @@ pub(crate) struct ToolSandboxPrepare<'a> {
     pub(crate) proxy_credentials: &'a std::collections::BTreeSet<String>,
     pub(crate) reserved_proxy_ports: &'a std::collections::BTreeSet<u16>,
     /// Command-owned proxy variables. These carry a proxy credential whose
-    /// authority is restricted to that command's domain policy.
+    /// authority is restricted to that command sandbox's proxy policy.
     pub(crate) scoped_proxy_env_vars: &'a std::collections::BTreeMap<String, Vec<(String, String)>>,
     pub(crate) proxy_trust_bundle_paths: &'a [std::path::PathBuf],
     /// Shared token broker for nonce-at-L7 resolution. When `None` a new
@@ -128,7 +128,7 @@ fn required_scoped_proxy_env<'a>(
 ) -> nono::Result<&'a [(String, String)]> {
     envs.get(scope).map(Vec::as_slice).ok_or_else(|| {
         nono::NonoError::SandboxInit(format!(
-            "tool-sandbox command '{command}' has a proxy-routed policy but no scoped proxy"
+            "command sandbox for '{command}' has a proxy policy but no scoped proxy"
         ))
     })
 }
@@ -162,7 +162,7 @@ fn validate_scoped_proxy_network(
 ) -> nono::Result<()> {
     if matches!(caps.network_mode(), nono::NetworkMode::AllowAll) {
         return Err(nono::NonoError::SandboxInit(format!(
-            "tool-sandbox command '{command}' combines proxy-routed authority with unrestricted network"
+            "command sandbox for '{command}' combines proxy policy with unrestricted direct network access"
         )));
     }
     if policy.network.as_ref().is_some_and(|network| {
@@ -172,7 +172,7 @@ fn validate_scoped_proxy_network(
             .any(|port| reserved_proxy_ports.contains(port))
     }) {
         return Err(nono::NonoError::SandboxInit(format!(
-            "tool-sandbox command '{command}' grants an active nono proxy port through tcp_connect_ports"
+            "command sandbox for '{command}' grants an active nono proxy port through direct network policy"
         )));
     }
     Ok(())

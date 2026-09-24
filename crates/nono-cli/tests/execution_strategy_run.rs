@@ -239,7 +239,7 @@ fn env_credentials_with_command_policies_non_shim_entry_succeeds() {
 }
 
 /// A script written into a writable grant-dir (cwd) must still execute under
-/// an active `command_policies` outer exec gate.
+/// an active `command_policies` execute gate on the session sandbox.
 #[test]
 #[cfg(target_os = "linux")]
 fn command_policies_allows_script_exec_in_writable_grant_dir() {
@@ -322,7 +322,7 @@ fn command_policies_allows_immutable_store_shebang_wrapper() {
 }
 
 /// Same as above but for a binary compiled at runtime, so it wasn't on disk
-/// when the outer exec gate was set up.
+/// when the session sandbox execute gate was set up.
 #[test]
 #[cfg(target_os = "linux")]
 fn command_policies_allows_compiled_binary_exec_in_writable_grant_dir() {
@@ -361,7 +361,7 @@ fn command_policies_allows_compiled_binary_exec_in_writable_grant_dir() {
 }
 
 /// Same-FS rename from a child directory to its parent must succeed under
-/// `command_policies`. The outer exec gate must grant Landlock Refer (#1689).
+/// `command_policies`. The session sandbox execute gate must grant Landlock Refer (#1689).
 #[test]
 #[cfg(target_os = "linux")]
 fn command_policies_allows_same_fs_rename_from_child_dir() {
@@ -383,7 +383,7 @@ echo rename succeeded";
         .assert_stdout_contains("rename succeeded");
 }
 
-/// Workspace-only profile with an active `command_policies` outer exec gate.
+/// Workspace-only profile with an active `command_policies` execute gate on the session sandbox.
 #[cfg(target_os = "linux")]
 fn command_policies_profile(t: &NonoTest, name: &str) -> Profile {
     t.write_profile(

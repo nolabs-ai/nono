@@ -59,4 +59,4 @@ steps:
   - text: >-
       nono run -s --no-audit --no-diagnostics --allow-cwd --profile "$GH_PROFILE" -- sh -c 'gh issue comment 1052 --repo always-further/nono --body "wrapped bypass attempt"'
     comment: >-
-      Exercise child-command mediation. Expected: wrapping gh in sh does not bypass policy; nono still blocks the child gh issue comment.
+      Exercise command mediation. Expected: wrapping gh in sh does not bypass policy; nono still blocks the gh issue comment.

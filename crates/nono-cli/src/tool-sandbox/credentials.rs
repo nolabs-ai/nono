@@ -85,7 +85,7 @@ pub(crate) fn resolve_credentials(
             CommandCredentialType::Proxy => {
                 if !proxy_credentials.contains(name) {
                     return Err(NonoError::SandboxInit(format!(
-                        "tool-sandbox proxy credential '{name}' was not prepared by the proxy runtime"
+                        "command sandbox proxy credential '{name}' was not prepared by the proxy runtime"
                     )));
                 }
                 resolved.insert(name.clone(), ResolvedCredential::Proxy);

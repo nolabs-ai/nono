@@ -219,25 +219,25 @@ pub struct GroupsConfig {
 /// startup command. They are not enforced for child processes, so they
 /// cannot serve as a security boundary. Configured values still parse and
 /// are surfaced via runtime warnings (see [`crate::command_blocking_deprecation`]).
-/// Prefer resource-based controls: filesystem deny rules, narrower filesystem
-/// grants, `unlink_protection`, and network policy.
+/// Prefer filesystem, network, and command policies: filesystem deny rules,
+/// narrower filesystem grants, `unlink_protection`, and network policy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandsConfig {
     /// Startup-only command allowlist override. Not enforced for child
-    /// processes; prefer resource-based controls.
+    /// processes; prefer filesystem, network, and command policies.
     #[serde(default)]
     #[deprecated(
         since = "0.33.0",
-        note = "startup-only, not enforced for child processes; prefer resource-based controls"
+        note = "startup-only, not enforced for child processes; prefer filesystem, network, and command policies"
     )]
     pub allow: Vec<String>,
     /// Startup-only command denylist extension. Not enforced for child
-    /// processes; prefer resource-based controls.
+    /// processes; prefer filesystem, network, and command policies.
     #[serde(default)]
     #[deprecated(
         since = "0.33.0",
-        note = "startup-only, not enforced for child processes; prefer resource-based controls"
+        note = "startup-only, not enforced for child processes; prefer filesystem, network, and command policies"
     )]
     pub deny: Vec<String>,
 }
@@ -2247,7 +2247,7 @@ pub struct SecurityConfig {
     ///
     /// A named backend here (e.g. a `webhook`) answers the prompts instead of
     /// the terminal. This is kept separate from `command_policies` on purpose:
-    /// setting it does NOT switch on the tool-sandbox runtime. Empty (default)
+    /// setting it does NOT activate the command-mediation runtime. Empty (default)
     /// keeps the interactive terminal prompt. Uses the same
     /// [`ApprovalBackendConfig`] shape as `command_policies.approval_backends`.
     #[serde(default)]
@@ -9206,9 +9206,9 @@ mod tests {
             }
         }"#;
         validate_against_schema(json)
-            .expect("documented tool-sandbox edge policy should pass schema validation");
+            .expect("documented command-policy edge should pass schema validation");
         serde_json::from_str::<Profile>(json)
-            .expect("documented tool-sandbox edge policy should parse as a profile");
+            .expect("documented command-policy edge should parse as a profile");
     }
 
     #[test]
@@ -11477,7 +11477,7 @@ mod tests {
     #[test]
     fn platform_overrides_merge_adds_command_daemon_pid_source() {
         // `daemon_pid_source` declared only in the current platform's override must
-        // land on the command's effective policy, alongside the base's fields.
+        // land on the effective command sandbox policy, alongside the base's fields.
         let current_os = crate::platform::current_os_name();
         let json = format!(
             r#"{{

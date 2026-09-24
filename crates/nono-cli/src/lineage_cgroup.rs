@@ -1,7 +1,7 @@
-//! Linux cgroup v2 lineage marker for tool-sandbox caller attribution.
+//! Linux cgroup v2 lineage marker for command-policy caller attribution.
 //!
 //! A daemonized caller (setsid + double-fork, reparented to pid 1) severs
-//! `resolve_caller`'s parent-pid walk. Each Tool Sandbox command instead self-attaches,
+//! `resolve_caller`'s parent-pid walk. Each mediated command instead self-attaches,
 //! pre-exec, to a per-command cgroup; membership survives reparenting and a
 //! sandboxed command can never write `/sys/fs/cgroup` (Landlock grants none), so
 //! reading a severed caller's `/proc/<pid>/cgroup` attributes it unforgeably to its

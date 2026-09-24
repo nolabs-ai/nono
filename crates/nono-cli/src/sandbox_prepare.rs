@@ -506,14 +506,14 @@ struct PendingCwdAccessRequest {
 pub(crate) struct PreparedSandbox {
     pub(crate) caps: CapabilitySet,
     /// Resolved filesystem deny paths (groups + profile `filesystem.deny`).
-    /// Threaded to the tool-sandbox so a mediated command's live cwd can be
+    /// Threaded to command mediation so a mediated command's live cwd can be
     /// rejected when it falls under a directory the agent is denied.
     pub(crate) deny_paths: Vec<PathBuf>,
     pub(crate) secrets: Vec<nono::LoadedSecret>,
     pub(crate) profile_display_name: Option<String>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Command binaries already resolved while validating `command_policies`.
-    /// Reused by the tool-sandbox plan build so every controlled binary is
+    /// Reused by the command-mediation plan build so every controlled binary is
     /// only read and hashed once per invocation, not twice.
     pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
     /// Named approval backends from the profile `security` section, decoupled

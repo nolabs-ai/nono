@@ -491,6 +491,16 @@
         ]
       }
     },
+    "snap_linux": {
+      "description": "Installed Snap package contents on Linux",
+      "platform": "linux",
+      "allow": {
+        "read": [
+          "/snap",
+          "/var/lib/snapd/snap"
+        ]
+      }
+    },
     "claude_code_macos": {
       "description": "Claude Code macOS-specific state and credential paths",
       "platform": "macos",

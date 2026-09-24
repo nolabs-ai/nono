@@ -340,8 +340,20 @@ where
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
-                debug!("Upstream read error: {}", e);
-                break;
+                // rustls surfaces a peer TCP-closing without a TLS `close_notify` as
+                // `UnexpectedEof` rather than `Ok(0)` (see the rustls manual's "Unexpected
+                // EOF" section). Many real upstreams skip `close_notify` on an otherwise
+                // clean shutdown, so we can't treat every occurrence as a transport
+                // failure without breaking them. It's still only safe to treat as EOF once
+                // the response's own HTTP framing shows the body was fully received —
+                // otherwise a truncated body could hide an unrewritten token field.
+                if e.kind() == std::io::ErrorKind::UnexpectedEof && is_complete_http1_response(&raw)
+                {
+                    break;
+                }
+                return Err(ProxyError::HttpParse(format!(
+                    "upstream read error while buffering response for OAuth capture rewrite: {e}"
+                )));
             }
             Err(_) => {
                 return Err(ProxyError::HttpParse(
@@ -437,6 +449,58 @@ fn rewrite_http1_response(raw: &[u8], rewrite: ResponseRewrite<'_>) -> Result<Ve
 
 fn find_header_end(raw: &[u8]) -> Option<usize> {
     raw.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+/// Whether `raw` already holds a complete HTTP/1.1 response by its own framing:
+/// a `Content-Length` body that has been fully received, or a chunked body
+/// whose terminal chunk has arrived.
+///
+/// A body with neither header is close-delimited per RFC 7230 §3.3.3, but this
+/// function is only reached on a peer closing *without* TLS `close_notify` —
+/// exactly the truncation `close_notify` exists to detect. Without a length or
+/// terminal chunk to corroborate that the close was intentional, there is no
+/// way to tell a clean close-delimited end from an attacker cutting the
+/// connection mid-body, so that case returns `false` (fail closed) rather than
+/// assuming completion.
+///
+/// Returns `false` if the headers themselves haven't finished arriving yet,
+/// since completeness can't be judged without them.
+fn is_complete_http1_response(raw: &[u8]) -> bool {
+    let Some(header_end) = find_header_end(raw) else {
+        return false;
+    };
+    let Ok(head_str) = std::str::from_utf8(&raw[..header_end]) else {
+        return false;
+    };
+    let body = &raw[header_end + 4..];
+
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+    for line in head_str.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        {
+            chunked = true;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse().ok();
+        }
+    }
+
+    if chunked {
+        return decode_chunked_body(body).is_ok();
+    }
+    if let Some(len) = content_length {
+        return body.len() >= len;
+    }
+    false
 }
 
 fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
@@ -549,5 +613,38 @@ mod tests {
                 .contains("content-encoded OAuth capture response"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn is_complete_http1_response_false_before_headers_finish() {
+        assert!(!is_complete_http1_response(
+            b"HTTP/1.1 200 OK\r\nContent-Len"
+        ));
+    }
+
+    #[test]
+    fn is_complete_http1_response_content_length_needs_full_body() {
+        let full = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+        let truncated = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+        assert!(is_complete_http1_response(full));
+        assert!(!is_complete_http1_response(truncated));
+    }
+
+    #[test]
+    fn is_complete_http1_response_chunked_needs_terminal_chunk() {
+        let full = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n0\r\n\r\n";
+        let truncated = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nab";
+        assert!(is_complete_http1_response(full));
+        assert!(!is_complete_http1_response(truncated));
+    }
+
+    #[test]
+    fn is_complete_http1_response_no_framing_fails_closed() {
+        // No Content-Length and no chunked Transfer-Encoding means an EOF here
+        // (already known to lack TLS close_notify, see the caller) can't be
+        // distinguished from truncation, so it must not be treated as complete
+        // even when the server declares `Connection: close`.
+        let raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nwhatever bytes arrived";
+        assert!(!is_complete_http1_response(raw));
     }
 }

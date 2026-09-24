@@ -353,6 +353,23 @@ fn format_command_failed_not_sandbox_line(exit_code: i32) -> String {
     )
 }
 
+/// Footer label for a network audit decision.
+///
+/// Allow-class decisions never reach the footer (the caller filters to
+/// denials), but the match stays total and honest so a variant slipping
+/// through is labeled as what it is, never misreported as a denial.
+fn network_denial_decision_label(decision: &nono::undo::NetworkAuditDecision) -> &'static str {
+    match decision {
+        nono::undo::NetworkAuditDecision::Deny => "deny",
+        nono::undo::NetworkAuditDecision::ApproveDenied => "approval_denied",
+        nono::undo::NetworkAuditDecision::ApproveTimeout => "approval_timeout",
+        nono::undo::NetworkAuditDecision::ApproveError => "approval_error",
+        nono::undo::NetworkAuditDecision::Allow => "allow",
+        nono::undo::NetworkAuditDecision::ApproveRequested => "approval_requested",
+        nono::undo::NetworkAuditDecision::ApproveGranted => "approval_granted",
+    }
+}
+
 fn format_allow_net_help_line() -> String {
     "[nono]   --allow-net        unrestricted network for this session".to_string()
 }
@@ -641,6 +658,11 @@ pub struct DiagnosticFormatter<'a> {
     canonical_denial_paths: Vec<PathBuf>,
     /// Pre-built diagnostics; when empty, [`Self::format_footer`] builds a report on demand.
     session_diagnostics: &'a [nono::NonoDiagnostic],
+    /// Network denial events observed by the proxy during this session.
+    /// Authoritative (the proxy's own decisions), unlike the stderr-derived
+    /// `network_blocked_hint`. Populated only in supervised mode with an
+    /// active proxy.
+    network_denials: Vec<nono::undo::NetworkAuditEvent>,
 }
 
 impl<'a> DiagnosticFormatter<'a> {
@@ -668,6 +690,7 @@ impl<'a> DiagnosticFormatter<'a> {
             suppressed_system_service_operations: &[],
             canonical_denial_paths: Vec::new(),
             session_diagnostics: &[],
+            network_denials: Vec::new(),
         }
     }
 
@@ -854,6 +877,17 @@ impl<'a> DiagnosticFormatter<'a> {
     #[must_use]
     pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
         self.session_id = session_id;
+        self
+    }
+
+    /// Add network denial events observed by the proxy during this session.
+    ///
+    /// Callers should pass only denial-class decisions (`Deny`,
+    /// `ApproveDenied`, `ApproveTimeout`, `ApproveError`); allowed traffic
+    /// has no place in a failure diagnostic.
+    #[must_use]
+    pub fn with_network_denials(mut self, denials: Vec<nono::undo::NetworkAuditEvent>) -> Self {
+        self.network_denials = denials;
         self
     }
 
@@ -1213,6 +1247,7 @@ impl<'a> DiagnosticFormatter<'a> {
         let has_path_findings =
             !path_diagnostics.is_empty() || !pathname_unix_diagnostics.is_empty();
         let has_observed_path_evidence = self.has_observed_path_evidence(diagnostics);
+        let has_network_denials = !self.network_denials.is_empty();
         let primary_protected_root_attempt = matches!(
             primary_verdict.as_ref(),
             Some(ErrorVerdict::LikelySandbox(hint))
@@ -1221,6 +1256,7 @@ impl<'a> DiagnosticFormatter<'a> {
 
         if !has_path_findings
             && ipc_diagnostics.is_empty()
+            && !has_network_denials
             && matches!(
                 primary_verdict.as_ref(),
                 Some(ErrorVerdict::MissingPath(_)) | Some(ErrorVerdict::NonSandboxFailure(_))
@@ -1251,12 +1287,21 @@ impl<'a> DiagnosticFormatter<'a> {
                 self.format_system_service_diagnostics(&mut lines, &system_service_diagnostics);
                 lines.push("[nono]".to_string());
                 self.format_system_service_guidance(&mut lines, &system_service_diagnostics);
+                if has_network_denials {
+                    lines.push("[nono]".to_string());
+                    self.format_network_denial_guidance(&mut lines);
+                }
             } else {
                 if let Some(verdict) = primary_verdict.as_ref() {
                     self.format_primary_verdict_guidance(&mut lines, verdict);
                     lines.push("[nono]".to_string());
                 }
-                if !has_observed_path_evidence {
+                if has_network_denials {
+                    // The proxy's own denials are authoritative: never claim
+                    // the failure "may be unrelated to sandbox restrictions"
+                    // when nono itself denied network traffic.
+                    self.format_network_denial_guidance(&mut lines);
+                } else if !has_observed_path_evidence {
                     lines.push(
                         "[nono] No path denials were observed during this session.".to_string(),
                     );
@@ -1269,7 +1314,7 @@ impl<'a> DiagnosticFormatter<'a> {
                 lines.push("[nono]".to_string());
                 self.format_grant_help(&mut lines, diagnostics);
                 self.format_follow_up_from_diagnostics(&mut lines, diagnostics);
-            } else if stderr_network_diagnostic(diagnostics).is_some() {
+            } else if !has_network_denials && stderr_network_diagnostic(diagnostics).is_some() {
                 // Same principle as has_observed_path_evidence: a blocked
                 // capability config alone isn't evidence this failure was
                 // network-related. Only a logged network denial hint earns
@@ -1292,6 +1337,14 @@ impl<'a> DiagnosticFormatter<'a> {
                 lines.push("[nono]".to_string());
                 self.format_system_service_guidance(&mut lines, &system_service_diagnostics);
             }
+        }
+
+        // Path/IPC findings took the branches above without reaching the
+        // network section; append it so proxy denials are never silently
+        // dropped from the footer. The no-path/no-IPC branch prints its own.
+        if has_network_denials && (has_path_findings || !ipc_diagnostics.is_empty()) {
+            lines.push("[nono]".to_string());
+            self.format_network_denial_guidance(&mut lines);
         }
 
         lines.join("\n")
@@ -2028,6 +2081,71 @@ impl<'a> DiagnosticFormatter<'a> {
     fn format_network_grant_help(&self, lines: &mut Vec<String>) {
         lines.push("[nono] To grant additional access, re-run with:".to_string());
         lines.push(format_allow_net_help_line());
+    }
+
+    /// Render proxy-observed network denials with grant guidance.
+    ///
+    /// Unlike the stderr heuristics behind `stderr_network_diagnostic`, these
+    /// events are the proxy's own decisions, so they are proof the sandbox
+    /// denied network traffic. Targets and reasons originate from
+    /// agent-controlled requests and are sanitized before reaching the
+    /// terminal.
+    fn format_network_denial_guidance(&self, lines: &mut Vec<String>) {
+        const MAX_RENDERED_DENIALS: usize = 5;
+        const MAX_REASON_CHARS: usize = 256;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut rendered: Vec<String> = Vec::new();
+        let mut denied_hosts: Vec<String> = Vec::new();
+        for event in &self.network_denials {
+            let decision = network_denial_decision_label(&event.decision);
+            let mode = crate::audit_commands::network_mode_label(&event.mode);
+            let mut target = sanitize_for_diagnostic(&event.target);
+            if let Some(port) = event.port {
+                target = format!("{target}:{port}");
+            }
+            let reason = event.reason.as_deref().map(|reason| {
+                crate::command_display::truncate_chars(
+                    &sanitize_for_diagnostic(reason),
+                    MAX_REASON_CHARS,
+                )
+            });
+            if !seen.insert((decision, mode, target.clone(), reason.clone())) {
+                continue;
+            }
+            rendered.push(match &reason {
+                Some(reason) => format!("[nono]   {decision} {mode} {target} ({reason})"),
+                None => format!("[nono]   {decision} {mode} {target}"),
+            });
+            if matches!(
+                event.denial_category,
+                Some(nono::undo::NetworkAuditDenialCategory::HostDenied)
+            ) {
+                let host = sanitize_for_diagnostic(&event.target);
+                if !host.is_empty() && !denied_hosts.contains(&host) {
+                    denied_hosts.push(host);
+                }
+            }
+        }
+
+        let total = rendered.len();
+        lines.push("[nono] Network denials were observed during this session:".to_string());
+        for line in rendered.iter().take(MAX_RENDERED_DENIALS) {
+            lines.push(line.clone());
+        }
+        if total > MAX_RENDERED_DENIALS {
+            lines.push(format!(
+                "[nono]   ...and {} more (run `nono audit show` for the full record)",
+                total - MAX_RENDERED_DENIALS
+            ));
+        }
+        if !denied_hosts.is_empty() {
+            lines.push("[nono]".to_string());
+            lines.push("[nono] To allow this traffic, re-run with:".to_string());
+            for host in denied_hosts.iter().take(MAX_RENDERED_DENIALS) {
+                lines.push(format!("[nono]   --allow-domain {host}"));
+            }
+        }
     }
 
     fn format_command_for_run(&self) -> Option<String> {
@@ -3414,6 +3532,134 @@ mod tests {
         assert!(!output.contains("Next steps:"));
         assert!(!output.contains("nono why --path"));
         assert!(!output.ends_with('\n'));
+    }
+
+    fn make_denied_network_event(
+        target: &str,
+        reason: &str,
+        category: nono::undo::NetworkAuditDenialCategory,
+    ) -> nono::undo::NetworkAuditEvent {
+        nono::undo::NetworkAuditEvent {
+            timestamp_unix_ms: 0,
+            mode: nono::undo::NetworkAuditMode::Connect,
+            decision: nono::undo::NetworkAuditDecision::Deny,
+            route_id: None,
+            auth_mechanism: None,
+            auth_outcome: None,
+            managed_credential_active: None,
+            injection_mode: None,
+            denial_category: Some(category),
+            endpoint_policy_action: None,
+            endpoint_policy_rule: None,
+            approval_backend: None,
+            credential_capture_action: None,
+            credential_capture_name: None,
+            credential_capture_command: None,
+            credential_capture_argv: None,
+            credential_capture_exit_status: None,
+            credential_capture_duration_ms: None,
+            credential_capture_stdout_bytes: None,
+            credential_capture_stderr: None,
+            credential_capture_cache_scope: None,
+            credential_capture_output_format: None,
+            credential_capture_header_names: None,
+            credential_capture_stdin_mode: None,
+            credential_capture_interactive: None,
+            spiffe_context: None,
+            target: target.to_string(),
+            upstream: None,
+            port: Some(443),
+            method: None,
+            path: None,
+            status: None,
+            reason: Some(reason.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_supervised_network_denial_replaces_unrelated_claim() {
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_network_denials(vec![make_denied_network_event(
+                "example.com",
+                "host example.com:443 is not in the allowlist",
+                nono::undo::NetworkAuditDenialCategory::HostDenied,
+            )]);
+        let output = formatter.format_footer(56);
+
+        assert!(output.contains("Network denials were observed during this session:"));
+        assert!(output.contains(
+            "deny connect example.com:443 (host example.com:443 is not in the allowlist)"
+        ));
+        assert!(output.contains("--allow-domain example.com"));
+        // nono's own proxy denied the request, so the footer must not claim
+        // the failure may be unrelated to sandbox restrictions.
+        assert!(!output.contains("No path denials were observed"));
+        assert!(!output.contains("may be unrelated to sandbox restrictions"));
+        assert!(!output.contains("does not look like a sandbox denial"));
+        // The authoritative per-host hint replaces the generic stderr-derived
+        // --allow-net suggestion.
+        assert!(!output.contains("--allow-net"));
+    }
+
+    #[test]
+    fn test_supervised_network_denial_dedupes_and_sanitizes() {
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_network_denials(vec![
+                make_denied_network_event(
+                    "example.com",
+                    "host example.com:443 is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+                make_denied_network_event(
+                    "example.com",
+                    "host example.com:443 is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+                make_denied_network_event(
+                    "evil.example\x1b[31m.com",
+                    "reason with \x1b[2J escape",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+            ]);
+        let output = formatter.format_footer(56);
+
+        // Repeated identical denials (e.g. client retries) render once.
+        assert_eq!(
+            output
+                .matches(
+                    "deny connect example.com:443 (host example.com:443 is not in the allowlist)"
+                )
+                .count(),
+            1
+        );
+        // Attacker-influenced hostnames and reasons are stripped of control
+        // sequences before reaching the terminal.
+        assert!(!output.contains('\x1b'));
+        assert!(output.contains("evil.example.com"));
+        assert!(output.contains("reason with "));
+    }
+
+    #[test]
+    fn test_supervised_network_denial_non_host_category_omits_allow_domain() {
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_network_denials(vec![make_denied_network_event(
+                "api.example.com",
+                "endpoint policy denied POST /v1/admin",
+                nono::undo::NetworkAuditDenialCategory::EndpointPolicy,
+            )]);
+        let output = formatter.format_footer(56);
+
+        assert!(output.contains("Network denials were observed during this session:"));
+        assert!(output.contains("endpoint policy denied POST /v1/admin"));
+        // --allow-domain would not fix an endpoint-policy denial; suggesting
+        // it would coach the user into a broader grant than the policy needs.
+        assert!(!output.contains("--allow-domain"));
     }
 
     #[test]

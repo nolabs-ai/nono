@@ -1327,6 +1327,10 @@ nono why --host api.openai.com --port 443
 nono why --self --host https://github.com/my-org/repo
 ```
 
+When endpoint rules apply, the path is checked with the proxy's normalization and ambiguity rules. Encoded separators such as `%2f` can therefore be denied even by a `/**` rule. This checks whether a path matches any permitted HTTP method; it does not select a method for the request. Domains without endpoint restrictions are unaffected.
+
+Use HTTP URL syntax for endpoint queries: percent-encode spaces, omit control characters, and use an ASCII hostname (Punycode for internationalized domains). Invalid HTTP URLs are reported as denied with an explanation rather than normalized into an allowed path.
+
 ### `--port`
 
 Network port (default: 443). Used with `--host`.

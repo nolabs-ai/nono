@@ -17,6 +17,227 @@ is shape and routing:
 - normal agent API calls resolve phantoms only through the admitted proxy route
 - denied Keychain or credential-store access does not prevent phantom-backed use
 
+## macOS Keychain persistence
+
+On macOS, captured real OAuth tokens persist to an ACL-restricted macOS
+Keychain item instead of `~/.local/state/nono/oauth-capture/providers.json`.
+The ACL trusts only the `nono` binary at the path it was saved from, so
+reading the item from any other process (including a bare `security` CLI
+invocation) triggers a system Allow/Deny dialog rather than a silent read —
+that dialog is the protection working, not a bug.
+
+After a login capture on macOS:
+
+- confirm `~/.local/state/nono/oauth-capture/providers.json` was **not**
+  created (macOS never writes this file)
+- from a separate terminal, run:
+
+  ```sh
+  security find-generic-password -s nono -a oauth_capture_store -w
+  ```
+
+  Expect either a system Allow/Deny dialog or a denial — a real token value
+  printed without a prompt would indicate the ACL is not restrictive enough
+- kill and restart the `nono run` session against the same profile and
+  confirm the previously captured phantom still resolves (`resolved OAuth
+  phantom token for admitted consumer`), proving persistence survived the
+  restart via Keychain rather than the file backend
+
+## Configuring the persistence backend
+
+The backend is chosen by the managed, profile-wide scalar
+`oauth_capture_store_backend`. The default is `auto` (macOS Keychain on macOS,
+the `providers.json` file backend elsewhere). Set it to `file` to force the
+file backend on every platform, including macOS, or `keychain` to force the
+Keychain backend (which resolves to the file backend off macOS).
+
+### Option A — macOS Keychain (default)
+
+Enabling an `oauth_capture` provider is enough to turn persistence on; on macOS
+it routes to the ACL-restricted Keychain automatically. Because the Keychain
+backend also derives a `security` mediation, the profile **must** define a
+`security` command policy with a session sandbox — otherwise resolution fails
+closed (see [Errors](#errors) below).
+
+```jsonc
+{
+  // "auto" is the default; shown here for clarity. Omit for the same behaviour.
+  "oauth_capture_store_backend": "auto",
+
+  "credential_providers": {
+    "codex": {
+      "type": "oauth_capture",
+      "token_endpoints": [
+        {
+          "host": "https://auth.openai.com",
+          "path": "/oauth/token",
+          "response_fields": [
+            { "path": "access_token",  "kind": "opaque" },
+            { "path": "refresh_token", "kind": "opaque" }
+          ]
+        }
+      ]
+    }
+  },
+
+  // Required when the Keychain backend is active. Give `security` a session
+  // sandbox permissive enough for your agent's normal `security` usage; nono
+  // auto-prepends a deny intercept for the oauth_capture_store account, so you
+  // never write that rule yourself. The fs_read below is illustrative — scope
+  // it to what your agent legitimately needs from `security`.
+  "command_policies": {
+    "commands": {
+      "security": {
+        "sandbox": {
+          "fs_read": ["~/Library/Keychains"]
+        }
+      }
+    }
+  }
+}
+```
+
+The item lands under service `nono`, account `oauth_capture_store`;
+`~/.local/state/nono/oauth-capture/providers.json` is never written.
+
+### Option B — plaintext `providers.json` (opt out of the Keychain)
+
+For headless/SSH hosts, or anyone who does not want the store in the login
+keychain. No `security` policy is needed — the mediation is not derived for the
+file backend.
+
+```jsonc
+{
+  "oauth_capture_store_backend": "file",
+
+  "credential_providers": {
+    "codex": {
+      "type": "oauth_capture",
+      "token_endpoints": [
+        {
+          "host": "https://auth.openai.com",
+          "path": "/oauth/token",
+          "response_fields": [
+            { "path": "access_token",  "kind": "opaque" },
+            { "path": "refresh_token", "kind": "opaque" }
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+Persists to `~/.local/state/nono/oauth-capture/providers.json` (`0600`, parent
+directory `0700`), on every platform including macOS.
+
+### Switching from `file` to the Keychain: the leftover plaintext store
+
+Switching the backend does **not** migrate or remove an existing
+`providers.json`. Under the Keychain backend nono never opens that file, so a
+copy written by an earlier file-backend session lingers with live OAuth tokens
+in it, protected only by mode `0600`.
+
+nono never removes the file on its own: it is the live store again the moment a
+profile sets `"file"` back, and it is the only copy of those tokens, so removal
+forces a fresh login for every captured provider.
+
+Instead there are two surfaces:
+
+- **`nono run`** prints a passive two-line reminder after the child exits,
+  pointing at `nono setup`. It asks nothing and blocks nothing, and it fires only
+  on a **clean exit** — a failing run already has diagnostics competing for
+  attention. Suppressed by `--silent`.
+- **`nono setup`** offers the interactive removal, defaulting to no.
+
+The offer is deliberately *not* on the run path. A full-screen TUI agent (Claude
+Code, Codex) switches the terminal to the alternate screen buffer and clears it,
+so a pre-launch notice is never read and a prompt cannot be answered while the
+agent owns the terminal. Prompting after the child exits instead interrupts
+someone who has just finished their session and leaves them to relaunch the
+agent. A one-time migration artifact belongs behind a one-time deliberate
+action.
+
+Removal is `unlink`, **not a secure erase**: the plaintext blocks stay on the
+device until reused, and any filesystem snapshot taken while the file existed
+still holds the tokens.
+
+Note `nono setup` takes no `--profile`, so it has no backend preference in scope.
+It offers whenever the file exists on macOS, where `auto` (the default) resolves
+to the Keychain. A profile that explicitly sets `"file"` still uses this file,
+which is why the prompt says so and defaults to no.
+
+To verify:
+
+1. Run with `"oauth_capture_store_backend": "file"` (Option B) and complete a
+   capture. Confirm `~/.local/state/nono/oauth-capture/providers.json` exists
+   and is non-empty.
+2. Switch the profile to `"keychain"` (or `"auto"`) and run a real TUI child,
+   e.g. `nono run --profile claude -- claude`. Exit it cleanly. After the TUI
+   releases the terminal you must see, with no prompt and no pause:
+
+```
+  warning: plaintext OAuth token file left over from the file backend:
+           ~/.local/state/nono/oauth-capture/providers.json — run `nono setup` to remove it.
+```
+
+3. Repeat with a command that exits non-zero (e.g. `-- false`): the reminder must
+   **not** appear.
+4. Repeat with `--silent`: nothing is printed.
+5. Run `nono setup`. It must offer removal:
+
+```
+  warning: plaintext OAuth token file left over from the file backend
+
+           ~/.local/state/nono/oauth-capture/providers.json
+           18.2 KB, last written 2026-08-13
+
+           This session persisted captured OAuth tokens to the macOS Keychain,
+           so nono never opened this file. It still holds OAuth access and
+           refresh tokens in plaintext, protected only by file mode 0600.
+
+           Removing it forces a fresh login for every captured provider, and
+           is not what you want if you may set the "file" backend again.
+
+  Remove it now? [y/N]
+```
+
+6. Answer with a bare newline. The file must still exist, and the manual `rm`
+   instruction is printed instead. A stray return must never delete credentials.
+7. Run `nono setup --check-only`: no prompt, nothing removed.
+8. Run `nono setup` again and answer `y`. The file is gone and the now-empty
+   `oauth-capture/` directory is pruned. Re-authenticate the provider to confirm
+   capture still works from scratch.
+9. Run `nono setup` with no leftover store: it prints nothing about OAuth.
+10. Repeat steps 2 and 5 on Linux with the file present: nothing is printed and
+    nothing is offered. There the file backend is the only backend, so
+    `providers.json` is the live store and both surfaces would be wrong.
+11. Switch back to `"file"` and run: no reminder, and the store is read and
+    rebuilt as usual.
+
+### Errors
+
+If the Keychain backend is selected but the login keychain is locked or
+otherwise not writable (SSH session, post-sleep without a GUI unlock, or a
+lock-on-inactivity policy), capture **fails closed** — it does not fall back to
+a file or to memory. The write path surfaces:
+
+```
+OAuth capture keystore error: OAuth capture store save for nono/oauth_capture_store blocked: keychain is locked (OSStatus -25308). Common causes: SSH session, post-sleep without GUI unlock, or Keychain Access set to lock on inactivity. OAuth capture fails closed and is unavailable until the login keychain is unlocked; there is no in-memory fallback.
+```
+
+`OSStatus -25308` is `errSecInteractionNotAllowed`; you may also see `-25293`
+(`errSecAuthFailed`) or `-25304` (`errSecNotAvailable`), all reported
+identically. Unlock the login keychain, or switch to Option B.
+
+If you enable the Keychain backend but omit the `security` command policy,
+profile resolution refuses to start rather than silently breaking the agent's
+`security` calls:
+
+```
+profile enables OAuth-capture Keychain persistence on macOS but does not define a command_policies.commands."security" policy with a session sandbox. Define command_policies.commands."security".sandbox (or .from.session) so the agent's other `security` calls keep working while reads of account 'oauth_capture_store' are refused, or set oauth_capture_store_backend = "file" to opt out of the Keychain backend.
+```
+
 ## Claude Code
 
 Login capture:

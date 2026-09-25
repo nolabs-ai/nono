@@ -45,7 +45,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -101,6 +101,7 @@ pub(crate) struct PreparedToolSandboxRuntime {
 struct ToolSandboxState {
     runtime_dir: PathBuf,
     socket_path: PathBuf,
+    control_socket: ControlSocketEndpoint,
     /// Dedicated URL-open listener socket path, present only when a command
     /// declares `open_urls`. Kept separate from `socket_path` so the shim
     /// handshake protocol is untouched.
@@ -183,6 +184,24 @@ struct ShimIdentity {
 struct FileId {
     dev: u64,
     ino: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NamespaceIdentity {
+    mount: FileId,
+    root: FileId,
+}
+
+/// Identity captured from the runtime-owned command-mediation listener.
+///
+/// This is intentionally separate from the profile-derived Unix-socket
+/// allowlist. It identifies the one transport that may use the command
+/// notification budget; it does not authorize a connection.
+#[derive(Clone, Debug)]
+struct ControlSocketEndpoint {
+    path: PathBuf,
+    socket: FileId,
+    namespace: Option<NamespaceIdentity>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +326,7 @@ impl PreparedToolSandboxRuntime {
         let mut runtime_cleanup = RuntimeDirCleanup::new(runtime_dir.clone());
         let socket_path = runtime_dir.join("supervisor.sock");
         let listener = bind_runtime_socket(&socket_path)?;
+        let control_socket = ControlSocketEndpoint::capture(&socket_path)?;
         // Bind a dedicated URL-open listener only when a command needs it.
         let (url_socket_path, url_listener) = if config.any_command_allows_url_open() {
             let url_socket_path = runtime_dir.join("url.sock");
@@ -395,6 +415,7 @@ impl PreparedToolSandboxRuntime {
             inner: Arc::new(ToolSandboxState {
                 runtime_dir,
                 socket_path,
+                control_socket,
                 url_socket_path,
                 shim_dir,
                 url_open_shim,
@@ -476,6 +497,20 @@ impl PreparedToolSandboxRuntime {
                 )
             })
             .collect())
+    }
+
+    /// True only for a connect to this runtime's private command-mediation
+    /// listener. A successful result selects its separate notification budget;
+    /// the normal AF_UNIX policy decision still authorizes the operation.
+    pub(crate) fn is_control_socket_connect(
+        &self,
+        child_pid: u32,
+        syscall: i32,
+        sockaddrs: &[nono::sandbox::SockaddrInfo],
+    ) -> bool {
+        self.inner
+            .control_socket
+            .matches_connect(child_pid, syscall, sockaddrs)
     }
 
     /// Invariant: must never add a filesystem Write grant. `caps` is cloned
@@ -5337,6 +5372,106 @@ fn file_id(metadata: &fs::Metadata) -> FileId {
     }
 }
 
+impl NamespaceIdentity {
+    fn for_process(pid: u32) -> Result<Self> {
+        let mount = fs::metadata(format!("/proc/{pid}/ns/mnt")).map_err(|source| {
+            NonoError::ConfigRead {
+                path: PathBuf::from(format!("/proc/{pid}/ns/mnt")),
+                source,
+            }
+        })?;
+        let root =
+            fs::metadata(format!("/proc/{pid}/root")).map_err(|source| NonoError::ConfigRead {
+                path: PathBuf::from(format!("/proc/{pid}/root")),
+                source,
+            })?;
+        Ok(Self {
+            mount: file_id(&mount),
+            root: file_id(&root),
+        })
+    }
+}
+
+impl ControlSocketEndpoint {
+    fn capture(path: &Path) -> Result<Self> {
+        let canonical_path =
+            path.canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        let metadata = fs::metadata(&canonical_path).map_err(|source| NonoError::ConfigRead {
+            path: canonical_path.clone(),
+            source,
+        })?;
+        if !metadata.file_type().is_socket() {
+            return Err(NonoError::SandboxInit(format!(
+                "tool-sandbox control endpoint is not a socket: {}",
+                canonical_path.display()
+            )));
+        }
+        Ok(Self {
+            // The shim receives this exact path spelling. Preserve it for the
+            // classification check; canonicalization would reject a runtime
+            // directory reached through a symlinked temporary root.
+            path: path.to_path_buf(),
+            socket: file_id(&metadata),
+            // Procfs identity is an additional guard for the rate-limit
+            // classification only. If it is unavailable, retain the existing
+            // runtime behavior and use the general budget instead.
+            namespace: NamespaceIdentity::for_process(std::process::id()).ok(),
+        })
+    }
+
+    fn matches_connect(
+        &self,
+        child_pid: u32,
+        syscall: i32,
+        sockaddrs: &[nono::sandbox::SockaddrInfo],
+    ) -> bool {
+        let [sockaddr] = sockaddrs else {
+            return false;
+        };
+        if syscall != nono::sandbox::SYS_CONNECT
+            || sockaddr.family != libc::AF_UNIX as u16
+            || sockaddr.unix_kind != Some(nono::sandbox::UnixSocketKind::Pathname)
+        {
+            return false;
+        }
+        let Some(path) = sockaddr.unix_path.as_deref() else {
+            return false;
+        };
+        // Path equality compares normalized components. The notification budget
+        // needs exact bytes so syntactic aliases such as `socket/../socket` or
+        // `./socket` cannot obtain the special treatment.
+        if !path.is_absolute() || path.as_os_str().as_bytes() != self.path.as_os_str().as_bytes() {
+            return false;
+        }
+
+        let (Some(supervisor_namespace), Ok(child_namespace)) =
+            (self.namespace, NamespaceIdentity::for_process(child_pid))
+        else {
+            return false;
+        };
+        if child_namespace != supervisor_namespace {
+            return false;
+        }
+
+        // Resolve via the notifying process's root so a chroot or a future
+        // namespace change cannot make the same absolute bytes name a different
+        // endpoint. NamespaceIdentity above makes this path the supervisor's
+        // view today, while this lookup keeps the invariant explicit.
+        let Ok(relative) = path.strip_prefix("/") else {
+            return false;
+        };
+        let target = PathBuf::from(format!("/proc/{child_pid}/root")).join(relative);
+        let Ok(metadata) = fs::metadata(target) else {
+            return false;
+        };
+        metadata.file_type().is_socket() && file_id(&metadata) == self.socket
+    }
+}
+
 /// Core gate for `validate_initial_exec` after the caller has resolved the
 /// canonical path to a `FileId`. Extracted so the ordering invariant (bypass
 /// before policy-command rejection) can be tested without touching the
@@ -6470,9 +6605,18 @@ mod tests {
         shim_dir: PathBuf,
         shim: ShimIdentity,
     ) -> ToolSandboxState {
+        let control_socket = ControlSocketEndpoint {
+            path: socket_path.clone(),
+            socket: FileId { dev: 1, ino: 1 },
+            namespace: Some(
+                NamespaceIdentity::for_process(std::process::id())
+                    .expect("test process namespace identity"),
+            ),
+        };
         ToolSandboxState {
             runtime_dir,
             socket_path,
+            control_socket,
             url_socket_path: None,
             shim_dir: shim_dir.clone(),
             url_open_shim: None,
@@ -6671,6 +6815,215 @@ mod tests {
                 id: FileId { dev: 1, ino: 1 },
             },
         )
+    }
+
+    fn control_socket_sockaddr(path: &Path) -> nono::sandbox::SockaddrInfo {
+        nono::sandbox::SockaddrInfo {
+            family: libc::AF_UNIX as u16,
+            port: 0,
+            is_loopback: true,
+            unix_kind: Some(nono::sandbox::UnixSocketKind::Pathname),
+            unix_path: Some(path.to_path_buf()),
+        }
+    }
+
+    #[test]
+    fn control_socket_endpoint_matches_only_its_bound_socket() -> Result<()> {
+        let dir = test_tempdir()?;
+        let control = dir.path().join("supervisor.sock");
+        let _listener = bind_runtime_socket(&control)?;
+        let endpoint = ControlSocketEndpoint::capture(&control)?;
+        let pid = std::process::id();
+
+        assert!(endpoint.matches_connect(
+            pid,
+            nono::sandbox::SYS_CONNECT,
+            &[control_socket_sockaddr(&endpoint.path)],
+        ));
+
+        let sibling = dir.path().join("url.sock");
+        let _sibling_listener = bind_runtime_socket(&sibling)?;
+        assert!(
+            !endpoint.matches_connect(
+                pid,
+                nono::sandbox::SYS_CONNECT,
+                &[control_socket_sockaddr(&sibling)],
+            ),
+            "the URL-opening socket must not draw from the command budget"
+        );
+        for syscall in [
+            nono::sandbox::SYS_BIND,
+            nono::sandbox::SYS_SENDTO,
+            nono::sandbox::SYS_SENDMSG,
+            nono::sandbox::SYS_SENDMMSG,
+        ] {
+            assert!(
+                !endpoint
+                    .matches_connect(pid, syscall, &[control_socket_sockaddr(&endpoint.path)],),
+                "only connect may draw from the command budget (syscall {syscall})"
+            );
+        }
+        assert!(
+            !endpoint.matches_connect(
+                pid,
+                nono::sandbox::SYS_CONNECT,
+                &[control_socket_sockaddr(Path::new("supervisor.sock"))],
+            ),
+            "relative aliases must not draw from the command budget"
+        );
+        assert!(
+            !endpoint.matches_connect(
+                pid,
+                nono::sandbox::SYS_CONNECT,
+                &[control_socket_sockaddr(
+                    &endpoint
+                        .path
+                        .parent()
+                        .expect("socket parent")
+                        .join(".")
+                        .join(endpoint.path.file_name().expect("socket filename"),),
+                )],
+            ),
+            "syntactic aliases must not draw from the command budget"
+        );
+        assert!(
+            !endpoint.matches_connect(
+                pid,
+                nono::sandbox::SYS_CONNECT,
+                &[nono::sandbox::SockaddrInfo {
+                    family: libc::AF_UNIX as u16,
+                    port: 0,
+                    is_loopback: true,
+                    unix_kind: Some(nono::sandbox::UnixSocketKind::Abstract),
+                    unix_path: None,
+                }],
+            ),
+            "abstract and malformed Unix addresses must not draw from the command budget"
+        );
+        assert!(
+            !endpoint.matches_connect(
+                pid,
+                nono::sandbox::SYS_CONNECT,
+                &[nono::sandbox::SockaddrInfo {
+                    family: libc::AF_UNIX as u16,
+                    port: 0,
+                    is_loopback: true,
+                    unix_kind: Some(nono::sandbox::UnixSocketKind::Pathname),
+                    unix_path: None,
+                }],
+            ),
+            "an unparsed pathname socket must not draw from the command budget"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_socket_endpoint_preserves_symlinked_runtime_path_spelling() -> Result<()> {
+        let dir = test_tempdir()?;
+        let real_parent = dir.path().join("real");
+        fs::create_dir(&real_parent).map_err(|source| NonoError::ConfigWrite {
+            path: real_parent.clone(),
+            source,
+        })?;
+        let linked_parent = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: linked_parent.clone(),
+                source,
+            }
+        })?;
+        let runtime_path = linked_parent.join("supervisor.sock");
+        let _listener = bind_runtime_socket(&runtime_path)?;
+        let endpoint = ControlSocketEndpoint::capture(&runtime_path)?;
+        let canonical_path =
+            runtime_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: runtime_path.clone(),
+                    source,
+                })?;
+        let pid = std::process::id();
+
+        assert_eq!(endpoint.path, runtime_path);
+        assert!(endpoint.matches_connect(
+            pid,
+            nono::sandbox::SYS_CONNECT,
+            &[control_socket_sockaddr(&runtime_path)],
+        ));
+        assert_ne!(canonical_path, runtime_path);
+        assert!(
+            !endpoint.matches_connect(
+                pid,
+                nono::sandbox::SYS_CONNECT,
+                &[control_socket_sockaddr(&canonical_path)],
+            ),
+            "a canonical alias must not draw from the command budget"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_socket_endpoint_rejects_namespace_and_inode_changes() -> Result<()> {
+        let dir = test_tempdir()?;
+        let control = dir.path().join("supervisor.sock");
+        let listener = bind_runtime_socket(&control)?;
+        let endpoint = ControlSocketEndpoint::capture(&control)?;
+        let pid = std::process::id();
+
+        let mut different_root = endpoint.clone();
+        let root = &mut different_root
+            .namespace
+            .as_mut()
+            .expect("test endpoint namespace")
+            .root;
+        root.ino = root.ino.saturating_add(1);
+        assert!(
+            !different_root.matches_connect(
+                pid,
+                nono::sandbox::SYS_CONNECT,
+                &[control_socket_sockaddr(&endpoint.path)],
+            ),
+            "a different child root must not draw from the command budget"
+        );
+        let mut different_mount = endpoint.clone();
+        let mount = &mut different_mount
+            .namespace
+            .as_mut()
+            .expect("test endpoint namespace")
+            .mount;
+        mount.ino = mount.ino.saturating_add(1);
+        assert!(
+            !different_mount.matches_connect(
+                pid,
+                nono::sandbox::SYS_CONNECT,
+                &[control_socket_sockaddr(&endpoint.path)],
+            ),
+            "a different child mount namespace must not draw from the command budget"
+        );
+        assert!(
+            !endpoint.matches_connect(
+                u32::MAX,
+                nono::sandbox::SYS_CONNECT,
+                &[control_socket_sockaddr(&endpoint.path)],
+            ),
+            "an unavailable child procfs view must fail closed from the exemption"
+        );
+
+        drop(listener);
+        fs::remove_file(&control).map_err(|source| NonoError::ConfigWrite {
+            path: control.clone(),
+            source,
+        })?;
+        let _replacement = bind_runtime_socket(&control)?;
+        assert!(
+            !endpoint.matches_connect(
+                pid,
+                nono::sandbox::SYS_CONNECT,
+                &[control_socket_sockaddr(&endpoint.path)],
+            ),
+            "a replacement socket at the same pathname must not draw from the command budget"
+        );
+        Ok(())
     }
 
     // Peer pid 1 with an unrelated root: the walk ends before the root (as after a

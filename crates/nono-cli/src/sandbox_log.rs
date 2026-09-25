@@ -7,6 +7,8 @@ use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader};
 #[cfg(target_os = "macos")]
+use std::os::unix::process::ExitStatusExt;
+#[cfg(target_os = "macos")]
 use std::process::{Child, Command, Stdio};
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
@@ -14,6 +16,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 #[cfg(target_os = "macos")]
 use tracing::debug;
+
+/// Best-effort log evidence and whether collection failed.
+#[derive(Default)]
+pub struct SandboxLogCollection {
+    pub violations: Vec<nono::SandboxViolation>,
+    pub unavailable: bool,
+}
 
 #[cfg(target_os = "macos")]
 const LOG_STREAM_PREDICATE: &str = "((processID == 0) AND (senderImagePath CONTAINS \"/Sandbox\")) OR (process == \"sandboxd\") OR (subsystem == \"com.apple.sandbox.reporting\")";
@@ -75,8 +84,10 @@ pub struct SandboxLogCollector {
 impl SandboxLogCollector {
     #[must_use]
     pub fn start(child_pid: i32, command_name: Option<String>) -> Option<Self> {
-        let mut child = match Command::new("/usr/bin/log")
-            .args([
+        Self::start_with_command(
+            child_pid,
+            command_name,
+            Command::new("/usr/bin/log").args([
                 "stream",
                 "--style",
                 "ndjson",
@@ -84,11 +95,16 @@ impl SandboxLogCollector {
                 "debug",
                 "--predicate",
                 LOG_STREAM_PREDICATE,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+            ]),
+        )
+    }
+
+    fn start_with_command(
+        child_pid: i32,
+        command_name: Option<String>,
+        command: &mut Command,
+    ) -> Option<Self> {
+        let mut child = match command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
             Ok(child) => child,
             Err(e) => {
                 debug!("sandbox log stream failed to spawn: {e}");
@@ -141,8 +157,16 @@ impl SandboxLogCollector {
                         break;
                     }
                 }
-            })
-            .ok()?;
+            });
+        let reader_thread = match reader_thread {
+            Ok(reader_thread) => reader_thread,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                debug!("sandbox log reader failed to start: {e}");
+                return None;
+            }
+        };
 
         Some(Self {
             child,
@@ -154,20 +178,35 @@ impl SandboxLogCollector {
     }
 
     #[must_use]
-    pub fn finish(self) -> Vec<SandboxViolation> {
-        self.finish_inner(true)
+    pub fn finish(self) -> SandboxLogCollection {
+        self.finish_inner(Some(Command::new("/usr/bin/log").args([
+            "show",
+            "--style",
+            "ndjson",
+            "--last",
+            "10s",
+            "--predicate",
+            LOG_STREAM_PREDICATE,
+        ])))
     }
 
     #[must_use]
-    pub fn finish_realtime_only(self) -> Vec<SandboxViolation> {
-        self.finish_inner(false)
+    pub fn finish_realtime_only(self) -> SandboxLogCollection {
+        self.finish_inner(None)
     }
 
-    fn finish_inner(mut self, include_historical_fallback: bool) -> Vec<SandboxViolation> {
-        // Kill the real-time stream — it may or may not have captured
-        // events depending on timing.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+    fn finish_inner(mut self, historical_command: Option<&mut Command>) -> SandboxLogCollection {
+        // An unsuccessful exit before shutdown means collection failed. Do not
+        // mistake our own SIGKILL of a running stream for an access failure.
+        let prior_status = self.child.try_wait();
+        let killed = !matches!(prior_status, Ok(Some(_))) && self.child.kill().is_ok();
+        let mut unavailable = match self.child.wait() {
+            Ok(status) => {
+                prior_status.is_err()
+                    || !(status.success() || killed && status.signal() == Some(nix::libc::SIGKILL))
+            }
+            Err(_) => true,
+        };
 
         if let Some(reader_thread) = self.reader_thread.take() {
             let _ = reader_thread.join();
@@ -188,17 +227,29 @@ impl SandboxLogCollector {
         // (e.g. `cat`). The child can exit before the log system delivers
         // the denial event. Fall back to a historical log query which is
         // deterministic — events are already committed by this point.
-        if include_historical_fallback && violations.is_empty() {
+        if violations.is_empty()
+            && let Some(command) = historical_command
+        {
             let filter = ViolationFilter {
                 pid: Some(self.child_pid),
                 process_name: self.command_name.clone(),
             };
-            if let Some(historical) = collect_historical_violations(&filter) {
-                violations = historical;
+            match collect_historical_violations(&filter, command) {
+                Ok(historical) => {
+                    violations = historical;
+                    unavailable = false;
+                }
+                Err(e) => {
+                    debug!("sandbox log history unavailable: {e}");
+                    unavailable = true;
+                }
             }
         }
 
-        violations
+        SandboxLogCollection {
+            violations,
+            unavailable,
+        }
     }
 }
 
@@ -217,27 +268,21 @@ pub struct SandboxLogCollector;
 /// pick up denials from unrelated sandboxed apps (Safari, Messages, etc.) that
 /// happened to deny a filesystem op in the same window.
 #[cfg(target_os = "macos")]
-fn collect_historical_violations(filter: &ViolationFilter) -> Option<Vec<SandboxViolation>> {
-    let predicate = LOG_STREAM_PREDICATE;
-
-    let output = Command::new("/usr/bin/log")
-        .args([
-            "show",
-            "--style",
-            "ndjson",
-            "--last",
-            "10s",
-            "--predicate",
-            predicate,
-        ])
+fn collect_historical_violations(
+    filter: &ViolationFilter,
+    command: &mut Command,
+) -> nono::Result<Vec<SandboxViolation>> {
+    let output = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
-        .ok()?;
+        .map_err(nono::NonoError::Io)?;
 
     if !output.status.success() {
         debug!("log show exited with {:?}", output.status.code());
-        return None;
+        return Err(nono::NonoError::CommandExecution(std::io::Error::other(
+            "sandbox log history query failed",
+        )));
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
@@ -268,11 +313,7 @@ fn collect_historical_violations(filter: &ViolationFilter) -> Option<Vec<Sandbox
         }
     }
 
-    if violations.is_empty() {
-        None
-    } else {
-        Some(violations)
-    }
+    Ok(violations)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -424,7 +465,127 @@ fn parse_event_message(filter: &ViolationFilter, message: &str) -> Option<Sandbo
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{ViolationFilter, parse_event_message, parse_violation_line};
+    use super::{SandboxLogCollector, ViolationFilter, parse_event_message, parse_violation_line};
+    use std::process::Command;
+
+    #[test]
+    fn failed_log_stream_is_reported_as_unavailable() {
+        let mut collector = SandboxLogCollector::start_with_command(
+            1234,
+            None,
+            Command::new("/bin/sh").args(["-c", "printf 'private diagnostic' >&2; exit 1"]),
+        )
+        .expect("start log command");
+        collector.child.wait().expect("wait for failed command");
+
+        let result = collector.finish_realtime_only();
+        assert!(
+            result.unavailable,
+            "failed log collection must not look empty"
+        );
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn successful_empty_log_stream_is_not_reported_as_unavailable() {
+        let mut collector = SandboxLogCollector::start_with_command(
+            1234,
+            None,
+            Command::new("/bin/sh").args(["-c", "exit 0"]),
+        )
+        .expect("start log command");
+        collector.child.wait().expect("wait for successful command");
+
+        let result = collector.finish_realtime_only();
+        assert!(!result.unavailable);
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn stopping_a_running_log_stream_is_not_a_collection_failure() {
+        let collector = SandboxLogCollector::start_with_command(
+            1234,
+            None,
+            Command::new("/bin/sleep").arg("30"),
+        )
+        .expect("start log command");
+
+        assert!(!collector.finish_realtime_only().unavailable);
+    }
+
+    fn completed_stream(script: &str) -> SandboxLogCollector {
+        let mut collector = SandboxLogCollector::start_with_command(
+            1234,
+            None,
+            Command::new("/bin/sh").args(["-c", script]),
+        )
+        .expect("start log command");
+        collector.child.wait().expect("wait for log command");
+        collector
+    }
+
+    #[test]
+    fn failed_historical_query_does_not_look_like_empty_logs() {
+        let collector = completed_stream("exit 0");
+        let result = collector.finish_inner(Some(Command::new("/bin/sh").args([
+            "-c",
+            "printf '%s\\n' '{\"eventMessage\":\"Sandbox: cat(1234) deny(1) file-read-data /tmp/private\"}'; exit 1",
+        ])));
+
+        assert!(result.unavailable);
+        assert!(
+            result.violations.is_empty(),
+            "failed query output is not evidence"
+        );
+    }
+
+    #[test]
+    fn successful_empty_history_recovers_failed_stream() {
+        let collector = completed_stream("exit 1");
+        let result = collector.finish_inner(Some(Command::new("/bin/sh").args(["-c", "exit 0"])));
+
+        assert!(!result.unavailable);
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn historical_spawn_failure_is_reported_as_unavailable() {
+        let collector = completed_stream("exit 0");
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let result =
+            collector.finish_inner(Some(&mut Command::new(temp.path().join("missing-log"))));
+
+        assert!(result.unavailable);
+    }
+
+    #[test]
+    fn successful_history_recovers_evidence_without_foreign_or_duplicate_denials() {
+        let collector = completed_stream("exit 1");
+        let result = collector.finish_inner(Some(Command::new("/bin/sh").args([
+            "-c",
+            r#"printf '%s\n' \
+              '{"eventMessage":"Sandbox: cat(1234) deny(1) file-read-data /tmp/denied"}' \
+              '{"eventMessage":"Sandbox: cat(1234) deny(1) file-read-data /tmp/denied"}' \
+              '{"eventMessage":"Sandbox: other(9999) deny(1) file-read-data /tmp/foreign"}' \
+              '{"eventMessage":"Sandbox: cat(1234) deny(1) mach-lookup com.apple.logd"}'"#,
+        ])));
+
+        assert!(!result.unavailable);
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(result.violations[0].target.as_deref(), Some("/tmp/denied"));
+    }
+
+    #[test]
+    fn partial_stream_evidence_survives_collection_failure() {
+        let collector = completed_stream(
+            r#"printf '%s\n' '{"eventMessage":"Sandbox: cat(1234) deny(1) file-read-data /tmp/denied"}'; exit 1"#,
+        );
+        let result = collector.finish_realtime_only();
+
+        assert!(result.unavailable);
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(result.violations[0].target.as_deref(), Some("/tmp/denied"));
+    }
 
     fn pid_filter(pid: i32) -> ViolationFilter {
         ViolationFilter {

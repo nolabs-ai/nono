@@ -21,9 +21,9 @@
 use nono::SessionDiagnosticReport;
 use nono::diagnostic::{
     DenialReason, DenialRecord, IpcDenialRecord, NonoDiagnostic, NonoDiagnosticCode,
-    NonoDiagnosticDetail, NonoRemediation, SandboxViolation, dedupe_denials,
-    diagnostic_application_failure, diagnostic_likely_sandbox_path, diagnostic_missing_path,
-    diagnostic_network_blocked, diagnostic_protected_file_write,
+    NonoDiagnosticDetail, NonoDiagnosticSeverity, NonoRemediation, SandboxViolation,
+    dedupe_denials, diagnostic_application_failure, diagnostic_likely_sandbox_path,
+    diagnostic_missing_path, diagnostic_network_blocked, diagnostic_protected_file_write,
     filesystem_denials_from_violations, follow_up_diagnostics,
 };
 use nono::try_canonicalize;
@@ -346,6 +346,17 @@ fn format_command_failed_line(exit_code: i32) -> String {
     format!("[nono] Command exited with code {}.", exit_code)
 }
 
+fn sandbox_log_unavailable_diagnostic() -> NonoDiagnostic {
+    NonoDiagnostic::new(
+        NonoDiagnosticCode::IoError,
+        NonoDiagnosticSeverity::Warning,
+        "macOS sandbox denial logs could not be collected; denial details may be incomplete.",
+    )
+    .with_hint(
+        "Sandbox enforcement is unchanged. macOS may restrict unified log access for this account.",
+    )
+}
+
 fn format_command_failed_not_sandbox_line(exit_code: i32) -> String {
     format!(
         "[nono] The command failed, but this does not look like a sandbox denial. (exit code {})",
@@ -604,6 +615,8 @@ pub struct DiagnosticFormatter<'a> {
     denials: &'a [DenialRecord],
     ipc_denials: &'a [IpcDenialRecord],
     sandbox_violations: &'a [SandboxViolation],
+    /// Collection of macOS sandbox logs failed, so denial evidence may be incomplete.
+    sandbox_logs_unavailable: bool,
     /// Paths that are write-protected due to trust verification
     protected_paths: &'a [PathBuf],
     /// Primary verdict extracted from the command output.
@@ -653,6 +666,7 @@ impl<'a> DiagnosticFormatter<'a> {
             denials: &[],
             ipc_denials: &[],
             sandbox_violations: &[],
+            sandbox_logs_unavailable: false,
             protected_paths: &[],
             primary_verdict: None,
             blocked_protected_file: None,
@@ -747,6 +761,11 @@ impl<'a> DiagnosticFormatter<'a> {
             violations,
         );
         self.append_observation_diagnostics(&mut report.diagnostics);
+        if self.sandbox_logs_unavailable {
+            report
+                .diagnostics
+                .push(sandbox_log_unavailable_diagnostic());
+        }
         report.diagnostics.extend(follow_up_diagnostics());
         report
     }
@@ -812,6 +831,27 @@ impl<'a> DiagnosticFormatter<'a> {
     pub fn with_sandbox_violations(mut self, violations: &'a [SandboxViolation]) -> Self {
         self.sandbox_violations = violations;
         self
+    }
+
+    /// Record that OS sandbox log collection failed independently of enforcement.
+    #[must_use]
+    pub fn with_sandbox_logs_unavailable(mut self, unavailable: bool) -> Self {
+        self.sandbox_logs_unavailable = unavailable;
+        self
+    }
+
+    /// Render a collection warning without attributing failure to the command.
+    #[must_use]
+    pub fn format_sandbox_log_warning(&self) -> String {
+        if !self.sandbox_logs_unavailable {
+            return String::new();
+        }
+        let diagnostic = sandbox_log_unavailable_diagnostic();
+        let mut lines = vec![format!("[nono] Warning: {}", diagnostic.message)];
+        if let Some(hint) = diagnostic.hint {
+            lines.push(format!("[nono] {hint}"));
+        }
+        render_diagnostic_block(&lines.join("\n"))
     }
 
     /// Add paths that are write-protected due to trust verification.
@@ -889,7 +929,13 @@ impl<'a> DiagnosticFormatter<'a> {
                 self.format_supervised_footer_with_diagnostics(exit_code, diagnostics)
             }
         };
-        render_diagnostic_block(&body)
+        let mut output = render_diagnostic_block(&body);
+        let warning = self.format_sandbox_log_warning();
+        if !warning.is_empty() {
+            output.push_str("\n\n");
+            output.push_str(&warning);
+        }
+        output
     }
 
     /// Check whether the resolved binary path falls under any allowed read path.
@@ -1256,7 +1302,7 @@ impl<'a> DiagnosticFormatter<'a> {
                     self.format_primary_verdict_guidance(&mut lines, verdict);
                     lines.push("[nono]".to_string());
                 }
-                if !has_observed_path_evidence {
+                if !has_observed_path_evidence && !self.sandbox_logs_unavailable {
                     lines.push(
                         "[nono] No path denials were observed during this session.".to_string(),
                     );
@@ -3378,6 +3424,79 @@ mod tests {
     // --- Supervised mode tests ---
 
     #[test]
+    fn test_sandbox_log_unavailable_is_a_structured_warning() {
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps).with_sandbox_logs_unavailable(true);
+        let report = formatter.build_session_report(0);
+        let warnings: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == NonoDiagnosticCode::IoError)
+            .collect();
+
+        assert_eq!(report.exit_code, 0);
+        assert!(report.denials.is_empty());
+        assert!(report.violations.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].severity, nono::NonoDiagnosticSeverity::Warning);
+        assert!(
+            warnings[0]
+                .message
+                .contains("denial details may be incomplete")
+        );
+        let json = match report.to_json() {
+            Ok(json) => json,
+            Err(error) => panic!("serialize diagnostics: {error}"),
+        };
+        assert!(json.contains("\"code\":\"io_error\""));
+        assert!(json.contains("\"severity\":\"warning\""));
+
+        let available = DiagnosticFormatter::new(&caps).build_session_report(0);
+        assert!(
+            available
+                .diagnostics
+                .iter()
+                .all(|diagnostic| { diagnostic.code != NonoDiagnosticCode::IoError })
+        );
+    }
+
+    #[test]
+    fn test_sandbox_log_unavailable_footer_does_not_infer_no_sandbox_failure() {
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_logs_unavailable(true);
+        let output = format_footer_with_session_report(formatter, 1);
+
+        assert_eq!(
+            output.matches("denial details may be incomplete").count(),
+            1
+        );
+        assert!(!output.contains("No path denials were observed"));
+        assert!(!output.contains("The failure may be unrelated"));
+        assert!(!output.contains("--allow"));
+        assert!(!output.contains("sudo"));
+    }
+
+    #[test]
+    fn test_sandbox_log_warning_does_not_claim_the_command_failed() {
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps).with_sandbox_logs_unavailable(true);
+        let output = formatter.format_sandbox_log_warning();
+
+        assert!(!output.is_empty());
+        assert!(output.contains("denial details may be incomplete"));
+        assert!(!output.contains("failed"));
+        assert!(!output.contains("blocked"));
+        assert!(!output.contains("exit code"));
+        assert!(
+            DiagnosticFormatter::new(&caps)
+                .format_sandbox_log_warning()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn test_supervised_no_denials_no_extensions() {
         let caps = make_test_caps(); // extensions_enabled defaults to false
         let formatter = DiagnosticFormatter::new(&caps).with_mode(DiagnosticMode::Supervised);
@@ -4191,9 +4310,12 @@ mod tests {
 
     #[test]
     fn test_supervised_rate_limited_denial() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tempdir should be created");
+        let denied_path = dir.path().join("flood");
         let caps = make_test_caps();
         let denials = vec![DenialRecord {
-            path: PathBuf::from("/tmp/flood"),
+            path: denied_path.clone(),
             access: AccessMode::Read,
             reason: DenialReason::RateLimited,
         }];
@@ -4203,11 +4325,11 @@ mod tests {
         let output = format_footer_with_session_report(formatter, 1);
 
         assert!(output.contains("Sandbox denial: 1 path blocked."));
-        assert!(output.contains("/tmp/flood (read)"));
+        assert!(output.contains(&format!("{} (read)", denied_path.display())));
         // Rate-limited denials are still actionable via a path flag. The
-        // suggested target falls back to the nearest existing parent since
-        // /tmp/flood itself doesn't exist.
-        assert!(output.contains("Fix flags: --read "));
+        // missing file falls back to its isolated parent, rather than /tmp
+        // which may contain protected state during other tests.
+        assert!(output.contains(&format!("Fix flags: --read {}", dir.path().display())));
         assert!(!output.contains("[permanently restricted]"));
     }
 

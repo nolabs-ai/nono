@@ -81,6 +81,12 @@ Capability expansion is not available on macOS. Apple's SIP (System Integrity Pr
 
 On macOS, supervised mode provides rollback snapshots and the diagnostic footer, but does not prompt for capability expansion.
 
+Sandbox denial details rely on access to macOS unified logs. If log collection
+fails, nono warns that denial details may be incomplete; macOS can restrict log
+access for standard (non-admin) accounts. The warning does not change sandbox
+enforcement or the command's exit status. `--no-diagnostics` suppresses the human
+warning, while `--diagnostics-json` includes it in the session diagnostics.
+
 ## Protected State
 
 The supervisor always blocks access to nono's own protected state roots, such as `~/.nono` and `$XDG_STATE_HOME/nono`, before consulting the approval backend. This prevents dynamic grants from exposing rollback data, audit state, or other internal nono files.

@@ -545,6 +545,12 @@ You can also load a profile by file path:
 nono run --profile ./profiles/my-agent.json -- my-command
 ```
 
+When the post-run save prompt updates an existing user profile, it adds the
+selected grants or suppressions while preserving the authored profile data,
+including `when` conditions for other platforms, `$schema`, and inheritance
+settings. The file is rewritten as formatted JSON, so comments and whitespace
+are not preserved.
+
 ### Overriding Pack Profiles
 
 CLI flags always take precedence over profile settings:

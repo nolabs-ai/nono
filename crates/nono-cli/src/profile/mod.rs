@@ -2783,11 +2783,10 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
 
 /// Load a profile by name or file path, injecting additional CLI-selected bases.
 ///
-/// Non-empty `cli_extends` behaves as if those base names were prepended to the
-/// selected profile's raw `extends` list before inheritance resolution. Bases
-/// still resolve through the normal profile resolver, so cycle checks, sibling
-/// lookup, pack provenance, migration prompts, and validation remain shared
-/// with JSON-authored inheritance.
+/// CLI bases are merged before the selected profile's raw `extends` list.
+/// They may also be file paths, while JSON-authored inheritance continues to
+/// accept only names and registry references. Cycle checks, sibling lookup,
+/// pack provenance, migration prompts, and validation remain shared.
 pub fn load_profile_with_extends(name_or_path: &str, cli_extends: &[String]) -> Result<Profile> {
     load_profile_impl(name_or_path, cli_extends)
 }
@@ -2929,9 +2928,15 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         let policy = crate::policy::load_embedded_policy()?;
         if let Some(def) = policy.profiles.get(name_or_path) {
             tracing::info!("Using built-in profile: {}", name_or_path);
-            let mut profile = def.to_raw_profile();
-            prepend_cli_extends(&mut profile, cli_extends);
-            return resolve_and_finalize_profile(profile).map(Some);
+            let profile = resolve_extends_with_cli(
+                def.to_raw_profile(),
+                &mut Vec::new(),
+                0,
+                None,
+                None,
+                cli_extends,
+            )?;
+            return finalize_profile(profile).map(Some);
         }
     }
     Ok(None)
@@ -3380,30 +3385,20 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 /// (#1565). Drafts resolve `extends` the same way as `resolve_and_finalize_profile`
 /// (user profiles → packs → builtins).
 fn load_from_file(path: &Path, cli_extends: &[String]) -> Result<Profile> {
-    let (mut profile, source_path) = parse_file_backed_profile(path)?;
-    prepend_cli_extends(&mut profile, cli_extends);
+    let (profile, source_path) = parse_file_backed_profile(path)?;
     let context_dir = if is_under_user_profile_draft_dir(&source_path) {
         None
     } else {
         source_path.parent()
     };
-    resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(&source_path))
-}
-
-fn prepend_cli_extends(profile: &mut Profile, cli_extends: &[String]) {
-    if cli_extends.is_empty() {
-        return;
-    }
-    let mut extends = Vec::with_capacity(
-        cli_extends
-            .len()
-            .saturating_add(profile.extends.as_ref().map_or(0, Vec::len)),
-    );
-    extends.extend(cli_extends.iter().cloned());
-    if let Some(existing) = profile.extends.take() {
-        extends.extend(existing);
-    }
-    profile.extends = Some(extends);
+    resolve_extends_with_cli(
+        profile,
+        &mut Vec::new(),
+        0,
+        context_dir,
+        Some(&source_path),
+        cli_extends,
+    )
 }
 
 // ============================================================================
@@ -3437,10 +3432,24 @@ fn resolve_extends(
     context_dir: Option<&Path>,
     source_file: Option<&Path>,
 ) -> Result<Profile> {
-    let base_names = match child.extends {
-        Some(ref names) => names.clone(),
-        None => return Ok(child),
-    };
+    resolve_extends_with_cli(child, visited, depth, context_dir, source_file, &[])
+}
+
+/// Keep CLI references separate from the profile's own `extends`: accepting a
+/// file on the command line must not enable paths in JSON-authored inheritance.
+/// Recursive calls use `resolve_extends`, so the CLI allowance is never inherited.
+fn resolve_extends_with_cli(
+    child: Profile,
+    visited: &mut Vec<String>,
+    depth: usize,
+    context_dir: Option<&Path>,
+    source_file: Option<&Path>,
+    cli_extends: &[String],
+) -> Result<Profile> {
+    if cli_extends.is_empty() && child.extends.is_none() {
+        return Ok(child);
+    }
+    let base_names = child.extends.clone().unwrap_or_default();
 
     if depth >= MAX_INHERITANCE_DEPTH {
         return Err(NonoError::ProfileInheritance(format!(
@@ -3452,7 +3461,11 @@ fn resolve_extends(
 
     // Resolve each base and fold-merge them left-to-right
     let mut accumulated_base: Option<Profile> = None;
-    for base_name in &base_names {
+    for (base_name, from_cli) in cli_extends
+        .iter()
+        .map(|name| (name, true))
+        .chain(base_names.iter().map(|name| (name, false)))
+    {
         if visited.contains(base_name) {
             return Err(NonoError::ProfileInheritance(format!(
                 "circular dependency detected: {} -> {}",
@@ -3463,7 +3476,18 @@ fn resolve_extends(
 
         visited.push(base_name.clone());
 
-        let resolved = load_base_profile_raw(base_name, context_dir, source_file)?;
+        let resolved = if from_cli && is_file_path_ref(base_name) {
+            let (base, source_path) = parse_file_backed_profile(Path::new(base_name))?;
+            if is_under_user_profile_draft_dir(&source_path) {
+                // Match --profile's draft resolution: draft siblings cannot
+                // shadow user profiles, installed packs, or built-in bases.
+                ResolvedBase::Global(base)
+            } else {
+                ResolvedBase::Sibling(base, source_path)
+            }
+        } else {
+            load_base_profile_raw(base_name, context_dir, source_file)?
+        };
         let resolved_base = match resolved {
             ResolvedBase::Sibling(base, source_path) => resolve_extends(
                 base,
@@ -3491,9 +3515,9 @@ fn resolve_extends(
 }
 
 /// Distinguishes where a base profile was resolved from so `resolve_extends`
-/// can propagate the canonical source directory only for sibling-resolved
-/// profiles. Global sources clear the context to prevent project-local files
-/// from hijacking built-in inheritance chains.
+/// can propagate the canonical source directory for file-backed profiles.
+/// Global sources (including explicit draft files) clear the context to prevent
+/// local files from shadowing the intended user/pack/built-in inheritance chain.
 enum ResolvedBase {
     Sibling(Profile, PathBuf),
     Global(Profile),
@@ -4935,6 +4959,270 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_cli_extends_file_paths_preserve_merge_order() {
+        with_config_env(|config_dir| {
+            crate::test_env::write_user_profile(
+                config_dir,
+                "named-base",
+                r#"{ "filesystem": { "read": ["/tmp/named"] } }"#,
+            );
+            crate::test_env::write_user_profile(
+                config_dir,
+                "json-base",
+                r#"{ "filesystem": { "read": ["/tmp/json"] } }"#,
+            );
+            crate::test_env::write_user_profile(
+                config_dir,
+                "selected",
+                r#"{
+                    "extends": "json-base",
+                    "filesystem": { "read": ["/tmp/selected"] },
+                    "workdir": { "access": "read" }
+                }"#,
+            );
+            let absolute = config_dir.join("absolute.json");
+            std::fs::write(
+                &absolute,
+                r#"{
+                    // CLI files use the same comment-aware parser as --profile.
+                    "filesystem": { "read": ["/tmp/absolute"] },
+                    "workdir": { "access": "readwrite" }
+                }"#,
+            )
+            .expect("write absolute base");
+            // Keep CWD unchanged: other tests may resolve relative paths concurrently.
+            let relative_dir = tempfile::tempdir_in(".").expect("relative tempdir");
+            let relative = Path::new(".")
+                .join(relative_dir.path().file_name().expect("tempdir name"))
+                .join("relative.jsonc");
+            std::fs::write(
+                &relative,
+                r#"{ "filesystem": { "read": ["/tmp/relative"] } }"#,
+            )
+            .expect("write relative base");
+            assert!(relative.is_relative());
+            let bases = vec![
+                "named-base".to_string(),
+                absolute.to_string_lossy().into_owned(),
+                relative.to_string_lossy().into_owned(),
+            ];
+            let profile = load_profile_with_extends("selected", &bases).expect("load CLI files");
+            assert_eq!(
+                profile.filesystem.read,
+                [
+                    "/tmp/named",
+                    "/tmp/absolute",
+                    "/tmp/relative",
+                    "/tmp/json",
+                    "/tmp/selected"
+                ]
+            );
+            assert_eq!(profile.workdir.access, WorkdirAccess::Read);
+
+            let selected_path = config_dir.join("nono/profiles/selected.json");
+            let by_path =
+                load_profile_with_extends(selected_path.to_str().expect("UTF-8 path"), &bases)
+                    .expect("load selected profile by path");
+            assert_eq!(
+                serde_json::to_value(&profile).expect("serialize named profile"),
+                serde_json::to_value(&by_path).expect("serialize path profile")
+            );
+            let builtin = load_profile_with_extends("default", &bases).expect("extend builtin");
+            assert_eq!(
+                builtin.filesystem.read,
+                ["/tmp/named", "/tmp/absolute", "/tmp/relative"]
+            );
+        });
+    }
+
+    #[test]
+    fn test_cli_extends_file_and_name_preserve_multi_base_overrides() {
+        with_config_env(|config_dir| {
+            for (name, content) in [
+                ("selected", r#"{}"#),
+                (
+                    "first",
+                    r#"{
+                    "network": { "network_profile": "developer", "credentials": ["github"] },
+                    "open_urls": { "allow_origins": ["https://first.example.com"], "allow_localhost": true }
+                }"#,
+                ),
+                (
+                    "second",
+                    r#"{
+                    "network": { "network_profile": null, "credentials": [] },
+                    "open_urls": { "allow_origins": ["https://second.example.com"] }
+                }"#,
+                ),
+                ("mixin", r#"{ "extends": ["first", "second"] }"#),
+            ] {
+                crate::test_env::write_user_profile(config_dir, name, content);
+            }
+            let path = config_dir.join("nono/profiles/mixin.json");
+            let by_name =
+                load_profile_with_extends("selected", &["mixin".to_string()]).expect("named mixin");
+            let by_path =
+                load_profile_with_extends("selected", &[path.to_string_lossy().into_owned()])
+                    .expect("file mixin");
+            assert_eq!(
+                serde_json::to_value(&by_name).expect("serialize named mixin"),
+                serde_json::to_value(&by_path).expect("serialize path mixin")
+            );
+            assert_eq!(by_path.network.network_profile, InheritableValue::Clear);
+            assert!(by_path.network.resolved_credentials().is_empty());
+            let urls = by_path.open_urls.expect("inherited open_urls");
+            assert_eq!(urls.allow_origins, ["https://second.example.com"]);
+            assert!(!urls.allow_localhost);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cli_extends_file_uses_symlink_referent_siblings() {
+        with_config_env(|config_dir| {
+            let source_dir = config_dir.join("source");
+            let link_dir = config_dir.join("links");
+            std::fs::create_dir_all(&source_dir).expect("source dir");
+            std::fs::create_dir_all(&link_dir).expect("link dir");
+            std::fs::write(
+                source_dir.join("overlay.json"),
+                r#"{ "extends": "sibling" }"#,
+            )
+            .expect("write overlay");
+            for (dir, grant) in [(&source_dir, "/tmp/referent"), (&link_dir, "/tmp/link")] {
+                std::fs::write(
+                    dir.join("sibling.json"),
+                    serde_json::json!({ "filesystem": { "read": [grant] } }).to_string(),
+                )
+                .expect("write sibling");
+            }
+            let link = link_dir.join("overlay.json");
+            std::os::unix::fs::symlink(source_dir.join("overlay.json"), &link)
+                .expect("link overlay");
+            let profile =
+                load_profile_with_extends("default", &[link.to_string_lossy().into_owned()])
+                    .expect("load symlinked CLI base");
+            assert_eq!(profile.filesystem.read, ["/tmp/referent"]);
+        });
+    }
+
+    #[test]
+    fn test_cli_extends_file_keeps_draft_sibling_lookup_disabled() {
+        with_config_env(|config_dir| {
+            crate::test_env::write_user_profile(
+                config_dir,
+                "base",
+                r#"{ "filesystem": { "read": ["/tmp/user"] } }"#,
+            );
+            let drafts = config_dir.join("nono/profile-drafts");
+            std::fs::create_dir_all(drafts.join("nested")).expect("drafts dir");
+            std::fs::write(
+                drafts.join("base.json"),
+                r#"{ "filesystem": { "read": ["/tmp/draft"] } }"#,
+            )
+            .expect("write draft sibling");
+            std::fs::write(drafts.join("overlay.json"), r#"{ "extends": "base" }"#)
+                .expect("write draft overlay");
+            let path = drafts.join("nested/../overlay.json");
+            let profile =
+                load_profile_with_extends("default", &[path.to_string_lossy().into_owned()])
+                    .expect("load CLI draft");
+            assert_eq!(profile.filesystem.read, ["/tmp/user"]);
+        });
+    }
+
+    #[test]
+    fn test_cli_extends_file_preserves_registry_refs_and_pack_provenance() {
+        with_config_env(|config_dir| {
+            let install_dir = build_fake_pack_store(
+                config_dir,
+                "acme",
+                "base",
+                "pack-base",
+                r#"{
+                    "filesystem": { "read": ["/tmp/pack"] },
+                    "session_hooks": { "before": { "script": "$PACK_DIR/hooks/setup.sh" } }
+                }"#,
+                Some("setup.sh"),
+            );
+            let path = config_dir.join("overlay.json");
+            std::fs::write(
+                &path,
+                r#"{ "extends": "acme/base", "filesystem": { "read": ["/tmp/file"] } }"#,
+            )
+            .expect("write file inheriting registry base");
+            let bases = vec!["acme/base".to_string(), path.to_string_lossy().into_owned()];
+            for selected in ["default", "acme/base"] {
+                let profile = load_profile_with_extends(selected, &bases)
+                    .expect("registry references still resolve as packs");
+                assert_eq!(profile.filesystem.read, ["/tmp/pack", "/tmp/file"]);
+                assert_eq!(profile.packs, ["acme/base"]);
+                let before = profile.session_hooks.before.expect("inherited pack hook");
+                assert_eq!(before.script, install_dir.join("hooks/setup.sh"));
+                assert_eq!(
+                    before.source_pack.map(|p| p.key()),
+                    Some("acme/base".to_string())
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_cli_extends_file_rejects_invalid_files_and_cycles() {
+        with_config_env(|config_dir| {
+            let missing = config_dir.join("missing.json");
+            let err =
+                load_profile_with_extends("default", &[missing.to_string_lossy().into_owned()])
+                    .expect_err("missing file must fail");
+            assert!(matches!(err, NonoError::ProfileRead { .. }));
+
+            let malformed = config_dir.join("malformed.json");
+            std::fs::write(&malformed, "{").expect("write malformed file");
+            let err =
+                load_profile_with_extends("default", &[malformed.to_string_lossy().into_owned()])
+                    .expect_err("malformed file must fail");
+            assert!(matches!(err, NonoError::ProfileParse(_)));
+
+            let first = config_dir.join("first.json");
+            std::fs::write(&first, r#"{ "extends": "second" }"#).expect("write first");
+            std::fs::write(config_dir.join("second.json"), r#"{ "extends": "first" }"#)
+                .expect("write second");
+            let err = load_profile_with_extends("default", &[first.to_string_lossy().into_owned()])
+                .expect_err("cyclic file inheritance must fail");
+            assert!(
+                matches!(&err, NonoError::ProfileInheritance(message) if message.contains("circular dependency")),
+                "expected cycle diagnostic, got {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_cli_extends_file_does_not_enable_json_path_references() {
+        with_config_env(|config_dir| {
+            let inner = config_dir.join("inner.json");
+            std::fs::write(&inner, "{}").expect("write inner file");
+            let outer = config_dir.join("outer.json");
+            std::fs::write(&outer, serde_json::json!({ "extends": inner }).to_string())
+                .expect("write JSON path reference");
+            let inner_ref = inner.to_string_lossy().into_owned();
+            let outer_ref = outer.to_string_lossy().into_owned();
+            // The same path is allowed as a CLI base but remains invalid in the
+            // selected profile's JSON or in an explicitly selected base's JSON.
+            for (selected, bases) in [
+                (outer_ref.as_str(), vec![inner_ref.clone()]),
+                ("default", vec![inner_ref, outer_ref.clone()]),
+            ] {
+                let err = load_profile_with_extends(selected, &bases)
+                    .expect_err("JSON extends paths must remain invalid");
+                assert!(
+                    matches!(&err, NonoError::ProfileInheritance(message) if message.contains("invalid base profile name")),
+                    "expected JSON name validation error, got {err}"
+                );
+            }
+        });
     }
 
     #[cfg(unix)]

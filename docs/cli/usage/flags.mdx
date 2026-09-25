@@ -808,16 +808,18 @@ nono run -p nolabs-ai/openclaw -- openclaw gateway
 
 #### `--extends`
 
-Extend the selected profile with an additional base profile for one invocation. Repeatable; bases are merged left-to-right, then any `extends` already in the selected profile is resolved, and the selected profile remains the final override layer.
+Extend the selected profile with an additional base profile for one invocation. Accepts a profile name, registry reference, or file path. Repeatable; bases are merged left-to-right, then any `extends` already in the selected profile is resolved, and the selected profile remains the final override layer.
 
 ```bash
 nono run --profile my-agent \
   --extends linux-host-compat \
-  --extends extra-git \
+  --extends ./project-overlay.json \
   -- my-agent
 ```
 
-This is equivalent to temporarily prepending those bases to the profile JSON's `extends` field. It requires `--profile` and conflicts with `--config`. Inherited filesystem and network grants can widen sandbox permissions, so treat each base profile as explicit policy input.
+Relative file paths resolve from the current directory, like `--profile`. Use `./` to distinguish a local path from a registry reference such as `namespace/name`. File bases support JSON comments and resolve their own inheritance, including named sibling profiles, before merging. The profile JSON's `extends` field still accepts only names and registry references.
+
+The merge order is equivalent to temporarily prepending those bases to the profile JSON's `extends` field. It requires `--profile` and conflicts with `--config`. Inherited filesystem and network grants can widen sandbox permissions, so treat each base profile as explicit policy input.
 
 #### `--workdir`
 

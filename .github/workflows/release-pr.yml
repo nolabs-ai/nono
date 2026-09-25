@@ -55,6 +55,22 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cross build --release --target aarch64-unknown-linux-gnu -p nono-cli
 
+      - name: Smoke test release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          if [[ "$target" == "aarch64-unknown-linux-gnu" ]]; then
+            # This artifact is cross-built on x86_64. qemu-user cannot exercise
+            # Landlock, but it can prove that the produced executable starts.
+            cross run --release --target "$target" -p nono-cli -- --version
+          else
+            bin="target/$target/release/nono"
+            "$bin" --version
+            NONO_NO_SAVE_PROMPT=1 NONO_NO_MIGRATE=1 \
+              "$bin" run --no-audit --no-rollback --allow-cwd -- /bin/true
+          fi
+
       - name: Verify binary does not link libdbus (Linux)
         if: runner.os == 'Linux'
         shell: bash

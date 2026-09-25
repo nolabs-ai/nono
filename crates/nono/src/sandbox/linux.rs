@@ -9,8 +9,9 @@ use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
     PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
 };
+use nix::fcntl::{OFlag, open};
+use nix::sys::stat::Mode;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
@@ -680,17 +681,22 @@ fn normalize_path_access(
 /// Returning the same descriptor used for metadata validation prevents a path
 /// replacement between type/device classification and rule installation.
 fn open_path_rule(cap: &crate::capability::FsCapability, abi: ABI) -> Result<OpenedPathRule> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-        .open(&cap.resolved)
-        .map_err(|e| {
-            NonoError::SandboxInit(format!(
-                "Cannot open Landlock rule path {}: {}",
-                cap.resolved.display(),
-                e
-            ))
-        })?;
+    // Do not use std::fs::OpenOptions::custom_flags here. On musl, O_ACCMODE
+    // includes O_PATH, so Rust's standard-library access-mode mask strips the
+    // flag and turns this into an ordinary permission-checked read open.
+    let path_fd = open(
+        &cap.resolved,
+        OFlag::O_PATH | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "Cannot open Landlock rule path {}: {}",
+            cap.resolved.display(),
+            e
+        ))
+    })?;
+    let file = std::fs::File::from(path_fd);
     let metadata = file.metadata().map_err(|e| {
         NonoError::SandboxInit(format!(
             "Cannot inspect opened Landlock rule path {}: {}",
@@ -3928,6 +3934,17 @@ mod tests {
                     .contains(AccessFs::IoctlDev)
             );
         }
+    }
+
+    #[test]
+    fn test_open_path_rule_retains_o_path_flag() {
+        let cap = crate::capability::FsCapability::new_file("/dev/null", AccessMode::Read)
+            .expect("device capability");
+        let rule = open_path_rule(&cap, ABI::V1).expect("open path rule");
+        let flags = nix::fcntl::fcntl(&rule.path_fd, nix::fcntl::FcntlArg::F_GETFL)
+            .expect("inspect path fd flags");
+
+        assert_ne!(flags & libc::O_PATH, 0, "Landlock rule fd must use O_PATH");
     }
 
     /// `open_path_rule` opens `cap.resolved` with `O_PATH`, so the kernel

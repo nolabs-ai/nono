@@ -1604,19 +1604,23 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             };
 
             #[cfg(target_os = "macos")]
-            let sandbox_violations = if supervisor.is_some() {
+            let sandbox_log_collection = if supervisor.is_some() {
                 let include_historical_sandbox_log =
                     exit_code != 0 || !denials.is_empty() || error_observation.has_findings();
                 match sandbox_log_collector {
                     Some(collector) if include_historical_sandbox_log => collector.finish(),
                     Some(collector) => collector.finish_realtime_only(),
-                    None => Vec::new(),
+                    None => crate::sandbox_log::SandboxLogCollection {
+                        unavailable: true,
+                        ..Default::default()
+                    },
                 }
             } else {
-                Vec::new()
+                crate::sandbox_log::SandboxLogCollection::default()
             };
             #[cfg(not(target_os = "macos"))]
-            let sandbox_violations = Vec::new();
+            let sandbox_log_collection = crate::sandbox_log::SandboxLogCollection::default();
+            let sandbox_violations = sandbox_log_collection.violations;
             let visible_sandbox_violations = filter_suppressed_system_service_violations(
                 &sandbox_violations,
                 config.suppressed_system_service_operations,
@@ -1644,10 +1648,14 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     config.diagnostic_verbosity,
                     tool_sandbox_policy_denial,
                 );
+            let should_warn_about_sandbox_logs = sandbox_log_collection.unavailable
+                && !config.no_diagnostics
+                && !config.diagnostics_json;
 
             // Print diagnostic footer on non-zero exit or when the PTY
             // output or OS sandbox logs show a likely sandbox-related issue.
-            if should_print_diagnostics || config.diagnostics_json {
+            if should_print_diagnostics || config.diagnostics_json || should_warn_about_sandbox_logs
+            {
                 let diag_session_id = if supervisor.is_some() {
                     pty_session_id
                         .or_else(|| supervisor.map(|s| s.session_id))
@@ -1673,6 +1681,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .with_denials(&denials)
                     .with_ipc_denials(&ipc_denials)
                     .with_sandbox_violations(&sandbox_violations)
+                    .with_sandbox_logs_unavailable(sandbox_log_collection.unavailable)
                     .with_protected_paths(config.protected_paths)
                     .with_error_observation(error_observation)
                     .with_current_dir(config.current_dir)
@@ -1710,6 +1719,11 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     let formatter = base_formatter.with_session_report(&diagnostic_report);
                     let footer = formatter.format_footer(exit_code);
                     crate::output::print_diagnostic_footer(&footer);
+                } else if should_warn_about_sandbox_logs {
+                    // An unavailable observer is worth reporting even when the
+                    // command succeeds; do not imply the command was denied.
+                    let warning = base_formatter.format_sandbox_log_warning();
+                    crate::output::print_diagnostic_footer(&warning);
                 }
             }
 

@@ -22,6 +22,7 @@ pub(crate) struct PreparedProfileSave {
     pub(crate) profile_name: String,
     pub(crate) profile_path: PathBuf,
     pub(crate) profile: profile::Profile,
+    source: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Copy)]
@@ -739,8 +740,11 @@ pub(crate) fn write_profile(prepared: &PreparedProfileSave) -> Result<()> {
         ))
     })?;
 
-    let profile_json = serde_json::to_string_pretty(&prepared.profile)
-        .map_err(|e| NonoError::LearnError(format!("Failed to serialize profile: {}", e)))?;
+    let profile_json = match &prepared.source {
+        Some(source) => serde_json::to_string_pretty(source),
+        None => serde_json::to_string_pretty(&prepared.profile),
+    }
+    .map_err(|e| NonoError::LearnError(format!("Failed to serialize profile: {}", e)))?;
     atomic_write(
         &prepared.profile_path,
         format!("{profile_json}\n").as_bytes(),
@@ -1685,7 +1689,15 @@ pub(crate) fn prepare_profile_save_from_patch(
     let profile_path = profile::resolve_user_profile_path(profile_name)?;
 
     if profile_path.exists() {
-        let mut existing = profile::load_raw_profile_from_path(&profile_path)?;
+        let content = std::fs::read(&profile_path).map_err(|source| NonoError::ProfileRead {
+            path: profile_path.clone(),
+            source,
+        })?;
+        let mut existing = profile::parse_profile_bytes(&content)?;
+        let text = std::str::from_utf8(&content)
+            .map_err(|e| NonoError::ProfileParse(format!("invalid UTF-8: {e}")))?;
+        let mut source = crate::jsonc::parse(text).map_err(NonoError::ProfileParse)?;
+        patch_profile_source(&mut source, &existing, patch)?;
         merge_profile_patch(&mut existing, patch);
 
         return Ok(PreparedProfileSave {
@@ -1693,6 +1705,7 @@ pub(crate) fn prepare_profile_save_from_patch(
             profile_name: profile_name.to_string(),
             profile_path,
             profile: existing,
+            source: Some(source),
         });
     }
 
@@ -1728,7 +1741,127 @@ pub(crate) fn prepare_profile_save_from_patch(
         profile_name: profile_name.to_string(),
         profile_path,
         profile: new_profile,
+        source: None,
     })
+}
+
+/// Update authored data rather than serializing the platform-evaluated profile.
+/// Both representations come from the same bytes, validated before patching.
+fn patch_profile_source(
+    source: &mut serde_json::Value,
+    existing: &profile::Profile,
+    patch: &profile::Profile,
+) -> Result<()> {
+    let source = source
+        .as_object_mut()
+        .ok_or_else(|| NonoError::ProfileParse("profile must be an object".to_string()))?;
+    let fs_fields: &[(&str, &[String], &[String])] = &[
+        ("allow", &existing.filesystem.allow, &patch.filesystem.allow),
+        ("read", &existing.filesystem.read, &patch.filesystem.read),
+        ("write", &existing.filesystem.write, &patch.filesystem.write),
+        (
+            "allow_file",
+            &existing.filesystem.allow_file,
+            &patch.filesystem.allow_file,
+        ),
+        (
+            "read_file",
+            &existing.filesystem.read_file,
+            &patch.filesystem.read_file,
+        ),
+        (
+            "write_file",
+            &existing.filesystem.write_file,
+            &patch.filesystem.write_file,
+        ),
+        (
+            "bypass_protection",
+            &existing.filesystem.bypass_protection,
+            &patch.filesystem.bypass_protection,
+        ),
+        (
+            "suppress_save_prompt",
+            &existing.filesystem.suppress_save_prompt,
+            &patch.filesystem.suppress_save_prompt,
+        ),
+    ];
+    for (field, current, requested) in fs_fields {
+        if !requested.is_empty() {
+            let filesystem = profile_source_section(source, "filesystem")?;
+            append_profile_source_entries(filesystem, field, current, requested)?;
+        }
+    }
+    append_profile_source_entries(
+        source,
+        "unsafe_macos_seatbelt_rules",
+        &existing.unsafe_macos_seatbelt_rules,
+        &patch.unsafe_macos_seatbelt_rules,
+    )?;
+
+    if let Some(patch_urls) = &patch.open_urls
+        && (patch_urls.allow_localhost || !patch_urls.allow_origins.is_empty())
+    {
+        // Unlike filesystem, open_urls accepts null as an absent configuration.
+        if source
+            .get("open_urls")
+            .is_some_and(serde_json::Value::is_null)
+        {
+            source.insert("open_urls".to_string(), serde_json::json!({}));
+        }
+        let urls = profile_source_section(source, "open_urls")?;
+        let current_origins = existing
+            .open_urls
+            .as_ref()
+            .map_or(&[][..], |urls| urls.allow_origins.as_slice());
+        append_profile_source_entries(
+            urls,
+            "allow_origins",
+            current_origins,
+            &patch_urls.allow_origins,
+        )?;
+        if patch_urls.allow_localhost {
+            urls.insert("allow_localhost".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+    Ok(())
+}
+
+fn profile_source_section<'a>(
+    source: &'a mut serde_json::Map<String, serde_json::Value>,
+    section: &str,
+) -> Result<&'a mut serde_json::Map<String, serde_json::Value>> {
+    source
+        .entry(section)
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| NonoError::ProfileParse(format!("{section} must be an object")))
+}
+
+fn append_profile_source_entries(
+    source: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    current: &[String],
+    requested: &[String],
+) -> Result<()> {
+    // Evaluate duplicates against the active projection, but never flatten its
+    // source entries. A conditional entry for another OS must not hide a grant.
+    let mut seen: std::collections::HashSet<_> = current.iter().collect();
+    let additions: Vec<_> = requested
+        .iter()
+        .filter(|entry| seen.insert(*entry))
+        .cloned()
+        .map(serde_json::Value::String)
+        .collect();
+    if additions.is_empty() {
+        return Ok(());
+    }
+    source
+        .entry(field)
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| NonoError::ProfileParse(format!("{field} must be an array")))?
+        .extend(additions);
+    Ok(())
 }
 
 fn read_input_line() -> Result<String> {
@@ -2633,6 +2766,326 @@ mod tests {
             denial_selector_visible_range(0, 0, DENIAL_SELECTOR_MAX_VISIBLE_ITEMS),
             (0, 0)
         );
+    }
+
+    fn write_existing_profile_patch(source: &str, patch: &profile::Profile) -> serde_json::Value {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+        let source_path = profile::get_user_profile_path("authored").expect("profile path");
+        std::fs::create_dir_all(source_path.parent().expect("profile dir")).expect("mkdir");
+        std::fs::write(&source_path, source).expect("write source");
+
+        let prepared = prepare_profile_save_from_patch(patch, "tool", "authored", None)
+            .expect("prepare profile save");
+        assert!(matches!(prepared.action, SaveAction::Updated));
+        write_profile(&prepared).expect("write profile");
+
+        let saved = std::fs::read(&source_path).expect("read saved profile");
+        profile::parse_profile_bytes(&saved).expect("saved profile remains valid");
+        serde_json::from_slice(&saved).expect("saved JSON")
+    }
+
+    #[test]
+    fn write_profile_preserves_authored_conditions_and_metadata() {
+        let source = serde_json::json!({
+            "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+            "meta": {"name": "authored", "version": "1.0", "description": null},
+            "extends": "default",
+            "groups": {"include": [
+                {"name": "go_runtime_macos", "when": "macos"},
+                {"name": "go_runtime_linux", "when": "linux"}
+            ]},
+            "filesystem": {
+                "read_file": [
+                    {"path": "~/macos.json", "when": "macos"},
+                    {"path": "~/linux.json", "when": "linux"}
+                ],
+                "deny": [{"path": "~/private", "when": "macos"}],
+                "bypass_protection": [{"path": "~/tool", "when": "linux"}]
+            },
+            "environment": null,
+            "allow_gpu": null,
+            "open_urls": {"allow_origins": [
+                {"origin": "https://macos.example.com", "when": "macos"},
+                {"origin": "https://linux.example.com", "when": "linux"}
+            ]},
+            "platform_overrides": {
+                "macos": {"filesystem": {"read": ["~/Library"]}},
+                "linux": {"filesystem": {"read": ["~/.local"]}}
+            }
+        });
+        let patch = profile::Profile {
+            filesystem: profile::FilesystemConfig {
+                read_file: vec!["~/new.json".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let saved = write_existing_profile_patch(&source.to_string(), &patch);
+        let mut expected = source;
+        expected["filesystem"]["read_file"] = serde_json::json!([
+            {"path": "~/macos.json", "when": "macos"},
+            {"path": "~/linux.json", "when": "linux"},
+            "~/new.json"
+        ]);
+        assert_eq!(saved, expected);
+    }
+
+    #[test]
+    fn write_profile_appends_supported_lists_without_changing_other_fields() {
+        for field in [
+            "allow",
+            "read",
+            "write",
+            "allow_file",
+            "read_file",
+            "write_file",
+            "bypass_protection",
+            "suppress_save_prompt",
+        ] {
+            let source = serde_json::json!({
+                "filesystem": {field: ["~/old"], "deny": ["~/private"]}
+            });
+            let patch: profile::Profile = serde_json::from_value(serde_json::json!({
+                "filesystem": {field: ["~/old", "~/new", "~/new"]}
+            }))
+            .expect("patch");
+            let saved = write_existing_profile_patch(&source.to_string(), &patch);
+            assert_eq!(
+                saved,
+                serde_json::json!({
+                    "filesystem": {field: ["~/old", "~/new"], "deny": ["~/private"]}
+                }),
+                "patch field: {field}"
+            );
+        }
+
+        let source = serde_json::json!({
+            "unsafe_macos_seatbelt_rules": ["(allow user-preference-read)"],
+            "allow_gpu": null
+        });
+        let patch = profile::Profile {
+            unsafe_macos_seatbelt_rules: vec![
+                "(allow user-preference-read)".to_string(),
+                "(allow user-preference-write)".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            write_existing_profile_patch(&source.to_string(), &patch),
+            serde_json::json!({
+                "unsafe_macos_seatbelt_rules": [
+                    "(allow user-preference-read)", "(allow user-preference-write)"
+                ],
+                "allow_gpu": null
+            })
+        );
+    }
+
+    #[test]
+    fn write_profile_patches_urls_without_materializing_unrelated_defaults() {
+        let patch = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: vec!["https://new.example.com".to_string()],
+                allow_localhost: false,
+            }),
+            ..Default::default()
+        };
+        for source in [
+            serde_json::json!({}),
+            serde_json::json!({"open_urls": null}),
+            serde_json::json!({"open_urls": {}}),
+        ] {
+            assert_eq!(
+                write_existing_profile_patch(&source.to_string(), &patch),
+                serde_json::json!({"open_urls": {
+                    "allow_origins": ["https://new.example.com"]
+                }})
+            );
+        }
+
+        let source = serde_json::json!({"open_urls": {
+            "allow_origins": ["https://old.example.com", "https://new.example.com"],
+            "allow_localhost": true
+        }});
+        assert_eq!(
+            write_existing_profile_patch(&source.to_string(), &patch),
+            source
+        );
+
+        let localhost_patch = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: Vec::new(),
+                allow_localhost: true,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            write_existing_profile_patch(
+                r#"{"open_urls":{"allow_localhost":false}}"#,
+                &localhost_patch
+            ),
+            serde_json::json!({"open_urls": {"allow_localhost": true}})
+        );
+
+        let empty_patch = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: Vec::new(),
+                allow_localhost: false,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            write_existing_profile_patch(r#"{"open_urls":null}"#, &empty_patch),
+            serde_json::json!({"open_urls": null})
+        );
+    }
+
+    #[test]
+    fn write_profile_deduplicates_against_active_conditions_only() {
+        let current = std::env::consts::OS;
+        let other = if current == "macos" { "linux" } else { "macos" };
+        let source = serde_json::json!({
+            "filesystem": {"read_file": [
+                {"path": "~/existing", "when": current},
+                {"path": "~/new", "when": other}
+            ]},
+            "open_urls": {"allow_origins": [
+                {"origin": "https://existing.example.com", "when": current},
+                {"origin": "https://new.example.com", "when": other}
+            ]}
+        });
+        let patch = profile::Profile {
+            filesystem: profile::FilesystemConfig {
+                read_file: vec!["~/existing".to_string(), "~/new".to_string()],
+                ..Default::default()
+            },
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: vec![
+                    "https://existing.example.com".to_string(),
+                    "https://new.example.com".to_string(),
+                ],
+                allow_localhost: false,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            write_existing_profile_patch(&source.to_string(), &patch),
+            serde_json::json!({
+                "filesystem": {"read_file": [
+                    {"path": "~/existing", "when": current},
+                    {"path": "~/new", "when": other},
+                    "~/new"
+                ]},
+                "open_urls": {"allow_origins": [
+                    {"origin": "https://existing.example.com", "when": current},
+                    {"origin": "https://new.example.com", "when": other},
+                    "https://new.example.com"
+                ]}
+            })
+        );
+    }
+
+    #[test]
+    fn write_profile_keeps_jsonc_data_and_untouched_nulls() {
+        let source = r#"{
+            // Editor metadata belongs to the authored profile.
+            "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+            "environment": null,
+            "open_urls": null,
+        }"#;
+        let patch = profile::Profile {
+            filesystem: profile::FilesystemConfig {
+                suppress_save_prompt: vec!["~/noisy".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            write_existing_profile_patch(source, &patch),
+            serde_json::json!({
+                "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+                "environment": null,
+                "open_urls": null,
+                "filesystem": {"suppress_save_prompt": ["~/noisy"]}
+            })
+        );
+    }
+
+    #[test]
+    fn write_profile_rejects_invalid_source_without_modifying_it() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            temp_config.path().to_str().expect("config path"),
+        )]);
+        let source_path = profile::get_user_profile_path("invalid").expect("profile path");
+        std::fs::create_dir_all(source_path.parent().expect("profile dir")).expect("mkdir");
+        let patch = profile::Profile {
+            filesystem: profile::FilesystemConfig {
+                read_file: vec!["~/new.json".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for source in [
+            "{",
+            r#"{"unknown":true}"#,
+            r#"{"filesystem":{"read_file":null}}"#,
+            r#"{"command_policies":null}"#,
+            r#"{"filesystem":{"read":[{"path":"~/a","when":"macos:26:extra"}]}}"#,
+            r#"{"network":{"custom_credentials":{"example":{
+                "upstream":"https://api.example.com",
+                "credential_key":"invalid-key",
+                "env_var":"EXAMPLE_TOKEN"
+            }}}}"#,
+        ] {
+            std::fs::write(&source_path, source).expect("write invalid source");
+            assert!(
+                prepare_profile_save_from_patch(&patch, "tool", "invalid", None).is_err(),
+                "invalid source should be rejected: {source}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&source_path).expect("read source"),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn write_profile_creates_a_loadable_profile_with_the_selected_base() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            temp_config.path().to_str().expect("config path"),
+        )]);
+        let patch = profile::Profile {
+            filesystem: profile::FilesystemConfig {
+                read_file: vec!["~/new.json".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let prepared =
+            prepare_profile_save_from_patch(&patch, "tool", "new-profile", Some("default"))
+                .expect("prepare new profile");
+        assert!(matches!(prepared.action, SaveAction::Created));
+        write_profile(&prepared).expect("write new profile");
+        let saved = std::fs::read(&prepared.profile_path).expect("read profile");
+        let loaded = profile::parse_profile_bytes(&saved).expect("load profile");
+        assert_eq!(loaded.meta.name, "new-profile");
+        assert_eq!(loaded.extends, Some(vec!["default".to_string()]));
+        assert_eq!(loaded.filesystem.read_file, ["~/new.json"]);
     }
 
     #[test]

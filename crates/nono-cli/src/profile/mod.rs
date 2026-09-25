@@ -3188,19 +3188,6 @@ fn load_profile_from_path_impl(path: &Path, cli_extends: &[String]) -> Result<Pr
     finalize_profile(load_from_file(path, cli_extends)?)
 }
 
-/// Load a raw profile from a direct file path without resolving inheritance.
-pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
-    if !path.exists() {
-        return Err(NonoError::ProfileRead {
-            path: path.to_path_buf(),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "profile file not found"),
-        });
-    }
-
-    tracing::info!("Loading raw profile from path: {}", path.display());
-    parse_profile_file(path)
-}
-
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
 #[allow(deprecated)]
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {

@@ -1,8 +1,5 @@
 use crate::command_policy::{CommandSandboxConfig, ResolvedCommandBinary};
-use crate::tool_sandbox::protocol::{
-    TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_SHIM_DIR_ENV, TOOL_SANDBOX_SOCKET_ENV,
-    TOOL_SANDBOX_URL_SOCKET_ENV, ToolSandboxShimRequest,
-};
+use crate::tool_sandbox::protocol::ToolSandboxShimRequest;
 use nono::{NonoError, Result};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -189,33 +186,9 @@ pub(crate) fn override_proxy_env(env: &mut Vec<Vec<u8>>, vars: &[(String, String
     }
 }
 
-pub(crate) fn inject_chaining_control_env(
-    env: &mut Vec<Vec<u8>>,
-    socket_path: &Path,
-    shim_dir: &Path,
-) {
-    let socket_prefix = format!("{TOOL_SANDBOX_SOCKET_ENV}=");
-    let shim_dir_prefix = format!("{TOOL_SANDBOX_SHIM_DIR_ENV}=");
-    let launch_spec_prefix = format!("{TOOL_SANDBOX_LAUNCH_SPEC_ENV}=");
-    env.retain(|entry| {
-        !entry.starts_with(socket_prefix.as_bytes())
-            && !entry.starts_with(shim_dir_prefix.as_bytes())
-            && !entry.starts_with(launch_spec_prefix.as_bytes())
-    });
-    env.push(format!("{TOOL_SANDBOX_SOCKET_ENV}={}", socket_path.display()).into_bytes());
-    env.push(format!("{TOOL_SANDBOX_SHIM_DIR_ENV}={}", shim_dir.display()).into_bytes());
-}
-
-/// Inject the URL-open socket env var and `BROWSER` for a brokered child whose
-/// command declares `open_urls` or `allow_launch_services`.
-///
-/// Both vars are stripped first (a child cannot smuggle its own) then set to
-/// the runtime's URL socket and the open shim path. Needed for
-/// `allow_launch_services` too: the shim only recognizes itself as the
-/// URL-open relay when this env var is present, and a bare `open` in the
-/// child's $PATH always resolves to the shim, never straight to
-/// `/usr/bin/open`, once any command in the profile needs the shim. No-op
-/// when URL opening is not enabled for this command.
+/// Point `BROWSER` at the session's open shim for a child whose policy allows
+/// URL opening. The shim discovers the URL socket from its executable path;
+/// the broker resolves the caller and enforces its URL policy on each request.
 pub(crate) fn inject_url_open_env(
     env: &mut Vec<Vec<u8>>,
     policy: &CommandSandboxConfig,
@@ -225,15 +198,9 @@ pub(crate) fn inject_url_open_env(
     if policy.open_urls.is_none() && !policy.allow_launch_services {
         return;
     }
-    let (Some(url_socket_path), Some(shim_path)) = (url_socket_path, url_open_shim_path) else {
+    let (Some(_), Some(shim_path)) = (url_socket_path, url_open_shim_path) else {
         return;
     };
-
-    let socket_prefix = format!("{TOOL_SANDBOX_URL_SOCKET_ENV}=").into_bytes();
-    env.retain(|entry| !entry.starts_with(&socket_prefix));
-    let mut socket_entry = socket_prefix;
-    socket_entry.extend_from_slice(url_socket_path.as_os_str().as_bytes());
-    env.push(socket_entry);
 
     // Point BROWSER at the open shim so libraries that honour it route through
     // the runtime instead of attempting a (denied) direct browser launch.
@@ -849,12 +816,7 @@ mod tests {
             Some(Path::new("/tmp/shims/open")),
         );
 
-        let socket_prefix = format!("{TOOL_SANDBOX_URL_SOCKET_ENV}=").into_bytes();
-        assert!(
-            env.iter().any(|e| e.starts_with(&socket_prefix)),
-            "allow_launch_services must get the URL socket env var, since the shim only \
-             recognizes itself as the URL-open relay when it's present"
-        );
+        assert!(env.iter().all(|entry| !entry.starts_with(b"NONO_")));
         assert!(
             env.iter().any(|e| e.starts_with(b"BROWSER=")),
             "allow_launch_services must get BROWSER pointed at the shim too"

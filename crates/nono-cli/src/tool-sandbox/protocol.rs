@@ -6,12 +6,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-pub(crate) const TOOL_SANDBOX_SOCKET_ENV: &str = "NONO_TOOL_SANDBOX_SOCKET";
-pub(crate) const TOOL_SANDBOX_SHIM_DIR_ENV: &str = "NONO_TOOL_SANDBOX_SHIM_DIR";
 pub(crate) const TOOL_SANDBOX_LAUNCH_SPEC_ENV: &str = "NONO_TOOL_SANDBOX_LAUNCH_SPEC";
-/// Path to the runtime's dedicated URL-open listener socket. Injected into the
-/// brokered child so the open-url helper can reach the unsandboxed runtime.
-pub(crate) const TOOL_SANDBOX_URL_SOCKET_ENV: &str = "NONO_TOOL_SANDBOX_URL_SOCKET";
 
 /// Read/write timeout the runtime applies to an accepted URL-open connection so
 /// a slow or idle client cannot stall the handler (and, on Linux, the

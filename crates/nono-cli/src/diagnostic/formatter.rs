@@ -4191,9 +4191,12 @@ mod tests {
 
     #[test]
     fn test_supervised_rate_limited_denial() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tempdir should be created");
+        let denied_path = dir.path().join("flood");
         let caps = make_test_caps();
         let denials = vec![DenialRecord {
-            path: PathBuf::from("/tmp/flood"),
+            path: denied_path.clone(),
             access: AccessMode::Read,
             reason: DenialReason::RateLimited,
         }];
@@ -4203,11 +4206,11 @@ mod tests {
         let output = format_footer_with_session_report(formatter, 1);
 
         assert!(output.contains("Sandbox denial: 1 path blocked."));
-        assert!(output.contains("/tmp/flood (read)"));
+        assert!(output.contains(&format!("{} (read)", denied_path.display())));
         // Rate-limited denials are still actionable via a path flag. The
-        // suggested target falls back to the nearest existing parent since
-        // /tmp/flood itself doesn't exist.
-        assert!(output.contains("Fix flags: --read "));
+        // missing file falls back to its isolated parent, rather than /tmp
+        // which may contain protected state during other tests.
+        assert!(output.contains(&format!("Fix flags: --read {}", dir.path().display())));
         assert!(!output.contains("[permanently restricted]"));
     }
 

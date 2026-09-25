@@ -13,19 +13,19 @@ use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
     apply_environment_set_vars, apply_export_env, default_env_allow_patterns,
-    effective_argv_for_binary, env_shebang_target_interpreter, inject_chaining_control_env,
-    inject_url_open_env, split_env_entry,
+    effective_argv_for_binary, env_shebang_target_interpreter, inject_url_open_env,
+    split_env_entry,
 };
 use crate::tool_sandbox::launch::{
     exit_status_code, prepare_launcher_command, remove_launch_spec, write_launch_spec,
 };
 use crate::tool_sandbox::protocol::{
     ChildCapsSpec, FsGrantSpec, StdioFds, StdioLimitActionSpec, StdioLimitSpec,
-    StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_SHIM_DIR_ENV,
-    TOOL_SANDBOX_SOCKET_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT, ToolSandboxChildLaunchSpec,
-    ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse, ToolSandboxShimRequest,
-    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_frame_ack, recv_stdio_fds,
-    send_frame_ack, send_stdio_fds, validate_ipc_request, write_frame, write_response,
+    StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT,
+    ToolSandboxChildLaunchSpec, ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse,
+    ToolSandboxShimRequest, ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame,
+    recv_frame_ack, recv_stdio_fds, send_frame_ack, send_stdio_fds, validate_ipc_request,
+    write_frame, write_response,
 };
 use landlock::{
     AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -447,17 +447,7 @@ impl PreparedToolSandboxRuntime {
     }
 
     pub(crate) fn env_overrides(&self) -> Vec<(String, String)> {
-        vec![
-            ("PATH".to_string(), self.inner.session_path.clone()),
-            (
-                TOOL_SANDBOX_SOCKET_ENV.to_string(),
-                self.inner.socket_path.display().to_string(),
-            ),
-            (
-                TOOL_SANDBOX_SHIM_DIR_ENV.to_string(),
-                self.inner.shim_dir.display().to_string(),
-            ),
-        ]
+        vec![("PATH".to_string(), self.inner.session_path.clone())]
     }
 
     pub(crate) fn broker_secret_env_vars(
@@ -723,60 +713,26 @@ pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
         return true;
     }
 
-    // The browser-open shim is also a copy of the nono binary; detect it before
-    // the generic shim path since it does not use the shim handshake socket.
-    if crate::tool_sandbox::url_shim::current_exe_is_url_open_shim() {
-        exit_from_result(crate::tool_sandbox::url_shim::run_url_open_shim());
-        return true;
-    }
-
-    if std::env::var_os(TOOL_SANDBOX_SOCKET_ENV).is_some()
-        && std::env::var_os(TOOL_SANDBOX_SHIM_DIR_ENV).is_some()
-        && current_exe_is_tool_sandbox_shim()
-    {
-        exit_from_result(run_shim());
-        return true;
-    }
-
-    // A shim copy with a missing/invalid handshake must not fall through to
-    // Cli::parse(), which would parse its argv as top-level nono subcommands
-    // (ps, stop, rollback, ...) against unrelated sessions.
-    if current_exe_is_tool_sandbox_shim_copy_by_path() {
-        exit_from_result(Err(NonoError::SandboxInit(
-            "running as a command-mediation shim copy but the broker handshake \
-             (NONO_TOOL_SANDBOX_SOCKET / NONO_TOOL_SANDBOX_SHIM_DIR) is missing \
-             or invalid; refusing rather than falling back to the nono CLI"
-                .to_string(),
-        )));
-        return true;
-    }
-
-    false
-}
-
-/// Identity check independent of [`TOOL_SANDBOX_SHIM_DIR_ENV`]; used only to
-/// refuse execution, never to grant broker access.
-fn current_exe_is_tool_sandbox_shim_copy_by_path() -> bool {
-    std::env::current_exe()
-        .map(|exe| path_has_tool_sandbox_shim_shape(&exe))
-        .unwrap_or(false)
-}
-
-fn path_has_tool_sandbox_shim_shape(exe: &Path) -> bool {
-    let Some(shims_dir) = exe.parent() else {
-        return false;
+    let shim = match crate::tool_sandbox::shim::Shim::current() {
+        Ok(Some(shim)) => shim,
+        Ok(None) => return false,
+        Err(err) => {
+            exit_from_result(Err(err));
+            return true;
+        }
     };
-    if shims_dir.file_name().and_then(OsStr::to_str) != Some("shims") {
-        return false;
+    // A recognized shim always exits through its broker flow, including when
+    // the socket is missing or the broker rejects it. Never parse shim argv as
+    // top-level nono subcommands (ps, stop, rollback, ...).
+    let socket_path = shim.socket_path();
+    if shim.is_url_open() {
+        exit_from_result(crate::tool_sandbox::url_shim::run_url_open_shim(
+            &socket_path,
+        ));
+    } else {
+        exit_from_result(run_shim(&shim.exe, &socket_path));
     }
-    let Some(runtime_dir_name) = shims_dir
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(OsStr::to_str)
-    else {
-        return false;
-    };
-    runtime_dir_name.starts_with("nono-tool-sandbox-")
+    true
 }
 
 fn exit_from_result(result: Result<()>) {
@@ -816,29 +772,9 @@ fn log_cross_process_shim_startup() {
     );
 }
 
-fn current_exe_is_tool_sandbox_shim() -> bool {
-    let Some(shim_dir) = std::env::var_os(TOOL_SANDBOX_SHIM_DIR_ENV).map(PathBuf::from) else {
-        return false;
-    };
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    exe.starts_with(shim_dir)
-}
-
-fn run_shim() -> Result<()> {
+fn run_shim(shim_exe: &Path, socket_path: &Path) -> Result<()> {
     let start_shim = std::time::Instant::now();
     log_cross_process_shim_startup();
-    let socket_path = std::env::var_os(TOOL_SANDBOX_SOCKET_ENV)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            NonoError::SandboxInit("command-mediation shim socket env missing".to_string())
-        })?;
-    let shim_exe = std::env::current_exe().map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "command-mediation shim failed to locate current executable: {err}"
-        ))
-    })?;
     let command = shim_exe
         .file_name()
         .map(OsStr::to_os_string)
@@ -890,7 +826,7 @@ fn run_shim() -> Result<()> {
     validate_ipc_request(&request)?;
 
     let start_connect = std::time::Instant::now();
-    let mut stream = UnixStream::connect(&socket_path).map_err(|err| {
+    let mut stream = UnixStream::connect(socket_path).map_err(|err| {
         NonoError::SandboxInit(format!(
             "command-mediation shim failed to connect to {}: {err}",
             socket_path.display()
@@ -898,7 +834,7 @@ fn run_shim() -> Result<()> {
     })?;
     tool_sandbox_profile_log!("shim:socket_connect: {:?}", start_connect.elapsed());
     let start_send = std::time::Instant::now();
-    send_shim_identity_fd(&stream, &shim_exe)?;
+    send_shim_identity_fd(&stream, shim_exe)?;
     write_frame(&mut stream, &request)?;
     recv_frame_ack(&mut stream)?;
     send_stdio_fds(&stream)?;
@@ -4523,7 +4459,7 @@ fn filter_child_env(
         }
     }
     drop(broker);
-    // Runs before PATH/chaining/set_vars/creds so nono-injected vars still win.
+    // Runs before PATH/set_vars/creds so nono-injected vars still win.
     apply_export_env(
         &mut env,
         request,
@@ -4535,7 +4471,6 @@ fn filter_child_env(
         env.retain(|entry| !entry.starts_with(b"PATH="));
         env.push(format!("PATH={}", state.session_path).into_bytes());
     }
-    inject_chaining_control_env(&mut env, &state.socket_path, &state.shim_dir);
     inject_url_open_env(
         &mut env,
         policy,
@@ -6032,35 +5967,6 @@ mod tests {
         ResolvedExecutableKind, ResolvedExecutableShape,
     };
 
-    #[test]
-    fn shim_shape_matches_materialised_shim_copy() {
-        assert!(path_has_tool_sandbox_shim_shape(Path::new(
-            "/tmp/nono-tool-sandbox-abc123/shims/git"
-        )));
-    }
-
-    #[test]
-    fn shim_shape_rejects_wrong_parent_dir_name() {
-        // Not inside a `shims/` directory at all.
-        assert!(!path_has_tool_sandbox_shim_shape(Path::new(
-            "/tmp/nono-tool-sandbox-abc123/git"
-        )));
-    }
-
-    #[test]
-    fn shim_shape_rejects_wrong_grandparent_prefix() {
-        // `shims/` exists, but its parent isn't a `nono-tool-sandbox-*` dir.
-        assert!(!path_has_tool_sandbox_shim_shape(Path::new(
-            "/tmp/some-other-dir/shims/git"
-        )));
-    }
-
-    #[test]
-    fn shim_shape_rejects_arbitrary_copy() {
-        assert!(!path_has_tool_sandbox_shim_shape(Path::new(
-            "/tmp/notshim/git"
-        )));
-    }
     use std::collections::BTreeMap;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;

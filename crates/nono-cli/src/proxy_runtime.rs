@@ -2026,6 +2026,12 @@ fn load_command_credential_source(
         command,
         outer_caps,
     );
+    if safe_path.is_empty() {
+        return Err(NonoError::SandboxInit(format!(
+            "cannot resolve supervisor credential source '{command}': \
+             no remaining PATH entry is safe for this sandbox"
+        )));
+    }
     let mut child = Command::new(command)
         .args(args)
         .env("PATH", &safe_path)

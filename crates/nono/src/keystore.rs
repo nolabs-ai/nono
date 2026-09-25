@@ -1157,7 +1157,7 @@ fn load_single_secret(_service: &str, account: &str) -> Result<Zeroizing<String>
 /// Build a `Command` for a bare-name host-side broker binary (`op`, `bw`,
 /// `security`), with PATH stripped of any sandbox-writable directory when
 /// `outer_caps` is provided. See [`load_secret_by_ref`] for why this matters.
-fn broker_command(program: &str, outer_caps: Option<&CapabilitySet>) -> Command {
+fn broker_command(program: &str, outer_caps: Option<&CapabilitySet>) -> Result<Command> {
     broker_command_with_path(program, &broker_ambient_path(), outer_caps)
 }
 
@@ -1180,11 +1180,16 @@ fn broker_command_with_path(
     program: &str,
     ambient_path: &str,
     outer_caps: Option<&CapabilitySet>,
-) -> Command {
+) -> Result<Command> {
     let mut command = Command::new(program);
     if let Some(caps) = outer_caps {
         let safe_path =
             crate::broker_path::sanitize_broker_path_for_binary(ambient_path, program, caps);
+        if safe_path.is_empty() {
+            return Err(NonoError::KeystoreAccess(format!(
+                "cannot resolve '{program}': no remaining PATH entry is safe for this sandbox"
+            )));
+        }
         command.env("PATH", safe_path);
     }
     // When a test has installed a thread-local PATH, apply it even if
@@ -1195,7 +1200,7 @@ fn broker_command_with_path(
     if outer_caps.is_none() && TEST_BROKER_PATH.with(|slot| slot.borrow().is_some()) {
         command.env("PATH", ambient_path);
     }
-    command
+    Ok(command)
 }
 
 #[cfg(test)]
@@ -1247,7 +1252,7 @@ fn load_from_op(uri: &str, outer_caps: Option<&CapabilitySet>) -> Result<Zeroizi
 
     tracing::debug!("Loading secret from 1Password: {}", redact_op_uri(uri));
 
-    let mut child = broker_command("op", outer_caps)
+    let mut child = broker_command("op", outer_caps)?
         .args(["read", "--", uri])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1333,7 +1338,7 @@ fn load_from_bw(uri: &str, outer_caps: Option<&CapabilitySet>) -> Result<Zeroizi
     } else {
         "password"
     };
-    let mut child = broker_command("bw", outer_caps)
+    let mut child = broker_command("bw", outer_caps)?
         .args(["get", bw_object, "--", item_id])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1512,7 +1517,7 @@ fn load_from_apple_password(
             redact_apple_password_uri(uri)
         );
 
-        let mut child = broker_command("security", outer_caps)
+        let mut child = broker_command("security", outer_caps)?
             .args(["find-internet-password", "-s", server, "-a", account, "-w"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2176,6 +2181,7 @@ mod tests {
 
         let ambient_path = format!("{}:{}", writable_bin.display(), real_bin.display());
         let status = broker_command_with_path("op", &ambient_path, Some(&caps))
+            .expect("sanitized PATH still has a safe directory")
             .status()
             .expect("spawn op via sanitized PATH");
         assert!(status.success());
@@ -2187,6 +2193,38 @@ mod tests {
         assert!(
             real_marker.exists(),
             "real binary on the non-writable directory should have run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_command_errors_when_sanitized_path_is_empty() {
+        use crate::capability::{AccessMode, CapabilitySource, FsCapability};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_bin = root.path().join("bin");
+        std::fs::create_dir_all(&writable_bin).expect("mkdir");
+        let cwd_op = root.path().join("op");
+        std::fs::write(&cwd_op, "#!/bin/sh\nexit 0\n").expect("write cwd op");
+        let mut perms = std::fs::metadata(&cwd_op).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&cwd_op, perms).expect("chmod");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_bin.clone(),
+            resolved: crate::path::try_canonicalize(&writable_bin),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let err = broker_command_with_path("op", &writable_bin.display().to_string(), Some(&caps))
+            .expect_err("empty sanitized PATH must not spawn");
+        assert!(
+            err.to_string().contains("no remaining PATH entry is safe"),
+            "unexpected error: {err}"
         );
     }
 

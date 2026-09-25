@@ -91,7 +91,7 @@ pub enum AuditEventPayload {
         /// Sandbox runtime event emitted when execution starts.
         event: SandboxRuntimeAuditEvent,
     },
-    /// Tool sandbox command policy decision.
+    /// Command policy decision.
     CommandPolicy {
         /// Command policy decision event.
         event: Box<CommandPolicyAuditEvent>,
@@ -111,11 +111,11 @@ pub struct SandboxRuntimeAuditEvent {
     /// Whether Landlock execute restrictions were enforced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landlock_execute_enforced: Option<bool>,
-    /// Whether tool sandbox command mediation was active.
+    /// Whether command mediation was active.
     pub tool_sandbox_active: bool,
 }
 
-/// Tool sandbox command policy decision captured in the audit log.
+/// Command policy decision captured in the audit log.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CommandPolicyAuditEvent {
     /// RFC3339 timestamp.
@@ -501,7 +501,7 @@ impl AuditRecorder {
         Ok(())
     }
 
-    /// Record a tool sandbox command policy decision.
+    /// Record a command-policy decision.
     ///
     /// `outcome` is how the event's `decision` folds into the session rollup;
     /// the caller owns that vocabulary and so owns the classification.

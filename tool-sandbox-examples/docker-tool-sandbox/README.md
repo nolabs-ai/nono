@@ -1,4 +1,4 @@
-# Docker tool-sandbox prototype
+# Docker command-policy prototype
 
 This example puts two boundaries around a small command-line tool:
 
@@ -41,7 +41,7 @@ Every docker command uses the `--cap-drop=ALL` and `--security-opt=no-new-privil
 
 ## Scripted walkthrough
 
-If you prefer to run a single scripted walkthrough of the tool sandbox, you can use the `demonator` tool instead.
+If you prefer to run a single scripted walkthrough of command mediation, you can use the `demonator` tool instead.
 
 Install `demonator` with `cargo install demonator`, then run from this
 directory:
@@ -139,8 +139,8 @@ docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true \
 ```
 
 The first request is allowed. The POST is denied by method policy, the
-`/private` request by path policy, and `example.org` by domain policy. A command
-such as `cat /work/secret.txt` is denied by its tool-specific filesystem policy.
+`/private` request by endpoint policy, and `example.org` by proxy domain rules. A command
+such as `cat /work/secret.txt` is denied by the command sandbox's filesystem policy.
 
 The `curl` command sandbox explicitly receives nono's local proxy environment
 and generated interception CA variables (`HTTPS_PROXY`, `SSL_CERT_FILE`, and
@@ -148,8 +148,8 @@ related variables). This is what lets the allowed HTTPS request work inside the
 container while keeping the domain and endpoint rules enforced by nono.
 
 The important distinction is that the container is the coarse outer boundary,
-while nono expresses the tool-specific policy: exact executable, allowed
-arguments, filesystem capabilities, and domain/endpoint network policy.
+while nono expresses the command policy: exact executable, allowed arguments,
+filesystem policy, and proxy domain and endpoint rules.
 
 ## Security notes
 
@@ -161,6 +161,6 @@ arguments, filesystem capabilities, and domain/endpoint network policy.
   fixtures owned by `root:root`; only `/work/output` is writable by `nono`.
 - The profile intentionally grants only the one input file and one output
   directory. If you change the tool or image layout, update both the outer
-  filesystem grants and the nested command sandbox grants.
+  filesystem grants and the nested command sandbox policy.
 - Inspect the profile before adapting it to real tools. Never add real
   credentials or broad host mounts to this demo.

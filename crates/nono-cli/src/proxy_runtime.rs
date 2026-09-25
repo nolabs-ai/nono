@@ -1836,7 +1836,7 @@ fn collect_tool_sandbox_proxy_grants(
             .is_some_and(|credential| credential.credential_type == CommandCredentialType::Proxy)
         {
             return Err(NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{name}' must be granted with sandbox.credentials and endpoint_policy"
+                "command sandbox proxy credential '{name}' must be granted with sandbox.credentials and endpoint_policy"
             )));
         }
     }
@@ -1850,7 +1850,7 @@ fn collect_tool_sandbox_proxy_grants(
                 credential.credential_type == CommandCredentialType::Proxy
             }) {
                 return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox proxy credential '{name}' must include endpoint_policy"
+                    "command sandbox proxy credential '{name}' must include endpoint_policy"
                 )));
             }
             continue;
@@ -1863,7 +1863,7 @@ fn collect_tool_sandbox_proxy_grants(
         }
         let endpoint_policy = grant.endpoint_policy.as_ref().ok_or_else(|| {
             NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{}' requires endpoint_policy",
+                "command sandbox proxy credential '{}' requires endpoint_policy",
                 grant.name
             ))
         })?;
@@ -1871,26 +1871,26 @@ fn collect_tool_sandbox_proxy_grants(
         let endpoint_policy = endpoint_policy_to_proxy_policy(config, endpoint_policy);
         let upstream = credential.upstream.clone().ok_or_else(|| {
             NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{}' missing upstream",
+                "command sandbox proxy credential '{}' missing upstream",
                 grant.name
             ))
         })?;
         let env_var = credential.env_var.clone().ok_or_else(|| {
             NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{}' missing env_var",
+                "command sandbox proxy credential '{}' missing env_var",
                 grant.name
             ))
         })?;
         nono::validate_destination_env_var(&env_var).map_err(|err| {
             NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{}' has invalid env_var: {err}",
+                "command sandbox proxy credential '{}' has invalid env_var: {err}",
                 grant.name
             ))
         })?;
         if let Some(base_url_env_var) = &credential.base_url_env_var {
             nono::validate_destination_env_var(base_url_env_var).map_err(|err| {
                 NonoError::ConfigParse(format!(
-                    "tool-sandbox proxy credential '{}' has invalid base_url_env_var: {err}",
+                    "command sandbox proxy credential '{}' has invalid base_url_env_var: {err}",
                     grant.name
                 ))
             })?;
@@ -1952,14 +1952,14 @@ fn collect_tool_sandbox_proxy_grants(
         if let Some(existing) = custom_credentials.get(&grant.name) {
             if existing != &route {
                 return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox proxy credential '{}' has conflicting endpoint policies across command grants",
+                    "command sandbox proxy credential '{}' has conflicting endpoint policies across command grants",
                     grant.name
                 )));
             }
         } else {
             if credentials.iter().any(|name| name == &grant.name) {
                 return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox proxy credential '{}' collides with an existing proxy credential route",
+                    "command sandbox proxy credential '{}' collides with an existing proxy credential route",
                     grant.name
                 )));
             }
@@ -2204,12 +2204,12 @@ fn validate_endpoint_approval_backend(
         .or(config.approval_defaults.backend.as_deref())
         .ok_or_else(|| {
             NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{credential_name}' endpoint_policy approve route requires an approval backend"
+                "command sandbox proxy credential '{credential_name}' endpoint_policy approve route requires an approval backend"
             ))
         })?;
     if !config.approval_backends.contains_key(backend_name) {
         return Err(NonoError::ConfigParse(format!(
-            "tool-sandbox proxy credential '{credential_name}' endpoint_policy references unknown approval backend '{backend_name}'"
+            "command sandbox proxy credential '{credential_name}' endpoint_policy references unknown approval backend '{backend_name}'"
         )));
     };
     Ok(())
@@ -3432,12 +3432,12 @@ fn tool_sandbox_proxy_credential_env_vars(
         .find(|route| route.prefix.trim_matches('/') == prefix)
         .ok_or_else(|| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox proxy credential '{credential_name}' did not produce a proxy route"
+                "command sandbox proxy credential '{credential_name}' did not produce a proxy route"
             ))
         })?;
     let env_var = route.env_var.as_ref().ok_or_else(|| {
         NonoError::ConfigParse(format!(
-            "tool-sandbox proxy credential '{credential_name}' missing env_var"
+            "command sandbox proxy credential '{credential_name}' missing env_var"
         ))
     })?;
     let token_value = credential_env_vars
@@ -3446,7 +3446,7 @@ fn tool_sandbox_proxy_credential_env_vars(
         .map(|(_, value)| value.clone())
         .ok_or_else(|| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox proxy credential '{credential_name}' is unavailable to the proxy"
+                "command sandbox proxy credential '{credential_name}' is unavailable to the proxy"
             ))
         })?;
 
@@ -5303,7 +5303,7 @@ mod tests {
         );
     }
 
-    /// Live regression test for the tool-sandbox-proxy-credential variant of
+    /// Live regression test for the command-sandbox proxy-credential variant of
     /// `load_command_credential_source` (this file has its own copy,
     /// separate from `tool_sandbox::policy`'s). Same bare-name-resolution
     /// broker as the other copy — a trojan on a sandbox-writable PATH dir

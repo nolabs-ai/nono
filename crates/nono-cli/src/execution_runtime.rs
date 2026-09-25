@@ -378,7 +378,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let strategy = flags.strategy;
     if tool_sandbox_active && !matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
         return Err(NonoError::ConfigParse(
-            "tool-sandbox command_policies require supervised execution".to_string(),
+            "command policies require supervised execution".to_string(),
         ));
     }
 
@@ -766,7 +766,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             // Look up the approval backend for supervised file/capability
             // prompts. It lives under the profile `security` section, kept
             // separate from `command_policies` so it does not switch on
-            // tool-sandbox. Fail closed: if a backend is configured but cannot
+            // command mediation. Fail closed: if a backend is configured but cannot
             // be built or picked, error out — never quietly drop back to the
             // terminal prompt. Nothing configured returns `None`, keeping the
             // prompt.
@@ -839,7 +839,7 @@ fn validate_command_policy_execution_support() -> Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(NonoError::UnsupportedPlatform(
-            "tool-sandbox command_policies are only supported on Linux and macOS".to_string(),
+            "command policies are only supported on Linux and macOS".to_string(),
         ))
     }
 }

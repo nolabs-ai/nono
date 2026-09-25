@@ -1,4 +1,4 @@
-//! Child-side URL-open helper for brokered tool-sandbox commands.
+//! Command-sandbox URL-open helper for brokered commands.
 //!
 //! A brokered child (e.g. `gk`) runs under a tight `process-exec` allowlist and
 //! cannot launch `/usr/bin/open`, `xdg-open`, or a shell. To open a browser for
@@ -35,7 +35,7 @@ pub(crate) fn run_url_open_shim(socket_path: &Path) -> Result<()> {
         .find(|arg| arg.starts_with("http://") || arg.starts_with("https://"))
         .ok_or_else(|| {
             NonoError::SandboxInit(
-                "tool-sandbox URL-open shim: no http(s) URL argument found".to_string(),
+                "command-mediation URL-open shim: no http(s) URL argument found".to_string(),
             )
         })?;
 
@@ -48,7 +48,7 @@ pub(crate) fn run_url_open_shim(socket_path: &Path) -> Result<()> {
 
     let mut stream = UnixStream::connect(socket_path).map_err(|err| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox URL-open shim failed to connect to {}: {err}",
+            "command-mediation URL-open shim failed to connect to {}: {err}",
             socket_path.display()
         ))
     })?;
@@ -56,7 +56,7 @@ pub(crate) fn run_url_open_shim(socket_path: &Path) -> Result<()> {
         .set_read_timeout(Some(std::time::Duration::from_secs(120)))
         .map_err(|err| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox URL-open shim set_read_timeout: {err}"
+                "command-mediation URL-open shim set_read_timeout: {err}"
             ))
         })?;
 
@@ -70,7 +70,7 @@ pub(crate) fn run_url_open_shim(socket_path: &Path) -> Result<()> {
             .error
             .unwrap_or_else(|| "unknown error".to_string());
         Err(NonoError::SandboxInit(format!(
-            "tool-sandbox denied opening URL: {reason}"
+            "command policy denied opening URL: {reason}"
         )))
     }
 }

@@ -146,7 +146,7 @@ pub struct InterceptCtx<'a> {
     pub upstream_proxy: Option<InterceptUpstreamProxy<'a>>,
     pub approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     pub credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
-    /// Optional nonce resolver for substituting tool-sandbox broker nonces
+    /// Optional nonce resolver for substituting command-mediation broker nonces
     /// (`nono_<hex>`) found in request header values before forwarding upstream.
     pub nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
     pub enable_h2: bool,

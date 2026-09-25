@@ -65,7 +65,7 @@ impl ApprovalBackend for TerminalApproval {
                 reason,
                 ..
             } => {
-                eprintln!("[nono] tool-sandbox command launch requires approval:");
+                eprintln!("[nono] command-policy launch requires approval:");
                 eprintln!("[nono]   Command: {}", sanitize_for_terminal(command));
                 let display_args: Vec<String> = args
                     .iter()
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn sanitize_caller_strips_control_chars() {
-        // Caller name from tool-sandbox IPC — must not contain control characters
+        // Caller name from command-mediation IPC — must not contain control characters
         let malicious_caller = "session\x01\x02\x03injected";
         let sanitized = sanitize_for_terminal(malicious_caller);
         assert!(!sanitized.chars().any(|c| c.is_control()));

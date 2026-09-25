@@ -283,7 +283,7 @@ The examples above assume the sandboxed agent itself performs the login, using
 the top-level `network.open_port` grant for its loopback callback listener. If
 instead the login CLI runs as a mediated command (declared in
 `command_policies`), it must be granted its callback port on that command's
-network policy — the top-level grant does not extend to a tool-sandbox child:
+network policy — the session sandbox's grant does not extend to a command sandbox:
 
 ```json
 "network": {
@@ -294,7 +294,7 @@ network policy — the top-level grant does not extend to a tool-sandbox child:
 
 `vault login -method=oidc` binds `http://localhost:8250/oidc/callback` (and
 increments if busy). Use `open_port` / `open_port_range` rather than
-`tcp_bind_ports`, which cannot be enforced for tool-sandbox children on macOS.
+`tcp_bind_ports`, which cannot be enforced for command sandboxes on macOS.
 
 ## Add endpoint policy
 

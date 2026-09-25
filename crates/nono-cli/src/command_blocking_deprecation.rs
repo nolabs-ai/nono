@@ -9,12 +9,12 @@ use nono::manifest::CapabilityManifest;
 use std::path::Path;
 
 const DEPRECATION_SUMMARY: &str = "deprecated in v0.33.0: startup-only command gating, not kernel-enforced. \
-     Child processes can bypass it. Prefer resource-based controls such as \
+     Child processes can bypass it. Prefer filesystem, network, and command policies such as \
      add_deny_access, narrower filesystem grants, unlink_protection, and network policy.";
 pub(crate) const BLOCKED_COMMAND_REASON: &str = "Command blocking is deprecated in v0.33.0 and only checks the directly-invoked \
-     startup command. Child processes can bypass it. Prefer resource-based controls \
-     such as add_deny_access, narrower filesystem grants, unlink_protection, and \
-     network policy.";
+     startup command. Child processes can bypass it. Prefer filesystem, network, and \
+     command policies such as add_deny_access, narrower filesystem grants, \
+     unlink_protection, and network policy.";
 
 fn format_commands(commands: &[String]) -> String {
     commands.join(", ")

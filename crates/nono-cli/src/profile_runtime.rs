@@ -55,7 +55,7 @@ pub(crate) struct PreparedProfile {
     /// [`profile::expand_vars`] at prepare time.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     /// Command binaries already resolved (canonicalized, stat'd, hashed) while
-    /// validating the profile's `command_policies`. Building the tool-sandbox
+    /// validating the profile's `command_policies`. Building the command-mediation
     /// plan reuses this instead of resolving — and re-hashing — every
     /// controlled binary a second time.
     pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
@@ -1008,7 +1008,7 @@ fn prepare_profile_with_options(
 
 /// Validates that the active platform can support the profile's
 /// `command_policies`, returning the binaries resolved along the way (if
-/// any) so callers that go on to build a tool-sandbox plan can reuse this
+/// any) so callers that go on to build a command-mediation plan can reuse this
 /// resolution instead of re-reading and re-hashing every controlled binary.
 fn validate_command_policy_runtime_support(
     profile: &profile::Profile,
@@ -1023,7 +1023,7 @@ fn validate_command_policy_runtime_support(
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(nono::NonoError::UnsupportedPlatform(
-            "tool-sandbox command_policies are only supported on Linux and macOS".to_string(),
+            "command policies are only supported on Linux and macOS".to_string(),
         ))
     }
 
@@ -1057,12 +1057,12 @@ fn validate_linux_command_policy_runtime_support(
 
     let abi = nono::detect_abi().map_err(|err| {
         nono::NonoError::UnsupportedPlatform(format!(
-            "tool-sandbox profile uses TCP port network rules but Landlock enforcement is unavailable: {err}"
+            "command sandbox policy uses direct TCP port rules but Landlock enforcement is unavailable: {err}"
         ))
     })?;
     if !abi.has_network() {
         return Err(nono::NonoError::UnsupportedPlatform(format!(
-            "tool-sandbox profile uses TCP port network rules but {} lacks Landlock TCP support (requires ABI V4+)",
+            "command sandbox policy uses direct TCP port rules but {} lacks Landlock TCP support (requires ABI V4+)",
             abi
         )));
     }
@@ -1804,7 +1804,7 @@ echo hi
     #[test]
     fn active_command_policy_runtime_support_rejects_unsupported_platform() {
         let err = validate_command_policy_runtime_support(&active_command_policy_profile())
-            .expect_err("active tool-sandbox runtime must fail on unsupported platforms");
+            .expect_err("active command-mediation runtime must fail on unsupported platforms");
 
         assert!(
             err.to_string().contains("Linux and macOS"),

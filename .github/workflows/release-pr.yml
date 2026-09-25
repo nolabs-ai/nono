@@ -13,8 +13,8 @@ env:
 
 # Only run on chore: release v* PRs.
 jobs:
-  cross-compile:
-    name: Cross-compile ${{ matrix.target }}
+  build:
+    name: Build ${{ matrix.target }}
     if: "startsWith(github.event.pull_request.title, 'chore: release v')"
     runs-on: ${{ matrix.os }}
     strategy:
@@ -28,7 +28,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-22.04-arm
           - target: x86_64-unknown-linux-musl
             os: ubuntu-22.04
     steps:
@@ -43,33 +43,23 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install cross
-
-      - name: Build (native)
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p nono-cli
-
-      - name: Build (cross aarch64-unknown-linux-gnu)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cross build --release --target aarch64-unknown-linux-gnu -p nono-cli
 
       - name: Smoke test release binary
         shell: bash
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
-          if [[ "$target" == "aarch64-unknown-linux-gnu" ]]; then
-            # This artifact is cross-built on x86_64. qemu-user cannot exercise
-            # Landlock, but it can prove that the produced executable starts.
-            cross run --release --target "$target" -p nono-cli -- --version
+          bin="target/$target/release/nono"
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            smoke_command="/usr/bin/true"
           else
-            bin="target/$target/release/nono"
-            "$bin" --version
-            NONO_NO_SAVE_PROMPT=1 NONO_NO_MIGRATE=1 \
-              "$bin" run --no-audit --no-rollback --allow-cwd -- /bin/true
+            smoke_command="/bin/true"
           fi
+          "$bin" --version
+          NONO_NO_SAVE_PROMPT=1 NONO_NO_MIGRATE=1 \
+            "$bin" run --no-audit --no-rollback --allow-cwd -- "$smoke_command"
 
       - name: Verify binary does not link libdbus (Linux)
         if: runner.os == 'Linux'

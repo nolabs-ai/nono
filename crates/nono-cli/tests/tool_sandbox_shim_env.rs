@@ -13,7 +13,19 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+// A concurrent fork can inherit fs::copy's writable destination fd until exec,
+// even with CLOEXEC. Linux then rejects execution of that inode with ETXTBSY.
+// Keep fixture copies and every subprocess launch in this test binary serialized.
+static PROCESS_LOCK: Mutex<()> = Mutex::new(());
+
+fn process_guard() -> MutexGuard<'static, ()> {
+    PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 const DISCOVERY_VARS: [&str; 3] = [
     "NONO_TOOL_SANDBOX_SOCKET",
@@ -117,6 +129,7 @@ fn broker(
 
 #[test]
 fn command_shim_uses_its_session_socket_and_executable_name() {
+    let _guard = process_guard();
     let runtime = Runtime::new();
     let exe = runtime.shim("git");
     for conflicting_env in [false, true] {
@@ -154,6 +167,7 @@ fn command_shim_uses_its_session_socket_and_executable_name() {
 
 #[test]
 fn url_shim_uses_its_session_socket_with_sanitized_or_conflicting_env() {
+    let _guard = process_guard();
     let runtime = Runtime::new();
     let exe = runtime.shim("open");
     for success in [true, false] {
@@ -186,6 +200,7 @@ fn url_shim_uses_its_session_socket_with_sanitized_or_conflicting_env() {
 
 #[test]
 fn missing_or_invalid_broker_never_falls_through_to_cli() {
+    let _guard = process_guard();
     let runtime = Runtime::new();
     for (name, socket_name, arg) in [
         ("git", "supervisor.sock", "--version"),
@@ -207,6 +222,7 @@ fn missing_or_invalid_broker_never_falls_through_to_cli() {
 
 #[test]
 fn malformed_broker_response_fails_closed() {
+    let _guard = process_guard();
     let runtime = Runtime::new();
     let exe = runtime.shim("open");
     let server = broker(&runtime.socket("url.sock"), |mut stream| {
@@ -224,6 +240,7 @@ fn malformed_broker_response_fails_closed() {
 
 #[test]
 fn ordinary_cli_ignores_shim_discovery_variables() {
+    let _guard = process_guard();
     let mut command = Command::new(env!("CARGO_BIN_EXE_nono"));
     command.env_clear().arg("--version");
     for key in DISCOVERY_VARS {
@@ -236,6 +253,7 @@ fn ordinary_cli_ignores_shim_discovery_variables() {
 
 #[test]
 fn real_broker_mediates_nested_commands_without_discovery_variables() {
+    let _guard = process_guard();
     let t = nono_test!("shim-env");
     let profile = t.write_profile(
         "shim-env",
@@ -280,6 +298,7 @@ fn real_broker_mediates_nested_commands_without_discovery_variables() {
 
 #[test]
 fn real_url_broker_preserves_origin_policy_without_discovery_variables() {
+    let _guard = process_guard();
     let t = nono_test!("shim-url-env");
     let profile = t.write_profile(
         "shim-url-env",

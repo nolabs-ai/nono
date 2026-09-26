@@ -317,7 +317,7 @@ pub struct ExecConfig<'a> {
     /// env filtering and before `env_vars` (credentials/proxy/hooks). Values are
     /// already variable-expanded. Bypasses allow/deny filtering by design.
     pub set_vars: Vec<(String, String)>,
-    /// Prepared tool-sandbox runtime. When present, the outer child gets shims on PATH
+    /// Prepared command-mediation runtime. When present, the session sandbox gets shims on PATH
     /// and an additional Linux execute-only Landlock gate.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub tool_sandbox_runtime: Option<&'a crate::tool_sandbox::PreparedToolSandboxRuntime>,
@@ -390,7 +390,7 @@ pub struct SupervisorConfig<'a> {
     /// mode without that opt-in, where AF_UNIX passes through (issue #1901).
     #[cfg(target_os = "linux")]
     pub unix_socket_allowlist: &'a [nono::UnixSocketCapability],
-    /// Prepared tool-sandbox runtime listener for command-policy shim requests.
+    /// Prepared command-mediation runtime listener for command-policy shim requests.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub tool_sandbox_runtime: Option<&'a crate::tool_sandbox::PreparedToolSandboxRuntime>,
 }
@@ -725,7 +725,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                             env_c.push(cstr);
                         }
                         // Respect any PATH already built for the child, including
-                        // Tool Sandbox  and profile environment filtering.
+                        // Command-sandbox and profile environment filtering.
                         let current_path = env_c
                             .iter()
                             .find_map(|entry| {
@@ -751,7 +751,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                         && let Some(shim) = create_open_shim(&nono_exe, &socket_path)
                     {
                         // Respect any PATH already built for the child, including
-                        // tool-sandbox and profile environment filtering.
+                        // Command-sandbox and profile environment filtering.
                         let current_path = env_c
                             .iter()
                             .find_map(|entry| {
@@ -894,7 +894,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // required.
 
     // Become a child-subreaper whenever the supervisor may need to read a
-    // descendant's /proc/<pid>/mem: tool-sandbox command mediation
+    // descendant's /proc/<pid>/mem: command mediation
     // (`tool_sandbox_runtime`) or seccomp-notify mediation of network/AF_UNIX/
     // openat (`child_requires_dumpable`). That read is ancestry-gated by
     // ptrace_may_access under Yama ptrace_scope=1, so a descendant that
@@ -1086,7 +1086,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             let chdir_before_sandbox = false;
 
             if chdir_before_sandbox {
-                // tool-sandbox must preserve the shim's original cwd without turning it
+                // Command mediation must preserve the shim's original cwd without turning it
                 // into an outer-session filesystem grant. Landlock still
                 // mediates later file access after the sandbox is applied.
                 // SAFETY: `current_dir_c` was prepared before fork and remains
@@ -1118,7 +1118,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     && let Err(e) = tool_sandbox_runtime.apply_outer_exec_gate()
                 {
                     let detail = format!(
-                        "nono: failed to apply tool-sandbox outer exec gate in supervised child: {}\n",
+                        "nono: failed to apply the command-mediation execute gate to the session sandbox: {}\n",
                         e
                     );
                     let msg = detail.as_bytes();
@@ -1775,9 +1775,10 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
 }
 
 fn output_contains_tool_sandbox_policy_denial(output: &str) -> bool {
-    output
-        .lines()
-        .any(|line| line.trim_start().starts_with("nono: tool-sandbox denied "))
+    output.lines().any(|line| {
+        line.trim_start()
+            .starts_with("nono: command policy denied ")
+    })
 }
 
 fn should_suppress_diagnostics_for_tool_sandbox_denial(
@@ -2410,7 +2411,7 @@ fn signal_pty_foreground_group(pty: &crate::pty_proxy::PtyProxy, child: Pid, sig
 }
 
 /// Relay a Ctrl-C or Ctrl-\ intercepted by the PtyProxy to mediated
-/// tool-sandbox children.
+/// command sandboxes.
 fn handle_pty_signal_relay(pty: Option<&mut crate::pty_proxy::PtyProxy>) {
     let Some(pty) = pty else {
         return;
@@ -2609,7 +2610,7 @@ fn run_supervisor_loop(
     url_listener: Option<&SupervisorListener>,
     killed_by_timeout: &mut bool,
 ) -> Result<(WaitStatus, Vec<DenialRecord>, Vec<UrlDenialRecord>)> {
-    // Start the macOS tool-sandbox background listener thread (no-op if tool-sandbox not active).
+    // Start the macOS command-mediation listener thread (no-op when mediation is inactive).
     #[cfg(target_os = "macos")]
     if let Some(tool_sandbox_runtime) = config.tool_sandbox_runtime
         && let Err(e) = tool_sandbox_runtime.handle_listener(
@@ -2618,7 +2619,7 @@ fn run_supervisor_loop(
             config.audit_recorder.clone(),
         )
     {
-        debug!("tool-sandbox handle_listener error: {e}");
+        debug!("command-mediation handle_listener error: {e}");
     }
     let mut sock_fd = sock.as_raw_fd();
     let listener_fd = url_listener.map_or(-1, |l| l.as_raw_fd());
@@ -2871,7 +2872,7 @@ fn run_supervisor_loop(
                     .map(|d| format!("{d:?}"))
                     .unwrap_or_else(|| "n/a".to_string());
                 eprintln!(
-                    "[tool-sandbox-prof] supervisor_loop:total: {:?} ({} iterations, after_sock_close: {})",
+                    "[command-mediation-prof] supervisor_loop:total: {:?} ({} iterations, after_sock_close: {})",
                     self.start.elapsed(),
                     self.iterations,
                     after_sock_close
@@ -2990,7 +2991,7 @@ fn run_supervisor_loop(
                         || pty.is_some()
                     {
                         debug!(
-                            "Supervisor socket closed, continuing for seccomp/proxy/PTY/URL/tool-sandbox listener"
+                            "Supervisor socket closed, continuing for seccomp/proxy/PTY/URL/command-mediation listener"
                         );
                         sock_fd_active = false;
                         loop_timer.sock_inactive_at.get_or_insert(Instant::now());
@@ -3086,7 +3087,7 @@ fn run_supervisor_loop(
                         config.audit_recorder.clone(),
                     )
                 {
-                    debug!("Error handling tool-sandbox shim request: {}", e);
+                    debug!("Error handling command-mediation shim request: {}", e);
                 }
 
                 if let (Some(tool_sandbox_url_idx), Some(runtime)) =
@@ -3098,7 +3099,7 @@ fn run_supervisor_loop(
                         config.audit_recorder.clone(),
                     )
                 {
-                    debug!("Error handling tool-sandbox URL request: {}", e);
+                    debug!("Error handling command-mediation URL request: {}", e);
                 }
 
                 if let Some(ref mut p) = pty
@@ -3775,7 +3776,7 @@ fn validate_and_open_url(
 /// Returns `Ok(())` if the URL passes all checks. Does not open the browser.
 ///
 /// This implementation must stay in sync with [`crate::url_open::validate_url`],
-/// which is the shared implementation used by the tool-sandbox runtime.
+/// which is the shared implementation used by the command-mediation runtime.
 /// TODO: Refactor `crate::url_open::validate_url` to return `UrlDenial` directly
 /// so this function can delegate without duplicating the logic.
 fn validate_url(url: &str, config: &SupervisorConfig<'_>) -> std::result::Result<(), UrlDenial> {
@@ -4515,10 +4516,10 @@ mod tests {
     #[test]
     fn test_output_contains_tool_sandbox_policy_denial() {
         assert!(output_contains_tool_sandbox_policy_denial(
-            "nono: tool-sandbox denied git: Command 'git' is blocked: entrypoint missing\n"
+            "nono: command policy denied git: Command 'git' is blocked: entrypoint missing\n"
         ));
         assert!(output_contains_tool_sandbox_policy_denial(
-            "  nono: tool-sandbox denied ssh: Command 'ssh' is blocked: explicit_deny\n"
+            "  nono: command policy denied ssh: Command 'ssh' is blocked: explicit_deny\n"
         ));
         assert!(!output_contains_tool_sandbox_policy_denial(
             "git: fatal: could not read from remote repository\n"

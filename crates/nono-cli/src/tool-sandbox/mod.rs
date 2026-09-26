@@ -1,4 +1,4 @@
-//! Tool sandbox runtime support.
+//! Command-mediation runtime support.
 //!
 //! The profile resolver lives in `command_policy`; this module owns the
 //! Linux/macOS runtime pieces: private shim materialisation, outer exec gating,
@@ -96,12 +96,136 @@ pub(crate) struct ToolSandboxPrepare<'a> {
     /// these, so a command can't be steered into a directory the agent is denied.
     pub(crate) deny_paths: &'a [std::path::PathBuf],
     pub(crate) policy_root: &'a std::path::Path,
-    pub(crate) proxy_credential_env_vars:
-        &'a std::collections::BTreeMap<String, Vec<(String, String)>>,
+    pub(crate) proxy_credentials: &'a std::collections::BTreeSet<String>,
+    pub(crate) reserved_proxy_ports: &'a std::collections::BTreeSet<u16>,
+    /// Command-owned proxy variables. These carry a proxy credential whose
+    /// authority is restricted to that command sandbox's proxy policy.
+    pub(crate) scoped_proxy_env_vars: &'a std::collections::BTreeMap<String, Vec<(String, String)>>,
     pub(crate) proxy_trust_bundle_paths: &'a [std::path::PathBuf],
     /// Shared token broker for nonce-at-L7 resolution. When `None` a new
     /// private broker is created for this session.
     pub(crate) shared_broker: Option<crate::tool_sandbox::token_broker::SharedBroker>,
+}
+
+/// Stable identity for the proxy enforcing one effective command sandbox.
+/// Intercept indices refer to their position after profile inheritance/merge.
+pub(crate) fn proxy_scope_key(
+    command: &str,
+    caller: &str,
+    intercept_index: Option<usize>,
+) -> String {
+    match intercept_index {
+        Some(index) => format!("{command}::{caller}::intercept::{index}"),
+        None => format!("{command}::{caller}"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn required_scoped_proxy_env<'a>(
+    envs: &'a std::collections::BTreeMap<String, Vec<(String, String)>>,
+    scope: &str,
+    command: &str,
+) -> nono::Result<&'a [(String, String)]> {
+    envs.get(scope).map(Vec::as_slice).ok_or_else(|| {
+        nono::NonoError::SandboxInit(format!(
+            "command sandbox for '{command}' has a proxy policy but no scoped proxy"
+        ))
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn policy_uses_proxy_route(
+    policy: &crate::command_policy::CommandSandboxConfig,
+    credentials: &std::collections::BTreeMap<String, self::credentials::ResolvedCredential>,
+) -> bool {
+    let uses_proxy_credential = self::policy::policy_credential_names(policy)
+        .iter()
+        .any(|name| {
+            matches!(
+                credentials.get(*name),
+                Some(self::credentials::ResolvedCredential::Proxy)
+            )
+        });
+    let uses_proxy_domain = policy
+        .network
+        .as_ref()
+        .is_some_and(|network| !network.allow_domain.is_empty());
+    uses_proxy_credential || uses_proxy_domain
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_scoped_proxy_network(
+    caps: &nono::CapabilitySet,
+    policy: &crate::command_policy::CommandSandboxConfig,
+    reserved_proxy_ports: &std::collections::BTreeSet<u16>,
+    command: &str,
+) -> nono::Result<()> {
+    if matches!(caps.network_mode(), nono::NetworkMode::AllowAll) {
+        return Err(nono::NonoError::SandboxInit(format!(
+            "command sandbox for '{command}' combines proxy policy with unrestricted direct network access"
+        )));
+    }
+    if policy.network.as_ref().is_some_and(|network| {
+        network
+            .tcp_connect_ports
+            .iter()
+            .any(|port| reserved_proxy_ports.contains(port))
+    }) {
+        return Err(nono::NonoError::SandboxInit(format!(
+            "command sandbox for '{command}' grants an active nono proxy port through direct network policy"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod proxy_scope_tests {
+    use super::{proxy_scope_key, validate_scoped_proxy_network};
+    use crate::command_policy::{CommandNetworkConfig, CommandSandboxConfig};
+    use nono::{CapabilitySet, NetworkMode};
+
+    #[test]
+    fn keys_distinguish_callers_and_intercepts() {
+        assert_eq!(proxy_scope_key("curl", "session", None), "curl::session");
+        assert_eq!(proxy_scope_key("curl", "git", None), "curl::git");
+        assert_eq!(
+            proxy_scope_key("curl", "git", Some(2)),
+            "curl::git::intercept::2"
+        );
+    }
+
+    #[test]
+    fn scoped_proxy_rejects_unrestricted_and_session_port_network() {
+        let allow_all = CapabilitySet::new().set_network_mode(NetworkMode::AllowAll);
+        assert!(
+            validate_scoped_proxy_network(
+                &allow_all,
+                &CommandSandboxConfig::default(),
+                &std::collections::BTreeSet::from([9000]),
+                "curl",
+            )
+            .is_err()
+        );
+
+        let mut restricted = CapabilitySet::new();
+        restricted.add_tcp_connect_port(9000);
+        let policy = CommandSandboxConfig {
+            network: Some(CommandNetworkConfig {
+                tcp_connect_ports: vec![9000],
+                ..CommandNetworkConfig::default()
+            }),
+            ..CommandSandboxConfig::default()
+        };
+        assert!(
+            validate_scoped_proxy_network(
+                &restricted,
+                &policy,
+                &std::collections::BTreeSet::from([8000, 9000]),
+                "curl"
+            )
+            .is_err()
+        );
+    }
 }
 
 /// Does `caps` grant `mode` access to `path`, via a directory subtree grant or
@@ -500,7 +624,9 @@ pub(crate) use self::audit_context::ToolSandboxAuditContext;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use self::policy::*;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use self::policy::{InvocationPolicyOutcome, evaluate_invocation_policy};
+pub(crate) use self::policy::{
+    InvocationPolicyOutcome, evaluate_invocation_policy, policy_credential_names,
+};
 
 #[cfg(target_os = "linux")]
 #[path = "platform/linux.rs"]

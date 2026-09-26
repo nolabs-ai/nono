@@ -19,7 +19,7 @@ use nono_proxy::config::{
     EndpointPolicyRule as ProxyEndpointPolicyRule, InjectMode,
 };
 use regex::Regex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,10 +34,17 @@ use zeroize::Zeroizing;
 
 pub(crate) struct ActiveProxyRuntime {
     pub(crate) env_vars: Vec<(String, String)>,
-    pub(crate) tool_sandbox_credential_env_vars: BTreeMap<String, Vec<(String, String)>>,
+    pub(crate) tool_sandbox_proxy_credentials: BTreeSet<String>,
+    pub(crate) scoped_proxy_env_vars: BTreeMap<String, Vec<(String, String)>>,
     pub(crate) tool_sandbox_trust_bundle_paths: Vec<std::path::PathBuf>,
     pub(crate) handle: Option<nono_proxy::server::ProxyHandle>,
+    pub(crate) scoped_handles: Vec<nono_proxy::server::ProxyHandle>,
 }
+
+type ScopedProxyRuntimes = (
+    BTreeMap<String, Vec<(String, String)>>,
+    Vec<nono_proxy::server::ProxyHandle>,
+);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveProxySettings {
@@ -1792,6 +1799,20 @@ fn extend_proxy_settings_with_tool_sandbox_credentials(
                 CommandFromConfig::Deny(_) => {}
             }
         }
+        for rule in &command.intercept {
+            if let Some(sandbox) = &rule.sandbox {
+                collect_tool_sandbox_proxy_grants(
+                    config,
+                    sandbox,
+                    outer_caps,
+                    credentials,
+                    custom_credentials,
+                    proxy_source_env_vars,
+                    base_url_env_vars,
+                    tool_sandbox_proxy_credentials,
+                )?;
+            }
+        }
     }
 
     Ok(())
@@ -1815,7 +1836,7 @@ fn collect_tool_sandbox_proxy_grants(
             .is_some_and(|credential| credential.credential_type == CommandCredentialType::Proxy)
         {
             return Err(NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{name}' must be granted with sandbox.credentials and endpoint_policy"
+                "command sandbox proxy credential '{name}' must be granted with sandbox.credentials and endpoint_policy"
             )));
         }
     }
@@ -1829,7 +1850,7 @@ fn collect_tool_sandbox_proxy_grants(
                 credential.credential_type == CommandCredentialType::Proxy
             }) {
                 return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox proxy credential '{name}' must include endpoint_policy"
+                    "command sandbox proxy credential '{name}' must include endpoint_policy"
                 )));
             }
             continue;
@@ -1842,7 +1863,7 @@ fn collect_tool_sandbox_proxy_grants(
         }
         let endpoint_policy = grant.endpoint_policy.as_ref().ok_or_else(|| {
             NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{}' requires endpoint_policy",
+                "command sandbox proxy credential '{}' requires endpoint_policy",
                 grant.name
             ))
         })?;
@@ -1850,26 +1871,26 @@ fn collect_tool_sandbox_proxy_grants(
         let endpoint_policy = endpoint_policy_to_proxy_policy(config, endpoint_policy);
         let upstream = credential.upstream.clone().ok_or_else(|| {
             NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{}' missing upstream",
+                "command sandbox proxy credential '{}' missing upstream",
                 grant.name
             ))
         })?;
         let env_var = credential.env_var.clone().ok_or_else(|| {
             NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{}' missing env_var",
+                "command sandbox proxy credential '{}' missing env_var",
                 grant.name
             ))
         })?;
         nono::validate_destination_env_var(&env_var).map_err(|err| {
             NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{}' has invalid env_var: {err}",
+                "command sandbox proxy credential '{}' has invalid env_var: {err}",
                 grant.name
             ))
         })?;
         if let Some(base_url_env_var) = &credential.base_url_env_var {
             nono::validate_destination_env_var(base_url_env_var).map_err(|err| {
                 NonoError::ConfigParse(format!(
-                    "tool-sandbox proxy credential '{}' has invalid base_url_env_var: {err}",
+                    "command sandbox proxy credential '{}' has invalid base_url_env_var: {err}",
                     grant.name
                 ))
             })?;
@@ -1931,14 +1952,14 @@ fn collect_tool_sandbox_proxy_grants(
         if let Some(existing) = custom_credentials.get(&grant.name) {
             if existing != &route {
                 return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox proxy credential '{}' has conflicting endpoint policies across command grants",
+                    "command sandbox proxy credential '{}' has conflicting endpoint policies across command grants",
                     grant.name
                 )));
             }
         } else {
             if credentials.iter().any(|name| name == &grant.name) {
                 return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox proxy credential '{}' collides with an existing proxy credential route",
+                    "command sandbox proxy credential '{}' collides with an existing proxy credential route",
                     grant.name
                 )));
             }
@@ -2183,12 +2204,12 @@ fn validate_endpoint_approval_backend(
         .or(config.approval_defaults.backend.as_deref())
         .ok_or_else(|| {
             NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{credential_name}' endpoint_policy approve route requires an approval backend"
+                "command sandbox proxy credential '{credential_name}' endpoint_policy approve route requires an approval backend"
             ))
         })?;
     if !config.approval_backends.contains_key(backend_name) {
         return Err(NonoError::ConfigParse(format!(
-            "tool-sandbox proxy credential '{credential_name}' endpoint_policy references unknown approval backend '{backend_name}'"
+            "command sandbox proxy credential '{credential_name}' endpoint_policy references unknown approval backend '{backend_name}'"
         )));
     };
     Ok(())
@@ -2948,17 +2969,21 @@ pub(crate) fn start_proxy_runtime(
     let NetworkIntent::ProxyFiltered(proxy) = intent else {
         return Ok(ActiveProxyRuntime {
             env_vars: Vec::new(),
-            tool_sandbox_credential_env_vars: BTreeMap::new(),
+            tool_sandbox_proxy_credentials: BTreeSet::new(),
+            scoped_proxy_env_vars: BTreeMap::new(),
             tool_sandbox_trust_bundle_paths: Vec::new(),
             handle: None,
+            scoped_handles: Vec::new(),
         });
     };
     if !proxy.is_active() {
         return Ok(ActiveProxyRuntime {
             env_vars: Vec::new(),
-            tool_sandbox_credential_env_vars: BTreeMap::new(),
+            tool_sandbox_proxy_credentials: BTreeSet::new(),
+            scoped_proxy_env_vars: BTreeMap::new(),
             tool_sandbox_trust_bundle_paths: Vec::new(),
             handle: None,
+            scoped_handles: Vec::new(),
         });
     }
 
@@ -2968,6 +2993,15 @@ pub(crate) fn start_proxy_runtime(
     proxy_config.outer_caps = Some(caps.clone());
 
     apply_tls_intercept_config(&mut proxy_config, proxy)?;
+
+    // Command-only credential routes must never be present on the session
+    // proxy: its transport token is intentionally visible to the outer
+    // sandbox. Only per-scope proxies may expose these routes.
+    let mut session_proxy_config = proxy_config.clone();
+    remove_tool_sandbox_routes(
+        &mut session_proxy_config,
+        &proxy.tool_sandbox_proxy_credentials,
+    );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -2990,14 +3024,23 @@ pub(crate) fn start_proxy_runtime(
     let handle = rt
         .block_on(async {
             nono_proxy::server::start_with_nonce_resolver(
-                proxy_config.clone(),
-                approval_registry,
-                credential_capture_backend,
-                nonce_resolver,
+                session_proxy_config.clone(),
+                approval_registry.clone(),
+                credential_capture_backend.clone(),
+                nonce_resolver.clone(),
             )
             .await
         })
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy: {}", e)))?;
+
+    let (scoped_proxy_env_vars, scoped_handles) = start_command_scoped_proxies(
+        proxy,
+        &proxy_config,
+        &rt,
+        approval_registry,
+        credential_capture_backend,
+        nonce_resolver,
+    )?;
 
     let port = handle.port;
     if proxy.allow_bind_ports.is_empty() {
@@ -3013,7 +3056,7 @@ pub(crate) fn start_proxy_runtime(
     // including misses — to the user-visible info level so the silent
     // "WARN at debug" failure mode (issue #797) becomes immediately
     // discoverable.
-    let route_rows = handle.route_diagnostics(&proxy_config);
+    let route_rows = handle.route_diagnostics(&session_proxy_config);
     if !route_rows.is_empty() {
         info!("Proxy routes:");
         for summary in &route_rows {
@@ -3063,12 +3106,18 @@ pub(crate) fn start_proxy_runtime(
     //
     // On Linux, Landlock cannot express deny-within-allow, so the protected-
     // root rules don't shadow the grant; a plain FS cap is sufficient.
-    let tool_sandbox_trust_bundle_paths = handle
+    let tool_sandbox_trust_bundle_paths: Vec<PathBuf> = handle
         .intercept_ca_path()
-        .map(|path| vec![path.to_path_buf()])
-        .unwrap_or_default();
+        .into_iter()
+        .chain(
+            scoped_handles
+                .iter()
+                .filter_map(nono_proxy::server::ProxyHandle::intercept_ca_path),
+        )
+        .map(Path::to_path_buf)
+        .collect();
 
-    if let Some(ca_path) = handle.intercept_ca_path() {
+    for ca_path in &tool_sandbox_trust_bundle_paths {
         #[cfg(target_os = "macos")]
         {
             let path_str = crate::policy::path_to_utf8(ca_path)?;
@@ -3101,18 +3150,8 @@ pub(crate) fn start_proxy_runtime(
         env_vars.push((key, value));
     }
 
-    let credential_env_vars = handle.credential_env_vars(&proxy_config);
-    let tool_sandbox_credential_env_vars = scoped_tool_sandbox_proxy_credential_env_vars(
-        proxy,
-        &proxy_config,
-        &credential_env_vars,
-        port,
-    )?;
-    let tool_sandbox_env_var_names = tool_sandbox_proxy_env_var_names(proxy, &proxy_config);
+    let credential_env_vars = handle.credential_env_vars(&session_proxy_config);
     for (key, value) in credential_env_vars {
-        if tool_sandbox_env_var_names.contains(&key) {
-            continue;
-        }
         env_vars.push((key, value));
     }
     extend_provider_base_url_env_vars(proxy, port, &mut env_vars);
@@ -3121,10 +3160,240 @@ pub(crate) fn start_proxy_runtime(
 
     Ok(ActiveProxyRuntime {
         env_vars,
-        tool_sandbox_credential_env_vars,
+        tool_sandbox_proxy_credentials: proxy
+            .tool_sandbox_proxy_credentials
+            .iter()
+            .cloned()
+            .collect(),
+        scoped_proxy_env_vars,
         tool_sandbox_trust_bundle_paths,
         handle: Some(handle),
+        scoped_handles,
     })
+}
+
+fn remove_tool_sandbox_routes(
+    config: &mut nono_proxy::config::ProxyConfig,
+    credential_names: &HashSet<String>,
+) {
+    config
+        .routes
+        .retain(|route| !credential_names.contains(route.prefix.trim_matches('/')));
+}
+
+/// Start a narrow proxy for each effective command sandbox that uses proxy
+/// routes. Each caller and intercept override gets a distinct listener and
+/// credential, so a child cannot reuse broader authority from another scope.
+fn start_command_scoped_proxies(
+    proxy: &ProxyLaunchOptions,
+    base: &nono_proxy::config::ProxyConfig,
+    rt: &tokio::runtime::Runtime,
+    approval_registry: Option<nono_proxy::approval::ApprovalBackendRegistry>,
+    credential_capture_backend: Option<Arc<dyn nono_proxy::capture::CredentialCaptureBackend>>,
+    nonce_resolver: Option<Arc<dyn nono_proxy::NonceResolver>>,
+) -> Result<ScopedProxyRuntimes> {
+    let mut envs = BTreeMap::new();
+    let mut handles = Vec::new();
+    let Some(policies) = proxy.command_policies.as_ref() else {
+        return Ok((envs, handles));
+    };
+    let scopes = command_proxy_scopes(policies);
+    for (scope_index, (scope, sandbox)) in scopes.into_iter().enumerate() {
+        let credential_names = scoped_proxy_credential_names(proxy, sandbox);
+        if !requires_command_scoped_proxy(sandbox, &credential_names) {
+            continue;
+        }
+        let mut config = base.clone();
+        config.bind_port = 0;
+        config.allowed_hosts = match sandbox.network.as_ref() {
+            Some(network) if network.allow_all => vec!["*".to_string()],
+            Some(network) => network.allow_domain.clone(),
+            None => Vec::new(),
+        };
+        config.strict_filter = true;
+        retain_scoped_proxy_routes(&mut config, &credential_names);
+        // A scoped proxy may need TLS interception for endpoint-enforced
+        // credential routes. Give each listener its own bundle path so one
+        // ephemeral CA cannot overwrite another listener's trust anchor.
+        config.intercept_ca_dir = scoped_intercept_ca_dir(
+            base.intercept_ca_dir.as_deref(),
+            scope_index,
+            !config.routes.is_empty(),
+        )?;
+        config.oauth_capture.clear();
+        let handle = rt
+            .block_on(nono_proxy::server::start_with_nonce_resolver(
+                config.clone(),
+                approval_registry.clone(),
+                credential_capture_backend.clone(),
+                nonce_resolver.clone(),
+            ))
+            .map_err(|e| {
+                NonoError::SandboxInit(format!("Failed to start command proxy for '{scope}': {e}"))
+            })?;
+        let mut scope_env = handle.env_vars();
+        validate_scoped_proxy_env(&scope_env, &scope)?;
+        let credential_env = handle.credential_env_vars(&config);
+        for credential_name in &credential_names {
+            let vars = tool_sandbox_proxy_credential_env_vars(
+                proxy,
+                &config,
+                &credential_env,
+                handle.port,
+                credential_name,
+            )?;
+            extend_scoped_proxy_env(&mut scope_env, vars, &scope)?;
+        }
+        envs.insert(scope, scope_env);
+        handles.push(handle);
+    }
+    Ok((envs, handles))
+}
+
+fn validate_scoped_proxy_env(vars: &[(String, String)], scope: &str) -> Result<()> {
+    let mut names = BTreeSet::new();
+    for (name, _) in vars {
+        if !names.insert(name.as_str()) {
+            return Err(NonoError::ConfigParse(format!(
+                "command proxy scope '{scope}' has duplicate proxy environment variable '{name}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn scoped_proxy_credential_names<'a>(
+    proxy: &ProxyLaunchOptions,
+    sandbox: &'a crate::command_policy::CommandSandboxConfig,
+) -> Vec<&'a str> {
+    let mut seen = BTreeSet::new();
+    crate::tool_sandbox::policy_credential_names(sandbox)
+        .into_iter()
+        .filter(|name| proxy.tool_sandbox_proxy_credentials.contains(*name) && seen.insert(*name))
+        .collect()
+}
+
+fn requires_command_scoped_proxy(
+    sandbox: &crate::command_policy::CommandSandboxConfig,
+    credential_names: &[&str],
+) -> bool {
+    let uses_domain_proxy = sandbox
+        .network
+        .as_ref()
+        .is_some_and(|network| !network.allow_all && !network.allow_domain.is_empty());
+    uses_domain_proxy || !credential_names.is_empty()
+}
+
+fn retain_scoped_proxy_routes(
+    config: &mut nono_proxy::config::ProxyConfig,
+    credential_names: &[&str],
+) {
+    config
+        .routes
+        .retain(|route| credential_names.contains(&route.prefix.trim_matches('/')));
+}
+
+fn extend_scoped_proxy_env(
+    target: &mut Vec<(String, String)>,
+    vars: Vec<(String, String)>,
+    scope: &str,
+) -> Result<()> {
+    for (name, value) in vars {
+        if is_scoped_proxy_reserved_env(&name)
+            || target.iter().any(|(existing, _)| existing == &name)
+        {
+            return Err(NonoError::ConfigParse(format!(
+                "command proxy scope '{scope}' has conflicting environment variable '{name}'"
+            )));
+        }
+        target.push((name, value));
+    }
+    Ok(())
+}
+
+fn is_scoped_proxy_reserved_env(name: &str) -> bool {
+    matches!(
+        name,
+        "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "ALL_PROXY"
+            | "NO_PROXY"
+            | "http_proxy"
+            | "https_proxy"
+            | "all_proxy"
+            | "no_proxy"
+            | "NONO_NO_PROXY"
+            | "NONO_PROXY_TOKEN"
+            | "NODE_USE_ENV_PROXY"
+            | "SSL_CERT_FILE"
+            | "CURL_CA_BUNDLE"
+            | "NODE_EXTRA_CA_CERTS"
+            | "REQUESTS_CA_BUNDLE"
+            | "GIT_SSL_CAINFO"
+    )
+}
+
+fn scoped_intercept_ca_dir(
+    base: Option<&Path>,
+    scope_index: usize,
+    has_routes: bool,
+) -> Result<Option<PathBuf>> {
+    let Some(base) = base.filter(|_| has_routes) else {
+        return Ok(None);
+    };
+    let dir = base.join(format!("scope-{scope_index}"));
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        NonoError::SandboxInit(format!(
+            "failed to create scoped TLS-intercept dir '{}': {err}",
+            dir.display()
+        ))
+    })?;
+    set_intercept_ca_dir_permissions(&dir)?;
+    Ok(Some(dir))
+}
+
+fn command_proxy_scopes(
+    policies: &crate::command_policy::CommandPoliciesConfig,
+) -> Vec<(String, &crate::command_policy::CommandSandboxConfig)> {
+    let mut scopes = Vec::new();
+    for (name, command) in &policies.commands {
+        let mut caller_sandboxes = Vec::new();
+        match command.from.get("session") {
+            Some(from) => {
+                if let Some(sandbox) = from.sandbox() {
+                    caller_sandboxes.push(("session", sandbox));
+                }
+            }
+            None => {
+                if let Some(sandbox) = command.sandbox.as_ref() {
+                    caller_sandboxes.push(("session", sandbox));
+                }
+            }
+        }
+        for (caller, from) in &command.from {
+            if caller != "session"
+                && let Some(sandbox) = from.sandbox()
+            {
+                caller_sandboxes.push((caller.as_str(), sandbox));
+            }
+        }
+
+        for (caller, sandbox) in caller_sandboxes {
+            scopes.push((
+                crate::tool_sandbox::proxy_scope_key(name, caller, None),
+                sandbox,
+            ));
+            for (index, rule) in command.intercept.iter().enumerate() {
+                if let Some(sandbox) = rule.sandbox.as_ref() {
+                    scopes.push((
+                        crate::tool_sandbox::proxy_scope_key(name, caller, Some(index)),
+                        sandbox,
+                    ));
+                }
+            }
+        }
+    }
+    scopes
 }
 
 fn extend_provider_base_url_env_vars(
@@ -3149,77 +3418,46 @@ fn extend_provider_base_url_env_vars(
     }
 }
 
-fn tool_sandbox_proxy_env_var_names(
-    proxy: &ProxyLaunchOptions,
-    proxy_config: &nono_proxy::config::ProxyConfig,
-) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for credential_name in &proxy.tool_sandbox_proxy_credentials {
-        let prefix = credential_name.trim_matches('/');
-        names.insert(format!("{}_BASE_URL", prefix.to_uppercase()));
-        if let Some(base_url_env_var) = proxy.tool_sandbox_base_url_env_vars.get(credential_name) {
-            names.insert(base_url_env_var.clone());
-        }
-        for route in proxy_config
-            .routes
-            .iter()
-            .filter(|route| route.prefix.trim_matches('/') == prefix)
-        {
-            if let Some(env_var) = &route.env_var {
-                names.insert(env_var.clone());
-            } else if let Some(credential_key) = &route.credential_key
-                && !credential_key.contains("://")
-            {
-                names.insert(credential_key.to_uppercase());
-            }
-        }
-    }
-    names
-}
-
-fn scoped_tool_sandbox_proxy_credential_env_vars(
+fn tool_sandbox_proxy_credential_env_vars(
     proxy: &ProxyLaunchOptions,
     proxy_config: &nono_proxy::config::ProxyConfig,
     credential_env_vars: &[(String, String)],
     port: u16,
-) -> Result<BTreeMap<String, Vec<(String, String)>>> {
-    let mut scoped = BTreeMap::new();
-    for credential_name in &proxy.tool_sandbox_proxy_credentials {
-        let prefix = credential_name.trim_matches('/');
-        let route = proxy_config
-            .routes
-            .iter()
-            .find(|route| route.prefix.trim_matches('/') == prefix)
-            .ok_or_else(|| {
-                NonoError::SandboxInit(format!(
-                    "tool-sandbox proxy credential '{credential_name}' did not produce a proxy route"
-                ))
-            })?;
-        let env_var = route.env_var.as_ref().ok_or_else(|| {
-            NonoError::ConfigParse(format!(
-                "tool-sandbox proxy credential '{credential_name}' missing env_var"
+    credential_name: &str,
+) -> Result<Vec<(String, String)>> {
+    let prefix = credential_name.trim_matches('/');
+    let route = proxy_config
+        .routes
+        .iter()
+        .find(|route| route.prefix.trim_matches('/') == prefix)
+        .ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "command sandbox proxy credential '{credential_name}' did not produce a proxy route"
             ))
         })?;
-        let token_value = credential_env_vars
-            .iter()
-            .find(|(key, _)| key == env_var)
-            .map(|(_, value)| value.clone())
-            .ok_or_else(|| {
-                NonoError::SandboxInit(format!(
-                    "tool-sandbox proxy credential '{credential_name}' is unavailable to the proxy"
-                ))
-            })?;
+    let env_var = route.env_var.as_ref().ok_or_else(|| {
+        NonoError::ConfigParse(format!(
+            "command sandbox proxy credential '{credential_name}' missing env_var"
+        ))
+    })?;
+    let token_value = credential_env_vars
+        .iter()
+        .find(|(key, _)| key == env_var)
+        .map(|(_, value)| value.clone())
+        .ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "command sandbox proxy credential '{credential_name}' is unavailable to the proxy"
+            ))
+        })?;
 
-        let mut env_vars = vec![(env_var.clone(), token_value)];
-        if let Some(base_url_env_var) = proxy.tool_sandbox_base_url_env_vars.get(credential_name) {
-            env_vars.push((
-                base_url_env_var.clone(),
-                format!("http://127.0.0.1:{}/{}", port, prefix),
-            ));
-        }
-        scoped.insert(credential_name.clone(), env_vars);
+    let mut env_vars = vec![(env_var.clone(), token_value)];
+    if let Some(base_url_env_var) = proxy.tool_sandbox_base_url_env_vars.get(credential_name) {
+        env_vars.push((
+            base_url_env_var.clone(),
+            format!("http://127.0.0.1:{port}/{prefix}"),
+        ));
     }
-    Ok(scoped)
+    Ok(env_vars)
 }
 
 /// Choose the directory the proxy will write the TLS-intercept trust bundle
@@ -3315,13 +3553,187 @@ mod tests {
 
     use crate::command_policy::{
         ApprovalBackendConfig, ApprovalBackendType, CommandCredentialConfig,
-        CommandCredentialGrantPolicyConfig, CommandPolicyConfig, EndpointRuleConfig,
+        CommandCredentialGrantPolicyConfig, CommandFromConfig, CommandNetworkConfig,
+        CommandPoliciesConfig, CommandPolicyConfig, CommandSandboxConfig, EndpointRuleConfig,
+        InterceptActionConfig, InterceptRuleConfig,
     };
 
     // Shared across all tests that dup/dup2 the process's stdin fd, so two such tests
     // never race on fd 0 when cargo runs them concurrently.
     #[cfg(unix)]
     static STDIN_MANIPULATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn domain_sandbox(domain: &str) -> CommandSandboxConfig {
+        CommandSandboxConfig {
+            network: Some(CommandNetworkConfig {
+                allow_domain: vec![domain.to_string()],
+                ..CommandNetworkConfig::default()
+            }),
+            ..CommandSandboxConfig::default()
+        }
+    }
+
+    fn sandbox_domains(sandbox: &CommandSandboxConfig) -> Vec<&str> {
+        sandbox
+            .network
+            .iter()
+            .flat_map(|network| network.allow_domain.iter().map(String::as_str))
+            .collect()
+    }
+
+    #[test]
+    fn command_proxy_scopes_cover_direct_caller_and_intercept_sandboxes() {
+        let mut from = BTreeMap::new();
+        from.insert(
+            "git".to_string(),
+            CommandFromConfig::Policy(Box::new(domain_sandbox("git.example"))),
+        );
+        let command = CommandPolicyConfig {
+            sandbox: Some(domain_sandbox("direct.example")),
+            from,
+            intercept: vec![
+                InterceptRuleConfig {
+                    args: Some(vec!["ordinary".to_string()]),
+                    match_config: None,
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
+                },
+                InterceptRuleConfig {
+                    args: Some(vec!["special".to_string()]),
+                    match_config: None,
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: Some(domain_sandbox("intercept.example")),
+                },
+            ],
+            ..CommandPolicyConfig::default()
+        };
+        let policies = CommandPoliciesConfig {
+            commands: BTreeMap::from([("curl".to_string(), command)]),
+            ..CommandPoliciesConfig::default()
+        };
+
+        let scopes: BTreeMap<_, _> = command_proxy_scopes(&policies).into_iter().collect();
+
+        assert_eq!(scopes.len(), 4);
+        assert_eq!(sandbox_domains(scopes["curl::session"]), ["direct.example"]);
+        assert_eq!(sandbox_domains(scopes["curl::git"]), ["git.example"]);
+        for key in ["curl::session::intercept::1", "curl::git::intercept::1"] {
+            assert_eq!(sandbox_domains(scopes[key]), ["intercept.example"]);
+        }
+    }
+
+    #[test]
+    fn command_proxy_scopes_use_explicit_session_policy() {
+        let command = CommandPolicyConfig {
+            from: BTreeMap::from([(
+                "session".to_string(),
+                CommandFromConfig::Policy(Box::new(domain_sandbox("session.example"))),
+            )]),
+            ..CommandPolicyConfig::default()
+        };
+        let policies = CommandPoliciesConfig {
+            commands: BTreeMap::from([("curl".to_string(), command)]),
+            ..CommandPoliciesConfig::default()
+        };
+
+        let scopes: BTreeMap<_, _> = command_proxy_scopes(&policies).into_iter().collect();
+
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(
+            sandbox_domains(scopes["curl::session"]),
+            ["session.example"]
+        );
+    }
+
+    #[test]
+    fn scoped_proxy_keeps_only_credentials_granted_by_effective_sandbox() {
+        let proxy = ProxyLaunchOptions {
+            tool_sandbox_proxy_credentials: HashSet::from([
+                "allowed-api".to_string(),
+                "other-api".to_string(),
+            ]),
+            ..ProxyLaunchOptions::default()
+        };
+        let sandbox = CommandSandboxConfig {
+            credentials: vec![CommandCredentialGrantConfig::Policy(
+                CommandCredentialGrantPolicyConfig {
+                    name: "allowed-api".to_string(),
+                    endpoint_policy: Some(EndpointPolicyConfig::default()),
+                },
+            )],
+            ..CommandSandboxConfig::default()
+        };
+        let mut config = nono_proxy::config::ProxyConfig {
+            routes: vec![
+                nono_proxy::config::RouteConfig {
+                    prefix: "allowed-api".to_string(),
+                    ..nono_proxy::config::RouteConfig::default()
+                },
+                nono_proxy::config::RouteConfig {
+                    prefix: "other-api".to_string(),
+                    ..nono_proxy::config::RouteConfig::default()
+                },
+                nono_proxy::config::RouteConfig {
+                    prefix: "session-api".to_string(),
+                    ..nono_proxy::config::RouteConfig::default()
+                },
+            ],
+            ..nono_proxy::config::ProxyConfig::default()
+        };
+
+        let names = scoped_proxy_credential_names(&proxy, &sandbox);
+        retain_scoped_proxy_routes(&mut config, &names);
+
+        assert_eq!(names, ["allowed-api"]);
+        assert_eq!(config.routes.len(), 1);
+        assert_eq!(config.routes[0].prefix, "allowed-api");
+    }
+
+    #[test]
+    fn proxy_credentials_require_a_scope_without_domain_grants() {
+        let proxy = ProxyLaunchOptions {
+            tool_sandbox_proxy_credentials: HashSet::from(["allowed-api".to_string()]),
+            ..ProxyLaunchOptions::default()
+        };
+        let sandbox = CommandSandboxConfig {
+            credentials: vec![CommandCredentialGrantConfig::Policy(
+                CommandCredentialGrantPolicyConfig {
+                    name: "allowed-api".to_string(),
+                    endpoint_policy: Some(EndpointPolicyConfig::default()),
+                },
+            )],
+            ..CommandSandboxConfig::default()
+        };
+
+        let credential_names = scoped_proxy_credential_names(&proxy, &sandbox);
+        assert_eq!(credential_names, ["allowed-api"]);
+        assert!(sandbox.network.is_none());
+        assert!(requires_command_scoped_proxy(&sandbox, &credential_names));
+    }
+
+    #[test]
+    fn scoped_proxy_env_rejects_transport_and_credential_collisions() {
+        let mut env = Vec::new();
+
+        let error = extend_scoped_proxy_env(
+            &mut env,
+            vec![("HTTP_PROXY".to_string(), "phantom".to_string())],
+            "curl::session",
+        )
+        .expect_err("credential env must not replace proxy transport");
+
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting environment variable")
+        );
+
+        let duplicate_transport = vec![
+            ("HTTP_PROXY".to_string(), "first".to_string()),
+            ("HTTP_PROXY".to_string(), "second".to_string()),
+        ];
+        assert!(validate_scoped_proxy_env(&duplicate_transport, "curl::session").is_err());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -4000,6 +4412,64 @@ mod tests {
     }
 
     #[test]
+    fn intercept_only_proxy_credentials_are_collected() -> Result<()> {
+        let mut policies = CommandPoliciesConfig::default();
+        policies.credentials.insert(
+            "api".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://api.example.com".to_string()),
+                env_var: Some("API_TOKEN".to_string()),
+                ..CommandCredentialConfig::default()
+            },
+        );
+        policies.commands.insert(
+            "curl".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig::default()),
+                intercept: vec![InterceptRuleConfig {
+                    args: Some(vec!["special".to_string()]),
+                    match_config: None,
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: Some(CommandSandboxConfig {
+                        credentials: vec![CommandCredentialGrantConfig::Policy(
+                            CommandCredentialGrantPolicyConfig {
+                                name: "api".to_string(),
+                                endpoint_policy: Some(EndpointPolicyConfig::default()),
+                            },
+                        )],
+                        ..CommandSandboxConfig::default()
+                    }),
+                }],
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        let mut credentials = Vec::new();
+        let mut custom_credentials = HashMap::new();
+        let mut proxy_source_env_vars = HashMap::new();
+        let mut base_url_env_vars = HashMap::new();
+        let mut tool_sandbox_proxy_credentials = HashSet::new();
+        extend_proxy_settings_with_tool_sandbox_credentials(
+            Some(&policies),
+            &nono::CapabilitySet::default(),
+            &mut credentials,
+            &mut custom_credentials,
+            &mut proxy_source_env_vars,
+            &mut base_url_env_vars,
+            &mut tool_sandbox_proxy_credentials,
+        )?;
+
+        assert_eq!(credentials, ["api".to_string()]);
+        assert!(custom_credentials.contains_key("api"));
+        assert_eq!(
+            tool_sandbox_proxy_credentials,
+            HashSet::from(["api".to_string()])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tool_sandbox_proxy_endpoint_policy_preserves_deny_and_approve_routes() {
         let policy = EndpointPolicyConfig {
             default: PolicyDecisionConfig::Decision(PolicyDecision::Deny),
@@ -4119,7 +4589,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_sandbox_proxy_env_vars_are_scoped_out_of_global_env() -> Result<()> {
+    fn tool_sandbox_proxy_routes_are_removed_from_session_proxy() -> Result<()> {
         let mut proxy = ProxyLaunchOptions::default();
         proxy
             .tool_sandbox_proxy_credentials
@@ -4153,6 +4623,10 @@ mod tests {
             upgrades: vec![],
             rate_limit: None,
         });
+        proxy_config.routes.push(nono_proxy::config::RouteConfig {
+            prefix: "session-api".to_string(),
+            ..nono_proxy::config::RouteConfig::default()
+        });
         let credential_env_vars = vec![
             (
                 "GITHUB-API_BASE_URL".to_string(),
@@ -4161,27 +4635,27 @@ mod tests {
             ("GITHUB_TOKEN".to_string(), "phantom-token".to_string()),
         ];
 
-        let scoped = scoped_tool_sandbox_proxy_credential_env_vars(
+        let scoped = tool_sandbox_proxy_credential_env_vars(
             &proxy,
             &proxy_config,
             &credential_env_vars,
             7777,
+            "github-api",
         )?;
-        let env_names = tool_sandbox_proxy_env_var_names(&proxy, &proxy_config);
+        remove_tool_sandbox_routes(&mut proxy_config, &proxy.tool_sandbox_proxy_credentials);
 
-        assert!(env_names.contains("GITHUB-API_BASE_URL"));
-        assert!(env_names.contains("GITHUB_API_BASE_URL"));
-        assert!(env_names.contains("GITHUB_TOKEN"));
         assert_eq!(
-            scoped.get("github-api"),
-            Some(&vec![
+            scoped,
+            vec![
                 ("GITHUB_TOKEN".to_string(), "phantom-token".to_string()),
                 (
                     "GITHUB_API_BASE_URL".to_string(),
                     "http://127.0.0.1:7777/github-api".to_string()
                 ),
-            ])
+            ]
         );
+        assert_eq!(proxy_config.routes.len(), 1);
+        assert_eq!(proxy_config.routes[0].prefix, "session-api");
         Ok(())
     }
 
@@ -4829,7 +5303,7 @@ mod tests {
         );
     }
 
-    /// Live regression test for the tool-sandbox-proxy-credential variant of
+    /// Live regression test for the command-sandbox proxy-credential variant of
     /// `load_command_credential_source` (this file has its own copy,
     /// separate from `tool_sandbox::policy`'s). Same bare-name-resolution
     /// broker as the other copy — a trojan on a sandbox-writable PATH dir

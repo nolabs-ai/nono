@@ -1,7 +1,7 @@
 //! Shared URL validation and browser-opening helpers.
 //!
 //! Both the supervisor (for the directly-launched process) and the
-//! tool-sandbox runtime (for brokered `command_policies` children) delegate
+//! command-mediation runtime (for brokered command sandboxes) delegate
 //! browser opens to an unsandboxed process. Because the browser is launched
 //! outside the sandbox, the origin/scheme allow-list is the only gate between
 //! the sandboxed child and an arbitrary `open`/`xdg-open` invocation.

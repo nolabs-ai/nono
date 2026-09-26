@@ -5,6 +5,9 @@ static PASSTHROUGH_INTERCEPT_ACTION: crate::command_policy::InterceptActionConfi
 pub(super) struct ResolvedInterceptAction<'a> {
     pub(super) action: &'a crate::command_policy::InterceptActionConfig,
     pub(super) rule_label: Option<ResolvedInterceptRuleLabel<'a>>,
+    /// Index in the effective (post-merge) intercept list. This is also the
+    /// stable identity of a matched rule's sandbox-specific proxy.
+    pub(super) rule_index: Option<usize>,
     /// Per-rule sandbox override for this matched invocation (passthrough).
     /// `None` for the fallthrough and rules without an override.
     pub(super) sandbox: Option<&'a crate::command_policy::CommandSandboxConfig>,
@@ -23,6 +26,7 @@ impl<'a> ResolvedInterceptAction<'a> {
         Self {
             action: &PASSTHROUGH_INTERCEPT_ACTION,
             rule_label: None,
+            rule_index: None,
             sandbox: None,
         }
     }
@@ -55,6 +59,7 @@ pub(super) fn resolve_intercept_action<'a>(
                 return Ok(ResolvedInterceptAction {
                     action: &rule.action,
                     rule_label: Some(ResolvedInterceptRuleLabel::Args(args)),
+                    rule_index: Some(index),
                     sandbox: rule.sandbox.as_ref(),
                 });
             }
@@ -72,6 +77,7 @@ pub(super) fn resolve_intercept_action<'a>(
             return Ok(ResolvedInterceptAction {
                 action: &rule.action,
                 rule_label: Some(ResolvedInterceptRuleLabel::Predicate(index)),
+                rule_index: Some(index),
                 sandbox: rule.sandbox.as_ref(),
             });
         }
@@ -181,12 +187,12 @@ pub(super) fn resolve_exec_command(
     command: &[String],
 ) -> nono::Result<(std::path::PathBuf, Vec<Vec<u8>>)> {
     let helper_raw = command.first().ok_or_else(|| {
-        nono::NonoError::SandboxInit("tool-sandbox exec action has empty command".to_string())
+        nono::NonoError::SandboxInit("command-policy exec action has empty command".to_string())
     })?;
     let helper_path = std::path::PathBuf::from(crate::policy::expand_env_vars_strict(helper_raw)?);
     if !helper_path.is_absolute() {
         return Err(nono::NonoError::SandboxInit(format!(
-            "tool-sandbox exec helper must be an absolute path; got '{}'",
+            "command-policy exec helper must be an absolute path; got '{}'",
             helper_path.display()
         )));
     }
@@ -213,7 +219,7 @@ pub(super) fn resolve_exec_helper<'a>(
     let (helper_path, extra_args) = resolve_exec_command(command)?;
     let helper = exec_helpers.get(&helper_path).ok_or_else(|| {
         nono::NonoError::SandboxInit(format!(
-            "tool-sandbox exec helper not pre-resolved: {}",
+            "command-policy exec helper not pre-resolved: {}",
             helper_path.display()
         ))
     })?;
@@ -344,7 +350,7 @@ fn invocation_args(argv: &[Vec<u8>]) -> nono::Result<Vec<String>> {
         .skip(1)
         .map(|arg| {
             std::str::from_utf8(arg).map(str::to_owned).map_err(|_| {
-                nono::NonoError::SandboxInit("tool-sandbox argv is not UTF-8".to_string())
+                nono::NonoError::SandboxInit("command-policy argv is not UTF-8".to_string())
             })
         })
         .collect()
@@ -358,10 +364,12 @@ fn invocation_env(env: &[Vec<u8>]) -> nono::Result<std::collections::BTreeMap<St
             continue;
         };
         let name = std::str::from_utf8(name).map_err(|_| {
-            nono::NonoError::SandboxInit("tool-sandbox env name is not UTF-8".to_string())
+            nono::NonoError::SandboxInit("command-policy environment name is not UTF-8".to_string())
         })?;
         let value = std::str::from_utf8(value).map_err(|_| {
-            nono::NonoError::SandboxInit("tool-sandbox env value is not UTF-8".to_string())
+            nono::NonoError::SandboxInit(
+                "command-policy environment value is not UTF-8".to_string(),
+            )
         })?;
         result.insert(name.to_string(), value.to_string());
     }
@@ -375,17 +383,16 @@ fn split_env_entry_for_policy(entry: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn proxy_port_from_env(env: &[Vec<u8>]) -> Option<u16> {
-    env.iter().find_map(|entry| {
-        let (name, value) = split_env_entry_for_policy(entry)?;
-        if !matches!(
-            name,
-            b"HTTPS_PROXY" | b"HTTP_PROXY" | b"https_proxy" | b"http_proxy"
+pub(super) fn proxy_port_from_vars(env: &[(String, String)]) -> Option<u16> {
+    env.iter().find_map(|(name, value)| {
+        if matches!(
+            name.as_str(),
+            "HTTPS_PROXY" | "HTTP_PROXY" | "https_proxy" | "http_proxy"
         ) {
-            return None;
+            loopback_http_proxy_port(value)
+        } else {
+            None
         }
-        let value = std::str::from_utf8(value).ok()?;
-        loopback_http_proxy_port(value)
     })
 }
 
@@ -610,7 +617,7 @@ pub(super) fn approval_deny_reason(decision: &nono::supervisor::ApprovalDecision
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn policy_credential_names(
+pub(crate) fn policy_credential_names(
     policy: &crate::command_policy::CommandSandboxConfig,
 ) -> Vec<&str> {
     let mut names = Vec::with_capacity(policy.use_credentials.len() + policy.credentials.len());
@@ -638,7 +645,7 @@ pub(super) fn reject_unenforced_resources(
         return Err(nono::NonoError::BlockedCommand {
             command: command.to_string(),
             reason:
-                "sandbox.resources is parsed by tool-sandbox Schema 2 but not yet enforced by this runtime"
+                "sandbox.resources is parsed by command-sandbox Schema 2 but not yet enforced by this runtime"
                     .to_string(),
         });
     }
@@ -734,6 +741,7 @@ mod intercept_tests {
             .expect("resolve intercept");
 
         assert_eq!(resolved.rule_label(), "push --force");
+        assert_eq!(resolved.rule_index, Some(0));
         assert!(matches!(
             resolved.action,
             InterceptActionConfig::Approve { .. }
@@ -1192,6 +1200,7 @@ mod intercept_tests {
         )
         .expect("resolve intercept");
         assert_eq!(with.sandbox, Some(&override_sandbox));
+        assert_eq!(with.rule_index, Some(0));
 
         let without = resolve_intercept_action(
             &config,
@@ -1200,6 +1209,7 @@ mod intercept_tests {
         )
         .expect("resolve intercept");
         assert_eq!(without.sandbox, None);
+        assert_eq!(without.rule_index, Some(1));
 
         // Fallthrough (no matching rule) also has no override.
         let fallthrough = resolve_intercept_action(
@@ -1209,6 +1219,7 @@ mod intercept_tests {
         )
         .expect("resolve intercept");
         assert_eq!(fallthrough.sandbox, None);
+        assert_eq!(fallthrough.rule_index, None);
     }
 
     #[test]
@@ -1349,7 +1360,7 @@ mod intercept_tests {
         assert!(matches!(
             err,
             Some(message)
-                if message.contains("sandbox.resources is parsed by tool-sandbox Schema 2 but not yet enforced")
+                if message.contains("sandbox.resources is parsed by command-sandbox Schema 2 but not yet enforced")
         ));
     }
 

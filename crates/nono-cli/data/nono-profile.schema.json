@@ -67,7 +67,7 @@
     },
     "command_policies": {
       "$ref": "#/$defs/CommandPoliciesConfig",
-      "description": "tool-sandbox command-control policy. tool-sandbox activates only when commands is non-empty; broker-mediated enforcement is available on Linux and macOS, with platform-specific capability limits."
+      "description": "Command policy. Command mediation activates only when commands is non-empty; broker-mediated enforcement is available on Linux and macOS, with platform-specific capability limits."
     },
     "workdir": {
       "$ref": "#/$defs/WorkdirConfig",
@@ -624,7 +624,7 @@
         "approval_backends": {
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/ApprovalBackendConfig" },
-          "description": "Where supervised-mode file/capability approval prompts are sent. A named backend here (e.g. a webhook) answers the prompts instead of the terminal. Kept separate from command_policies on purpose: setting it does not switch on tool-sandbox. Empty keeps the interactive terminal prompt."
+          "description": "Where supervised-mode file/capability approval prompts are sent. A named backend here (e.g. a webhook) answers the prompts instead of the terminal. Kept separate from command_policies on purpose: setting it does not activate command mediation. Empty keeps the interactive terminal prompt."
         },
         "approval_defaults": {
           "oneOf": [
@@ -853,13 +853,13 @@
         "allow": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Deprecated in v0.33.0. Startup-only command allowlist override. Not enforced for child processes; prefer resource-based controls instead.",
+          "description": "Deprecated in v0.33.0. Startup-only command allowlist override. Not enforced for child processes; prefer filesystem, network, and command policies instead.",
           "deprecated": true
         },
         "deny": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer resource-based controls instead.",
+          "description": "Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer filesystem, network, and command policies instead.",
           "deprecated": true
         }
       }
@@ -1587,7 +1587,7 @@
     },
     "CommandPoliciesConfig": {
       "type": "object",
-      "description": "tool-sandbox command-control policy.",
+      "description": "Command policy.",
       "additionalProperties": false,
       "properties": {
         "executable_dirs": {
@@ -1597,7 +1597,7 @@
         },
         "allow_writable_executables": {
           "type": "boolean",
-          "description": "Explicit profile-wide trust downgrade that disables tool-sandbox checks for policy, deny-only, and outer executable allow-list paths writable through the sandbox capability set."
+          "description": "Explicit profile-wide trust downgrade that disables command-mediation checks for policy-controlled, deny-only, and session executable allow-list paths writable through the session sandbox's capability set."
         },
         "entrypoint": {
           "$ref": "#/$defs/CommandPolicyIdentifier",
@@ -1615,12 +1615,12 @@
         "credentials": {
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/CommandCredentialConfig" },
-          "description": "Named command credentials that may be injected only into selected child-tool-sandbox policies."
+          "description": "Named command credentials that may be injected only into selected command sandbox policies."
         },
         "commands": {
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/CommandPolicyConfig" },
-          "description": "Policy-controlled command definitions. A non-empty object activates tool-sandbox."
+          "description": "Policy-controlled command definitions. A non-empty object activates command mediation."
         },
         "deny_direct_exec_bypass": {
           "type": "array",
@@ -1883,7 +1883,7 @@
       "properties": {
         "executable": {
           "type": "string",
-          "description": "Optional exact executable file for this command. When set, tool-sandbox binds the command name to this canonical file instead of resolving the first PATH match."
+          "description": "Optional exact executable file for this command. When set, command mediation binds the command name to this canonical file instead of resolving the first PATH match."
         },
         "allow_writable_executable": {
           "type": "boolean",
@@ -1892,7 +1892,7 @@
         "can_use": {
           "type": "array",
           "items": { "$ref": "#/$defs/CommandPolicyIdentifier" },
-          "description": "Other commands this command may invoke through tool-sandbox chaining. If no explicit self-invocation entry is configured, self-invocation keeps the command's current effective policy and does not require listing the command here."
+          "description": "Other commands this command may invoke through command mediation. If no explicit self-invocation entry is configured, self-invocation keeps the current effective command sandbox and does not require listing the command here."
         },
         "sandbox": {
           "$ref": "#/$defs/CommandSandboxConfig",
@@ -1917,7 +1917,7 @@
         "allow_direct_exec_bypass": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Canonical executable paths allowed to bypass child-tool-sandbox when invoked directly, while PATH invocation remains shim-controlled."
+          "description": "Canonical executable paths allowed to bypass the command sandbox when invoked directly, while PATH invocation remains shim-controlled."
         },
         "allow_direct_exec_bypass_with_credentials": {
           "type": "boolean",
@@ -1958,7 +1958,7 @@
       "properties": {
         "sandbox": {
           "$ref": "#/$defs/CommandSandboxConfig",
-          "description": "Child sandbox selected for this caller edge."
+          "description": "Command sandbox policy selected for this caller edge."
         },
         "invocation_policy": {
           "$ref": "#/$defs/InvocationPolicyConfig",
@@ -1973,50 +1973,50 @@
         "fs_read": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Directory read grants for the selected child-tool-sandbox policy."
+          "description": "Directory read grants in the selected command sandbox policy."
         },
         "fs_read_file": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Exact file read grants for the selected child-tool-sandbox policy."
+          "description": "Exact file read grants in the selected command sandbox policy."
         },
         "fs_write": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Directory write grants for the selected child-tool-sandbox policy."
+          "description": "Directory write grants in the selected command sandbox policy."
         },
         "fs_write_file": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Exact file write grants for the selected child-tool-sandbox policy."
+          "description": "Exact file write grants in the selected command sandbox policy."
         },
         "unix_socket_bind": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "AF_UNIX socket bind grants for the selected child-tool-sandbox policy."
+          "description": "AF_UNIX socket bind grants in the selected command sandbox policy."
         },
         "use_credentials": {
           "type": "array",
           "items": { "$ref": "#/$defs/CommandPolicyIdentifier" },
-          "description": "Credential handles injected into this selected child-tool-sandbox policy."
+          "description": "Credential handles injected into the selected command sandbox."
         },
         "credentials": {
           "type": "array",
           "items": { "$ref": "#/$defs/CommandCredentialGrantConfig" },
-          "description": "Credential handles injected into this selected child-tool-sandbox policy, optionally with endpoint policy constraints."
+          "description": "Credential handles injected into the selected command sandbox, optionally with endpoint-policy constraints."
         },
         "argv_prepend": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Arguments inserted after the synthesized argv[0] and before shim-captured argv[1..] for this selected child-tool-sandbox policy."
+          "description": "Arguments inserted after the synthesized argv[0] and before shim-captured argv[1..] by the selected command sandbox policy."
         },
         "network": {
           "$ref": "#/$defs/CommandNetworkConfig",
-          "description": "Network grants for this selected child-tool-sandbox policy."
+          "description": "Network policy for the selected command sandbox."
         },
         "environment": {
           "$ref": "#/$defs/CommandEnvironmentConfig",
-          "description": "Environment carry-over rules for this selected child-tool-sandbox policy."
+          "description": "Environment carry-over rules for the selected command sandbox."
         },
         "allow_raw_file_credentials_in_chained_policy": {
           "type": "boolean",
@@ -2032,7 +2032,7 @@
         },
         "open_urls": {
           "$ref": "#/$defs/OpenUrlConfig",
-          "description": "Runtime-delegated URL opening for this command (e.g. OAuth2 login). The unsandboxed tool-sandbox runtime validates each requested URL against allow_origins before opening it in the user's browser. When omitted, inherits from the base profile; when present, replaces it entirely."
+          "description": "Runtime-delegated URL opening for this command (e.g. OAuth2 login). The unsandboxed command-mediation runtime validates each requested URL against allow_origins before opening it in the user's browser. When omitted, inherits from the base profile; when present, replaces it entirely."
         },
         "allow_launch_services": {
           "type": "boolean",
@@ -2041,7 +2041,7 @@
         "unsafe_macos_seatbelt_rules": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "macOS-only. Expert escape hatch: raw Seatbelt S-expression rules appended to this command's child sandbox profile, emitted after the generated denies (including the exec gate's (deny process-exec*)), so a later (allow ...) wins under Seatbelt's last-matching-rule semantics. Scoped to a single command or per-intercept override. Ignored on Linux."
+          "description": "macOS-only. Expert escape hatch: raw Seatbelt S-expression rules appended to this command sandbox's Seatbelt profile, emitted after the generated denies (including the exec gate's (deny process-exec*)), so a later (allow ...) wins under Seatbelt's last-matching-rule semantics. Scoped to a single command or per-intercept override. Ignored on Linux."
         }
       }
     },
@@ -2292,12 +2292,12 @@
         "allow_vars": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Authoritative environment variable allow-list for tool-sandbox. Supports exact names, trailing-prefix wildcards such as AWS_*, and a bare *."
+          "description": "Authoritative environment variable allow-list for command sandboxes. Supports exact names, trailing-prefix wildcards such as AWS_*, and a bare *."
         },
         "set_vars": {
           "type": "object",
           "additionalProperties": { "type": "string" },
-          "description": "Static environment variables injected after tool-sandbox environment filtering and before credential injection. PATH and NONO_* are reserved."
+          "description": "Static environment variables injected after command-sandbox environment filtering and before credential injection. PATH and NONO_* are reserved."
         }
       }
     },
@@ -2307,7 +2307,7 @@
       "not": {
         "enum": [".", "..", "session"]
       },
-      "description": "tool-sandbox command or credential identifier."
+      "description": "Command-policy command or credential identifier."
     },
     "WorkdirConfig": {
       "type": "object",

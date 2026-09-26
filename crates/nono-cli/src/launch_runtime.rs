@@ -34,7 +34,7 @@ pub(crate) struct LaunchPlan {
     pub(crate) cmd_args: Vec<OsString>,
     pub(crate) caps: CapabilitySet,
     /// Resolved filesystem deny paths (groups + profile `filesystem.deny`).
-    /// Threaded to the tool-sandbox so a mediated command's live working
+    /// Threaded to command mediation so a mediated command's live working
     /// directory can be rejected when it falls under a path the agent is denied.
     pub(crate) deny_paths: Vec<PathBuf>,
     pub(crate) loaded_secrets: Vec<nono::LoadedSecret>,
@@ -146,12 +146,12 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) proxy_leaf_validity: Option<std::time::Duration>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Environment variables the proxy must source (e.g. credential-bearing
-    /// values) for tool-sandbox brokered commands.
+    /// values) for brokered command sandboxes.
     pub(crate) proxy_source_env_vars: HashMap<String, String>,
-    /// Per-credential base-URL environment variables injected into tool-sandbox
+    /// Per-credential base-URL environment variables injected into command
     /// brokered commands so they target the proxy reverse-route.
     pub(crate) tool_sandbox_base_url_env_vars: HashMap<String, String>,
-    /// Credential names that are brokered to tool-sandbox commands via the proxy.
+    /// Credential names brokered to command sandboxes through the proxy.
     pub(crate) tool_sandbox_proxy_credentials: HashSet<String>,
     /// Proxy/supervisor session identifier, propagated to credential-capture.
     pub(crate) session_id: String,
@@ -261,7 +261,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) startup_timeout_secs: Option<u64>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Command binaries already resolved while validating `command_policies`,
-    /// reused when building the tool-sandbox plan instead of re-resolving.
+    /// reused when building the command-mediation plan instead of re-resolving.
     pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
     /// Named approval backends from the profile `security` section (decoupled
     /// from `command_policies`). Drives the supervised-mode approval backend.

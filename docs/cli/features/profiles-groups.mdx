@@ -661,13 +661,13 @@ Groups use a structured allow/deny taxonomy:
 
 **Protection groups**:
 
-- **`unlink_protection`** — Block file deletion globally, override for user-writable paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L573))
+- **`unlink_protection`** — Block file deletion globally, override for user-writable paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L586))
 
-- **`dangerous_commands`** — Cross-platform commands blocked by default to prevent destructive actions ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L580))
+- **`dangerous_commands`** — Cross-platform commands blocked by default to prevent destructive actions ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L593))
 
-- **`dangerous_commands_macos`** — macOS-specific commands blocked by default ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L613))
+- **`dangerous_commands_macos`** — macOS-specific commands blocked by default ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L626))
 
-- **`dangerous_commands_linux`** — Linux-specific commands blocked by default ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L624))
+- **`dangerous_commands_linux`** — Linux-specific commands blocked by default ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L637))
 
 **System path groups** (grant necessary system access):
 
@@ -675,69 +675,71 @@ Groups use a structured allow/deny taxonomy:
 
 - **`system_read_linux_core`** — Linux core system paths required for normal CLI execution ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L192))
 
-- **`system_write_macos`** — macOS paths requiring write for temp files and devices ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L292))
+- **`system_write_macos`** — macOS paths requiring write for temp files and devices ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L295))
 
-- **`system_write_linux`** — Linux paths requiring write for temp files and devices ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L306))
+- **`system_write_linux`** — Linux paths requiring write for temp files and devices ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L309))
 
-- **`linux_runtime_state`** — Linux runtime state paths for host session and service integration ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L264))
+- **`linux_runtime_state`** — Linux runtime state paths for host session and service integration ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L267))
 
-- **`linux_sysfs_read`** — Linux sysfs paths for kernel and device state inspection ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L274))
+- **`linux_sysfs_read`** — Linux sysfs paths for kernel and device state inspection ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L277))
 
-- **`linux_temp_read`** — Linux shared temporary directory read access ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L283))
+- **`linux_temp_read`** — Linux shared temporary directory read access ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L286))
 
 **Cache groups** (user-level caches and state):
 
-- **`user_caches_macos`** — User cache, log, and preference directories for macOS programs ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L325))
+- **`user_caches_macos`** — User cache, log, and preference directories for macOS programs ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L328))
 
-- **`user_caches_linux`** — User cache directories for Linux programs (XDG) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L339))
+- **`user_caches_linux`** — User cache directories for Linux programs (XDG) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L342))
 
-- **`claude_cache_linux`** — Claude Code CLI cache and MCP log directories on Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L348))
+- **`claude_cache_linux`** — Claude Code CLI cache and MCP log directories on Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L351))
 
 **Runtime groups** (language toolchain paths):
 
-- **`node_runtime`** — Node.js runtime and package manager paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L369))
+- **`node_runtime`** — Node.js runtime and package manager paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L372))
 
-- **`rust_runtime`** — Rust toolchain paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L423))
+- **`rust_runtime`** — Rust toolchain paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L426))
 
-- **`python_runtime`** — Python runtime paths (pyenv, conda, uv) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L412))
+- **`python_runtime`** — Python runtime paths (pyenv, conda, uv) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L415))
 
-- **`go_runtime`** — Go toolchain paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L432))
+- **`go_runtime`** — Go toolchain paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L435))
 
-- **`go_runtime_linux`** — Go build cache on Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L441))
+- **`go_runtime_linux`** — Go build cache on Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L444))
 
-- **`go_runtime_macos`** — Go build cache on macOS ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L450))
+- **`go_runtime_macos`** — Go build cache on macOS ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L453))
 
-- **`java_runtime`** — Java runtime and build tool paths (SDKMAN, Maven, Gradle) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L459))
+- **`java_runtime`** — Java runtime and build tool paths (SDKMAN, Maven, Gradle) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L462))
 
-- **`nix_runtime`** — Nix package manager runtime paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L545))
+- **`nix_runtime`** — Nix package manager runtime paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L558))
 
-- **`user_tools`** — User-local executables, .desktop files, man pages, and shell completions ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L357))
+- **`user_tools`** — User-local executables, .desktop files, man pages, and shell completions ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L360))
 
-- **`homebrew_macos`** — Homebrew installation paths on macOS ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L471))
+- **`homebrew_macos`** — Homebrew installation paths on macOS ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L474))
 
-- **`homebrew_linux`** — Homebrew (Linuxbrew) installation paths on Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L482))
+- **`homebrew_linux`** — Homebrew (Linuxbrew) installation paths on Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L485))
 
-- **`mise_manager`** — Mise - dev tools, env vars, task runner ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L401))
+- **`snap_linux`** — Installed Snap package contents on Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L494))
 
-- **`bun_runtime`** — Bun javascript runtime and package manager paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L384))
+- **`mise_manager`** — Mise - dev tools, env vars, task runner ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L404))
+
+- **`bun_runtime`** — Bun javascript runtime and package manager paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L387))
 
 **Tool-specific groups** (paths for specific applications):
 
-- **`claude_code_macos`** — Claude Code macOS-specific state and credential paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L491))
+- **`claude_code_macos`** — Claude Code macOS-specific state and credential paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L504))
 
-- **`claude_code_linux`** — Claude Code Linux-specific state paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L516))
+- **`claude_code_linux`** — Claude Code Linux-specific state paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L529))
 
-- **`codex_macos`** — Codex macOS-specific state and credential paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L506))
+- **`codex_macos`** — Codex macOS-specific state and credential paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L519))
 
-- **`opencode_linux`** — OpenCode binary directory (Landlock requires directory read to execute binaries) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L392))
+- **`opencode_linux`** — OpenCode binary directory (Landlock requires directory read to execute binaries) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L395))
 
-- **`vscode_macos`** — Visual Studio Code configuration and extension directories for macOS ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L525))
+- **`vscode_macos`** — Visual Studio Code configuration and extension directories for macOS ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L538))
 
-- **`vscode_linux`** — Visual Studio Code configuration and extension directories for Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L535))
+- **`vscode_linux`** — Visual Studio Code configuration and extension directories for Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L548))
 
 **Application config groups** (profile and configuration files):
 
-- **`git_config`** — Read access to git configuration files ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L561))
+- **`git_config`** — Read access to git configuration files ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L574))
 
 <Note>
   Group definitions are located in `crates/nono-cli/data/policy.json`. Each

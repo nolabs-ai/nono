@@ -9,8 +9,9 @@ use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
     PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
 };
+use nix::fcntl::{OFlag, open};
+use nix::sys::stat::Mode;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
@@ -309,7 +310,7 @@ impl DetectedAbi {
         AccessFs::from_all(self.abi).contains(AccessFs::Truncate)
     }
 
-    /// Whether execute access control is supported strongly enough for Tool Sandbox Execution.
+    /// Whether execute access control is supported strongly enough for command sandbox execution.
     #[must_use]
     pub fn has_execute(&self) -> bool {
         matches!(self.abi, ABI::V3 | ABI::V4 | ABI::V5 | ABI::V6)
@@ -680,17 +681,22 @@ fn normalize_path_access(
 /// Returning the same descriptor used for metadata validation prevents a path
 /// replacement between type/device classification and rule installation.
 fn open_path_rule(cap: &crate::capability::FsCapability, abi: ABI) -> Result<OpenedPathRule> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-        .open(&cap.resolved)
-        .map_err(|e| {
-            NonoError::SandboxInit(format!(
-                "Cannot open Landlock rule path {}: {}",
-                cap.resolved.display(),
-                e
-            ))
-        })?;
+    // Do not use std::fs::OpenOptions::custom_flags here. On musl, O_ACCMODE
+    // includes O_PATH, so Rust's standard-library access-mode mask strips the
+    // flag and turns this into an ordinary permission-checked read open.
+    let path_fd = open(
+        &cap.resolved,
+        OFlag::O_PATH | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "Cannot open Landlock rule path {}: {}",
+            cap.resolved.display(),
+            e
+        ))
+    })?;
+    let file = std::fs::File::from(path_fd);
     let metadata = file.metadata().map_err(|e| {
         NonoError::SandboxInit(format!(
             "Cannot inspect opened Landlock rule path {}: {}",
@@ -1409,7 +1415,7 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
     let abi = detect_abi()?;
     if !abi.has_execute() {
         return Err(NonoError::SandboxInit(format!(
-            "Tool Sandbox  execute restriction requires Landlock ABI V3+; detected {}",
+            "Command sandbox execute restriction requires Landlock ABI V3+; detected {}",
             abi.version_string()
         )));
     }
@@ -1419,20 +1425,20 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
         .handle_access(AccessFs::Execute)
         .map_err(|e| {
             NonoError::SandboxInit(format!(
-                "Tool Sandbox  execute restriction: kernel does not support Landlock Execute: {e}"
+                "Command sandbox execute restriction: kernel does not support Landlock Execute: {e}"
             ))
         })?
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::Refer)
         .map_err(|e| {
             NonoError::SandboxInit(format!(
-                "Tool Sandbox  execute restriction: cannot handle Refer: {e}"
+                "Command sandbox execute restriction: cannot handle Refer: {e}"
             ))
         })?
         .create()
         .map_err(|e| {
             NonoError::SandboxInit(format!(
-                "Tool Sandbox  execute restriction: ruleset create failed: {e}"
+                "Command sandbox execute restriction: ruleset create failed: {e}"
             ))
         })?;
 
@@ -1440,7 +1446,7 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
         let p = path.as_ref();
         let fd = PathFd::new(p).map_err(|e| {
             NonoError::SandboxInit(format!(
-                "Tool Sandbox  execute restriction: cannot open {}: {e}",
+                "Command sandbox execute restriction: cannot open {}: {e}",
                 p.display()
             ))
         })?;
@@ -1448,7 +1454,7 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
             .add_rule(PathBeneath::new(fd, AccessFs::Execute))
             .map_err(|e| {
                 NonoError::SandboxInit(format!(
-                    "Tool Sandbox  execute restriction: add_rule for {}: {e}",
+                    "Command sandbox execute restriction: add_rule for {}: {e}",
                     p.display()
                 ))
             })?;
@@ -1457,21 +1463,21 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
     if abi.has_refer() {
         let root_fd = PathFd::new("/").map_err(|e| {
             NonoError::SandboxInit(format!(
-                "Tool Sandbox  execute restriction: cannot open / for Refer grant: {e}"
+                "Command sandbox execute restriction: cannot open / for Refer grant: {e}"
             ))
         })?;
         ruleset = ruleset
             .add_rule(PathBeneath::new(root_fd, AccessFs::Refer))
             .map_err(|e| {
                 NonoError::SandboxInit(format!(
-                    "Tool Sandbox  execute restriction: add_rule for / (Refer): {e}"
+                    "Command sandbox execute restriction: add_rule for / (Refer): {e}"
                 ))
             })?;
     }
 
     let status = ruleset.restrict_self().map_err(|e| {
         NonoError::SandboxInit(format!(
-            "Tool Sandbox  execute restriction: restrict_self failed: {e}"
+            "Command sandbox execute restriction: restrict_self failed: {e}"
         ))
     })?;
 
@@ -1484,10 +1490,10 @@ fn ensure_execute_restriction_fully_enforced(status: landlock::RulesetStatus) ->
     match status {
         landlock::RulesetStatus::FullyEnforced => Ok(()),
         landlock::RulesetStatus::PartiallyEnforced => Err(NonoError::SandboxInit(
-            "Tool Sandbox  execute restriction: Landlock was only partially enforced".to_string(),
+            "Command sandbox execute restriction: Landlock was only partially enforced".to_string(),
         )),
         landlock::RulesetStatus::NotEnforced => Err(NonoError::SandboxInit(
-            "Tool Sandbox  execute restriction: Landlock was not enforced".to_string(),
+            "Command sandbox execute restriction: Landlock was not enforced".to_string(),
         )),
     }
 }
@@ -3928,6 +3934,17 @@ mod tests {
                     .contains(AccessFs::IoctlDev)
             );
         }
+    }
+
+    #[test]
+    fn test_open_path_rule_retains_o_path_flag() {
+        let cap = crate::capability::FsCapability::new_file("/dev/null", AccessMode::Read)
+            .expect("device capability");
+        let rule = open_path_rule(&cap, ABI::V1).expect("open path rule");
+        let flags = nix::fcntl::fcntl(&rule.path_fd, nix::fcntl::FcntlArg::F_GETFL)
+            .expect("inspect path fd flags");
+
+        assert_ne!(flags & libc::O_PATH, 0, "Landlock rule fd must use O_PATH");
     }
 
     /// `open_path_rule` opens `cap.resolved` with `O_PATH`, so the kernel

@@ -1,4 +1,4 @@
-//! Ephemeral Tool Isolation profile model and validation.
+//! Command policy profile model and validation.
 //!
 //! This module deliberately stops at profile semantics. Runtime resolution
 //! (PATH lookup, inode capture, Landlock probing, and child launch) builds on
@@ -270,7 +270,7 @@ impl CommandPoliciesConfig {
     }
 
     /// True if any command's sandbox (session-level or any `from` edge) declares
-    /// an `open_urls` policy. Used to decide whether the tool-sandbox runtime
+    /// an `open_urls` policy. Used to decide whether the command-mediation runtime
     /// needs to bind a URL-open listener socket at all.
     #[cfg(any(test, target_os = "linux", target_os = "macos"))]
     pub(crate) fn any_command_allows_url_open(&self) -> bool {
@@ -535,7 +535,7 @@ pub enum InterceptActionConfig {
     /// in the shim response. Primary use: credential-bearing output scanned by
     /// the token broker before reaching the agent.
     Capture,
-    /// Capture stdout, store it as a named tool-sandbox ambient credential, and return
+    /// Capture stdout, store it as a named command-sandbox ambient credential, and return
     /// a broker nonce instead of the real value.
     CaptureCredential {
         /// Command credential handle receiving the captured value.
@@ -597,7 +597,7 @@ pub struct InterceptRuleConfig {
     /// Action to take when this rule matches.
     #[serde(default)]
     pub action: InterceptActionConfig,
-    /// Optional sandbox that replaces the command's selected sandbox for the
+    /// Optional sandbox that replaces the selected command sandbox for the
     /// process this matched rule launches — any launching action (not
     /// `respond`, which launches nothing). Credentials resolve lazily, so
     /// omitting `credentials`/`use_credentials` injects none here.
@@ -809,7 +809,7 @@ pub struct CommandSandboxConfig {
     pub stdio: Option<CommandStdioConfig>,
     /// Supervisor-delegated URL opening for this command (e.g. OAuth2 login).
     ///
-    /// When set, the brokered child may ask the unsandboxed tool-sandbox runtime
+    /// When set, the command sandbox may ask the unsandboxed command-mediation runtime
     /// to open URLs whose origin matches `allow_origins`. When `None`, inherits
     /// from the base profile; when `Some`, replaces the base entirely so derived
     /// profiles can narrow it. An empty `allow_origins` means no URLs are allowed.
@@ -821,7 +821,7 @@ pub struct CommandSandboxConfig {
     #[serde(default)]
     pub allow_launch_services: bool,
     /// macOS-only expert escape hatch: raw Seatbelt S-expression rules appended
-    /// to this command's child sandbox profile. Rules are emitted after the
+    /// to this command sandbox's Seatbelt profile. Rules are emitted after the
     /// generated denies (including the exec gate's `(deny process-exec*)`), so a
     /// later `(allow ...)` wins under Seatbelt's last-matching-rule semantics.
     /// Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to a single
@@ -1091,7 +1091,7 @@ pub struct CommandNetworkConfig {
     #[serde(default)]
     pub tcp_bind_ports: Vec<u16>,
     /// Localhost ports this command may bind (e.g. an OAuth callback listener).
-    /// Unlike `tcp_bind_ports` these are enforceable for tool-sandbox children
+    /// Unlike `tcp_bind_ports` these are enforceable for command sandboxes
     /// on macOS — they mirror the top-level `network.open_port`.
     #[serde(default)]
     pub open_port: Vec<u16>,
@@ -1155,7 +1155,7 @@ pub(crate) fn validate_command_policies(
         if config.has_non_command_fields() {
             report.error(
                 "inactive_non_empty",
-                "command_policies has no policy commands but contains other tool-sandbox fields",
+                "command_policies has no policy-controlled commands but contains other command-policy fields",
             );
         }
         return report;
@@ -1165,7 +1165,7 @@ pub(crate) fn validate_command_policies(
     report.info(
         "active",
         format!(
-            "tool-sandbox active with {} policy-controlled command(s)",
+            "command mediation active with {} policy-controlled command(s)",
             config.commands.len()
         ),
     );
@@ -1199,7 +1199,7 @@ pub(crate) fn validate_command_policies(
     if config.allow_writable_executables {
         report.warning(
             "writable_executables_trust_downgrade",
-            "command_policies.allow_writable_executables disables tool-sandbox writable executable and parent-directory trust checks, including outer capability-set writability",
+            "command_policies.allow_writable_executables disables command-mediation writable-executable and parent-directory trust checks, including session-sandbox capability-set writability",
         );
     }
 
@@ -1248,7 +1248,7 @@ pub(crate) fn validate_legacy_blocked_command_interactions(
             report.error(
                 "policy_blocked_command_conflict",
                 format!(
-                    "command '{command_name}' is both policy-controlled and legacy blocked; use commands.allow to override the legacy blocked entry before tool-sandbox command-control resolution"
+                    "command '{command_name}' is both policy-controlled and legacy blocked; use commands.allow to override the legacy blocked entry before command-policy resolution"
                 ),
             );
             continue;
@@ -1260,7 +1260,7 @@ pub(crate) fn validate_legacy_blocked_command_interactions(
         report.info(
             "legacy_blocked_folded",
             format!(
-                "folded {} legacy blocked command(s) into active tool-sandbox as deny-only entries",
+                "folded {} legacy blocked command(s) into active command policy as deny-only entries",
                 deny_only_commands.len()
             ),
         );
@@ -1350,7 +1350,7 @@ pub(crate) fn resolve_policy_command_binaries(
                 warnings.push(CommandPolicyFinding::new(
                     "script_entrypoint",
                     format!(
-                        "command policy '{command_name}' resolved to script {}; child policy must grant interpreter/runtime {} explicitly",
+                        "command policy '{command_name}' resolved to script {}; its command sandbox policy must grant interpreter/runtime {} explicitly",
                         selected.canonical_path.display(),
                         interpreter
                     ),
@@ -1675,7 +1675,7 @@ fn validate_command(
         report.warning(
             "direct_exec_bypass",
             format!(
-                "command '{command_name}' allows direct canonical exec bypass outside child tool-sandbox"
+                "command '{command_name}' allows direct canonical exec bypass outside its command sandbox"
             ),
         );
         if command_uses_credentials(command) && !command.allow_direct_exec_bypass_with_credentials {
@@ -2899,6 +2899,26 @@ fn validate_sandbox_credentials(
     let mut credential_names = sandbox.use_credentials.clone();
     for credential in &sandbox.credentials {
         credential_names.push(credential.name().to_string());
+    }
+
+    let uses_proxy_credential = credential_names.iter().any(|name| {
+        config
+            .credentials
+            .get(name)
+            .is_some_and(|credential| credential.credential_type == CommandCredentialType::Proxy)
+    });
+    if uses_proxy_credential
+        && sandbox
+            .network
+            .as_ref()
+            .is_some_and(|network| network.allow_all)
+    {
+        report.error(
+            "proxy_credential_with_allow_all",
+            format!(
+                "command '{command_name}' from.{caller} combines a proxy credential with network.allow_all; unrestricted loopback access would bypass credential-route isolation"
+            ),
+        );
     }
 
     for credential_name in &credential_names {
@@ -5901,6 +5921,46 @@ mod tests {
                     && finding.message.contains("does-not-exist")
             }),
             "expected unknown_credential error for the override sandbox: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn proxy_credential_with_allow_all_is_rejected() {
+        let mut config = active_git_config();
+        config.credentials.insert(
+            "api".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://api.example.com".to_string()),
+                credential_key: Some("api-token".to_string()),
+                env_var: Some("API_TOKEN".to_string()),
+                ..Default::default()
+            },
+        );
+        config.commands.get_mut("git").expect("git command").sandbox = Some(CommandSandboxConfig {
+            credentials: vec![CommandCredentialGrantConfig::Policy(
+                CommandCredentialGrantPolicyConfig {
+                    name: "api".to_string(),
+                    endpoint_policy: Some(EndpointPolicyConfig::default()),
+                },
+            )],
+            network: Some(CommandNetworkConfig {
+                allow_all: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "proxy_credential_with_allow_all"),
+            "expected proxy credential isolation error: {:?}",
             report.errors
         );
     }

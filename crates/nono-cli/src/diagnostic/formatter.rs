@@ -4437,6 +4437,7 @@ mod tests {
 
     #[test]
     fn test_supervised_rate_limited_denial() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
         let caps = make_test_caps();
         let denials = vec![DenialRecord {
             path: PathBuf::from("/tmp/flood"),

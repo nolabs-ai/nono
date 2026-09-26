@@ -1,35 +1,35 @@
 ---
 title: Sandboxed Tool Execution
-description: Run selected commands in zero-trust ephemeral per-tool sandboxes with brokered chaining
+description: Run selected commands in zero-trust command sandboxes with brokered chaining
 ---
 
-Sandboxed Tool Execution lets a profile turn specific commands into fine-grained brokered tool executions. The supervisor acts as the Capability Broker and launches the tool into a fresh child sandbox built only from the selected command policy and its lifecycle.
+Sandboxed Tool Execution lets a profile turn specific commands into fine-grained brokered tool executions. The supervisor acts as the Capability Broker and launches each tool into a fresh command sandbox built from the command sandbox policy selected for that invocation.
 
-This means a single tool, such as git, kubectl, or curl, can be scoped with specific filesystem, network, and credential grants. The tool can be chained to a second selected tool with a separate policy. The second tool can be chained to a third, and so on.
+This means a single tool, such as git, kubectl, or curl, can be scoped with specific filesystem, network, and credential grants. The tool can be chained to a second selected tool with a separate command sandbox policy. The second tool can be chained to a third, and so on.
 
-For commands that should not run at all, see [Dangerous Command Blocking](/cli/features/dangerous-command-blocking). That page covers deny-only Tool Sandbox command-control entries and inherited `dangerous_commands` behavior.
+For commands that should not run at all, see [Dangerous Command Blocking](/cli/features/dangerous-command-blocking). That page covers deny-only command-policy entries and inherited `dangerous_commands` behavior.
 
 ## Mental Model
 
-A Tool Sandbox profile answers three questions:
+A command policy answers three questions:
 
 | Question | Field |
 |---|---|
-| What may the outer session run directly? | `command_policies.commands.<name>.sandbox` or `command_policies.commands.<name>.from.session` |
-| What may one Tool Sandbox command run next? | `command_policies.commands.<caller>.can_use` plus `command_policies.commands.<callee>.from.<caller>` for other commands; self-invocation is implicit unless a self-invocation entry is configured |
-| What does the selected child command receive? | `sandbox` or caller-specific `from.<caller>` grants |
+| What may the session sandbox run directly? | `command_policies.commands.<name>.sandbox` or `command_policies.commands.<name>.from.session` |
+| What may one mediated command run next? | `command_policies.commands.<caller>.can_use` plus `command_policies.commands.<callee>.from.<caller>` for other commands; self-invocation is implicit unless a self-invocation entry is configured |
+| What does the selected command sandbox receive? | `sandbox` or caller-specific `from.<caller>` grants |
 
 `command_policies.entrypoint` is still parsed for older profiles, but current profiles should express direct session access with `commands.<name>.sandbox` or `commands.<name>.from.session`.
 
-Each child command starts from a minimal runtime baseline. It does not inherit outer `--allow`, CWD access, broad profile groups, raw credential paths, or outer network access.
+Each command sandbox starts from a minimal runtime baseline. It does not inherit the session sandbox's `--allow` grants, CWD access, broad profile groups, raw credential paths, or network policy.
 
-When Tool Sandbox is active, the outer session's execute grant is built from every trusted directory on `PATH`: nono scans each non-writable `PATH` directory and allow-lists every executable file found there, plus its shared-library dependency closure — not just the initial program and the Tool Sandbox shims. A binary that lives outside `PATH` (for example a JVM's `jspawnhelper` under `/usr/lib/jvm/.../lib/`) is not covered by this scan and is denied unless it's reachable through `PATH`, added to `command_policies.executable_dirs`, or modeled as a command-policy hop with its own `sandbox.exec_paths` entry.
+When command mediation is active, the session sandbox's execute grant is built from every trusted directory on `PATH`: nono scans each non-writable `PATH` directory and allow-lists every executable file found there, plus its shared-library dependency closure — not just the initial program and the command-mediation shims. A binary that lives outside `PATH` (for example a JVM's `jspawnhelper` under `/usr/lib/jvm/.../lib/`) is not covered by this scan and is denied unless it's reachable through `PATH`, added to `command_policies.executable_dirs`, or modeled as a command-policy hop with its own `sandbox.exec_paths` entry.
 
-Tool Sandbox's real security boundary is at policy-controlled *commands*, not at execute-vs-no-execute for the outer session: once a command becomes a Tool Sandbox entry, everything it invokes is governed by `can_use`/`from` edges regardless of `PATH` membership.
+The command-mediation security boundary is at policy-controlled *commands*, not at execute-vs-no-execute for the session sandbox: once a command becomes a command-policy entry, everything it invokes is governed by `can_use`/`from` edges regardless of `PATH` membership.
 
 ## Available Fields
 
-Tool Sandbox configuration lives under `command_policies`. A minimal shape looks like this:
+Command-policy configuration lives under `command_policies`. A minimal shape looks like this:
 
 ```json
 {
@@ -47,10 +47,10 @@ The top-level `command_policies` object accepts these fields:
 
 | Field | Value | Use |
 |---|---|---|
-| `commands` | object | Policy-controlled commands. A non-empty object activates Tool Sandbox. |
-| `credentials` | object | Named credentials that selected child policies may request. |
+| `commands` | object | Policy-controlled commands. A non-empty object activates command mediation. |
+| `credentials` | object | Named credentials that selected command sandbox policies may request. |
 | `executable_dirs` | string array | Extra directories used while resolving command names before shim `PATH` is prepended. |
-| `allow_writable_executables` | boolean | Profile-wide trust downgrade for command targets writable by the sandbox capability set. |
+| `allow_writable_executables` | boolean | Profile-wide trust downgrade for command targets writable by the session sandbox capability set. |
 | `deny_direct_exec_bypass` | absolute path array | Canonical executable paths that must not bypass shim control. |
 | `approval_backends` | object | Named backends for `approve` decisions. |
 | `approval_defaults` | object | Default approval backend and timeout. |
@@ -68,11 +68,11 @@ Each entry under `commands` uses the command name as the key:
 
 | Field | Value | Use |
 |---|---|---|
-| `sandbox` | object | Direct-session policy shorthand. This lets the outer session run the command. |
+| `sandbox` | object | Direct-session command sandbox policy shorthand. This lets the session sandbox run the command. |
 | `from` | object | Caller-specific policies. Use `session` for direct session invocation or another command name for chaining. |
-| `can_use` | command-name array | Other commands this command may invoke through Tool Sandbox. If no self-invocation entry is configured, self-invocation keeps the current effective policy. |
+| `can_use` | command-name array | Other commands this command may invoke through command mediation. If no self-invocation entry is configured, self-invocation keeps the current effective command sandbox. |
 | `executable` | absolute path | Pin the command name to one executable file instead of the first `PATH` match. |
-| `allow_writable_executable` | boolean | Per-command trust downgrade for a pinned executable writable by the sandbox capability set. Requires absolute `executable`. |
+| `allow_writable_executable` | boolean | Per-command trust downgrade for a pinned executable writable by the session sandbox capability set. Requires absolute `executable`. |
 | `intercept` | array | Ordered argument-sequence mediation rules evaluated after invocation policy. |
 | `allow_direct_exec_bypass` | absolute path array | Compatibility escape hatch for direct canonical-path invocation. |
 | `allow_direct_exec_bypass_with_credentials` | boolean | Required when a credential-using command also allows direct exec bypass. |
@@ -86,29 +86,29 @@ Each entry under `commands` uses the command name as the key:
 | `{ "fs_read": ["."], ... }` | Bare sandbox shorthand for this caller. |
 | `{ "sandbox": { ... }, "invocation_policy": { ... } }` | Full edge policy with optional argv/env mediation before launch. |
 
-The selected `sandbox` object describes what the child receives:
+The selected `sandbox` object is the command sandbox policy and describes what the command receives:
 
 | Field | Value | Use |
 |---|---|---|
 | `fs_read` / `fs_write` | directory path arrays | Directory grants. |
 | `fs_read_file` / `fs_write_file` | file path arrays | Exact file grants. |
 | `exec_paths` | path arrays | Linux-only. Extra paths the child may execute, for multi-call tools (e.g. `git`) that re-exec their own helpers by absolute path from a compiled-in exec-path. A directory entry covers everything beneath it; a matching `fs_read` grant is still required, and missing paths are skipped so profiles can list per-distro candidates. Ignored on macOS. |
-| `network` | object | Child network grants. |
+| `network` | object | Command sandbox network policy. |
 | `environment` | object | Environment allow-list and injected static variables. |
 | `argv_prepend` | string array | Mandatory arguments inserted before caller-provided arguments. |
-| `use_credentials` | credential-name array | Named credentials injected into this selected policy. |
+| `use_credentials` | credential-name array | Named credentials injected into the selected command sandbox. |
 | `credentials` | array | Credential grants with optional endpoint policy constraints. |
 | `stdio` | object | Brokered stdout/stderr byte limits. |
-| `resources` | object | Optional child resource limits. |
+| `resources` | object | Optional command sandbox resource limits. |
 | `open_urls` | object | Runtime-delegated URL opening for this command. |
 | `allow_launch_services` | boolean | macOS-only direct LaunchServices URL opening. |
 | `allow_raw_file_credentials_in_chained_policy` | boolean | Required before non-session callers can receive raw-file credentials. |
-| `unsafe_macos_seatbelt_rules` | string array | macOS-only escape hatch: raw Seatbelt rules appended to this command's child profile after the deny gate (last-match-wins). Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to one command/intercept. Use sparingly — e.g. to let a command exec + read a binary it forks by absolute path. Honoured only for **user-authored profiles** (same trust boundary as `binary` — see below); pack and built-in profiles have these rules stripped with a warning. |
+| `unsafe_macos_seatbelt_rules` | string array | macOS-only escape hatch: raw Seatbelt rules appended to this command sandbox's Seatbelt profile after the deny gate (last-match-wins). Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to one command/intercept. Use sparingly — e.g. to let a command exec + read a binary it forks by absolute path. Honoured only for **user-authored profiles** (same trust boundary as `binary` — see below); pack and built-in profiles have these rules stripped with a warning. |
 | `unix_socket_bind` | path array | Grant `connect(2)` and `bind(2)` on the named pathname AF_UNIX socket files (supports the dynamic tokens below). Implied filesystem grant is ReadWrite on the file if it already exists, otherwise ReadWrite on its parent directory (so `bind(2)` can create it) — mirrors the agent-level `unix_socket_bind` field, see [AF_UNIX Socket Grants](/cli/features/profiles-groups#af-unix-socket-grants). A path that resolves to an existing dangling symlink is rejected. |
 
 ### Per-Intercept Sandbox Override
 
-An `intercept` rule may carry an optional `sandbox` (the same object described above). When the rule matches, the process the rule launches runs under the rule's `sandbox` instead of the command's selected sandbox — for that matched invocation only. This applies to every action that launches a process (`passthrough`, `capture`, `capture_credential`, and an approved `approve`); it does not apply to `respond`, which returns static output and launches nothing (a `sandbox` there is rejected at validation). Credentials resolve lazily, so an override that omits `credentials`/`use_credentials` injects no credential env vars for that invocation. The override **completely replaces** the command's selected sandbox for that invocation — it is validated for well-formedness (known credentials, valid paths, etc.) but is not checked against the command's base sandbox, so it is not restricted to narrowing. Author it as carefully as the command's base sandbox; it can grant capabilities the base sandbox does not.
+An `intercept` rule may carry an optional `sandbox` (the same object described above). When the rule matches, the process the rule launches runs under the rule's `sandbox` instead of the selected command sandbox — for that matched invocation only. This applies to every action that launches a process (`passthrough`, `capture`, `capture_credential`, and an approved `approve`); it does not apply to `respond`, which returns static output and launches nothing (a `sandbox` there is rejected at validation). Credentials resolve lazily, so an override that omits `credentials`/`use_credentials` injects no credential env vars for that invocation. The override **completely replaces** the selected command sandbox for that invocation — it is validated for well-formedness (known credentials, valid paths, etc.) but is not checked against the command's base sandbox, so it is not restricted to narrowing. Author it as carefully as the command's base sandbox; it can grant capabilities the base sandbox does not.
 
 ```jsonc
 {
@@ -126,7 +126,7 @@ An `intercept` rule may carry an optional `sandbox` (the same object described a
 
 Each `intercept` entry selects an invocation with either legacy `args` or an explicit `match` predicate, then applies an `action`. Rules are evaluated in order; the first match wins. Legacy `args` is a contiguous argument sequence matched within the invocation's arguments (an empty `args` is a catch-all). This lets subcommand rules match after command-global options, such as `git -c foo=bar push --force`. Broad single-argument rules like `["--force"]` match anywhere in the invocation, not only at the subcommand position.
 
-Use `match` when a rule needs an explicit predicate instead of a literal `args` window. `match.argv` accepts the same matcher shapes as `invocation_policy`: `exact`, `prefix`, or `contains`. `match.env` checks environment variables after Tool Sandbox environment filtering, so profiles can mediate out-of-band behavior such as `GIT_SSH_COMMAND` without matching raw host environment state.
+Use `match` when a rule needs an explicit predicate instead of a literal `args` window. `match.argv` accepts the same matcher shapes as `invocation_policy`: `exact`, `prefix`, or `contains`. `match.env` checks environment variables after command-sandbox environment filtering, so profiles can mediate out-of-band behavior such as `GIT_SSH_COMMAND` without matching raw host environment state.
 
 ```jsonc
 {
@@ -167,7 +167,7 @@ The helper runs with the matched command's real credentials, capabilities, and s
 
 ### Dynamic Filesystem Grants
 
-`fs_read`, `fs_write`, `fs_read_file`, and `fs_write_file` can contain dynamic provider tokens as well as literal paths. Tokens are expanded at launch before the child sandbox is built. They are opt-in: no dynamic paths are added unless a selected command policy includes one of these tokens.
+`fs_read`, `fs_write`, `fs_read_file`, and `fs_write_file` can contain dynamic provider tokens as well as literal paths. Tokens are expanded at launch before the command sandbox is built. They are opt-in: no dynamic paths are added unless a selected command sandbox policy includes one of these tokens.
 
 Supported tokens:
 
@@ -211,12 +211,33 @@ The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's wo
 
 | Field | Value | Notes |
 |---|---|---|
-| `allow_all` | boolean | Allows unrestricted child network access. |
+| `allow_all` | boolean | Allows unrestricted network access in the command sandbox. |
 | `allow_domain` | string array | Hostname allow-list. Valid only with an enforceable nono proxy/helper mode. |
 | `tcp_connect_ports` | port array | Raw TCP connect ports on Linux Landlock. Not hostname-filtered. |
-| `tcp_bind_ports` | port array | Raw TCP bind ports on Linux Landlock. Cannot be enforced for tool-sandbox children on macOS. |
+| `tcp_bind_ports` | port array | Raw TCP bind ports on Linux Landlock. Cannot be enforced for command sandboxes on macOS. |
 | `open_port` | port array | Localhost bind ports (e.g. an OAuth/OIDC loopback callback listener). Mirrors the top-level `network.open_port`; enforceable for children on macOS and Linux. |
 | `open_port_range` | `[start, end]` array | Inclusive localhost bind port ranges, e.g. `[[8250, 8255]]`. |
+
+### Command-scoped proxy policy
+
+An effective command sandbox whose network policy includes `network.allow_domain` receives a dedicated loopback proxy and fresh proxy credential. Its proxy policy does not inherit the session sandbox's broader domain allowlist, although the session network policy's domain denials still apply. The command sandbox may connect only to its selected proxy, so changing proxy environment variables, setting `NO_PROXY`, or opening a direct socket does not bypass its network policy unless the command sandbox policy separately grants raw TCP access.
+
+Proxy credentials granted by that effective command sandbox remain available through the dedicated proxy. Credential reverse routes may reach their configured upstreams under `endpoint_policy`, without adding those upstreams to the command's domain allowlist. Direct and ordinary forward-proxy requests still require `network.allow_domain` permission.
+
+A command sandbox policy that grants a proxy credential without `network.allow_domain` also receives a dedicated proxy with an empty domain allowlist. Only its explicitly granted credential routes are available.
+
+Proxy credentials cannot be combined with `network.allow_all`: unrestricted loopback access would let the command reach a broader proxy and defeat route isolation. On Linux, a raw `tcp_connect_ports` grant that collides with any active nono proxy port also fails closed at launch.
+
+A command-scoped proxy policy needs an active nono proxy, such as one activated by a top-level network policy with `network.allow_domain`. A command-scoped proxy credential activates the proxy by itself. If the selected command sandbox requires a scoped proxy but none is available, the command fails closed at launch.
+
+| Invocation | Selected command sandbox |
+|---|---|
+| Direct command with `from.session` | `commands.<name>.from.session.sandbox` |
+| Direct command without `from.session` | `commands.<name>.sandbox` |
+| Command launched by another mediated command | `commands.<name>.from.<caller>.sandbox` |
+| Matching intercept with its own `sandbox` | The intercept sandbox replaces the selection above |
+
+`sandbox` and `from.session` are alternative direct-session forms and cannot both be present. Chained access requires both the caller's `can_use` entry and the callee's `from.<caller>` policy; a missing caller edge does not fall back to the direct command sandbox. Direct, caller-specific, and intercept proxy policies are independent and are never merged. The caller's own command sandbox controls the caller, not its child.
 
 `environment.allow_vars` accepts exact names such as `PATH`, trailing-prefix wildcards such as `AWS_*`, and the bare wildcard `*`. `environment.set_vars` injects static values after filtering; `PATH` and `NONO_*` are reserved.
 
@@ -224,7 +245,7 @@ The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's wo
 
 ## Command Resolution
 
-By default, Tool Sandbox resolves a command to the first executable found on the original `PATH`, before the shim directory is prepended. Pin a command to an exact executable when PATH order should not decide the security boundary:
+By default, command mediation resolves a command to the first executable found on the original `PATH`, before the shim directory is prepended. Pin a command to an exact executable when PATH order should not decide the security boundary:
 
 ```json
 {
@@ -241,7 +262,7 @@ By default, Tool Sandbox resolves a command to the first executable found on the
 
 `executable` is canonicalized at startup and bound by path, inode, and digest. The command name still uses the shim, so `nono run --profile my-profile -- aws ...` reaches the pinned executable.
 
-Tool Sandbox rejects executables and executable parent directories that are writable through the outer sandbox capability set. This prevents a profile from both trusting a command target and granting the agent write or replace access to that same target. Homebrew-style or otherwise user-writable host toolchains are allowed when the sandbox does not grant write access to the executable or its parent.
+Command mediation rejects executables and executable parent directories that are writable through the session sandbox's capability set. This prevents a profile from both trusting a command target and granting the agent write or replace access to that same target. Homebrew-style or otherwise user-writable host toolchains are allowed when the session sandbox does not grant write access to the executable or its parent.
 
 If a low-assurance profile intentionally grants write access overlapping a command target, pin the command to a full absolute executable path and set `allow_writable_executable: true`:
 
@@ -259,9 +280,9 @@ If a low-assurance profile intentionally grants write access overlapping a comma
 }
 ```
 
-This is a per-command trust downgrade. It is rejected unless `executable` is set to an absolute file path; a relative path or a bare command name fails validation. It does not cover other binaries in that directory and does not change invocation: the agent still calls `demonator ...` through the Tool Sandbox shim.
+This is a per-command trust downgrade. It is rejected unless `executable` is set to an absolute file path; a relative path or a bare command name fails validation. It does not cover other binaries in that directory and does not change invocation: the agent still calls `demonator ...` through the command-mediation shim.
 
-For local demos or other low-assurance profiles that intentionally grant write access overlapping tool locations, a profile can disable the writable-executable trust check across Tool Sandbox:
+For local demos or other low-assurance profiles that intentionally grant write access overlapping tool locations, a profile can disable the writable-executable trust check across command mediation:
 
 ```json
 {
@@ -279,17 +300,17 @@ For local demos or other low-assurance profiles that intentionally grant write a
 }
 ```
 
-This is broader than `commands.<name>.allow_writable_executable`: it also covers deny-only commands and the outer executable allow-list used by Tool Sandbox.
+This is broader than `commands.<name>.allow_writable_executable`: it also covers deny-only commands and the session executable allow-list used by command mediation.
 
 Linux launches the verified executable object by file descriptor. macOS verifies the pinned file before sandboxing but must still call `execve()` by path, so a sandbox-writable executable or parent directory remains replaceable before launch. Avoid `allow_writable_executable` for high-assurance macOS policies.
 
-Interpreter-packaged tools, such as a Python `aws` entrypoint, are classified as shebang scripts. Tool Sandbox grants the selected script, its interpreter, and the interpreter's ELF loader closure. Language package directories, virtualenvs, SDK homes, and tool-specific data are not guessed by Tool Sandbox; grant those explicitly with `fs_read`, `fs_read_file`, `fs_write`, or `fs_write_file`.
+Interpreter-packaged tools, such as a Python `aws` entrypoint, are classified as shebang scripts. The command sandbox grants the selected script, its interpreter, and the interpreter's ELF loader closure. Language package directories, virtualenvs, SDK homes, and tool-specific data are not inferred by command mediation; grant those explicitly with `fs_read`, `fs_read_file`, `fs_write`, or `fs_write_file`.
 
 ## Daemon Attribution
 
-Tool Sandbox authorizes a request by walking the caller's process ancestry to the session. A daemon that double-forks and reparents to pid 1 (a tmux server, for example) severs that chain, so a request from it can no longer be tied to the command that spawned it. Rather than fall back to something replayable, Tool Sandbox attributes such a caller by a platform lineage marker, or denies it:
+Command mediation authorizes a request by walking the caller's process ancestry to the session. A daemon that double-forks and reparents to pid 1 (a tmux server, for example) severs that chain, so a request from it can no longer be tied to the command that spawned it. Rather than fall back to something replayable, command mediation attributes such a caller by a platform lineage marker, or denies it:
 
-- **Linux** places each Tool Sandbox command in a per-command cgroup that survives reparenting; a severed caller is attributed by reading its cgroup. No writable cgroup base means severed callers are denied.
+- **Linux** places each mediated command in a per-command cgroup that survives reparenting; a severed caller is attributed by reading its cgroup. No writable cgroup base means severed callers are denied.
 - **macOS** uses `commands.<name>.daemon_pid_source`: a helper nono runs to learn the pid of the daemon the command spawns. When a caller reparented to pid 1 is seen, nono runs each declared helper and attributes the caller to a command only if the reported pid matches, pinned by the daemon's kernel identity. No declared helper means severed callers are denied.
 
 Either way a severed caller resolves only to the command that spawned it, never the session, and is denied on any mismatch.
@@ -318,7 +339,7 @@ The helper runs **unsandboxed** in the supervisor. It MUST only read and emit a 
 
 ### macOS: mediated commands run in their own session
 
-To make that marker work for an ordinary orphan — a `child &` whose parent exits immediately, rather than a deliberate daemon — macOS Tool Sandbox puts **every** mediated launch in its own POSIX session (`setsid`) before exec. A session id cannot be joined after the fact, only created, which is what makes it unforgeable; a descendant keeps it across reparenting, so nono can still attribute a request whose ancestry walk has run off the top of the process tree.
+To make that marker work for an ordinary orphan — a `child &` whose parent exits immediately, rather than a deliberate daemon — macOS command mediation puts **every** mediated launch in its own POSIX session (`setsid`) before exec. A session id cannot be joined after the fact, only created, which is what makes it unforgeable; a descendant keeps it across reparenting, so nono can still attribute a request whose ancestry walk has run off the top of the process tree.
 
 The cost is that a mediated command has **no controlling terminal**, and cannot reacquire one (the session's pty already belongs to the direct child's session, so `TIOCSCTTY` is refused):
 
@@ -337,7 +358,7 @@ This profile lets the session invoke `jq` directly. The `jq` child can read the 
 {
   "extends": "default",
   "meta": {
-    "name": "eti-jq-readonly",
+    "name": "command-jq-readonly",
     "description": "Run jq with read-only access to this project"
   },
   "workdir": {
@@ -361,19 +382,19 @@ This profile lets the session invoke `jq` directly. The `jq` child can read the 
 Run:
 
 ```bash
-nono profile validate ~/.config/nono/profiles/eti-jq-readonly.json
-nono run --profile eti-jq-readonly -- jq '.name' package.json
+nono profile validate ~/.config/nono/profiles/command-jq-readonly.json
+nono run --profile command-jq-readonly -- jq '.name' package.json
 ```
 
 ### Direct Network Tool
 
-On Linux, this profile lets the session invoke `curl` and allows raw TCP connect on port 443. Hostname filtering is not implied by port rules. macOS Tool Sandbox rejects raw TCP port rules because Seatbelt cannot enforce per-port filters for these child sandboxes.
+On Linux, this profile lets the session invoke `curl` and allows raw TCP connect on port 443. Hostname filtering is not implied by port rules. macOS command mediation rejects raw TCP port rules because Seatbelt cannot enforce per-port filters for command sandboxes.
 
 ```json
 {
   "extends": "default",
   "meta": {
-    "name": "eti-curl-https",
+    "name": "command-curl-https",
     "description": "Run curl with raw TCP/443 egress"
   },
   "workdir": {
@@ -404,7 +425,7 @@ On Linux, this profile lets the session invoke `curl` and allows raw TCP connect
 Run:
 
 ```bash
-nono run --profile eti-curl-https -- curl -I https://example.com
+nono run --profile command-curl-https -- curl -I https://example.com
 ```
 
 If you need hostname enforcement, use an enforceable nono proxy/helper policy. `network.allow_domain` without such a helper is rejected.
@@ -425,7 +446,7 @@ the shim-prefixed `PATH`.
 {
   "extends": "default",
   "meta": {
-    "name": "eti-git-ssh",
+    "name": "command-git-ssh",
     "description": "Allow git to call ssh without direct session ssh"
   },
   "workdir": {
@@ -462,8 +483,8 @@ the shim-prefixed `PATH`.
 Run:
 
 ```bash
-nono run --profile eti-git-ssh -- git ls-remote git@github.com:owner/repo.git
-nono run --profile eti-git-ssh -- ssh -T git@github.com
+nono run --profile command-git-ssh -- git ls-remote git@github.com:owner/repo.git
+nono run --profile command-git-ssh -- ssh -T git@github.com
 ```
 
 Expected:
@@ -479,7 +500,7 @@ Build tools often execute helper programs. Model each helper explicitly.
 {
   "extends": "default",
   "meta": {
-    "name": "eti-make-cc",
+    "name": "command-make-cc",
     "description": "Allow make to call cc and pkg-config"
   },
   "workdir": {
@@ -525,11 +546,11 @@ Build tools often execute helper programs. Model each helper explicitly.
 }
 ```
 
-Compilers may invoke additional helpers such as assemblers, linkers, or language-specific drivers. When a build fails with a Tool Sandbox denial for a helper command, add that helper as another policy-controlled command and caller edge.
+Compilers may invoke additional helpers such as assemblers, linkers, or language-specific drivers. When a build fails with a command-policy denial for a helper command, add that helper as another policy-controlled command and caller edge.
 
 ## Environment Controls
 
-By default, Tool Sandbox preserves a small safe environment set. Override it with `environment.allow_vars`:
+By default, command mediation preserves a small safe environment set. Override it with `environment.allow_vars`:
 
 ```json
 {
@@ -609,7 +630,7 @@ The loader rule exists because `LD_PRELOAD` and friends load code into *any* dyn
 
 ## Mandatory Arguments
 
-Use `argv_prepend` when a selected child policy needs mandatory mode flags. The arguments are inserted after the synthesized `argv[0]` and before caller-provided arguments.
+Use `argv_prepend` when a selected command sandbox policy needs mandatory mode flags. The arguments are inserted after the synthesized `argv[0]` and before caller-provided arguments.
 
 ```json
 {
@@ -624,11 +645,11 @@ Use `argv_prepend` when a selected child policy needs mandatory mode flags. The 
 }
 ```
 
-This is useful for mode selection. It is not a substitute for sandbox grants; filesystem, network, and credential access are still controlled by the selected policy.
+This is useful for mode selection. It is not a substitute for sandbox grants; filesystem, network, and credential access are still controlled by the selected command sandbox policy.
 
 ## Credentials
 
-Tool Sandbox supports two credential types:
+Command sandbox policies support two credential types:
 
 | Type | Typical use |
 |---|---|
@@ -655,7 +676,7 @@ hostname/network enforcement on macOS:
 `path` may reference environment variables, optionally followed by a literal suffix,
 such as `"$XDG_RUNTIME_DIR/sccache.sock"`. Variables are expanded anywhere in 
 the string; if a referenced variable is unset, a command that selects the 
-credential fails before launch with a Tool Sandbox error naming the variable.
+credential fails before launch with a command-sandbox error naming the variable.
 Prefer the agent socket over raw private-key file grants.
 
 ### Shaping an ambient credential's phantom
@@ -677,7 +698,7 @@ An `ambient` credential may declare a `format`: a literal template with exactly 
 
 ## Stdio Output Mediation
 
-Tool Sandbox treats stdout and stderr as output capabilities. A tool that can print
+Command mediation treats stdout and stderr as output capabilities. A tool that can print
 unbounded data can exfiltrate files or credentials, or destabilize the broker
 with excessive output.
 
@@ -785,8 +806,8 @@ Policy-controlled commands are meant to be reached through shims. A direct path 
 
 Direct bypass is a compatibility escape hatch:
 
-- `tool` through `PATH` still uses Tool Sandbox;
-- `/usr/bin/tool` runs with outer session capabilities, not the child Tool Sandbox sandbox;
+- `tool` through `PATH` still uses command mediation;
+- `/usr/bin/tool` runs with session sandbox capabilities, not the command sandbox's capabilities;
 - deny-only blocked commands are never eligible;
 - credential-using commands require `allow_direct_exec_bypass_with_credentials: true`.
 
@@ -795,35 +816,35 @@ Direct bypass is a compatibility escape hatch:
 Use these commands while developing a profile:
 
 ```bash
-nono profile validate ~/.config/nono/profiles/my-eti-profile.json
-nono profile show my-eti-profile --json
-nono run --profile my-eti-profile --dry-run -- my-command --version
+nono profile validate ~/.config/nono/profiles/my-command-policy-profile.json
+nono profile show my-command-policy-profile --json
+nono run --profile my-command-policy-profile --dry-run -- my-command --version
 ```
 
 For command-control behavior:
 
 ```bash
 # Direct command should be allowed
-nono run --profile my-eti-profile -- allowed-command --version
+nono run --profile my-command-policy-profile -- allowed-command --version
 
 # A denied direct command should hit the shim and exit 126
-nono run --profile my-eti-profile -- denied-command --version
+nono run --profile my-command-policy-profile -- denied-command --version
 
 # Direct canonical path should be denied unless explicitly bypassed
 REAL="$(command -p -v denied-command)"
-nono run --profile my-eti-profile -- "$REAL" --version
+nono run --profile my-command-policy-profile -- "$REAL" --version
 ```
 
 ## Troubleshooting
 
 | Symptom | Meaning |
 |---|---|
-| `nono: Tool Sandbox denied <cmd>: missing session sandbox` | The outer session invoked a policy command without `commands.<name>.sandbox` or `commands.<name>.from.session`. |
-| `nono: Tool Sandbox denied <cmd>: missing from.<caller>` | A caller was allowed to invoke a callee name, but the callee has no `from.<caller>` policy. |
-| `Tool Sandbox credential '<name>' is unavailable: SSH_AUTH_SOCK is unset` | The selected policy references a local-socket credential backed by `SSH_AUTH_SOCK`, but no agent socket was available at session startup. |
+| `nono: command policy denied <cmd>: missing session sandbox` | The session sandbox invoked a policy-controlled command without `commands.<name>.sandbox` or `commands.<name>.from.session`. |
+| `nono: command policy denied <cmd>: missing from.<caller>` | A caller was allowed to invoke a callee name, but the callee has no `from.<caller>` policy. |
+| `command sandbox credential '<name>' is unavailable: SSH_AUTH_SOCK is unset` | The selected command sandbox policy references a local-socket credential backed by `SSH_AUTH_SOCK`, but no agent socket was available at session startup. |
 | `Permission denied (publickey)` | SSH reached the remote server; authentication failed outside nono. |
 | `Host key verification failed` | SSH could not verify the host from the known-hosts files the policy grants. |
-| `Tool Sandbox exec failed for script ... using interpreter ...` | The command resolved to a shebang script. Grant the required interpreter, package, and runtime data paths explicitly. |
-| `Tool Sandbox direct exec bypass denied` | A policy-controlled command was invoked by absolute path instead of through its shim. |
-| `Seatbelt cannot enforce raw per-port TCP rules for Tool Sandbox children` | The selected Tool Sandbox policy uses raw TCP port filters on macOS. Use a Linux host or a proxy-backed policy instead. |
-| `legacy_blocked_command` | A deprecated blocked-command entry was folded into Tool Sandbox as deny-only command control. |
+| `command sandbox exec failed for script ... using interpreter ...` | The command resolved to a shebang script. Grant the required interpreter, package, and runtime data paths explicitly. |
+| `command policy direct exec bypass denied` | A policy-controlled command was invoked by absolute path instead of through its shim. |
+| `Seatbelt cannot enforce raw per-port TCP rules for command sandboxes` | The selected command sandbox policy uses direct TCP port rules on macOS. Use a Linux host or a proxy policy instead. |
+| `legacy_blocked_command` | A deprecated blocked-command entry was folded into command policy as a deny-only entry. |

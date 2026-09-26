@@ -1,11 +1,11 @@
 ---
 title: Dangerous Command Blocking
-description: Block destructive commands with Tool Sandbox command-control policies
+description: Block destructive commands with command policies
 ---
 
-Dangerous command blocking prevents selected executables from running through Tool Sandbox shims. Use it for commands that should not be available to an agent at all, such as `rm`, `dd`, `chmod`, package managers, privilege escalation tools, or system administration commands.
+Dangerous command blocking prevents selected executables from running through command-mediation shims. Use it for commands that should not be available to an agent at all, such as `rm`, `dd`, `chmod`, package managers, privilege escalation tools, or system administration commands.
 
-This is different from giving a command a restricted child sandbox. A command with a `sandbox` policy is allowed to run with specific grants. A deny-only command is resolved and controlled, but every matching invocation is denied.
+This is different from giving a command a restricted command sandbox. A command with a command sandbox policy is allowed to run with specific grants. A deny-only command is resolved and controlled, but every matching invocation is denied.
 
 ## Recommended Shape
 
@@ -48,9 +48,9 @@ nono run --profile agent-with-command-denies -- rm -rf build
 
 Expected:
 
-- `rm` through `PATH` is denied by the Tool Sandbox shim;
+- `rm` through `PATH` is denied by the command-mediation shim;
 - direct canonical-path invocation, such as `/bin/rm`, is denied as a direct-exec bypass of a controlled command;
-- no child sandbox is launched for the denied command.
+- no command sandbox is launched for the denied command.
 
 ## Blocking Child Tools
 
@@ -92,13 +92,13 @@ Here `npm` may launch `node`, but an attempted `npm` lifecycle escape through `s
 
 The default profile includes `dangerous_commands`, `dangerous_commands_macos`, and `dangerous_commands_linux`. These groups still populate the older blocked-command list.
 
-When `command_policies.commands` is non-empty, Tool Sandbox folds inherited blocked commands into deny-only command-control entries. That gives dangerous commands shim coverage and direct-path bypass protection while Tool Sandbox is active.
+When `command_policies.commands` is non-empty, command mediation folds inherited blocked commands into deny-only command-policy entries. That gives dangerous commands shim coverage and direct-path bypass protection while command mediation is active.
 
-Inherited blocked commands do not activate Tool Sandbox by themselves. A profile that only inherits `dangerous_commands` still uses the older startup-command warning path. Add at least one `command_policies.commands` entry when you want Tool Sandbox command-control behavior.
+Inherited blocked commands do not activate command mediation by themselves. A profile that only inherits `dangerous_commands` still uses the older startup-command warning path. Add at least one `command_policies.commands` entry when you want command-policy behavior.
 
 ## Allowing One Dangerous Command
 
-If a profile inherits `dangerous_commands` but intentionally needs one command, use the profile's `commands.allow` compatibility field to remove that inherited blocked-command entry before Tool Sandbox command-control resolution:
+If a profile inherits `dangerous_commands` but intentionally needs one command, use the profile's `commands.allow` compatibility field to remove that inherited blocked-command entry before command-policy resolution:
 
 ```json
 {
@@ -125,7 +125,7 @@ Prefer avoiding broad command allowances. If the real need is to delete files in
 
 ## Direct Exec Bypass
 
-Policy-controlled and deny-only commands are meant to be reached through Tool Sandbox shims. Direct paths are denied unless explicitly allowed by `allow_direct_exec_bypass` on a policy-controlled command.
+Policy-controlled and deny-only commands are meant to be reached through command-mediation shims. Direct paths are denied unless explicitly allowed by `allow_direct_exec_bypass` on a policy-controlled command.
 
 Deny-only commands are never eligible for `allow_direct_exec_bypass`. The profile-wide `deny_direct_exec_bypass` list can also name canonical executable paths that must not be bypassed by any command policy.
 
@@ -152,4 +152,4 @@ These older command-blocking surfaces are still parsed for compatibility, but th
 - profile `commands.deny`;
 - capability manifest `process.blocked_commands`.
 
-For new profiles, put command-control policy under `command_policies`. Use [Tool Sandbox](/cli/features/tool-sandbox) when a command should be allowed with a specific child sandbox, and use this page when a command should not run.
+For new profiles, put command policy under `command_policies`. Use [Sandboxed Tool Execution](/cli/features/tool-sandbox) when a command should be allowed with a specific command sandbox, and use this page when a command should not run.

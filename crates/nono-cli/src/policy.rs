@@ -3953,6 +3953,23 @@ mod tests {
     }
 
     #[test]
+    fn test_snap_linux_group_includes_snap_mount_paths() {
+        let json = crate::config::embedded::embedded_policy_json();
+        let policy = load_policy(json).expect("parse policy.json");
+        let group = policy
+            .groups
+            .get("snap_linux")
+            .expect("snap_linux group must exist");
+        let read_paths = &group
+            .allow
+            .as_ref()
+            .expect("snap_linux must have allow block")
+            .read;
+        assert!(read_paths.contains(&"/snap".to_string()));
+        assert!(read_paths.contains(&"/var/lib/snapd/snap".to_string()));
+    }
+
+    #[test]
     fn test_find_denied_user_grants_detects_overlap() {
         let path = PathBuf::from("/nonexistent/test/secret");
         let policy = load_policy(

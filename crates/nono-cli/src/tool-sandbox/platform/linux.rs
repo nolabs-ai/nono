@@ -71,7 +71,7 @@ const ANCESTRY_DEPTH_LIMIT: usize = 64;
 macro_rules! tool_sandbox_profile_log {
         ($($arg:tt)*) => {
             if std::env::var_os("TOOL_SANDBOX_PROFILE_HOTPATH").is_some() {
-                eprintln!("[tool-sandbox-prof] {}", format_args!($($arg)*));
+                eprintln!("[command-mediation-prof] {}", format_args!($($arg)*));
             }
         };
     }
@@ -128,6 +128,8 @@ struct ToolSandboxState {
     landlock_abi: nono::DetectedAbi,
     baseline_cache: BaselineCache,
     proxy_trust_bundle_paths: Vec<PathBuf>,
+    scoped_proxy_env_vars: BTreeMap<String, Vec<(String, String)>>,
+    reserved_proxy_ports: BTreeSet<u16>,
     active_children: Mutex<HashMap<u32, ActiveChild>>,
     /// Attributes severed-ancestry callers to their spawning command. See `lineage_cgroup`.
     lineage: LineageMarker,
@@ -142,7 +144,7 @@ struct ToolSandboxState {
 }
 
 /// Pre-computed runtime-baseline files (ELF dependency closures + system files)
-/// granted to every tool-sandbox child. Built once at supervisor startup so the per-request
+/// granted to every command sandbox. Built once at supervisor startup so the per-request
 /// hot path does no recursive ELF parsing or directory walking.
 struct BaselineCache {
     closures: BTreeMap<PathBuf, Vec<PathBuf>>,
@@ -222,15 +224,15 @@ impl ResolvedToolSandboxPlan {
         };
         crate::command_policy::print_command_not_found_summary(&resolved.warnings);
         // Validate PATH/configured executable directories before using them
-        // for deny-only resolution and the outer executable identity gate.
+        // for deny-only resolution and the session executable identity gate.
         // The gate allows non-controlled executables while excluding
         // controlled command identities by path/inode.
         let search_dirs = command_search_dirs(config, path_env, outer_caps)?;
         validate_trusted_executable_dirs(&search_dirs, outer_caps)?;
         // BMETE command policies are scoped to command_policies.commands.
-        // Legacy startup command denies must not be folded into tool-sandbox as
+        // Legacy startup command denies must not be folded into command policy as
         // deny-only commands; doing so makes inherited dangerous-command
-        // entries part of the child sandbox trust boundary.
+        // entries part of the command sandbox trust boundary.
         let deny_only = resolve_deny_only_commands(config, &[], &[], &search_dirs)?;
         validate_controlled_binary_immutability(config, &resolved, &deny_only, outer_caps)?;
         let exec_helpers = crate::command_policy::resolve_policy_exec_helpers(config)?;
@@ -254,7 +256,7 @@ impl ResolvedToolSandboxPlan {
 }
 
 impl PreparedToolSandboxRuntime {
-    /// Path of the tool-sandbox runtime directory (mediation sockets and shim
+    /// Path of the command-mediation runtime directory (mediation sockets and shim
     /// binaries). Exposed so the session keepalive can refresh its timestamps
     /// and stop the OS temp cleaner from reaping it mid-session.
     pub(crate) fn runtime_dir(&self) -> Option<&Path> {
@@ -272,7 +274,9 @@ impl PreparedToolSandboxRuntime {
             outer_caps,
             deny_paths,
             policy_root,
-            proxy_credential_env_vars,
+            proxy_credentials,
+            reserved_proxy_ports,
+            scoped_proxy_env_vars,
             proxy_trust_bundle_paths,
             shared_broker,
         } = input;
@@ -319,8 +323,7 @@ impl PreparedToolSandboxRuntime {
         );
 
         let start_credentials = std::time::Instant::now();
-        let credential_handles =
-            resolve_credentials(&plan.config.credentials, proxy_credential_env_vars)?;
+        let credential_handles = resolve_credentials(&plan.config.credentials, proxy_credentials)?;
         tool_sandbox_profile_log!(
             "prepare:resolve_credentials: {:?}",
             start_credentials.elapsed()
@@ -408,6 +411,8 @@ impl PreparedToolSandboxRuntime {
                 landlock_abi,
                 baseline_cache,
                 proxy_trust_bundle_paths: proxy_trust_bundle_paths.to_vec(),
+                scoped_proxy_env_vars: scoped_proxy_env_vars.clone(),
+                reserved_proxy_ports: reserved_proxy_ports.clone(),
                 active_children: Mutex::new(HashMap::new()),
                 lineage,
                 active_count: AtomicUsize::new(0),
@@ -434,7 +439,7 @@ impl PreparedToolSandboxRuntime {
         self.inner.lineage.teardown();
         if let Err(err) = guarded_remove_runtime_dir(&self.inner.runtime_dir) {
             debug!(
-                "tool-sandbox runtime dir cleanup skipped for {}: {}",
+                "command-mediation runtime dir cleanup skipped for {}: {}",
                 self.inner.runtime_dir.display(),
                 err
             );
@@ -460,7 +465,7 @@ impl PreparedToolSandboxRuntime {
         secrets: &[nono::LoadedSecret],
     ) -> Result<Vec<(String, String)>> {
         let mut broker = self.inner.token_broker.lock().map_err(|_| {
-            NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
+            NonoError::SandboxInit("command-mediation token broker lock poisoned".to_string())
         })?;
         Ok(secrets
             .iter()
@@ -505,7 +510,7 @@ impl PreparedToolSandboxRuntime {
             self.inner.landlock_abi,
         )?;
         Option::<OwnedFd>::from(ruleset).ok_or_else(|| {
-            NonoError::SandboxInit("tool-sandbox execution gate was not created".to_string())
+            NonoError::SandboxInit("command-mediation execution gate was not created".to_string())
         })
     }
 
@@ -531,13 +536,13 @@ impl PreparedToolSandboxRuntime {
             .map(|identity| identity.path.as_path())
     }
 
-    /// Initial command identity gate when tool-sandbox is active.
+    /// Initial command identity gate when command mediation is active.
     ///
     /// Allowed cases:
     /// - bare command name (no `/`) that is a policy command — runs through its shim
     /// - any path or name whose canonical inode is in `allow_direct_exec_bypass`
     /// - non-controlled executable identities, which continue under the
-    ///   outer session sandbox
+    ///   session sandbox
     ///
     /// Direct execution of a controlled or deny-only binary is rejected by
     /// the binary identity, independent of the wrapper that attempted it.
@@ -610,7 +615,7 @@ impl PreparedToolSandboxRuntime {
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
                 Err(err) => {
                     return Err(NonoError::SandboxInit(format!(
-                        "tool-sandbox URL listener accept failed: {err}"
+                        "command-mediation URL listener accept failed: {err}"
                     )));
                 }
             }
@@ -638,7 +643,7 @@ impl PreparedToolSandboxRuntime {
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
                 Err(err) => {
                     return Err(NonoError::SandboxInit(format!(
-                        "tool-sandbox supervisor accept failed: {err}"
+                        "command-mediation supervisor accept failed: {err}"
                     )));
                 }
             }
@@ -658,7 +663,7 @@ impl PreparedToolSandboxRuntime {
             write_response(
                 &mut stream,
                 126,
-                Some("tool-sandbox shim request queue limit exceeded".to_string()),
+                Some("command-mediation shim request queue limit exceeded".to_string()),
                 Vec::new(),
             )?;
             return Ok(());
@@ -669,7 +674,7 @@ impl PreparedToolSandboxRuntime {
             let result =
                 handle_shim_stream(state, stream, session_root_pid, &session_id, audit_recorder);
             if let Err(err) = result {
-                warn!("tool-sandbox shim handling failed: {err}");
+                warn!("command-mediation shim handling failed: {err}");
             }
         });
         Ok(())
@@ -682,7 +687,7 @@ impl Drop for ToolSandboxState {
         self.lineage.teardown();
         if let Err(err) = guarded_remove_runtime_dir(&self.runtime_dir) {
             debug!(
-                "tool-sandbox runtime dir cleanup skipped for {}: {err}",
+                "command-mediation runtime dir cleanup skipped for {}: {err}",
                 self.runtime_dir.display()
             );
         }
@@ -738,7 +743,7 @@ pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
     // (ps, stop, rollback, ...) against unrelated sessions.
     if current_exe_is_tool_sandbox_shim_copy_by_path() {
         exit_from_result(Err(NonoError::SandboxInit(
-            "running as a tool-sandbox shim copy but the broker handshake \
+            "running as a command-mediation shim copy but the broker handshake \
              (NONO_TOOL_SANDBOX_SOCKET / NONO_TOOL_SANDBOX_SHIM_DIR) is missing \
              or invalid; refusing rather than falling back to the nono CLI"
                 .to_string(),
@@ -827,11 +832,11 @@ fn run_shim() -> Result<()> {
     let socket_path = std::env::var_os(TOOL_SANDBOX_SOCKET_ENV)
         .map(PathBuf::from)
         .ok_or_else(|| {
-            NonoError::SandboxInit("tool-sandbox shim socket env missing".to_string())
+            NonoError::SandboxInit("command-mediation shim socket env missing".to_string())
         })?;
     let shim_exe = std::env::current_exe().map_err(|err| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox shim failed to locate current executable: {err}"
+            "command-mediation shim failed to locate current executable: {err}"
         ))
     })?;
     let command = shim_exe
@@ -839,7 +844,7 @@ fn run_shim() -> Result<()> {
         .map(OsStr::to_os_string)
         .and_then(|name| name.into_string().ok())
         .ok_or_else(|| {
-            NonoError::SandboxInit("tool-sandbox shim command name invalid".to_string())
+            NonoError::SandboxInit("command-mediation shim command name invalid".to_string())
         })?;
     let start_env = std::time::Instant::now();
     let argv = std::env::args_os()
@@ -856,7 +861,7 @@ fn run_shim() -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|err| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox shim cwd failed: {err}. '{command}' is running in a directory its \
+                "command-mediation shim cwd failed: {err}. '{command}' is running in a directory its \
                  sandbox does not grant read on (getcwd needs to resolve the cwd). If '{command}' \
                  was invoked in a directory outside its policy — e.g. a sibling git worktree — add \
                  \".\" to the command's fs_read so its live working directory is readable."
@@ -887,7 +892,7 @@ fn run_shim() -> Result<()> {
     let start_connect = std::time::Instant::now();
     let mut stream = UnixStream::connect(&socket_path).map_err(|err| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox shim failed to connect to {}: {err}",
+            "command-mediation shim failed to connect to {}: {err}",
             socket_path.display()
         ))
     })?;
@@ -904,7 +909,7 @@ fn run_shim() -> Result<()> {
     );
     let response: ToolSandboxShimResponse = read_frame(&mut stream)?;
     if let Some(error) = response.error {
-        eprintln!("nono: tool-sandbox denied {}: {error}", request.command);
+        eprintln!("nono: command policy denied {}: {error}", request.command);
     }
     if !response.captured_stdout.is_empty() {
         use std::io::Write;
@@ -923,7 +928,7 @@ fn run_child_launcher() -> Result<()> {
     let spec_path = std::env::var_os(TOOL_SANDBOX_LAUNCH_SPEC_ENV)
         .map(PathBuf::from)
         .ok_or_else(|| {
-            NonoError::SandboxInit("tool-sandbox launch spec env missing".to_string())
+            NonoError::SandboxInit("command-mediation launch spec env missing".to_string())
         })?;
     let start_parse = std::time::Instant::now();
     let bytes = fs::read(&spec_path).map_err(|err| NonoError::ConfigRead {
@@ -931,7 +936,9 @@ fn run_child_launcher() -> Result<()> {
         source: err,
     })?;
     let spec: ToolSandboxChildLaunchSpec = serde_json::from_slice(&bytes).map_err(|err| {
-        NonoError::ConfigParse(format!("failed to parse tool-sandbox launch spec: {err}"))
+        NonoError::ConfigParse(format!(
+            "failed to parse command-mediation launch spec: {err}"
+        ))
     })?;
     tool_sandbox_profile_log!(
         "launcher:read_and_parse_spec: {:?} ({} bytes)",
@@ -946,14 +953,14 @@ fn run_child_launcher() -> Result<()> {
             let result = unsafe { libc::setpgid(0, 0) };
             if result != 0 {
                 return Err(NonoError::SandboxInit(format!(
-                    "tool-sandbox direct_fds setpgid failed: {}",
+                    "command-mediation direct_fds setpgid failed: {}",
                     std::io::Error::last_os_error()
                 )));
             }
         }
         other => {
             return Err(NonoError::ConfigParse(format!(
-                "invalid tool-sandbox stdio mode '{other}'"
+                "invalid command-mediation stdio mode '{other}'"
             )));
         }
     }
@@ -961,7 +968,7 @@ fn run_child_launcher() -> Result<()> {
     let cwd = OsString::from_vec(spec.cwd.clone());
     std::env::set_current_dir(&cwd).map_err(|err| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox child chdir failed before sandbox: {err}"
+            "command sandbox chdir failed before sandboxing: {err}"
         ))
     })?;
 
@@ -988,7 +995,7 @@ fn run_child_launcher() -> Result<()> {
     // AccessMode::Read maps to AccessFs::Execute in the Linux sandbox, so
     // any fs_read dir grant (e.g. fs_read:["."] in the git profile) would
     // otherwise let the child exec arbitrary workspace binaries. This layer
-    // confines exec to the specific binary, interpreter (if any), and tool-sandbox
+    // confines exec to the specific binary, interpreter (if any), and command-sandbox
     // shims listed in allowed_exec_paths by the supervisor.
     let exec_paths: Vec<PathBuf> = spec
         .allowed_exec_paths
@@ -1007,11 +1014,9 @@ fn run_child_launcher() -> Result<()> {
     // earlier (validate_ipc_request, env builder) but we re-check defensively.
     let mut argv_c: Vec<CString> = Vec::with_capacity(spec.argv.len());
     for arg in &spec.argv {
-        argv_c.push(
-            CString::new(arg.as_slice()).map_err(|_| {
-                NonoError::SandboxInit("tool-sandbox argv contains NUL".to_string())
-            })?,
-        );
+        argv_c.push(CString::new(arg.as_slice()).map_err(|_| {
+            NonoError::SandboxInit("command-mediation argv contains NUL".to_string())
+        })?);
     }
     let argv_ptrs: Vec<*const libc::c_char> = argv_c
         .iter()
@@ -1022,7 +1027,7 @@ fn run_child_launcher() -> Result<()> {
     let mut envp_c: Vec<CString> = Vec::with_capacity(spec.env.len());
     for entry in &spec.env {
         envp_c.push(CString::new(entry.as_slice()).map_err(|_| {
-            NonoError::SandboxInit("tool-sandbox env entry contains NUL".to_string())
+            NonoError::SandboxInit("command-mediation env entry contains NUL".to_string())
         })?);
     }
     let envp_ptrs: Vec<*const libc::c_char> = envp_c
@@ -1032,7 +1037,7 @@ fn run_child_launcher() -> Result<()> {
         .collect();
 
     let empty_path = CString::new("").map_err(|_| {
-        NonoError::SandboxInit("tool-sandbox: failed to build empty path CString".to_string())
+        NonoError::SandboxInit("command-mediation: failed to build empty path CString".to_string())
     })?;
 
     // For shebang scripts, execveat(AT_EMPTY_PATH) passes the fd to the
@@ -1077,7 +1082,7 @@ fn run_child_launcher() -> Result<()> {
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| "<unknown>".to_string());
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox execveat failed for script {} using interpreter {}: {err}. The selected child policy must grant the script, interpreter, interpreter ELF dependencies, and any required language runtime/package directories.",
+            "command sandbox execveat failed for script {} using interpreter {}: {err}. The selected command sandbox policy must grant the script, interpreter, interpreter ELF dependencies, and any required language runtime/package directories.",
             PathBuf::from(real_binary).display(),
             interpreter
         )));
@@ -1093,8 +1098,9 @@ fn run_child_launcher() -> Result<()> {
 fn open_and_verify_binary(path: &OsStr, spec: &ToolSandboxChildLaunchSpec) -> Result<OwnedFd> {
     use std::io::Read;
 
-    let path_c = CString::new(path.as_bytes())
-        .map_err(|_| NonoError::SandboxInit("tool-sandbox binary path contains NUL".to_string()))?;
+    let path_c = CString::new(path.as_bytes()).map_err(|_| {
+        NonoError::SandboxInit("command-mediation binary path contains NUL".to_string())
+    })?;
     let raw_fd = unsafe {
         libc::open(
             path_c.as_ptr(),
@@ -1112,20 +1118,20 @@ fn open_and_verify_binary(path: &OsStr, spec: &ToolSandboxChildLaunchSpec) -> Re
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox fstat failed for {}: {}",
+            "command-mediation fstat failed for {}: {}",
             PathBuf::from(path).display(),
             std::io::Error::last_os_error()
         )));
     }
     if (st.st_dev as u64) != spec.expected_dev || (st.st_ino as u64) != spec.expected_ino {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox binary inode changed before launch: {}",
+            "command-mediation binary inode changed before launch: {}",
             PathBuf::from(path).display()
         )));
     }
     if (st.st_size as u64) != spec.expected_size {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox binary size changed before launch: {}",
+            "command-mediation binary size changed before launch: {}",
             PathBuf::from(path).display()
         )));
     }
@@ -1134,7 +1140,7 @@ fn open_and_verify_binary(path: &OsStr, spec: &ToolSandboxChildLaunchSpec) -> Re
         .saturating_add(st.st_mtime_nsec as i128);
     if mtime_nanos != spec.expected_mtime_nanos {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox binary mtime changed before launch: {}",
+            "command-mediation binary mtime changed before launch: {}",
             PathBuf::from(path).display()
         )));
     }
@@ -1142,16 +1148,16 @@ fn open_and_verify_binary(path: &OsStr, spec: &ToolSandboxChildLaunchSpec) -> Re
     // Hash content via a duplicate fd so the original fd's offset stays at 0
     // for execveat. (execveat doesn't actually depend on offset, but keeping
     // the original untouched avoids relying on undocumented kernel behavior.)
-    let dup_fd = fd
-        .try_clone()
-        .map_err(|err| NonoError::SandboxInit(format!("tool-sandbox fd dup for hash: {err}")))?;
+    let dup_fd = fd.try_clone().map_err(|err| {
+        NonoError::SandboxInit(format!("command-mediation fd dup for hash: {err}"))
+    })?;
     let mut file = std::fs::File::from(dup_fd);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|err| NonoError::SandboxInit(format!("tool-sandbox binary fd read: {err}")))?;
+        let n = file.read(&mut buf).map_err(|err| {
+            NonoError::SandboxInit(format!("command-mediation binary fd read: {err}"))
+        })?;
         if n == 0 {
             break;
         }
@@ -1164,7 +1170,7 @@ fn open_and_verify_binary(path: &OsStr, spec: &ToolSandboxChildLaunchSpec) -> Re
         .collect();
     if actual_sha256 != spec.expected_sha256 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox binary content changed before launch: {}",
+            "command sandbox binary content changed before launch: {}",
             PathBuf::from(path).display()
         )));
     }
@@ -1193,14 +1199,14 @@ fn handle_url_open_stream(
         .and_then(|()| stream.set_write_timeout(Some(TOOL_SANDBOX_URL_IO_TIMEOUT)))
         .is_err()
     {
-        debug!("tool-sandbox URL open: failed to set socket timeout");
+        debug!("command-mediation URL open: failed to set socket timeout");
         return;
     }
 
     let peer_pid = match peer_credentials(stream.as_raw_fd()) {
         Ok(creds) => creds.pid,
         Err(err) => {
-            debug!("tool-sandbox URL open: peer pid resolution failed: {err}");
+            debug!("command-mediation URL open: peer pid resolution failed: {err}");
             return;
         }
     };
@@ -1208,7 +1214,7 @@ fn handle_url_open_stream(
     let request: ToolSandboxOpenUrlRequest = match read_frame(&mut stream) {
         Ok(request) => request,
         Err(err) => {
-            debug!("tool-sandbox URL open: malformed request: {err}");
+            debug!("command-mediation URL open: malformed request: {err}");
             return;
         }
     };
@@ -1228,11 +1234,11 @@ fn handle_url_open_stream(
     // can see WHY an open was denied (e.g. an origin missing from allow_origins).
     match &error {
         Some(reason) => warn!(
-            "tool-sandbox URL open denied (pid {peer_pid}): {} — {reason}",
+            "command-mediation URL open denied (pid {peer_pid}): {} — {reason}",
             request.url
         ),
         None => debug!(
-            "tool-sandbox URL open allowed (pid {peer_pid}): {}",
+            "command-mediation URL open allowed (pid {peer_pid}): {}",
             request.url
         ),
     }
@@ -1242,7 +1248,7 @@ fn handle_url_open_stream(
         error: error.clone(),
     };
     if let Err(err) = write_frame(&mut stream, &response) {
-        debug!("tool-sandbox URL open: failed to send response: {err}");
+        debug!("command-mediation URL open: failed to send response: {err}");
     }
 
     if let Some(recorder) = audit_recorder.as_ref()
@@ -1420,10 +1426,12 @@ fn handle_shim_stream_inner(
         return Err(err);
     }
 
+    let base_proxy_scope = scoped_proxy_key(&request.command, &caller, None);
     if let Some(invocation_policy) =
         select_invocation_policy(&state.plan.config, &request.command, &caller)
     {
-        let child_env = match filter_child_env(state, &request, policy, &caller) {
+        let child_env = match filter_child_env(state, &request, policy, &caller, &base_proxy_scope)
+        {
             Ok(env) => env,
             Err(err) => {
                 record_command_policy_audit(
@@ -1610,7 +1618,7 @@ fn handle_shim_stream_inner(
     let intercept = match command_config {
         Some(cc) => {
             match super::resolve_intercept_action(cc, &request.argv, || {
-                filter_child_env(state, &request, policy, &caller)
+                filter_child_env(state, &request, policy, &caller, &base_proxy_scope)
             }) {
                 Ok(intercept) => intercept,
                 Err(err) => {
@@ -1635,9 +1643,18 @@ fn handle_shim_stream_inner(
     let intercept_action = intercept.action;
 
     // A matched intercept rule may carry a sandbox that replaces the command's
-    // selected sandbox for the process this rule launches (every action except
-    // `respond`, which launches nothing). Absent -> the command's selected sandbox.
+    // command sandbox for the process this rule launches (every action except
+    // `respond`, which launches nothing). Absent -> the selected command sandbox.
     let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+    let effective_proxy_scope = scoped_proxy_key(
+        &request.command,
+        &caller,
+        intercept.sandbox.and(intercept.rule_index),
+    );
+    let launch_context = ChildLaunchContext {
+        caller: &caller,
+        proxy_scope: &effective_proxy_scope,
+    };
 
     if let crate::command_policy::InterceptActionConfig::Respond { stdout } = intercept_action {
         // Write the static payload to the shim's stdout fd, then respond.
@@ -1646,7 +1663,7 @@ fn handle_shim_stream_inner(
         let mut stdout_file = std::fs::File::from(stdio.stdout);
         if let Err(e) = stdout_file.write_all(stdout_bytes) {
             // Non-fatal: log and continue to send the response.
-            debug!("tool-sandbox Respond: failed to write static stdout: {e}");
+            debug!("command-mediation Respond: failed to write static stdout: {e}");
         }
         record_command_policy_audit(
             audit_recorder.as_ref(),
@@ -1774,11 +1791,12 @@ fn handle_shim_stream_inner(
                 None,
             )?;
             return Err(NonoError::SandboxInit(
-                "tool-sandbox active child limit exceeded".to_string(),
+                "command mediation active-command limit exceeded".to_string(),
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
+            let launch =
+                build_child_launch_spec(state, &request, effective_sandbox, &launch_context)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1798,7 +1816,7 @@ fn handle_shim_stream_inner(
                         Some(exit_code),
                     )?;
                     return Err(NonoError::SandboxInit(format!(
-                        "tool-sandbox credential capture command failed with exit code {exit_code}"
+                        "command sandbox credential capture failed with exit code {exit_code}"
                     )));
                 }
                 let captured = normalize_captured_credential(raw_output);
@@ -1809,7 +1827,7 @@ fn handle_shim_stream_inner(
                 let nonce = {
                     let mut broker = state.token_broker.lock().map_err(|_| {
                         NonoError::SandboxInit(
-                            "tool-sandbox token broker lock poisoned".to_string(),
+                            "command-mediation token broker lock poisoned".to_string(),
                         )
                     })?;
                     broker.store_named(
@@ -1872,11 +1890,12 @@ fn handle_shim_stream_inner(
                 None,
             )?;
             return Err(NonoError::SandboxInit(
-                "tool-sandbox active child limit exceeded".to_string(),
+                "command mediation active-command limit exceeded".to_string(),
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
+            let launch =
+                build_child_launch_spec(state, &request, effective_sandbox, &launch_context)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1885,14 +1904,14 @@ fn handle_shim_stream_inner(
                 let captured = {
                     let mut broker = state.token_broker.lock().map_err(|_| {
                         NonoError::SandboxInit(
-                            "tool-sandbox token broker lock poisoned".to_string(),
+                            "command-mediation token broker lock poisoned".to_string(),
                         )
                     })?;
                     broker.scan_and_reissue(raw_output)
                 };
                 if captured.len() > MAX_CAPTURE_STDOUT {
                     return Err(NonoError::SandboxInit(
-                        "tool-sandbox Capture: output exceeds limit".to_string(),
+                        "command-mediation Capture: output exceeds limit".to_string(),
                     ));
                 }
                 record_command_policy_audit(
@@ -1944,7 +1963,7 @@ fn handle_shim_stream_inner(
                 None,
             )?;
             return Err(NonoError::SandboxInit(
-                "tool-sandbox active child limit exceeded".to_string(),
+                "command mediation active-command limit exceeded".to_string(),
             ));
         }
         let result = (|| {
@@ -1953,11 +1972,11 @@ fn handle_shim_stream_inner(
             let launch = build_child_launch_spec_for_binary(
                 state,
                 &request,
-                policy,
+                effective_sandbox,
                 helper,
                 &extra_args,
                 false,
-                &caller,
+                &launch_context,
             )?;
             launch_child(state, &request.command, &caller, launch, stdio)
         })();
@@ -2032,12 +2051,12 @@ fn handle_shim_stream_inner(
             None,
         )?;
         return Err(NonoError::SandboxInit(
-            "tool-sandbox active child limit exceeded".to_string(),
+            "command mediation active-command limit exceeded".to_string(),
         ));
     }
 
     let result = (|| {
-        let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
+        let launch = build_child_launch_spec(state, &request, effective_sandbox, &launch_context)?;
         launch_child(state, &request.command, &caller, launch, stdio)
     })();
     state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -2108,23 +2127,23 @@ fn authenticate_shim(
     let shim_file = File::from(shim_fd);
     let metadata = shim_file.metadata().map_err(|err| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox shim authentication failed for pid {peer_pid}: fstat received shim fd failed: {err}"
+                "command-mediation shim authentication failed for pid {peer_pid}: fstat received shim fd failed: {err}"
             ))
         })?;
     if !metadata.is_file() {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox shim authentication failed for pid {peer_pid}: received shim fd is not a regular file"
+            "command-mediation shim authentication failed for pid {peer_pid}: received shim fd is not a regular file"
         )));
     }
     let id = file_id(&metadata);
     let identity = state.shims_by_command.get(command).ok_or_else(|| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox shim authentication failed for pid {peer_pid}: missing shim identity for {command}"
+            "command-mediation shim authentication failed for pid {peer_pid}: missing shim identity for {command}"
         ))
     })?;
     if identity.id != id {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox shim authentication failed for pid {peer_pid}: inode mismatch for {command}"
+            "command-mediation shim authentication failed for pid {peer_pid}: inode mismatch for {command}"
         )));
     }
     Ok(ShimAuth { peer_pid })
@@ -2187,19 +2206,18 @@ fn resolve_caller_with(
         return Ok(caller);
     }
     Err(NonoError::SandboxInit(
-        "tool-sandbox caller ancestry could not be trusted".to_string(),
+        "command-policy caller ancestry could not be trusted".to_string(),
     ))
 }
 
 /// Returns the active command for `pid` and the caller it was launched under.
 /// Self-invocation with no explicit self-invocation entry uses the launch caller so
-/// recursive tool calls keep the current effective policy instead of requiring
+/// recursive tool calls keep the current effective command sandbox instead of requiring
 /// a `<cmd>.can_use[<cmd>]` edge.
 fn live_active_child(pid: u32, state: &ToolSandboxState) -> Result<Option<(String, Caller)>> {
-    let map = state
-        .active_children
-        .lock()
-        .map_err(|_| NonoError::SandboxInit("tool-sandbox pid map lock poisoned".to_string()))?;
+    let map = state.active_children.lock().map_err(|_| {
+        NonoError::SandboxInit("command-mediation pid map lock poisoned".to_string())
+    })?;
     let Some(active) = map.get(&pid) else {
         return Ok(None);
     };
@@ -2241,7 +2259,7 @@ fn active_child_is_live(pid: u32, active: &ActiveChild) -> Result<bool> {
     let status = unsafe { libc::poll(&mut pfd, 1, 0) };
     if status < 0 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox pidfd poll failed for pid {pid}: {}",
+            "command-mediation pidfd poll failed for pid {pid}: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -2299,7 +2317,9 @@ fn select_effective_policy<'a>(
     caller: &Caller,
 ) -> Result<&'a CommandSandboxConfig> {
     let command = config.commands.get(command_name).ok_or_else(|| {
-        NonoError::SandboxInit(format!("unknown tool-sandbox command '{command_name}'"))
+        NonoError::SandboxInit(format!(
+            "unknown policy-controlled command '{command_name}'"
+        ))
     })?;
 
     match caller {
@@ -2323,7 +2343,7 @@ fn select_effective_policy<'a>(
             ..
         } => {
             let caller_command = config.commands.get(caller_name).ok_or_else(|| {
-                NonoError::SandboxInit(format!("unknown tool-sandbox caller '{caller_name}'"))
+                NonoError::SandboxInit(format!("unknown command-policy caller '{caller_name}'"))
             })?;
             if !caller_command
                 .can_use
@@ -2601,7 +2621,7 @@ fn detect_supported_exec_gate_abi() -> Result<nono::DetectedAbi> {
     let abi = Sandbox::detect_abi()?;
     if !abi.has_execute() {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox outer exec gate requires Landlock ABI V3+; detected {}",
+            "session sandbox execute gate requires Landlock ABI V3+; detected {}",
             abi.version_string()
         )));
     }
@@ -2664,10 +2684,14 @@ fn validate_trusted_executable_dirs(dirs: &[PathBuf], outer_caps: &CapabilitySet
             path: dir.clone(),
             source,
         })?;
-        reject_group_or_world_writable_path(dir, &metadata, "tool-sandbox executable directory")?;
+        reject_group_or_world_writable_path(
+            dir,
+            &metadata,
+            "policy-controlled executable directory",
+        )?;
         if outer_caps_grant_write(outer_caps, dir) {
             return Err(NonoError::SandboxInit(format!(
-                "tool-sandbox executable directory is writable by the outer session capability set: {}",
+                "command executable directory is writable by the session sandbox's capability set: {}",
                 dir.display()
             )));
         }
@@ -2775,19 +2799,19 @@ fn validate_controlled_file(
 ) -> Result<()> {
     if !allow_writable_path && outer_caps_grant_file_write(outer_caps, path) {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox {label} binary is writable by the outer session capability set: {}",
+            "command {label} binary is writable by the session sandbox's capability set: {}",
             path.display()
         )));
     }
     let parent = path.parent().ok_or_else(|| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox {label} binary has no parent directory: {}",
+            "command {label} binary has no parent directory: {}",
             path.display()
         ))
     })?;
     if !allow_writable_path && outer_caps_grant_write(outer_caps, parent) {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox {label} binary is replaceable through writable parent directory: {}",
+            "command {label} binary is replaceable through writable parent directory: {}",
             parent.display()
         )));
     }
@@ -2801,14 +2825,14 @@ fn reject_group_or_world_writable_path(
 ) -> Result<()> {
     if metadata.permissions().mode() & 0o022 != 0 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox {label} is group/world writable: {}",
+            "command {label} is group/world writable: {}",
             path.display()
         )));
     }
     Ok(())
 }
 
-/// Dirs the outer capability set grants write/readwrite to (e.g. cwd). Kept
+/// Dirs the session sandbox capability set grants write/readwrite to (e.g. cwd). Kept
 /// separate from `build_outer_exec_files`'s per-file enumeration since a
 /// writable dir's contents can change after setup.
 fn collect_outer_exec_writable_dirs(
@@ -2973,7 +2997,7 @@ fn create_runtime_dir() -> Result<PathBuf> {
         }
     }
     Err(NonoError::SandboxInit(
-        "failed to allocate tool-sandbox runtime dir".to_string(),
+        "failed to allocate command-mediation runtime dir".to_string(),
     ))
 }
 
@@ -2994,19 +3018,19 @@ fn unique_runtime_path(base: &Path, prefix: &str, suffix: &str) -> PathBuf {
 fn bind_runtime_socket(socket_path: &Path) -> Result<UnixListener> {
     if socket_path.exists() {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox runtime socket already exists: {}",
+            "command-mediation runtime socket already exists: {}",
             socket_path.display()
         )));
     }
     let listener = UnixListener::bind(socket_path).map_err(|err| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox bind socket {}: {err}",
+            "command-mediation bind socket {}: {err}",
             socket_path.display()
         ))
     })?;
     listener.set_nonblocking(true).map_err(|err| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox set nonblocking on socket {}: {err}",
+            "command-mediation set nonblocking on socket {}: {err}",
             socket_path.display()
         ))
     })?;
@@ -3027,8 +3051,9 @@ fn create_shim_dir(runtime_dir: &Path) -> Result<PathBuf> {
 }
 
 fn materialize_shim_source(shim_dir: &Path) -> Result<PathBuf> {
-    let nono_exe = std::env::current_exe()
-        .map_err(|err| NonoError::SandboxInit(format!("tool-sandbox current_exe failed: {err}")))?;
+    let nono_exe = std::env::current_exe().map_err(|err| {
+        NonoError::SandboxInit(format!("command-mediation current_exe failed: {err}"))
+    })?;
     let dest = shim_dir.join("nono-shim-src");
     fs::copy(&nono_exe, &dest).map_err(|source| NonoError::ConfigWrite {
         path: dest.clone(),
@@ -3168,7 +3193,7 @@ fn build_outer_exec_files<'a>(
                 })
             {
                 debug!(
-                    "tool-sandbox outer exec gate skipped {}: {}",
+                    "session sandbox execute gate skipped {}: {}",
                     canonical.display(),
                     err
                 );
@@ -3219,7 +3244,7 @@ fn add_outer_exec_file_with_deps(
     }
     let interpreter = shape.interpreter.ok_or_else(|| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox script {} has no resolved shebang interpreter",
+            "command-mediation script {} has no resolved shebang interpreter",
             path.display()
         ))
     })?;
@@ -3285,7 +3310,7 @@ fn wrapper_exec_target(path: &Path) -> Result<Option<PathBuf>> {
 fn trusted_outer_exec_interpreter(path: &Path, outer_caps: &CapabilitySet) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox script interpreter is not absolute: {}",
+            "command-mediation script interpreter is not absolute: {}",
             path.display()
         )));
     }
@@ -3306,14 +3331,14 @@ fn validate_outer_exec_file_immutable(path: &Path, outer_caps: &CapabilitySet) -
     })?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox outer executable is not an executable file: {}",
+            "session executable is not an executable file: {}",
             path.display()
         )));
     }
-    reject_group_or_world_writable_path(path, &metadata, "outer executable")?;
+    reject_group_or_world_writable_path(path, &metadata, "session executable")?;
     let parent = path.parent().ok_or_else(|| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox outer executable has no parent directory: {}",
+            "session executable has no parent directory: {}",
             path.display()
         ))
     })?;
@@ -3321,8 +3346,8 @@ fn validate_outer_exec_file_immutable(path: &Path, outer_caps: &CapabilitySet) -
         path: parent.to_path_buf(),
         source,
     })?;
-    reject_group_or_world_writable_path(parent, &parent_metadata, "outer executable directory")?;
-    validate_controlled_file(path, outer_caps, "outer executable", false)
+    reject_group_or_world_writable_path(parent, &parent_metadata, "session executable directory")?;
+    validate_controlled_file(path, outer_caps, "session executable", false)
 }
 
 fn add_outer_exec_elf_closure(
@@ -3346,7 +3371,7 @@ fn add_outer_exec_elf_closure(
 ///
 /// Also grants bare `Refer` on `/`. Landlock requires Refer in every stacked
 /// layer for rename/link, so omitting it here silently breaks same-FS
-/// renames the outer sandbox already permits (`command_policies` / #1689).
+/// renames the session sandbox already permits (`command_policies` / #1689).
 /// Bare `Refer` alone cannot widen access. Mirrors `restrict_execute`.
 fn apply_outer_exec_gate(
     paths: &[PathBuf],
@@ -3355,7 +3380,7 @@ fn apply_outer_exec_gate(
 ) -> Result<()> {
     let status = prepare_outer_exec_gate(paths, writable_dirs, abi)?
         .restrict_self()
-        .map_err(|err| NonoError::SandboxInit(format!("tool-sandbox restrict_self: {err}")))?;
+        .map_err(|err| NonoError::SandboxInit(format!("command-mediation restrict_self: {err}")))?;
     ensure_outer_exec_gate_fully_enforced(status.ruleset)
 }
 
@@ -3366,7 +3391,7 @@ fn prepare_outer_exec_gate(
 ) -> Result<landlock::RulesetCreated> {
     if !abi.has_execute() {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox outer exec gate requires Landlock ABI V3+; detected {}",
+            "session sandbox execute gate requires Landlock ABI V3+; detected {}",
             abi.version_string()
         )));
     }
@@ -3376,27 +3401,27 @@ fn prepare_outer_exec_gate(
         .handle_access(AccessFs::Execute)
         .map_err(|err| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox outer exec gate cannot handle Landlock Execute: {err}"
+                "session sandbox execute gate cannot handle Landlock Execute: {err}"
             ))
         })?
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::Refer)
         .map_err(|err| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox outer exec gate cannot handle Refer: {err}"
+                "session sandbox execute gate cannot handle Refer: {err}"
             ))
         })?
         .create()
         .map_err(|err| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox outer exec gate ruleset create failed: {err}"
+                "session sandbox execute gate ruleset create failed: {err}"
             ))
         })?;
 
     for path in paths {
         let fd = PathFd::new(path).map_err(|err| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox outer exec gate cannot open {}: {err}",
+                "session sandbox execute gate cannot open {}: {err}",
                 path.display()
             ))
         })?;
@@ -3404,7 +3429,7 @@ fn prepare_outer_exec_gate(
             .add_rule(PathBeneath::new(fd, AccessFs::Execute))
             .map_err(|err| {
                 NonoError::SandboxInit(format!(
-                    "tool-sandbox outer exec gate add_rule for {}: {err}",
+                    "session sandbox execute gate add_rule for {}: {err}",
                     path.display()
                 ))
             })?;
@@ -3414,7 +3439,7 @@ fn prepare_outer_exec_gate(
     for dir in writable_dirs {
         let fd = PathFd::new(dir).map_err(|err| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox outer exec gate cannot open {}: {err}",
+                "session sandbox execute gate cannot open {}: {err}",
                 dir.display()
             ))
         })?;
@@ -3422,7 +3447,7 @@ fn prepare_outer_exec_gate(
             .add_rule(PathBeneath::new(fd, AccessFs::Execute))
             .map_err(|err| {
                 NonoError::SandboxInit(format!(
-                    "tool-sandbox outer exec gate add_rule for {}: {err}",
+                    "session sandbox execute gate add_rule for {}: {err}",
                     dir.display()
                 ))
             })?;
@@ -3431,14 +3456,14 @@ fn prepare_outer_exec_gate(
     if abi.has_refer() {
         let root_fd = PathFd::new("/").map_err(|err| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox outer exec gate cannot open / for Refer grant: {err}"
+                "session sandbox execute gate cannot open / for Refer grant: {err}"
             ))
         })?;
         ruleset = ruleset
             .add_rule(PathBeneath::new(root_fd, AccessFs::Refer))
             .map_err(|err| {
                 NonoError::SandboxInit(format!(
-                    "tool-sandbox outer exec gate add_rule for / (Refer): {err}"
+                    "session sandbox execute gate add_rule for / (Refer): {err}"
                 ))
             })?;
     }
@@ -3450,10 +3475,10 @@ fn ensure_outer_exec_gate_fully_enforced(status: landlock::RulesetStatus) -> Res
     match status {
         landlock::RulesetStatus::FullyEnforced => Ok(()),
         landlock::RulesetStatus::PartiallyEnforced => Err(NonoError::SandboxInit(
-            "tool-sandbox outer exec gate was only partially enforced".to_string(),
+            "session sandbox execute gate was only partially enforced".to_string(),
         )),
         landlock::RulesetStatus::NotEnforced => Err(NonoError::SandboxInit(
-            "tool-sandbox outer exec gate was not enforced".to_string(),
+            "session sandbox execute gate was not enforced".to_string(),
         )),
     }
 }
@@ -3484,7 +3509,7 @@ fn send_fd_via_socket(socket_fd: RawFd, fd_to_send: RawFd) -> Result<()> {
     let sent = unsafe { libc::sendmsg(socket_fd, &msg, 0) };
     if sent < 0 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox sendmsg(SCM_RIGHTS) failed: {}",
+            "command-mediation sendmsg(SCM_RIGHTS) failed: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -3507,13 +3532,13 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     let received = unsafe { libc::recvmsg(socket_fd, &mut msg, 0) };
     if received < 0 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox recvmsg(SCM_RIGHTS) failed: {}",
+            "command-mediation recvmsg(SCM_RIGHTS) failed: {}",
             std::io::Error::last_os_error()
         )));
     }
     if received == 0 {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox recvmsg(SCM_RIGHTS) received EOF".to_string(),
+            "command-mediation recvmsg(SCM_RIGHTS) received EOF".to_string(),
         ));
     }
 
@@ -3524,14 +3549,14 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
         || unsafe { (*cmsg).cmsg_len } < cmsg_len(std::mem::size_of::<RawFd>())
     {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox recvmsg(SCM_RIGHTS) missing file descriptor".to_string(),
+            "command-mediation recvmsg(SCM_RIGHTS) missing file descriptor".to_string(),
         ));
     }
 
     let fd = unsafe { *cmsg_data(cmsg).cast::<RawFd>() };
     if fd < 0 {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox recvmsg(SCM_RIGHTS) received invalid file descriptor".to_string(),
+            "command-mediation recvmsg(SCM_RIGHTS) received invalid file descriptor".to_string(),
         ));
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
@@ -3565,11 +3590,16 @@ unsafe fn cmsg_data(cmsg: *mut libc::cmsghdr) -> *mut u8 {
     }
 }
 
+struct ChildLaunchContext<'a> {
+    caller: &'a Caller,
+    proxy_scope: &'a str,
+}
+
 fn build_child_launch_spec(
     state: &ToolSandboxState,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
-    caller: &Caller,
+    context: &ChildLaunchContext<'_>,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     let binary = state
         .plan
@@ -3579,7 +3609,7 @@ fn build_child_launch_spec(
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
         })?;
-    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true, caller)
+    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true, context)
 }
 
 /// Build a child launch spec that runs `binary` (the command's real binary OR
@@ -3598,7 +3628,7 @@ fn build_child_launch_spec_for_binary(
     binary: &ResolvedCommandBinary,
     extra_args: &[Vec<u8>],
     preserve_caller_argv0: bool,
-    caller: &Caller,
+    context: &ChildLaunchContext<'_>,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     let start_vbi = std::time::Instant::now();
     verify_binary_identity(binary)?;
@@ -3627,11 +3657,11 @@ fn build_child_launch_spec_for_binary(
     )?;
 
     let start_caps = std::time::Instant::now();
-    let mut caps = build_child_caps(state, binary, policy, request, &cwd)?;
+    let mut caps = build_child_caps(state, binary, policy, request, &cwd, context.proxy_scope)?;
     tool_sandbox_profile_log!("build_child_caps total: {:?}", start_caps.elapsed());
     caps.deduplicate();
 
-    let env = filter_child_env(state, request, policy, caller)?;
+    let env = filter_child_env(state, request, policy, context.caller, context.proxy_scope)?;
 
     // Build the execute allowlist. AccessMode::Read includes
     // AccessFs::Execute in the Landlock mapping; without an explicit
@@ -3774,6 +3804,7 @@ fn build_child_caps(
     policy: &CommandSandboxConfig,
     request: &ToolSandboxShimRequest,
     cwd: &Path,
+    proxy_scope: &str,
 ) -> Result<CapabilitySet> {
     let mut caps = CapabilitySet::new().block_network();
     caps.add_fs(FsCapability::new_file(
@@ -3801,7 +3832,7 @@ fn build_child_caps(
         &state.deny_paths,
     )?;
     add_policy_network(&mut caps, policy)?;
-    add_policy_proxy_network(&mut caps, state, request, policy)?;
+    add_policy_proxy_network(&mut caps, state, request, policy, proxy_scope)?;
     add_proxy_trust_bundle_caps(&mut caps, state, policy)?;
     add_policy_credentials(&mut caps, state, policy)?;
     add_url_open_caps(&mut caps, state, policy)?;
@@ -4178,7 +4209,7 @@ fn resolve_exec_paths(
             resolved.push(path);
         } else {
             warn!(
-                "tool-sandbox: skipping exec_path '{}' (resolved from '{}'): path does not exist",
+                "command-mediation: skipping exec_path '{}' (resolved from '{}'): path does not exist",
                 path.display(),
                 entry
             );
@@ -4218,16 +4249,25 @@ fn add_policy_proxy_network(
     state: &ToolSandboxState,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
+    proxy_scope: &str,
 ) -> Result<()> {
-    if matches!(caps.network_mode(), NetworkMode::AllowAll) {
+    if !super::policy_uses_proxy_route(policy, &state.credential_handles) {
         return Ok(());
     }
-    if !policy_uses_proxy_route(state, policy) {
-        return Ok(());
-    }
-    let port = super::proxy_port_from_env(&request.env).ok_or_else(|| {
+    super::validate_scoped_proxy_network(
+        caps,
+        policy,
+        &state.reserved_proxy_ports,
+        &request.command,
+    )?;
+    let scoped_env = super::required_scoped_proxy_env(
+        &state.scoped_proxy_env_vars,
+        proxy_scope,
+        &request.command,
+    )?;
+    let port = super::proxy_port_from_vars(scoped_env).ok_or_else(|| {
         NonoError::SandboxInit(
-            "tool-sandbox proxy-routed network policy was granted but no loopback proxy env was present"
+            "command sandbox proxy policy was granted but no loopback proxy environment was present"
                 .to_string(),
         )
     })?;
@@ -4238,18 +4278,14 @@ fn add_policy_proxy_network(
     Ok(())
 }
 
-fn policy_uses_proxy_route(state: &ToolSandboxState, policy: &CommandSandboxConfig) -> bool {
-    let uses_proxy_credential = super::policy_credential_names(policy).iter().any(|handle| {
-        matches!(
-            state.credential_handles.get(*handle),
-            Some(ResolvedCredential::Proxy { .. })
-        )
-    });
-    let uses_proxy_domain = policy
-        .network
-        .as_ref()
-        .is_some_and(|network| !network.allow_domain.is_empty());
-    uses_proxy_credential || uses_proxy_domain
+fn scoped_proxy_key(command: &str, caller: &Caller, intercept_index: Option<usize>) -> String {
+    let caller = match caller {
+        Caller::Session { .. } => "session",
+        Caller::Command {
+            command: parent, ..
+        } => parent,
+    };
+    super::proxy_scope_key(command, caller, intercept_index)
 }
 
 fn add_proxy_trust_bundle_caps(
@@ -4257,7 +4293,7 @@ fn add_proxy_trust_bundle_caps(
     state: &ToolSandboxState,
     policy: &CommandSandboxConfig,
 ) -> Result<()> {
-    if !policy_uses_proxy_route(state, policy) {
+    if !super::policy_uses_proxy_route(policy, &state.credential_handles) {
         return Ok(());
     }
     for path in &state.proxy_trust_bundle_paths {
@@ -4292,17 +4328,17 @@ fn add_policy_credentials(
                     .as_deref()
                     .unwrap_or("local socket unavailable");
                 return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox credential '{handle}' is unavailable: {reason}"
+                    "command sandbox credential '{handle}' is unavailable: {reason}"
                 )));
             }
             Some(ResolvedCredential::RawFile { path }) => {
                 caps.add_fs(FsCapability::new_file(path, AccessMode::Read)?);
             }
-            Some(ResolvedCredential::Proxy { .. }) => {}
+            Some(ResolvedCredential::Proxy) => {}
             Some(ResolvedCredential::Ambient { .. }) => {}
             None => {
                 return Err(NonoError::SandboxInit(format!(
-                    "tool-sandbox credential handle '{handle}' was not resolved"
+                    "command sandbox credential handle '{handle}' was not resolved"
                 )));
             }
         }
@@ -4318,7 +4354,7 @@ fn add_runtime_baseline(
     let start_baseline = std::time::Instant::now();
     let closure = baseline.closures.get(binary).ok_or_else(|| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox runtime baseline cache missing entry for {}",
+            "command-mediation runtime baseline cache missing entry for {}",
             binary.display()
         ))
     })?;
@@ -4445,6 +4481,7 @@ fn filter_child_env(
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
     caller: &Caller,
+    proxy_scope: &str,
 ) -> Result<Vec<Vec<u8>>> {
     let allowed_patterns: Vec<String> = policy
         .environment
@@ -4453,7 +4490,7 @@ fn filter_child_env(
         .unwrap_or_else(default_env_allow_patterns);
 
     let broker = state.token_broker.lock().map_err(|_| {
-        NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
+        NonoError::SandboxInit("command-mediation token broker lock poisoned".to_string())
     })?;
 
     let mut env = Vec::new();
@@ -4463,7 +4500,7 @@ fn filter_child_env(
             continue;
         };
         let key_str = std::str::from_utf8(key).map_err(|_| {
-            NonoError::SandboxInit("tool-sandbox env var name is not UTF-8".to_string())
+            NonoError::SandboxInit("command-mediation env var name is not UTF-8".to_string())
         })?;
         if key_str.starts_with("NONO_") {
             continue;
@@ -4471,7 +4508,7 @@ fn filter_child_env(
         // Drop linker/shell/interpreter injection vectors regardless of policy
         // allow_vars. A broad pattern like "*" or "LD_*" must NOT let
         // LD_PRELOAD / PYTHONPATH / NODE_OPTIONS / BASH_ENV / etc. through to
-        // a credential-bearing tool-sandbox child.
+        // a credential-bearing command sandbox.
         if crate::exec_strategy::env_sanitization::is_dangerous_env_var(key_str) {
             continue;
         }
@@ -4528,24 +4565,28 @@ fn filter_child_env(
                     .as_deref()
                     .unwrap_or("local socket unavailable");
                 return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox credential '{handle}' is unavailable: {reason}"
+                    "command sandbox credential '{handle}' is unavailable: {reason}"
                 )));
             }
             Some(ResolvedCredential::RawFile { .. }) => {}
-            Some(ResolvedCredential::Proxy { env_vars }) => {
-                for (name, value) in env_vars {
-                    let prefix = format!("{name}=").into_bytes();
-                    env.retain(|entry| !entry.starts_with(&prefix));
-                    env.push(format!("{name}={value}").into_bytes());
-                }
-            }
+            Some(ResolvedCredential::Proxy) => {}
             Some(ResolvedCredential::Ambient { .. }) => {}
             None => {
                 return Err(NonoError::SandboxInit(format!(
-                    "tool-sandbox credential handle '{handle}' was not resolved"
+                    "command sandbox credential handle '{handle}' was not resolved"
                 )));
             }
         }
+    }
+    // Apply this last so main-proxy transport and credential URLs cannot
+    // overwrite the narrower authority selected for this effective command sandbox.
+    if super::policy_uses_proxy_route(policy, &state.credential_handles) {
+        let vars = super::required_scoped_proxy_env(
+            &state.scoped_proxy_env_vars,
+            proxy_scope,
+            &request.command,
+        )?;
+        super::env::override_proxy_env(&mut env, vars);
     }
     Ok(env)
 }
@@ -4597,7 +4638,7 @@ fn launch_child(
             stdio,
         ),
         other => Err(NonoError::ConfigParse(format!(
-            "invalid tool-sandbox stdio mode '{other}'"
+            "invalid command-mediation stdio mode '{other}'"
         ))),
     };
     tool_sandbox_profile_log!(
@@ -4652,7 +4693,7 @@ fn launch_child_with_brokered_stdio(
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
     let limits = spec.stdio_limits.clone().ok_or_else(|| {
-        NonoError::SandboxInit("tool-sandbox brokered stdio missing limits".to_string())
+        NonoError::SandboxInit("command-mediation brokered stdio missing limits".to_string())
     })?;
     let (stdout_read, stdout_write) = create_pipe("stdout")?;
     let (stderr_read, stderr_write) = create_pipe("stderr")?;
@@ -4751,7 +4792,7 @@ fn create_pipe(stream_name: &str) -> Result<(OwnedFd, OwnedFd)> {
     let mut pipe_fds = [-1i32; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox brokered stdio {stream_name} pipe() failed: {}",
+            "command-mediation brokered stdio {stream_name} pipe() failed: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -4779,7 +4820,7 @@ fn relay_limited_output(
     loop {
         let n = source.read(&mut buf).map_err(|err| {
             NonoError::SandboxInit(format!(
-                "tool-sandbox brokered stdio {stream_name} read failed: {err}"
+                "command-mediation brokered stdio {stream_name} read failed: {err}"
             ))
         })?;
         if n == 0 {
@@ -4793,7 +4834,7 @@ fn relay_limited_output(
         if to_forward > 0 {
             target.write_all(&buf[..to_forward]).map_err(|err| {
                 NonoError::SandboxInit(format!(
-                    "tool-sandbox brokered stdio {stream_name} write failed: {err}"
+                    "command-mediation brokered stdio {stream_name} write failed: {err}"
                 ))
             })?;
             forwarded_bytes = forwarded_bytes.saturating_add(to_forward as u64);
@@ -4832,7 +4873,7 @@ fn join_relay_thread(
 ) -> Result<OutputRelayResult> {
     handle.join().map_err(|_| {
         NonoError::SandboxInit(format!(
-            "tool-sandbox brokered stdio {stream_name} relay panicked"
+            "command-mediation brokered stdio {stream_name} relay panicked"
         ))
     })?
 }
@@ -4852,7 +4893,7 @@ fn issue_existing_ambient_credential_nonce(
         .get(credential)
         .and_then(ResolvedCredential::phantom_template);
     let mut broker = state.token_broker.lock().map_err(|_| {
-        NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
+        NonoError::SandboxInit("command-mediation token broker lock poisoned".to_string())
     })?;
     Ok(Some(broker.store_named(
         credential.to_string(),
@@ -4877,10 +4918,10 @@ fn load_ambient_credential_source(
         )?)),
         Some(ResolvedCredential::Ambient { source: None, .. }) => Ok(None),
         Some(_) => Err(NonoError::SandboxInit(format!(
-            "tool-sandbox credential '{credential}' is not ambient"
+            "command sandbox credential '{credential}' is not ambient"
         ))),
         None => Err(NonoError::SandboxInit(format!(
-            "tool-sandbox credential handle '{credential}' was not resolved"
+            "command sandbox credential handle '{credential}' was not resolved"
         ))),
     }
 }
@@ -4914,7 +4955,7 @@ fn launch_child_with_capture(
     let mut pipe_fds = [-1i32; 2]; // [read_end, write_end]
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox Capture: pipe() failed: {}",
+            "command-mediation Capture: pipe() failed: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -4955,11 +4996,11 @@ fn launch_child_with_capture(
     remove_launch_spec(&spec_path);
 
     read_result.map_err(|e| {
-        NonoError::SandboxInit(format!("tool-sandbox Capture: pipe read failed: {e}"))
+        NonoError::SandboxInit(format!("command-mediation Capture: pipe read failed: {e}"))
     })?;
     if captured.len() > MAX_CAPTURE_STDOUT {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox Capture: output exceeds limit".to_string(),
+            "command-mediation Capture: output exceeds limit".to_string(),
         ));
     }
 
@@ -4975,13 +5016,13 @@ fn launch_child_with_pty(
 ) -> Result<ChildLaunchResult> {
     let pty = crate::pty_proxy::open_pty()?;
     let stdin_slave = nix::unistd::dup(&pty.slave).map_err(|err| {
-        NonoError::SandboxInit(format!("tool-sandbox PTY dup stdin failed: {err}"))
+        NonoError::SandboxInit(format!("command-mediation PTY dup stdin failed: {err}"))
     })?;
     let stdout_slave = nix::unistd::dup(&pty.slave).map_err(|err| {
-        NonoError::SandboxInit(format!("tool-sandbox PTY dup stdout failed: {err}"))
+        NonoError::SandboxInit(format!("command-mediation PTY dup stdout failed: {err}"))
     })?;
     let stderr_slave = nix::unistd::dup(&pty.slave).map_err(|err| {
-        NonoError::SandboxInit(format!("tool-sandbox PTY dup stderr failed: {err}"))
+        NonoError::SandboxInit(format!("command-mediation PTY dup stderr failed: {err}"))
     })?;
     let mut command = prepare_launcher_command(spec_path)?;
     command
@@ -5035,10 +5076,9 @@ fn track_child(
     launch_caller: &Caller,
 ) -> Result<()> {
     let pidfd = open_pidfd(child_pid)?;
-    let mut map = state
-        .active_children
-        .lock()
-        .map_err(|_| NonoError::SandboxInit("tool-sandbox pid map lock poisoned".to_string()))?;
+    let mut map = state.active_children.lock().map_err(|_| {
+        NonoError::SandboxInit("command-mediation pid map lock poisoned".to_string())
+    })?;
     map.insert(
         child_pid,
         ActiveChild {
@@ -5051,10 +5091,9 @@ fn track_child(
 }
 
 fn untrack_child(state: &ToolSandboxState, child_pid: u32) -> Result<()> {
-    let mut map = state
-        .active_children
-        .lock()
-        .map_err(|_| NonoError::SandboxInit("tool-sandbox pid map lock poisoned".to_string()))?;
+    let mut map = state.active_children.lock().map_err(|_| {
+        NonoError::SandboxInit("command-mediation pid map lock poisoned".to_string())
+    })?;
     map.remove(&child_pid);
     Ok(())
 }
@@ -5074,7 +5113,7 @@ fn open_pidfd(pid: u32) -> Result<OwnedFd> {
         _ => "pidfd_open failed",
     };
     Err(NonoError::SandboxInit(format!(
-        "tool-sandbox child liveness requires pidfd_open for pid {pid} to avoid PID reuse races; {reason}: {err}"
+        "command sandbox liveness requires pidfd_open for pid {pid} to avoid PID reuse races; {reason}: {err}"
     )))
 }
 
@@ -5107,7 +5146,7 @@ fn relay_pty_and_wait(child: &mut Child, master: OwnedFd, stdio: StdioFds) -> Re
             let err = std::io::Error::last_os_error();
             if err.kind() != std::io::ErrorKind::Interrupted {
                 return Err(NonoError::SandboxInit(format!(
-                    "tool-sandbox PTY poll failed: {err}"
+                    "command-mediation PTY poll failed: {err}"
                 )));
             }
         } else if poll_status > 0 {
@@ -5209,7 +5248,7 @@ fn read_fd(fd: i32) -> Result<Option<Vec<u8>>> {
             _ if err.raw_os_error() == Some(libc::EIO) => return Ok(Some(Vec::new())),
             _ => {
                 return Err(NonoError::SandboxInit(format!(
-                    "tool-sandbox PTY fd read failed: {err}"
+                    "command-mediation PTY fd read failed: {err}"
                 )));
             }
         }
@@ -5228,7 +5267,7 @@ fn write_all_fd(fd: i32, mut bytes: &[u8]) -> Result<()> {
             continue;
         }
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox PTY fd write failed: {err}"
+            "command-mediation PTY fd write failed: {err}"
         )));
     }
     Ok(())
@@ -5238,13 +5277,13 @@ fn set_nonblocking_fd(fd: i32) -> Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox fcntl(F_GETFL) failed: {}",
+            "command-mediation fcntl(F_GETFL) failed: {}",
             std::io::Error::last_os_error()
         )));
     }
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox fcntl(F_SETFL) failed: {}",
+            "command-mediation fcntl(F_SETFL) failed: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -5277,13 +5316,13 @@ fn verify_binary_identity(binary: &ResolvedCommandBinary) -> Result<()> {
         })?;
     if metadata.dev() != binary.dev || metadata.ino() != binary.ino {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox command binary changed inode before launch: {}",
+            "command sandbox binary changed inode before launch: {}",
             binary.canonical_path.display()
         )));
     }
     if metadata.size() != binary.size || mtime_nanos(&metadata) != binary.mtime_nanos {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox command binary changed metadata before launch: {}",
+            "command sandbox binary changed metadata before launch: {}",
             binary.canonical_path.display()
         )));
     }
@@ -5323,7 +5362,7 @@ fn check_exec_gate(
             return Some(NonoError::BlockedCommand {
                 command: original_program.to_string(),
                 reason: format!(
-                    "tool-sandbox direct exec bypass denied for policy-controlled command '{name}'"
+                    "command policy direct exec bypass denied for policy-controlled command '{name}'"
                 ),
             });
         }
@@ -5333,7 +5372,7 @@ fn check_exec_gate(
             return Some(NonoError::BlockedCommand {
                 command: original_program.to_string(),
                 reason: format!(
-                    "tool-sandbox direct exec denied for legacy blocked command '{name}'"
+                    "command policy direct exec denied for legacy blocked command '{name}'"
                 ),
             });
         }
@@ -5436,7 +5475,7 @@ fn fs_cap_from_spec(fs_grant: &FsGrantSpec) -> Result<FsCapability> {
         let original = PathBuf::from(OsString::from_vec(original.clone()));
         if !original.is_absolute() {
             return Err(NonoError::SandboxInit(format!(
-                "tool-sandbox child filesystem grant original path {} is not absolute",
+                "command sandbox filesystem grant original path {} is not absolute",
                 original.display()
             )));
         }
@@ -5449,7 +5488,7 @@ fn fs_cap_from_spec(fs_grant: &FsGrantSpec) -> Result<FsCapability> {
                 })?;
         if original_resolved != cap.resolved {
             return Err(NonoError::SandboxInit(format!(
-                "tool-sandbox child filesystem grant original path {} resolves to {}, expected {}",
+                "command sandbox filesystem grant original path {} resolves to {}, expected {}",
                 original.display(),
                 original_resolved.display(),
                 cap.resolved.display()
@@ -5472,7 +5511,7 @@ fn unix_socket_cap_from_spec(socket_grant: &UnixSocketGrantSpec) -> Result<UnixS
         let original = PathBuf::from(OsString::from_vec(original.clone()));
         if !original.is_absolute() {
             return Err(NonoError::SandboxInit(format!(
-                "tool-sandbox child unix socket grant original path {} is not absolute",
+                "command sandbox Unix socket grant original path {} is not absolute",
                 original.display()
             )));
         }
@@ -5483,7 +5522,7 @@ fn unix_socket_cap_from_spec(socket_grant: &UnixSocketGrantSpec) -> Result<UnixS
         };
         if original_cap.resolved != cap.resolved {
             return Err(NonoError::SandboxInit(format!(
-                "tool-sandbox child unix socket grant original path {} resolves to {}, expected {}",
+                "command sandbox Unix socket grant original path {} resolves to {}, expected {}",
                 original.display(),
                 original_cap.resolved.display(),
                 cap.resolved.display()
@@ -5500,7 +5539,7 @@ fn parse_access(value: &str) -> Result<AccessMode> {
         "write" => Ok(AccessMode::Write),
         "read+write" => Ok(AccessMode::ReadWrite),
         other => Err(NonoError::ConfigParse(format!(
-            "invalid tool-sandbox access mode '{other}'"
+            "invalid command-mediation access mode '{other}'"
         ))),
     }
 }
@@ -5510,7 +5549,7 @@ fn parse_socket_mode(value: &str) -> Result<UnixSocketMode> {
         "connect" => Ok(UnixSocketMode::Connect),
         "connect+bind" => Ok(UnixSocketMode::ConnectBind),
         other => Err(NonoError::ConfigParse(format!(
-            "invalid tool-sandbox unix socket mode '{other}'"
+            "invalid command-mediation unix socket mode '{other}'"
         ))),
     }
 }
@@ -5526,7 +5565,7 @@ fn guarded_remove_runtime_dir(path: &Path) -> Result<()> {
         || (metadata.permissions().mode() & 0o077) != 0
     {
         return Err(NonoError::SandboxInit(format!(
-            "unsafe tool-sandbox runtime dir shape: {}",
+            "unsafe command-mediation runtime dir shape: {}",
             path.display()
         )));
     }
@@ -5536,7 +5575,7 @@ fn guarded_remove_runtime_dir(path: &Path) -> Result<()> {
         .unwrap_or("");
     if !file_name.starts_with("nono-tool-sandbox-") {
         return Err(NonoError::SandboxInit(format!(
-            "refusing to clean non-tool-sandbox dir {}",
+            "refusing to clean non-command-mediation dir {}",
             path.display()
         )));
     }
@@ -5550,7 +5589,7 @@ fn guarded_remove_runtime_dir(path: &Path) -> Result<()> {
 }
 
 thread_local! {
-    /// Memoizes `canonicalize` during a single tool-sandbox prep pass.
+    /// Memoizes `canonicalize` during a single command-sandbox preparation pass.
     ///
     /// Shared-library resolution canonicalizes the same system paths (libc,
     /// ld-linux, libglib, …) inside *every* binary's dependency closure, and the
@@ -5730,7 +5769,7 @@ fn parse_elf(path: &Path) -> Result<ParsedElf> {
     }
     if data[5] != 1 {
         return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox supports little-endian ELF only: {}",
+            "command-mediation supports little-endian ELF only: {}",
             path.display()
         )));
     }
@@ -6149,7 +6188,7 @@ mod tests {
             path: ca.clone(),
             source,
         })?;
-        // Outer sandbox grants the package tree (read) — but nothing outside it.
+        // Session sandbox grants the package tree (read) — but nothing outside it.
         let outer = CapabilitySet::new().allow_path(tmp.path(), AccessMode::Read)?;
         let tmp_canon = tmp.path().canonicalize().expect("canonicalize tmp");
         let ca_canon = ca.canonicalize().expect("canonicalize ca");
@@ -6470,6 +6509,8 @@ mod tests {
                 system_files: Vec::new(),
             },
             proxy_trust_bundle_paths: Vec::new(),
+            scoped_proxy_env_vars: BTreeMap::new(),
+            reserved_proxy_ports: BTreeSet::new(),
             active_children: Mutex::new(HashMap::new()),
             lineage: LineageMarker::disabled_for_test(),
             active_count: AtomicUsize::new(0),
@@ -6491,7 +6532,7 @@ mod tests {
 
     #[test]
     fn outer_exec_gate_does_not_break_same_fs_rename_from_child_dir() {
-        // Regression for #1689: stacked outer exec gate must keep Refer so
+        // Regression for #1689: the stacked session sandbox execute gate must keep Refer so
         // pending/result.json -> result.json succeeds on the same filesystem.
         let detected = match nono::detect_abi() {
             Ok(detected) => detected,
@@ -6551,7 +6592,7 @@ mod tests {
         let code = libc::WEXITSTATUS(status);
         assert_eq!(
             code, 0,
-            "same-FS rename pending/result.json -> result.json failed under stacked outer exec gate \
+            "same-FS rename pending/result.json -> result.json failed under stacked session sandbox execute gate \
              (exit code {code}; 1=rename EXDEV/denied, 2=apply_landlock failed, \
              3=apply_outer_exec_gate failed)"
         );
@@ -6751,7 +6792,7 @@ mod tests {
         })?;
         assert!(
             err.to_string()
-                .contains("writable by the outer session capability set")
+                .contains("writable by the session sandbox's capability set")
         );
 
         let mut parent_write_caps = CapabilitySet::new();
@@ -6836,7 +6877,7 @@ mod tests {
                 })?;
         assert!(
             err.to_string()
-                .contains("writable by the outer session capability set")
+                .contains("writable by the session sandbox's capability set")
         );
 
         let mut parent_write_caps = CapabilitySet::new();
@@ -6949,7 +6990,7 @@ mod tests {
         );
         assert!(
             result.is_none(),
-            "non-controlled executable identities must not be blocked by tool-sandbox policy"
+            "non-controlled executable identities must not be blocked by command policy"
         );
     }
 
@@ -7659,7 +7700,7 @@ mod tests {
         )
         .expect_err("an env target mutable to the outer session must not enter the allowlist");
         assert!(
-            err.to_string().contains("writable by the outer session"),
+            err.to_string().contains("writable by the session sandbox"),
             "unexpected rejection: {err}"
         );
         assert!(

@@ -1,4 +1,4 @@
-/// Tool-sandbox token broker for credential isolation.
+/// Command-sandbox token broker for credential isolation.
 ///
 /// The token broker prevents real credential values from appearing in the
 /// agent process's address space. At session setup, any credential value that
@@ -6,7 +6,7 @@
 /// `nono_<64 hex chars>` (32 random bytes, hex-encoded). Real values live
 /// only in the broker, which is held in the supervisor process.
 ///
-/// When a tool-sandbox child is launched, `resolve_env_entry` replaces nonce env-var
+/// When a command sandbox is launched, `resolve_env_entry` replaces nonce env-var
 /// values with their real counterparts immediately before `execve`. When a
 /// `Capture` action returns stdout to the agent, `scan_and_reissue` redacts
 /// any broker nonce or broker-held value found in the captured output.
@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
 /// A shared, thread-safe token broker that can be held by both the proxy
-/// runtime and the tool-sandbox runtime.
+/// runtime and the command-mediation runtime.
 pub(crate) type SharedBroker = Arc<Mutex<TokenBroker>>;
 
 /// Create a new shared broker.

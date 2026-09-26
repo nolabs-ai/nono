@@ -1,16 +1,16 @@
 #!/bin/bash
-# Child and tool sandbox boundary tests
+# Session and command sandbox boundary tests
 # Covers credential injection, file/directory grants, and environment handling
-# in both the primary child sandbox and ETI tool sandboxes.
+# in both the session sandbox and command sandboxes.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
 
 echo ""
-echo -e "${BLUE}=== Child / Tool Sandbox Boundary Tests ===${NC}"
+echo -e "${BLUE}=== Session / Command Sandbox Boundary Tests ===${NC}"
 
 verify_nono_binary
-if ! require_working_sandbox "child/tool boundary suite"; then
+if ! require_working_sandbox "session/command sandbox boundary suite"; then
     print_summary
     exit 0
 fi
@@ -45,7 +45,7 @@ cat > "$CHILD_PROFILE" <<EOF
 {
   "meta": {
     "name": "integration-child-boundary",
-    "description": "Integration fixture for primary child sandbox boundaries"
+    "description": "Integration fixture for session sandbox boundaries"
   },
   "workdir": { "access": "none" },
   "filesystem": {
@@ -65,7 +65,7 @@ cat > "$TOOL_PROFILE" <<EOF
 {
   "meta": {
     "name": "integration-tool-boundary",
-    "description": "Integration fixture for ETI tool sandbox boundaries"
+    "description": "Integration fixture for command sandbox boundaries"
   },
   "workdir": { "access": "none" },
   "command_policies": {
@@ -102,7 +102,7 @@ cat > "$TOOL_NO_GRANTS_PROFILE" <<EOF
 {
   "meta": {
     "name": "integration-tool-no-grants",
-    "description": "Integration fixture proving ETI does not inherit outer path grants"
+    "description": "Integration fixture proving command sandboxes do not inherit session path grants"
   },
   "workdir": { "access": "none" },
   "command_policies": {
@@ -263,44 +263,44 @@ expect_file_contains() {
 }
 
 # =============================================================================
-# Primary Child Sandbox
+# Session Sandbox
 # =============================================================================
 
-echo "--- Primary Child Sandbox ---"
+echo "--- Session Sandbox ---"
 
-expect_exact_output "child sandbox reads granted directory file" "child-dir-read" \
+expect_exact_output "session sandbox reads granted directory file" "child-dir-read" \
     "$NONO_BIN" run --silent --no-audit --allow-cwd --allow "$TMPDIR/child-dir" -- \
     sh -c 'IFS= read -r value < "$1"; printf "%s" "$value"' sh "$TMPDIR/child-dir/read.txt"
 
-expect_success "child sandbox writes granted directory file" \
+expect_success "session sandbox writes granted directory file" \
     "$NONO_BIN" run --silent --no-audit --allow-cwd --allow "$TMPDIR/child-dir" -- \
     sh -c 'printf "%s" "child-dir-write" > "$1"' sh "$TMPDIR/child-dir/written.txt"
-expect_file_content "child sandbox directory write reached host file" \
+expect_file_content "session sandbox directory write reached host file" \
     "$TMPDIR/child-dir/written.txt" "child-dir-write"
 
-expect_exact_output "child sandbox reads granted single file" "child-file-read" \
+expect_exact_output "session sandbox reads granted single file" "child-file-read" \
     "$NONO_BIN" run --silent --no-audit --allow-cwd --read-file "$TMPDIR/child-read-file.txt" -- \
     sh -c 'IFS= read -r value < "$1"; printf "%s" "$value"' sh "$TMPDIR/child-read-file.txt"
 
-expect_success "child sandbox writes granted single file" \
+expect_success "session sandbox writes granted single file" \
     "$NONO_BIN" run --silent --no-audit --allow-cwd --write-file "$TMPDIR/child-write-file.txt" -- \
     sh -c 'printf "%s" "child-file-write" > "$1"' sh "$TMPDIR/child-write-file.txt"
-expect_file_content "child sandbox single-file write reached host file" \
+expect_file_content "session sandbox single-file write reached host file" \
     "$TMPDIR/child-write-file.txt" "child-file-write"
 
-expect_exact_output "child sandbox filters env and injects file credential" "child-visible|unset|child-secret" \
+expect_exact_output "session sandbox filters env and injects file credential" "child-visible|unset|child-secret" \
     env CHILD_ALLOWED=child-visible CHILD_DENIED=child-hidden \
     "$NONO_BIN" run --profile "$CHILD_PROFILE" --silent --no-audit -- \
     sh -c 'printf "%s|%s|%s" "$CHILD_ALLOWED" "${CHILD_DENIED-unset}" "$CHILD_SECRET"'
 
 # =============================================================================
-# ETI Tool Sandbox
+# Command Sandbox
 # =============================================================================
 
 echo ""
-echo "--- Tool Sandbox ---"
+echo "--- Command Sandbox ---"
 
-expect_output_payload "tool sandbox applies scoped fs env and credentials" \
+expect_output_payload "command sandbox applies scoped filesystem policy, environment, and credentials" \
     "tool-dir-read|tool-file-read|tool-raw-secret|tool-visible|tool-set|unset|tool-env-secret" \
     run_in_dir "$TMPDIR" env TOOL_ALLOWED=tool-visible TOOL_BLOCKED=tool-hidden \
     "$NONO_BIN" run --profile "$TOOL_PROFILE" --silent --no-audit --allow-cwd \
@@ -319,32 +319,32 @@ expect_output_payload "tool sandbox applies scoped fs env and credentials" \
     "$TMPDIR/tool-write-file.txt" \
     "$TMPDIR/tool-raw-secret.txt"
 
-expect_file_content "tool sandbox directory write reached host file" \
+expect_file_content "command sandbox directory write reached host file" \
     "$TMPDIR/tool-write-dir/written.txt" "tool-dir-write"
-expect_file_content "tool sandbox single-file write reached host file" \
+expect_file_content "command sandbox single-file write reached host file" \
     "$TMPDIR/tool-write-file.txt" "tool-file-write"
 
 # --trust-override skips the trust scan, which is what otherwise leaves the
 # aws-lc-rs pool threads behind and puts the supervised fork in
 # ThreadingContext::CryptoExpected. Without it the fork runs under Strict,
-# where a single stray thread started while preparing the tool-sandbox runtime
+# where a single stray thread started while preparing the command-mediation runtime
 # aborts the run before the child ever execs.
-expect_output_payload "tool sandbox forks under strict threading (--trust-override)" \
+expect_output_payload "command sandbox forks under strict threading (--trust-override)" \
     "strict-threading-ok" \
     run_in_dir "$TMPDIR" "$NONO_BIN" run --profile "$TOOL_PROFILE" --silent --no-audit \
     --allow-cwd --trust-override -- \
     sh -c 'printf "%s" "strict-threading-ok"'
 
 if is_macos; then
-    skip_test "tool sandbox does not inherit outer --allow directory" "macOS temp path denial is host-dependent"
-    skip_test "tool sandbox raw-file credential requires use_credentials" "macOS temp path denial is host-dependent"
+    skip_test "command sandbox does not inherit session --allow directory" "macOS temp path denial is host-dependent"
+    skip_test "command sandbox raw-file credential requires use_credentials" "macOS temp path denial is host-dependent"
 else
-    expect_failure "tool sandbox does not inherit outer --allow directory" \
+    expect_failure "command sandbox does not inherit session --allow directory" \
         run_in_dir "$TMPDIR" "$NONO_BIN" run --profile "$TOOL_NO_GRANTS_PROFILE" --silent --no-audit --allow-cwd \
         --allow "$TMPDIR/tool-outer-only" -- \
         sh -c 'IFS= read -r value < "$1" || exit 77; printf "%s" "$value"' sh "$TMPDIR/tool-outer-only/secret.txt"
 
-    expect_failure "tool sandbox raw-file credential requires use_credentials" \
+    expect_failure "command sandbox raw-file credential requires use_credentials" \
         run_in_dir "$TMPDIR" "$NONO_BIN" run --profile "$TOOL_NO_CREDENTIAL_USE_PROFILE" --silent --no-audit --allow-cwd -- \
         sh -c 'IFS= read -r value < "$1" || exit 77; printf "%s" "$value"' sh "$TMPDIR/tool-raw-secret.txt"
 fi

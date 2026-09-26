@@ -2,7 +2,7 @@ use crate::command_policy::{
     AmbientCredentialSourceConfig, CommandCredentialConfig, CommandCredentialType,
 };
 use nono::{NonoError, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
@@ -17,9 +17,7 @@ pub(crate) enum ResolvedCredential {
     RawFile {
         path: PathBuf,
     },
-    Proxy {
-        env_vars: Vec<(String, String)>,
-    },
+    Proxy,
     Ambient {
         source: Option<AmbientCredentialSourceConfig>,
         /// Visible-phantom template applied to every phantom issued for this
@@ -40,7 +38,7 @@ impl ResolvedCredential {
 
 pub(crate) fn resolve_credentials(
     credentials: &BTreeMap<String, CommandCredentialConfig>,
-    proxy_credential_env_vars: &BTreeMap<String, Vec<(String, String)>>,
+    proxy_credentials: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, ResolvedCredential>> {
     let mut resolved = BTreeMap::new();
     for (name, credential) in credentials {
@@ -85,17 +83,12 @@ pub(crate) fn resolve_credentials(
                 );
             }
             CommandCredentialType::Proxy => {
-                let env_vars = proxy_credential_env_vars.get(name).ok_or_else(|| {
-                    NonoError::SandboxInit(format!(
-                        "tool-sandbox proxy credential '{name}' was not prepared by the proxy runtime"
-                    ))
-                })?;
-                resolved.insert(
-                    name.clone(),
-                    ResolvedCredential::Proxy {
-                        env_vars: env_vars.clone(),
-                    },
-                );
+                if !proxy_credentials.contains(name) {
+                    return Err(NonoError::SandboxInit(format!(
+                        "command sandbox proxy credential '{name}' was not prepared by the proxy runtime"
+                    )));
+                }
+                resolved.insert(name.clone(), ResolvedCredential::Proxy);
             }
             CommandCredentialType::Ambient => {
                 let template = match &credential.format {

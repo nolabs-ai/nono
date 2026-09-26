@@ -10,13 +10,14 @@
 
 use super::ExecConfig;
 use crate::profile::LinuxSandboxPolicy;
+use nix::fcntl::{OFlag, open};
 use nix::libc;
+use nix::sys::stat::Mode;
 use nono::sandbox::{self, PreparedLandlockSandbox, PreparedSeccompNotifyFilter};
 use nono::{CapabilitySet, DetectedAbi, NonoError, Result};
 use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::sync::{Mutex, MutexGuard};
 
@@ -128,15 +129,14 @@ pub(super) fn promote_supervisor_socket(
 fn reserve_stdio() -> Result<Vec<OwnedFd>> {
     let mut reserved = Vec::new();
     loop {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-            .open("/dev/null")
-            .map_err(NonoError::Io)?;
-        if file.as_raw_fd() >= 3 {
+        // std::fs::OpenOptions strips O_PATH on musl because musl includes it
+        // in O_ACCMODE. Use nix so the requested descriptor semantics survive.
+        let fd = open("/dev/null", OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty())
+            .map_err(|error| NonoError::Io(error.into()))?;
+        if fd.as_raw_fd() >= 3 {
             break;
         }
-        reserved.push(file.into());
+        reserved.push(fd);
     }
     Ok(reserved)
 }

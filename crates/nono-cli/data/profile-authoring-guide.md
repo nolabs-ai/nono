@@ -119,9 +119,51 @@ Controls startup-time command gating. These checks run only at launch time and a
 
 ### command_policies
 
-tool-sandbox policies live under `command_policies`. Use `commands.<name>.executable` to bind a command name to one exact executable file instead of the first PATH match. By default, tool-sandbox rejects pinned executables and direct parent directories that are writable through the outer sandbox capability set. If a low-assurance profile intentionally grants write access overlapping a pinned executable, `commands.<name>.allow_writable_executable` is available as a per-command trust downgrade. It is valid only with an absolute `executable` path; relative paths and bare command names fail validation. For local demos, `command_policies.allow_writable_executables` disables the writable executable and parent-directory trust check across policy, deny-only, and outer executable allow-list paths. The agent still invokes the command name through the tool-sandbox shim. On macOS, tool-sandbox verifies the file before sandboxing but must still exec by path, so sandbox-writable pinned executables are not suitable for high-assurance policies.
+Command policies live under `command_policies`. Use `commands.<name>.executable` to bind a command name to one exact executable file instead of the first PATH match. By default, command mediation rejects pinned executables and direct parent directories that are writable through the session sandbox's capability set. If a low-assurance profile intentionally grants write access overlapping a pinned executable, `commands.<name>.allow_writable_executable` is available as a per-command trust downgrade. It is valid only with an absolute `executable` path; relative paths and bare command names fail validation. For local demos, `command_policies.allow_writable_executables` disables the writable executable and parent-directory trust check across policy, deny-only, and session executable allow-list paths. The agent still invokes the command name through the command-mediation shim. On macOS, command mediation verifies the file before sandboxing but must still exec by path, so sandbox-writable pinned executables are not suitable for high-assurance policies.
 
 Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_file`) may use dynamic provider tokens. `@git:config-files` expands to trusted global/system Git config files, Git file settings (attributes, excludes, commit templates), and the declared target of every `include.path` and `includeIf.*.path` directive — including conditional includes that do not currently fire. `@git:hooks-path` expands to trusted global/system `core.hooksPath` directories. `@git:common-dir` expands to the git common directory (`.git` in a regular repo, or the absolute path to the main repo's `.git` in a worktree). `@git:worktree` expands to the main worktree root (empty in a regular repo). `@git:toplevel` expands to the current checkout root. `@git:toplevel-parent` expands to the parent of the current checkout root. These tokens are opt-in per profile and ignore repo-local/worktree Git config so a checkout cannot grant itself extra host filesystem access.
+
+#### Command-scoped proxy policy
+
+An effective command sandbox whose network policy includes `network.allow_domain` receives a dedicated loopback proxy and a fresh proxy credential. Its proxy policy does not inherit the session sandbox's broader domain allowlist: the session sandbox may allow `"*"`, while the effective command sandbox for controlled `curl` invocations is limited to `github.com`. The session network policy's domain denials still apply. The supervisor replaces proxy-control environment variables immediately before execution, and the command sandbox may connect only to its dedicated proxy. Changing those variables, opting out with `NO_PROXY`, or using direct sockets does not grant access to the session proxy or direct network unless the command sandbox policy separately grants raw TCP access.
+
+Proxy credentials granted by the same effective command sandbox are served by that dedicated proxy. Their reverse routes may reach their configured upstreams and still enforce `endpoint_policy`, but those upstreams are not added to the command's domain allowlist: direct or ordinary forward-proxy access remains denied unless `network.allow_domain` also permits it.
+
+A command sandbox policy that grants a proxy credential without `network.allow_domain` also receives a dedicated proxy. Its domain allowlist is empty, so only its explicitly granted credential routes are usable.
+
+Proxy credentials cannot be combined with `network.allow_all`: unrestricted loopback access would let the command reach a broader proxy and defeat route isolation. On Linux, a raw `tcp_connect_ports` grant that collides with any active nono proxy port also fails closed at launch.
+
+A command-scoped proxy policy needs an active nono proxy. A top-level network policy with `network.allow_domain` activates it in the example below; a command-scoped proxy credential also activates the proxy by itself. If the selected command sandbox requires a scoped proxy but none is available, the command fails closed at launch.
+
+```json
+{
+  "network": { "allow_domain": ["*"] },
+  "command_policies": {
+    "commands": {
+      "curl": {
+        "sandbox": {
+          "network": { "allow_domain": ["github.com"] }
+        }
+      }
+    }
+  }
+}
+```
+
+With this profile, `curl https://github.com` is allowed and `curl https://example.com` is denied. Commands that are not mediated by this command policy continue to use the session sandbox's network policy.
+
+The effective command sandbox is selected as follows:
+
+| Invocation | Selected command sandbox |
+|---|---|
+| Direct command with `from.session` | `commands.<name>.from.session.sandbox` |
+| Direct command without `from.session` | `commands.<name>.sandbox` |
+| Command launched by another mediated command | `commands.<name>.from.<caller>.sandbox` |
+| Matching intercept with its own `sandbox` | The intercept sandbox replaces the selection above |
+
+`commands.<name>.sandbox` and `commands.<name>.from.session` are alternative ways to define direct access and cannot both be present. Chained access also requires the caller's `can_use` entry; there is no fallback from a missing `from.<caller>` edge to the direct sandbox.
+
+Each direct, caller-specific, and intercept command sandbox policy with `network.allow_domain` receives a distinct scoped proxy. For example, direct `curl` may allow `github.com`, while `curl` launched by `git` is independently limited by `curl.from.git.sandbox` to `api.github.com`. `git.sandbox` controls Git itself. Domain allowlists are replaced, not merged: neither the caller's command sandbox nor the non-intercepted command sandbox contributes domains to the selected command sandbox's proxy policy.
 
 `unix_socket_bind` (command sandbox only) grants `connect(2)`/`bind(2)` on named pathname AF_UNIX sockets, with the same implied filesystem coupling as the agent-level field of the same name. It also accepts the `@git:fsmonitor-socket` dynamic token, which expands to `fsmonitor--daemon.ipc` under the current worktree's private git-dir — resolved by a pure filesystem walk (no `git` process spawn), so an attacker-controlled working directory cannot influence resolution through `.git/config`.
 
@@ -142,15 +184,15 @@ Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_fil
 }
 ```
 
-#### Tool Sandbox  command-policy denials
+#### Command-policy denials
 
-Tool Sandbox denials are not filesystem denials. A message like:
+Command-policy denials are not filesystem-policy denials. A message like:
 
 ```text
-nono: tool-sandbox denied gh: Command 'gh' is blocked: agents may read issues but not comment on them
+nono: command policy denied gh: Command 'gh' is blocked: agents may read issues but not comment on them
 ```
 
-means the tool-sandbox command policy blocked the resolved command invocation. `nono why --path ...` only explains filesystem grants and denials, and `nono why --host ...` only explains network/proxy reachability. For command-policy denials, query the command edge directly:
+means the command policy blocked the resolved command invocation. `nono why --path ...` only explains filesystem-policy grants and denials, and `nono why --host ...` only explains network-policy reachability. For command-policy denials, query the command edge directly:
 
 ```sh
 nono why --profile <profile> --command gh -- issue comment 1052
@@ -158,7 +200,7 @@ nono profile show <profile>
 nono profile validate <profile>
 ```
 
-Look under `command_policies.commands.<command>.from.<caller>.invocation_policy` for argv or environment rules. For commands started directly by the sandboxed session, the caller is usually `session`; for a child tool launched by another controlled tool, the caller is the parent command name.
+Look under `command_policies.commands.<command>.from.<caller>.invocation_policy` for argv or environment rules. For commands started directly by the sandboxed session, the caller is usually `session`; for a mediated command launched by another controlled command, the caller is the parent command name.
 
 `invocation_policy` evaluates in this order: `deny`, then `approve`, then `allow`, then `default`. The `argv` matcher compares against the command arguments after the command name, so `gh issue comment 1052` matches `{"argv": {"prefix": ["issue", "comment"]}}`.
 
@@ -206,7 +248,7 @@ To allow a previously denied subcommand, remove or narrow the matching `deny` ru
 
 #### Proxy credential endpoint policy
 
-Some Tool Sandbox  policies intentionally use two layers:
+Some command policies intentionally use two layers:
 
 1. `invocation_policy` blocks obvious high-level CLI mutations before the child process runs.
 2. `sandbox.credentials[].endpoint_policy` blocks the underlying HTTP method and path even if the CLI uses a broad subcommand such as `gh api`.
@@ -620,7 +662,7 @@ Browser auth is command-scoped. Add `interaction.open_urls` to a specific captur
 }
 ```
 
-When `open_urls` is configured, nono gives the capture command a temporary `BROWSER` helper and URL-opening socket. On macOS it also prepends an `open` shim to `PATH`. URL requests through those helpers are validated against that capture entry's `interaction.open_urls`, not the child sandbox's top-level `open_urls`. Non-URL `open` fallback through the shim is available only when `allow_launch_services` is true.
+When `open_urls` is configured, nono gives the capture command a temporary `BROWSER` helper and URL-opening socket. On macOS it also prepends an `open` shim to `PATH`. URL requests through those helpers are validated against that capture entry's `interaction.open_urls`, not the command sandbox's top-level `open_urls`. Non-URL `open` fallback through the shim is available only when `allow_launch_services` is true.
 
 ### credential_providers and credential_routes
 
@@ -771,7 +813,7 @@ This is a **caller-declared** control: the field lives on the command doing the 
 - **Patterns:** exact names (`"TOOL_CONFIG"`) or a glob with a single `*` anywhere in the name (`"AWS_*"`, `"*_TOKEN"`, `"AWS_*_TOKEN"`), or a bare `"*"` (all). A pattern with more than one `*` (e.g. `"A**B"`) is rejected at load time.
 - **`PATH` and any `NONO_*` key are always excluded** — nono manages those — even under `"*"`. A pattern that explicitly targets them (exact `PATH`, or the `NONO_` prefix) is rejected at load time.
 - Values are taken verbatim and are **not** run through the credential broker. Use `export_env` for tooling variables, not credentials — those flow through `use_credentials`/`allow_vars`.
-- Applied on both the macOS and Linux tool-sandbox paths, before PATH/chaining/`set_vars`/credential injection, so nono-injected variables still win. Merges by dedup-append across the inheritance chain.
+- Applied on both the macOS and Linux command-mediation paths, before PATH/chaining/`set_vars`/credential injection, so nono-injected variables still win. Merges by dedup-append across the inheritance chain.
 
 #### Per-command caller: `commands.<caller>.export_env`
 

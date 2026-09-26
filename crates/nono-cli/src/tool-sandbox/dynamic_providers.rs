@@ -1,7 +1,7 @@
-//! Dynamic token expansion for per-command sandbox path lists.
+//! Dynamic token expansion for command sandbox path lists.
 //!
 //! Profile authors can place a sentinel like `@<provider>:<query>` in any
-//! per-command sandbox path list (`fs_read`, `fs_read_file`, `fs_write`,
+//! command sandbox path list (`fs_read`, `fs_read_file`, `fs_write`,
 //! `fs_write_file`). At launch time, the token is replaced with one or more
 //! concrete paths produced by the named provider — letting profiles cover
 //! user-specific state (e.g. paths referenced by the user's git config)

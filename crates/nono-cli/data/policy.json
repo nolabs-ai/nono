@@ -219,6 +219,7 @@
           "/etc/pki",
           "/etc/ca-certificates",
           "/etc/crypto-policies",
+          "/etc/fonts",
           "/etc/ld.so.cache",
           "/etc/ld.so.conf",
           "/etc/ld.so.conf.d",
@@ -488,6 +489,16 @@
       "allow": {
         "read": [
           "/home/linuxbrew/.linuxbrew"
+        ]
+      }
+    },
+    "snap_linux": {
+      "description": "Installed Snap package contents on Linux",
+      "platform": "linux",
+      "allow": {
+        "read": [
+          "/snap",
+          "/var/lib/snapd/snap"
         ]
       }
     },

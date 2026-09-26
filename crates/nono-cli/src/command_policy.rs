@@ -435,6 +435,18 @@ pub struct CommandCredentialConfig {
     /// sniffing a token prefix still recognises it. `ambient` credentials only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    /// Optional AWS SigV4 signing configuration for this per-command credential.
+    ///
+    /// When present, the scoped proxy signs outbound requests with AWS SigV4
+    /// credentials resolved host-side. The child sees only dummy keys; the real
+    /// credential never enters the sandbox. Mutually exclusive with `credential_key`
+    /// and `source` — use one credential mechanism, not multiple.
+    ///
+    /// Previously only available at session level (`network.custom_credentials.<r>.aws_auth`);
+    /// this extends it to per-command tool-sandbox routes, building on the scoped-proxy
+    /// infrastructure from #1981.
+    #[serde(default)]
+    pub aws_auth: Option<nono_proxy::config::AwsAuthConfig>,
 }
 
 impl Default for CommandCredentialConfig {
@@ -454,6 +466,7 @@ impl Default for CommandCredentialConfig {
             tls_client_key: None,
             source: None,
             format: None,
+            aws_auth: None,
         }
     }
 }

@@ -1579,7 +1579,7 @@ pub enum ClientAssertionConfig {
 /// the upstream URL.
 ///
 /// Mutually exclusive with `credential_key` and `oauth2`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AwsAuthConfig {
     /// AWS profile name to use for credentials.

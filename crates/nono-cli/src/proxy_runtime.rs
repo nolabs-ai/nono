@@ -1950,7 +1950,7 @@ fn collect_tool_sandbox_proxy_grants(
                     crate::policy::expand_path(path).map(|path| path.to_string_lossy().into_owned())
                 })
                 .transpose()?,
-            aws_auth: None,
+            aws_auth: credential.aws_auth.clone(),
             spiffe: None,
             rate_limit: None,
         };

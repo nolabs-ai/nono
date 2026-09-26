@@ -1781,6 +1781,7 @@ mod tests {
                 open_url_allow_localhost: false,
                 audit_recorder: None,
                 network_audit_events: None,
+                proxy_handle: None,
                 redaction_policy: &REDACTION_POLICY,
                 allow_launch_services_active: false,
                 proxy_port,

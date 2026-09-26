@@ -312,6 +312,22 @@ impl ProxyHandle {
         let _ = self.shutdown_tx.send(true);
     }
 
+    /// Clone the collected network audit events without clearing them.
+    ///
+    /// Read-only view for the end-of-session diagnostic footer. The events
+    /// stay queued so the subsequent [`Self::drain_audit_events`] in session
+    /// finalization still delivers every event to the persistent audit
+    /// record — the snapshot must never reduce audit coverage.
+    ///
+    /// Returns an empty vec when network audit was disabled at start.
+    #[must_use]
+    pub fn snapshot_audit_events(&self) -> Vec<nono::undo::NetworkAuditEvent> {
+        match self.audit_log.as_ref() {
+            Some(audit_log) => audit::snapshot_audit_events(audit_log),
+            None => Vec::new(),
+        }
+    }
+
     /// Drain and return collected network audit events.
     ///
     /// Returns an empty vec when network audit was disabled at start.

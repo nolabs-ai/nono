@@ -953,7 +953,7 @@ fn change_symbol(ct: &nono::undo::ChangeType) -> colored::ColoredString {
     }
 }
 
-fn network_mode_label(mode: &nono::undo::NetworkAuditMode) -> &'static str {
+pub(crate) fn network_mode_label(mode: &nono::undo::NetworkAuditMode) -> &'static str {
     match mode {
         nono::undo::NetworkAuditMode::Connect => "connect",
         nono::undo::NetworkAuditMode::ConnectIntercept => "connect_intercept",

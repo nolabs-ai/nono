@@ -339,6 +339,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             .unwrap_or(false),
         audit_recorder: audit_recorder.clone(),
         network_audit_events: supervisor_network_audit_events.as_ref(),
+        proxy_handle,
         redaction_policy,
         allow_launch_services_active: proxy
             .and_then(|p| p.open_url.as_ref())

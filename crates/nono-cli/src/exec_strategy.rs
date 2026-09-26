@@ -364,6 +364,10 @@ pub struct SupervisorConfig<'a> {
     /// Optional in-memory network/IPC audit events persisted into session metadata.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub network_audit_events: Option<&'a Mutex<Vec<nono::undo::NetworkAuditEvent>>>,
+    /// Running proxy handle, used to snapshot network denial events for the
+    /// diagnostic footer. Read-only here: session finalization performs the
+    /// destructive drain that feeds the persistent audit record.
+    pub proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     /// Redaction policy for command context in diagnostics.
     pub redaction_policy: &'a nono::ScrubPolicy,
     /// Whether direct LaunchServices opening is enabled for this session.
@@ -1668,6 +1672,24 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .iter()
                     .map(|d| nono::try_canonicalize(&d.path))
                     .collect();
+                // Read-only snapshot: the proxy's in-memory event queue is
+                // left intact for the destructive drain in session
+                // finalization, which owns delivery to the audit record.
+                let network_denials: Vec<nono::undo::NetworkAuditEvent> = supervisor
+                    .and_then(|s| s.proxy_handle)
+                    .map(nono_proxy::server::ProxyHandle::snapshot_audit_events)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|event| {
+                        matches!(
+                            event.decision,
+                            nono::undo::NetworkAuditDecision::Deny
+                                | nono::undo::NetworkAuditDecision::ApproveDenied
+                                | nono::undo::NetworkAuditDecision::ApproveTimeout
+                                | nono::undo::NetworkAuditDecision::ApproveError
+                        )
+                    })
+                    .collect();
                 let mut base_formatter = DiagnosticFormatter::new(config.caps)
                     .with_mode(mode)
                     .with_denials(&denials)
@@ -1682,7 +1704,8 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .with_suppressed_system_service_operations(
                         config.suppressed_system_service_operations,
                     )
-                    .with_canonical_denial_paths(canonical_denial_paths);
+                    .with_canonical_denial_paths(canonical_denial_paths)
+                    .with_network_denials(network_denials);
                 if let Some(program) = config.command.first() {
                     let argv_display: Vec<String> = config
                         .command
@@ -5162,6 +5185,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5290,6 +5314,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5384,6 +5409,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5431,6 +5457,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5485,6 +5512,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5555,6 +5583,7 @@ mod tests {
             open_url_allow_localhost: true,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5586,6 +5615,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5636,6 +5666,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5791,6 +5822,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: true,
             #[cfg(target_os = "linux")]
@@ -5850,6 +5882,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5898,6 +5931,7 @@ mod tests {
             open_url_allow_localhost: true,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5965,6 +5999,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]

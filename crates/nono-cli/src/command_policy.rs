@@ -2674,10 +2674,27 @@ fn validate_credential(
                     ),
                 );
             }
-            if credential.source.is_none() && credential.credential_key.is_none() {
+            if credential.source.is_none()
+                && credential.credential_key.is_none()
+                && credential.aws_auth.is_none()
+            {
                 report.error(
                     "invalid_credential",
-                    format!("proxy credential '{name}' must define source or credential_key"),
+                    format!(
+                        "proxy credential '{name}' must define source, credential_key, or aws_auth"
+                    ),
+                );
+            }
+            // aws_auth is mutually exclusive with source and credential_key —
+            // same constraint as the session-level config.
+            if credential.aws_auth.is_some()
+                && (credential.source.is_some() || credential.credential_key.is_some())
+            {
+                report.error(
+                    "invalid_credential",
+                    format!(
+                        "proxy credential '{name}' cannot combine aws_auth with source or credential_key"
+                    ),
                 );
             }
             if credential.tls_client_cert.is_some() ^ credential.tls_client_key.is_some() {

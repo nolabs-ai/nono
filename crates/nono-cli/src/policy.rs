@@ -3275,7 +3275,7 @@ mod tests {
     }
 
     #[test]
-    fn test_system_read_linux_core_does_not_grant_bare_etc_or_proc() {
+    fn test_system_read_linux_core_has_narrow_etc_grants() {
         let policy = load_embedded_policy().expect("embedded policy must parse");
         let group = policy
             .groups
@@ -3287,6 +3287,10 @@ mod tests {
             .map(|a| a.read.as_slice())
             .unwrap_or(&[]);
 
+        assert!(
+            read_paths.iter().any(|p| p == "/etc/mime.types"),
+            "system_read_linux_core must grant read access to '/etc/mime.types'"
+        );
         assert!(
             !read_paths.iter().any(|p| p == "/etc"),
             "system_read_linux_core must not grant bare '/etc'; use specific paths instead. Found: {:?}",

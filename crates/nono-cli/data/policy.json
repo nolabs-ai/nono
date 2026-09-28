@@ -231,6 +231,7 @@
           "/etc/os-release",
           "/etc/passwd",
           "/etc/services",
+          "/etc/mime.types",
           "/etc/manpath.config",
           "/etc/man_db.conf",
           "/var/cache/man",

@@ -86,6 +86,8 @@ fn test_schema_network_config_matches_rust_model() {
             "external_proxy",
             "upstream_bypass",
             "external_proxy_bypass",
+            "approval_backends",
+            "approval_defaults",
         ],
     );
 }

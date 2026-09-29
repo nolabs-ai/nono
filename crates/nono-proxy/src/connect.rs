@@ -105,7 +105,7 @@ pub struct NetworkApproval<'a> {
     /// suppress re-prompting for the rest of the session.
     pub session_decisions: &'a Mutex<HashMap<(String, u16), bool>>,
     /// In-flight prompt coordination so concurrent first-touch connections to
-    /// the same host share one prompt instead of stacking duplicate dialogs.
+    /// the same host share one prompt instead of stacking duplicate prompts.
     pub in_flight: &'a InFlightMap,
     /// Session identifier recorded in the approval request.
     pub session_id: &'a str,
@@ -419,8 +419,8 @@ async fn maybe_approve_host(
 /// Run the interactive prompt as the leader and return the authorization
 /// boolean, populating the session cache for session-scoped decisions.
 ///
-/// `request_approval` is synchronous and may block (dialog subprocess, webhook
-/// HTTP, terminal read), so it never runs on a Tokio worker thread — it is
+/// `request_approval` is synchronous and may block (webhook HTTP, terminal
+/// read), so it never runs on a Tokio worker thread — it is
 /// moved to the blocking pool and bounded by a backstop deadline. The backstop
 /// is derived from the backend's own configured timeout so it never preempts a
 /// legitimately-longer prompt; a backend that reports no timeout is capped by

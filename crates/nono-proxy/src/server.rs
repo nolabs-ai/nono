@@ -930,11 +930,11 @@ struct ProxyState {
         Arc<std::sync::Mutex<std::collections::HashMap<(String, u16), bool>>>,
     /// Coordinates concurrent first-touch network-approval prompts (keyed by
     /// `(host, port)`) so a burst of connections to the same not-yet-decided
-    /// host shares one prompt instead of stacking duplicate dialogs. Lives for
+    /// host shares one prompt instead of stacking duplicate prompts. Lives for
     /// the proxy's lifetime (one session).
     network_inflight: Arc<connect::InFlightMap>,
     /// Session identifier recorded in network approval requests, so a backend
-    /// (dialog/webhook) and the audit trail can attribute a prompt to the
+    /// (terminal/webhook) and the audit trail can attribute a prompt to the
     /// originating sandbox session.
     network_session_id: String,
     /// Optional supervisor-backed capture backend for command-backed credentials.

@@ -1870,7 +1870,7 @@ pub struct NetworkConfig {
     /// Where runtime host-approval prompts are sent when a CONNECT target is not
     /// on the allowlist.
     ///
-    /// A named backend here (e.g. `terminal`, `dialog`, `webhook`, or a `chain`)
+    /// A named backend here (e.g. `terminal`, `webhook`, or a `chain`)
     /// answers the prompt; an approved host is tunnelled, a denied one gets a
     /// 403. Empty (default) keeps the existing behavior: a not-allowed host is
     /// denied immediately with no prompt. Uses the same
@@ -7380,10 +7380,10 @@ mod tests {
 
         let mut child = child_profile();
         child.network.approval_backends.insert(
-            "dialog-gate".to_string(),
+            "webhook-gate".to_string(),
             ApprovalBackendConfig {
-                backend_type: crate::command_policy::ApprovalBackendType::Dialog,
-                url: None,
+                backend_type: crate::command_policy::ApprovalBackendType::Webhook,
+                url: Some("https://approval.example".to_string()),
                 timeout_secs: Some(30),
                 mode: None,
                 backends: Vec::new(),
@@ -7398,7 +7398,12 @@ mod tests {
                 .approval_backends
                 .contains_key("terminal-gate")
         );
-        assert!(merged.network.approval_backends.contains_key("dialog-gate"));
+        assert!(
+            merged
+                .network
+                .approval_backends
+                .contains_key("webhook-gate")
+        );
         // Child has no network defaults, so base's default is inherited.
         assert_eq!(
             merged

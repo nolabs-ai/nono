@@ -320,6 +320,26 @@ When an attestation is present, verification checks:
 
 The command policy rollup shown by `nono audit list` is covered by the session digest committed to the ledger, so editing `session.json` to hide a denial changes the digest and fails verification. The rollup is a view over events that remain individually recorded and hash-chained; `nono audit show` is where an operator confirms what the rollup summarizes.
 
+### `nono audit cleanup`
+
+Remove old audit sessions from disk. `--keep`, `--older-than`, and `--max-total-size` can be combined; each filter narrows further which sessions are removed.
+
+```bash
+# Retain only the 10 newest sessions
+nono audit cleanup --keep 10
+
+# Remove sessions older than 30 days
+nono audit cleanup --older-than 30
+
+# Remove the oldest sessions until the remaining total is under 500 MB
+nono audit cleanup --max-total-size 500
+
+# Preview what would be removed without deleting anything
+nono audit cleanup --keep 10 --dry-run
+```
+
+`--max-total-size` counts every remaining session's disk usage toward the budget, including sessions spared by `--keep` or `--older-than` — it removes oldest-first until the total is back under the given number of megabytes, or everything removable is gone.
+
 ## Use Cases
 
 ### Debugging

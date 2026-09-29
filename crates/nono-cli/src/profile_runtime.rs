@@ -62,7 +62,7 @@ pub(crate) struct PreparedProfile {
     /// [`profile::expand_vars`] at prepare time.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     /// Command binaries already resolved (canonicalized, stat'd, hashed) while
-    /// validating the profile's `command_policies`. Building the tool-sandbox
+    /// validating the profile's `command_policies`. Building the command-mediation
     /// plan reuses this instead of resolving — and re-hashing — every
     /// controlled binary a second time.
     pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
@@ -308,7 +308,12 @@ fn verify_stored_bundles(
             pack_ref,
         )?);
         if !artifact_path.exists() {
-            continue;
+            // Missing bundle artifacts must fail verification rather than be skipped.
+            return Err(nono::NonoError::PackageInstall(format!(
+                "trust bundle entry for '{}' in pack '{}' points at a missing path ('{}') - \
+                 reinstall with: nono pull {} --force",
+                artifact_name, pack_ref, installed_path, pack_ref
+            )));
         }
 
         let artifact_bytes = std::fs::read(&artifact_path).map_err(|e| {
@@ -1017,7 +1022,7 @@ fn prepare_profile_with_options(
 
 /// Validates that the active platform can support the profile's
 /// `command_policies`, returning the binaries resolved along the way (if
-/// any) so callers that go on to build a tool-sandbox plan can reuse this
+/// any) so callers that go on to build a command-mediation plan can reuse this
 /// resolution instead of re-reading and re-hashing every controlled binary.
 fn validate_command_policy_runtime_support(
     profile: &profile::Profile,
@@ -1032,7 +1037,7 @@ fn validate_command_policy_runtime_support(
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(nono::NonoError::UnsupportedPlatform(
-            "tool-sandbox command_policies are only supported on Linux and macOS".to_string(),
+            "command policies are only supported on Linux and macOS".to_string(),
         ))
     }
 
@@ -1066,12 +1071,12 @@ fn validate_linux_command_policy_runtime_support(
 
     let abi = nono::detect_abi().map_err(|err| {
         nono::NonoError::UnsupportedPlatform(format!(
-            "tool-sandbox profile uses TCP port network rules but Landlock enforcement is unavailable: {err}"
+            "command sandbox policy uses direct TCP port rules but Landlock enforcement is unavailable: {err}"
         ))
     })?;
     if !abi.has_network() {
         return Err(nono::NonoError::UnsupportedPlatform(format!(
-            "tool-sandbox profile uses TCP port network rules but {} lacks Landlock TCP support (requires ABI V4+)",
+            "command sandbox policy uses direct TCP port rules but {} lacks Landlock TCP support (requires ABI V4+)",
             abi
         )));
     }
@@ -1742,6 +1747,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verify_stored_bundles_rejects_entry_with_unresolvable_installed_path() {
+        let result = with_config_env(|config_dir| {
+            let artifact_content = r#"#!/bin/sh
+echo hi
+"#;
+            let (install_dir, _artifacts) = build_pack_with_scripts(
+                config_dir,
+                "acme",
+                "widget",
+                &[("hooks/before.sh", artifact_content)],
+            );
+
+            let bundle_json = serde_json::json!([{
+                "artifact": "hooks/before.sh",
+                "installed_path": "hooks/does-not-exist.sh",
+                "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+                "bundle": {}
+            }])
+            .to_string();
+            let bundle_path = install_dir.join(".nono-trust.bundle");
+            fs::write(&bundle_path, bundle_json).expect("write trust bundle");
+
+            verify_stored_bundles(
+                &install_dir,
+                &bundle_path,
+                "acme/widget",
+                Some("https://github.com/acme/widget-ci@refs/heads/main"),
+            )
+        });
+
+        let err = match result {
+            Ok(()) => panic!(
+                "BUG: trust bundle entry with an unresolvable installed_path was silently \
+                 accepted, skipping Sigstore verification for hooks/before.sh"
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("points at a missing path"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn active_command_policy_profile() -> profile::Profile {
         profile::Profile {
@@ -1769,7 +1818,7 @@ mod tests {
     #[test]
     fn active_command_policy_runtime_support_rejects_unsupported_platform() {
         let err = validate_command_policy_runtime_support(&active_command_policy_profile())
-            .expect_err("active tool-sandbox runtime must fail on unsupported platforms");
+            .expect_err("active command-mediation runtime must fail on unsupported platforms");
 
         assert!(
             err.to_string().contains("Linux and macOS"),

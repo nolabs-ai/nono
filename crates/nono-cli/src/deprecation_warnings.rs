@@ -1,30 +1,15 @@
 //! Per-thread deprecation warning machinery (counter + suppression).
 //!
-//! This module is NOT itself deprecated — it provides infrastructure that
-//! survives any individual deprecation cycle. The actual deprecated
-//! schema/flag definitions live in `deprecated_schema.rs` (single-cycle,
-//! deletable when v1.0.0 lands); this module's primitives are reusable
-//! whenever we want to count or suppress deprecation emissions.
-//!
-//! Why separate from `deprecated_schema.rs`: callers that wrap a parse in
-//! a counter (e.g. `cmd_validate`) or suppression scope (e.g.
-//! `load_profile_extends`) should not have to import from a module
-//! marked "delete this whole file at v1.0.0". The lint enforcement in
-//! `scripts/test-list-aliases.sh` keeps the deprecated module's import
-//! surface tight precisely because the file is going away — pulling
-//! these guards out preserves that property.
+//! Reusable infrastructure for counting or suppressing deprecation
+//! emissions during a profile parse, independent of any single
+//! deprecation's lifecycle.
 
 use std::cell::Cell;
 
 thread_local! {
-    /// `None` when not counting; `Some(n)` inside a counting scope. The
-    /// drain sites in `deprecated_schema::emit_deprecation_warning` bump
-    /// this when set.
     static WARNING_COUNTER: Cell<Option<usize>> = const { Cell::new(None) };
 
     /// Non-zero while inside one or more `WarningSuppressionGuard` scopes.
-    /// While suppressed, `deprecated_schema::emit_deprecation_warning`
-    /// neither prints to stderr nor increments the counter.
     static WARNING_SUPPRESS: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -113,22 +98,6 @@ impl Drop for WarningSuppressionGuard {
     }
 }
 
-/// Increment the per-thread counter if a `WarningCounterGuard` is active.
-/// No-op otherwise. Called from `deprecated_schema::emit_deprecation_warning`.
-pub(crate) fn note_deprecation() {
-    WARNING_COUNTER.with(|c| {
-        if let Some(n) = c.get() {
-            c.set(Some(n.saturating_add(1)));
-        }
-    });
-}
-
-/// Returns true while a `WarningSuppressionGuard` is active on this thread.
-/// Called from `deprecated_schema::emit_deprecation_warning`.
-pub(crate) fn is_suppressed() -> bool {
-    WARNING_SUPPRESS.with(|c| c.get() > 0)
-}
-
 #[cfg(test)]
 mod tests {
     //! These tests pin down the thread-local guards' invariants. They
@@ -177,10 +146,8 @@ mod tests {
         {
             let _g = WarningSuppressionGuard::begin();
             WARNING_SUPPRESS.with(|c| assert_eq!(c.get(), 1));
-            assert!(is_suppressed());
         }
         WARNING_SUPPRESS.with(|c| assert_eq!(c.get(), 0));
-        assert!(!is_suppressed());
     }
 
     #[test]
@@ -196,26 +163,5 @@ mod tests {
         WARNING_SUPPRESS.with(|c| assert_eq!(c.get(), 1));
         drop(outer);
         WARNING_SUPPRESS.with(|c| assert_eq!(c.get(), 0));
-    }
-
-    #[test]
-    fn note_deprecation_increments_only_inside_counter_scope() {
-        reset_thread_locals();
-        // Outside scope: no-op.
-        note_deprecation();
-        WARNING_COUNTER.with(|c| assert_eq!(c.get(), None));
-
-        // Inside scope: increments.
-        let g = WarningCounterGuard::begin();
-        note_deprecation();
-        note_deprecation();
-        let n = g.finish();
-        assert_eq!(n, 2);
-    }
-
-    #[test]
-    fn is_suppressed_is_false_outside_scope() {
-        reset_thread_locals();
-        assert!(!is_suppressed());
     }
 }

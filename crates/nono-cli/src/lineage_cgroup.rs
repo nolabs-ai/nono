@@ -1,7 +1,7 @@
-//! Linux cgroup v2 lineage marker for tool-sandbox caller attribution.
+//! Linux cgroup v2 lineage marker for command-policy caller attribution.
 //!
 //! A daemonized caller (setsid + double-fork, reparented to pid 1) severs
-//! `resolve_caller`'s parent-pid walk. Each Tool Sandbox command instead self-attaches,
+//! `resolve_caller`'s parent-pid walk. Each mediated command instead self-attaches,
 //! pre-exec, to a per-command cgroup; membership survives reparenting and a
 //! sandboxed command can never write `/sys/fs/cgroup` (Landlock grants none), so
 //! reading a severed caller's `/proc/<pid>/cgroup` attributes it unforgeably to its
@@ -304,7 +304,15 @@ fn sweep_stale_sessions(base: &Path) {
 fn teardown_session_tree(session_dir: &Path) {
     if let Ok(entries) = fs::read_dir(session_dir) {
         for entry in entries.flatten() {
-            remove_cgroup(&entry.path());
+            // Skip session_dir's own control files (memory.events, pids.peak, ...);
+            // only cmd_* are child cgroups rmdir can remove.
+            let is_cmd_dir = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(CMD_PREFIX));
+            if is_cmd_dir {
+                remove_cgroup(&entry.path());
+            }
         }
     }
     let _ = fs::remove_dir(session_dir);

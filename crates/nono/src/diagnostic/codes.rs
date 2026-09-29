@@ -3,7 +3,7 @@
 use crate::capability::AccessMode;
 use crate::diagnostic::NonoDiagnosticDetail;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Severity of a structured diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,66 +62,6 @@ pub enum NonoRemediation {
     },
     AllowCwd,
     DisableRollback,
-}
-
-/// Map structured remediation to the legacy CLI flag string shape.
-///
-/// Kept for backwards compatibility with code that read
-/// [`crate::IpcDenialRecord::suggested_flag`]. New code should use
-/// [`NonoRemediation`] and render flags in the CLI/bindings layer.
-#[deprecated(
-    since = "0.64.0",
-    note = "Use `NonoRemediation` instead. Legacy flag strings will be removed in 1.0.0."
-)]
-#[must_use]
-pub fn suggested_flag_for_remediation(rem: &NonoRemediation) -> Option<String> {
-    match rem {
-        NonoRemediation::GrantPath {
-            path,
-            access,
-            is_file,
-        } => {
-            let (flag, target) = suggested_flag_parts(path, *access, *is_file);
-            Some(format!("{flag} {}", target.display()))
-        }
-        NonoRemediation::GrantUnixSocket { path, bind } => {
-            let flag = if *bind {
-                "--allow-unix-socket-bind"
-            } else {
-                "--allow-unix-socket"
-            };
-            Some(format!("{flag} {}", path.display()))
-        }
-        NonoRemediation::AllowCwd => Some("--allow-cwd".to_string()),
-        NonoRemediation::DisableRollback => Some("--no-rollback".to_string()),
-        NonoRemediation::GrantNetwork => Some("--allow-net".to_string()),
-        NonoRemediation::RunDiscovery
-        | NonoRemediation::CheckPolicy
-        | NonoRemediation::AuthenticateCredentialProvider { .. }
-        | NonoRemediation::AdjustRollbackBudget { .. } => None,
-    }
-}
-
-fn suggested_flag_parts(
-    path: &Path,
-    requested: AccessMode,
-    is_file: bool,
-) -> (&'static str, PathBuf) {
-    if is_file {
-        let flag = match requested {
-            AccessMode::Read => "--read-file",
-            AccessMode::Write => "--write-file",
-            AccessMode::ReadWrite => "--allow-file",
-        };
-        return (flag, path.to_path_buf());
-    }
-
-    let flag = match requested {
-        AccessMode::Read => "--read",
-        AccessMode::Write => "--write",
-        AccessMode::ReadWrite => "--allow",
-    };
-    (flag, path.to_path_buf())
 }
 
 /// One structured diagnostic entry.

@@ -239,7 +239,7 @@ fn env_credentials_with_command_policies_non_shim_entry_succeeds() {
 }
 
 /// A script written into a writable grant-dir (cwd) must still execute under
-/// an active `command_policies` outer exec gate.
+/// an active `command_policies` execute gate on the session sandbox.
 #[test]
 #[cfg(target_os = "linux")]
 fn command_policies_allows_script_exec_in_writable_grant_dir() {
@@ -260,8 +260,69 @@ fn command_policies_allows_script_exec_in_writable_grant_dir() {
         .assert_stdout_contains("ok");
 }
 
+/// Nix-style wrapper with a package-specific interpreter.
+#[test]
+#[cfg(target_os = "linux")]
+fn command_policies_allows_immutable_store_shebang_wrapper() {
+    let t = nono_test!("cmd-policies-store-wrapper");
+    let store_dir = t.root().join("nix-store-like");
+    fs::create_dir(&store_dir).expect("create immutable store fixture");
+    fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o700))
+        .expect("seal immutable store fixture");
+
+    let interpreter = store_dir.join("bash");
+    fs::copy("/bin/sh", &interpreter).expect("copy package-specific interpreter");
+    fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o500))
+        .expect("seal package-specific interpreter");
+
+    let wrapped = store_dir.join(".pi-wrapped");
+    fs::write(
+        &wrapped,
+        format!(
+            "#!{}\nexec /usr/bin/printf 'wrapped ok\\n'\n",
+            interpreter.display()
+        ),
+    )
+    .expect("write wrapped executable");
+    fs::set_permissions(&wrapped, fs::Permissions::from_mode(0o500))
+        .expect("seal wrapped executable");
+
+    let wrapper = store_dir.join("pi");
+    fs::write(
+        &wrapper,
+        format!("#!{}\nexec {}\n", interpreter.display(), wrapped.display()),
+    )
+    .expect("write wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o500)).expect("seal wrapper");
+
+    let profile = t.write_profile(
+        "cmd-policies-store-wrapper",
+        &format!(
+            r#"{{
+                "meta": {{ "name": "cmd-policies-store-wrapper-test" }},
+                "filesystem": {{ "allow": ["{workspace}"], "read": ["{store_dir}"] }},
+                "network": {{ "block": true }},
+                "command_policies": {{
+                    "commands": {{
+                        "cat": {{ "executable": "/bin/cat" }}
+                    }}
+                }}
+            }}"#,
+            workspace = t.workspace().display(),
+            store_dir = store_dir.display(),
+        ),
+    );
+
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new(wrapper.as_os_str()))
+        .assert_success("an immutable package-specific shebang wrapper executes")
+        .assert_stdout_contains("wrapped ok");
+}
+
 /// Same as above but for a binary compiled at runtime, so it wasn't on disk
-/// when the outer exec gate was set up.
+/// when the session sandbox execute gate was set up.
 #[test]
 #[cfg(target_os = "linux")]
 fn command_policies_allows_compiled_binary_exec_in_writable_grant_dir() {
@@ -300,7 +361,7 @@ fn command_policies_allows_compiled_binary_exec_in_writable_grant_dir() {
 }
 
 /// Same-FS rename from a child directory to its parent must succeed under
-/// `command_policies`. The outer exec gate must grant Landlock Refer (#1689).
+/// `command_policies`. The session sandbox execute gate must grant Landlock Refer (#1689).
 #[test]
 #[cfg(target_os = "linux")]
 fn command_policies_allows_same_fs_rename_from_child_dir() {
@@ -322,7 +383,7 @@ echo rename succeeded";
         .assert_stdout_contains("rename succeeded");
 }
 
-/// Workspace-only profile with an active `command_policies` outer exec gate.
+/// Workspace-only profile with an active `command_policies` execute gate on the session sandbox.
 #[cfg(target_os = "linux")]
 fn command_policies_profile(t: &NonoTest, name: &str) -> Profile {
     t.write_profile(

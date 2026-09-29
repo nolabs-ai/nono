@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2088 # User-facing test descriptions intentionally use ~ notation.
 # Bypass Protection Tests
 # Verifies that the canonical filesystem.bypass_protection field and
 # --bypass-protection CLI flag correctly punch through deny groups while
@@ -10,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
 
 echo ""
-echo -e "${BLUE}=== Bypass Protection Tests ===${NC}"
+echo -e "${BLUE}Bypass Protection Tests${NC}"
 
 verify_nono_binary
 if ! require_working_sandbox "bypass protection suite"; then
@@ -33,11 +34,9 @@ echo ""
 echo "Test directory: $TMPDIR"
 echo ""
 
-# =============================================================================
 # CLI --bypass-protection
-# =============================================================================
 
-echo "--- CLI --bypass-protection ---"
+echo "CLI --bypass-protection"
 
 if [[ -d "$DOCKER_DIR" ]]; then
     # bypass-protection with matching grant should succeed
@@ -57,12 +56,10 @@ else
     skip_test "CLI --bypass-protection with --read" "~/.docker not found"
 fi
 
-# =============================================================================
 # Profile filesystem.bypass_protection
-# =============================================================================
 
 echo ""
-echo "--- Profile filesystem.bypass_protection ---"
+echo "Profile filesystem.bypass_protection"
 
 if [[ -d "$DOCKER_DIR" ]]; then
     # Profile with bypass_protection and matching filesystem grant
@@ -123,12 +120,10 @@ else
     skip_test "profile bypass_protection with read-only grant" "~/.docker not found"
 fi
 
-# =============================================================================
 # nono why with bypass_protection
-# =============================================================================
 
 echo ""
-echo "--- nono why with bypass_protection ---"
+echo "nono why with bypass_protection"
 
 if [[ -d "$DOCKER_DIR" ]]; then
     # Without bypass, ~/.docker should be denied
@@ -153,12 +148,10 @@ else
     skip_test "nono why reports .docker write denied with read-only profile" "~/.docker not found"
 fi
 
-# =============================================================================
 # Bypass protection with profile inheritance
-# =============================================================================
 
 echo ""
-echo "--- Profile Inheritance ---"
+echo "Profile Inheritance"
 
 if [[ -d "$DOCKER_DIR" ]]; then
     # Child profile inherits bypass_protection from parent via user profiles directory.
@@ -208,12 +201,10 @@ else
     skip_test "child profile shows .docker from inherited bypass" "~/.docker not found"
 fi
 
-# =============================================================================
 # Bypass protection does NOT bypass other deny groups
-# =============================================================================
 
 echo ""
-echo "--- Bypass scope is targeted ---"
+echo "Bypass scope is targeted"
 
 if [[ -d "$DOCKER_DIR" ]] && [[ -d "$HOME/.ssh" ]]; then
     # Bypassing .docker must NOT also unlock .ssh
@@ -225,12 +216,10 @@ else
     skip_test "bypass_protection for .docker does not bypass .ssh deny" "~/.docker or ~/.ssh not found"
 fi
 
-# =============================================================================
 # Warning output
-# =============================================================================
 
 echo ""
-echo "--- Warning output ---"
+echo "Warning output"
 
 if [[ -d "$DOCKER_DIR" ]]; then
     expect_output_not_contains "bypass_protection hides advisory by default" \
@@ -245,12 +234,10 @@ else
     skip_test "bypass_protection shows advisory with -v" "~/.docker not found"
 fi
 
-# =============================================================================
 # Required groups cannot be excluded
-# =============================================================================
 
 echo ""
-echo "--- Required group protection ---"
+echo "Required group protection"
 
 cat > "$PROFILES_DIR/exclude-required.json" <<EOF
 {
@@ -269,8 +256,6 @@ expect_output_contains "excluding required group mentions 'required'" \
     "required" \
     "$NONO_BIN" run --profile "$PROFILES_DIR/exclude-required.json" --dry-run -- echo ok
 
-# =============================================================================
 # Summary
-# =============================================================================
 
 print_summary

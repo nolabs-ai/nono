@@ -1,0 +1,170 @@
+{
+  "meta": {
+    "name": "docker-tool-sandbox",
+    "version": "0.1.0",
+    "description": "A harmless tool run inside Docker and a nono command sandbox"
+  },
+  "filesystem": {
+    "read": [
+      "/opt/nono-tool/demo-tool",
+      "/opt/nono-tool/profile.json",
+      "/work/allowed.txt",
+      "/usr/lib",
+      "/lib",
+      "/lib64"
+    ],
+    "write": ["/work/output"]
+  },
+  "network": {
+    "allow_domain": [
+      {
+        "domain": "example.com",
+        "endpoints": [
+          {"method": "GET", "path": "/"}
+        ]
+      }
+    ],
+    "deny_domain": ["example.org"]
+  },
+  "command_policies": {
+    "commands": {
+      "demo-tool": {
+        "executable": "/opt/nono-tool/demo-tool",
+        "from": {
+          "session": {
+            "sandbox": {
+              "fs_read": [
+                "/usr/lib",
+                "/lib",
+                "/lib64"
+              ],
+              "fs_read_file": [
+                "/opt/nono-tool/demo-tool",
+                "/work/allowed.txt"
+              ],
+              "fs_write": ["/work/output"],
+              "environment": {
+                "allow_vars": ["PATH", "HOME", "LANG"]
+              }
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "deny": [
+                {
+                  "argv": {"prefix": ["delete"]},
+                  "reason": "the tool may not delete files"
+                }
+              ],
+              "allow": [
+                {
+                  "argv": {"prefix": ["read"]},
+                  "reason": "the tool may read explicitly approved input"
+                },
+                {
+                  "argv": {"prefix": ["write"]},
+                  "reason": "the tool may write only to its output directory"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "cat": {
+        "executable": "/usr/bin/cat",
+        "from": {
+          "session": {
+            "sandbox": {
+              "fs_read": ["/usr/lib", "/lib", "/lib64"],
+              "fs_read_file": ["/usr/bin/cat", "/work/allowed.txt"]
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "allow": [
+                {
+                  "argv": {"prefix": ["/work/allowed.txt"]},
+                  "reason": "cat may read the approved fixture"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "sed": {
+        "executable": "/usr/bin/sed",
+        "from": {
+          "session": {
+            "sandbox": {
+              "fs_read": ["/usr/lib", "/lib", "/lib64"],
+              "fs_read_file": ["/usr/bin/sed", "/work/allowed.txt"]
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "allow": [
+                {
+                  "argv": {"prefix": ["-n", "1p", "/work/allowed.txt"]},
+                  "reason": "sed may inspect only the approved fixture"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "curl": {
+        "executable": "/usr/bin/curl",
+        "from": {
+          "session": {
+            "sandbox": {
+              "fs_read": [
+                "/usr/lib",
+                "/lib",
+                "/lib64",
+                "/etc/ssl/certs"
+              ],
+              "fs_read_file": ["/usr/bin/curl"],
+              "network": {
+                "allow_domain": ["example.com", "example.org"]
+              },
+              "environment": {
+                "allow_vars": [
+                  "PATH",
+                  "HOME",
+                  "LANG",
+                  "HTTP_PROXY",
+                  "HTTPS_PROXY",
+                  "NO_PROXY",
+                  "http_proxy",
+                  "https_proxy",
+                  "no_proxy",
+                  "SSL_CERT_FILE",
+                  "CURL_CA_BUNDLE",
+                  "REQUESTS_CA_BUNDLE"
+                ]
+              }
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "allow": [
+                {
+                  "argv": {"prefix": ["https://example.com/"]},
+                  "reason": "curl may request the explicitly allowed GET / endpoint"
+                },
+                {
+                  "argv": {"prefix": ["-X", "POST", "https://example.com/"]},
+                  "reason": "curl may demonstrate L7 method filtering"
+                },
+                {
+                  "argv": {"prefix": ["https://example.com/private"]},
+                  "reason": "curl may demonstrate L7 path filtering"
+                },
+                {
+                  "argv": {"prefix": ["https://example.org/"]},
+                  "reason": "curl may demonstrate domain filtering"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

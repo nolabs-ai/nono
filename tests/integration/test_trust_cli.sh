@@ -340,7 +340,6 @@ echo "--- Missing Literal Patterns ---"
 cat > "$MISSING_DIR/trust-policy.json" <<'EOF'
 {
   "predicate": "https://nono.sh/attestation/trust-policy/v1",
-  "version": 1,
   "includes": ["SKILLS.md"],
   "publishers": [],
   "blocklist": {
@@ -375,7 +374,6 @@ echo "--- Startup Enforcement ---"
 cat > "$STARTUP_DIR/trust-policy.json" <<'EOF'
 {
   "predicate": "https://nono.sh/attestation/trust-policy/v1",
-  "version": 1,
   "includes": ["SKILLS.md"],
   "publishers": [],
   "blocklist": {

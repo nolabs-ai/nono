@@ -44,17 +44,10 @@ pub struct IpcDenialRecord {
     pub reason: String,
     /// Structured remediation when this denial can be fixed by an explicit grant.
     pub remediation: Option<NonoRemediation>,
-    /// Legacy CLI flag suggestion retained for backwards compatibility.
-    #[deprecated(
-        since = "0.64.0",
-        note = "Use `remediation` instead. Will be removed in 1.0.0."
-    )]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub suggested_flag: Option<String>,
 }
 
 impl IpcDenialRecord {
-    /// Create an IPC denial record with structured remediation and legacy flag sync.
+    /// Create an IPC denial record with structured remediation.
     #[must_use]
     pub fn new(
         target: String,
@@ -62,19 +55,11 @@ impl IpcDenialRecord {
         reason: String,
         remediation: Option<NonoRemediation>,
     ) -> Self {
-        let suggested_flag = remediation.as_ref().and_then(|rem| {
-            #[allow(deprecated)]
-            {
-                crate::diagnostic::codes::suggested_flag_for_remediation(rem)
-            }
-        });
-        #[allow(deprecated)]
         Self {
             target,
             operation,
             reason,
             remediation,
-            suggested_flag,
         }
     }
 }
@@ -172,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn ipc_denial_record_keeps_legacy_suggested_flag_in_sync() {
+    fn ipc_denial_record_preserves_structured_remediation() {
         let remediation = NonoRemediation::GrantUnixSocket {
             path: PathBuf::from("/run/user/0/bus"),
             bind: false,
@@ -181,14 +166,8 @@ mod tests {
             "/run/user/0/bus".to_string(),
             "connect".to_string(),
             "no matching unix_socket capability".to_string(),
-            Some(remediation),
+            Some(remediation.clone()),
         );
-        #[allow(deprecated)]
-        {
-            assert_eq!(
-                record.suggested_flag.as_deref(),
-                Some("--allow-unix-socket /run/user/0/bus")
-            );
-        }
+        assert_eq!(record.remediation, Some(remediation));
     }
 }

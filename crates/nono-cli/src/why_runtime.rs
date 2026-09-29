@@ -583,7 +583,7 @@ fn query_command_policy(
         Ok(WhyInvocationPolicyOutcome::Deny { reason }) => query_ext::QueryResult::Denied {
             reason,
             details: Some(format!(
-                "Command '{command}' from '{caller}' with argv [{}] is denied by invocation_policy. This is an Tool Sandbox  command/argument policy denial, not a filesystem path denial.{endpoint_note}",
+                "Command '{command}' from '{caller}' with argv [{}] is denied by invocation_policy. This is a command-policy denial, not a filesystem-policy denial.{endpoint_note}",
                 crate::command_display::format_command_line(command_args)
             )),
             policy_source: Some(format!(
@@ -670,7 +670,7 @@ fn evaluate_invocation_policy_for_why(
     _argv: &[Vec<u8>],
 ) -> Result<WhyInvocationPolicyOutcome> {
     Err(NonoError::ConfigParse(
-        "tool-sandbox command-policy queries are only available on Linux and macOS".to_string(),
+        "command-policy queries are only available on Linux and macOS".to_string(),
     ))
 }
 
@@ -953,7 +953,7 @@ mod tests {
                 assert!(
                     details
                         .as_deref()
-                        .is_some_and(|value| value.contains("not a filesystem path denial"))
+                        .is_some_and(|value| value.contains("not a filesystem-policy denial"))
                 );
                 assert_eq!(
                     policy_source.as_deref(),

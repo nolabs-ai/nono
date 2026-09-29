@@ -123,8 +123,7 @@ pub struct ProfileDef {
     pub filesystem: profile::FilesystemConfig,
     #[serde(default)]
     pub network: profile::NetworkConfig,
-    /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
-    #[serde(default, alias = "secrets")]
+    #[serde(default)]
     pub env_credentials: profile::SecretsConfig,
     #[serde(default)]
     pub command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
@@ -132,8 +131,7 @@ pub struct ProfileDef {
     pub workdir: profile::WorkdirConfig,
     #[serde(default)]
     pub hooks: profile::HooksConfig,
-    /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
-    #[serde(default, alias = "undo")]
+    #[serde(default)]
     pub rollback: profile::RollbackConfig,
     #[serde(default)]
     pub open_urls: Option<profile::OpenUrlConfig>,
@@ -141,8 +139,6 @@ pub struct ProfileDef {
     pub allow_launch_services: Option<bool>,
     #[serde(default)]
     pub allow_gpu: Option<bool>,
-    #[serde(default)]
-    pub interactive: bool,
     #[serde(default)]
     pub packs: Vec<String>,
     #[serde(default)]
@@ -183,7 +179,6 @@ impl ProfileDef {
             allow_launch_services: self.allow_launch_services,
             allow_gpu: self.allow_gpu,
             allow_parent_of_protected: None,
-            interactive: self.interactive,
             skipdirs: Vec::new(),
             packs: self.packs.clone(),
             binary: None,
@@ -3280,7 +3275,7 @@ mod tests {
     }
 
     #[test]
-    fn test_system_read_linux_core_does_not_grant_bare_etc_or_proc() {
+    fn test_system_read_linux_core_has_narrow_etc_grants() {
         let policy = load_embedded_policy().expect("embedded policy must parse");
         let group = policy
             .groups
@@ -3292,6 +3287,10 @@ mod tests {
             .map(|a| a.read.as_slice())
             .unwrap_or(&[]);
 
+        assert!(
+            read_paths.iter().any(|p| p == "/etc/mime.types"),
+            "system_read_linux_core must grant read access to '/etc/mime.types'"
+        );
         assert!(
             !read_paths.iter().any(|p| p == "/etc"),
             "system_read_linux_core must not grant bare '/etc'; use specific paths instead. Found: {:?}",
@@ -3955,6 +3954,23 @@ mod tests {
             read_paths.contains(&"/nix/store".to_string()),
             "nix_runtime group must include /nix/store for NixOS compatibility"
         );
+    }
+
+    #[test]
+    fn test_snap_linux_group_includes_snap_mount_paths() {
+        let json = crate::config::embedded::embedded_policy_json();
+        let policy = load_policy(json).expect("parse policy.json");
+        let group = policy
+            .groups
+            .get("snap_linux")
+            .expect("snap_linux group must exist");
+        let read_paths = &group
+            .allow
+            .as_ref()
+            .expect("snap_linux must have allow block")
+            .read;
+        assert!(read_paths.contains(&"/snap".to_string()));
+        assert!(read_paths.contains(&"/var/lib/snapd/snap".to_string()));
     }
 
     #[test]

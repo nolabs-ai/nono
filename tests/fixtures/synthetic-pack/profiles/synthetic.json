@@ -11,6 +11,5 @@
     ]
   },
   "network": { "block": false },
-  "workdir": { "access": "readwrite" },
-  "interactive": false
+  "workdir": { "access": "readwrite" }
 }

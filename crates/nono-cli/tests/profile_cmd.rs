@@ -326,8 +326,8 @@ fn test_guide_outputs_markdown() {
         "guide should cover variable expansion"
     );
     assert!(
-        stdout.contains("Tool Sandbox  command-policy denials"),
-        "guide should cover Tool Sandbox  command-policy denials"
+        stdout.contains("Command-policy denials"),
+        "guide should cover command-policy denials"
     );
     assert!(
         stdout.contains("Proxy credential endpoint policy"),

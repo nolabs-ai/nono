@@ -1,7 +1,7 @@
 //! Shared URL validation and browser-opening helpers.
 //!
 //! Both the supervisor (for the directly-launched process) and the
-//! tool-sandbox runtime (for brokered `command_policies` children) delegate
+//! command-mediation runtime (for brokered command sandboxes) delegate
 //! browser opens to an unsandboxed process. Because the browser is launched
 //! outside the sandbox, the origin/scheme allow-list is the only gate between
 //! the sandboxed child and an arbitrary `open`/`xdg-open` invocation.
@@ -86,11 +86,17 @@ pub(crate) fn open_url_in_browser(
     #[cfg(target_os = "linux")]
     const BROWSER_OPENER: &str = "xdg-open";
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let safe_path = nono::sanitize_broker_path_for_binary(
+    let safe_path = nono::safe_broker_path_for_binary(
         &std::env::var("PATH").unwrap_or_default(),
         BROWSER_OPENER,
         outer_caps,
-    );
+    )
+    .ok_or_else(|| {
+        format!(
+            "Cannot launch browser: no remaining PATH entry is safe for resolving \
+             '{BROWSER_OPENER}' in this sandbox"
+        )
+    })?;
 
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open")
@@ -271,6 +277,38 @@ mod tests {
         assert!(
             real_marker.exists(),
             "the real (fallback) {OPENER} binary should have run instead"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn open_url_in_browser_rejects_empty_sanitized_path() {
+        use nono::{AccessMode, CapabilitySource, FsCapability};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_dir = root.path().join("writable-bin");
+        std::fs::create_dir_all(&writable_dir).expect("mkdir writable");
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_dir.clone(),
+            resolved: nono::try_canonicalize(&writable_dir),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let path = writable_dir.display().to_string();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("PATH", &path)]);
+        let err = open_url_in_browser("https://example.com/callback", &caps)
+            .expect_err("empty sanitized PATH must fail before spawning browser opener");
+
+        assert!(
+            err.contains("no remaining PATH entry is safe"),
+            "unexpected error: {err}"
         );
     }
 

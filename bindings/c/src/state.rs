@@ -143,7 +143,9 @@ pub unsafe extern "C" fn nono_sandbox_state_to_caps(
 mod tests {
     use super::*;
     use crate::capability_set::{
-        nono_capability_set_free, nono_capability_set_new, nono_capability_set_set_network_blocked,
+        nono_capability_set_block_dns, nono_capability_set_dns_enabled, nono_capability_set_free,
+        nono_capability_set_is_network_blocked, nono_capability_set_new,
+        nono_capability_set_set_network_blocked,
     };
     use std::ffi::CStr;
 
@@ -177,6 +179,10 @@ mod tests {
         // SAFETY: caps is valid.
         unsafe {
             nono_capability_set_set_network_blocked(caps, true);
+            assert_eq!(
+                nono_capability_set_block_dns(caps),
+                crate::types::NonoErrorCode::Ok
+            );
             let state = nono_sandbox_state_from_caps(caps);
 
             let json_ptr = nono_sandbox_state_to_json(state);
@@ -189,6 +195,12 @@ mod tests {
             let state2 = nono_sandbox_state_from_json(json_ptr);
             assert!(!state2.is_null());
 
+            let restored = nono_sandbox_state_to_caps(state2);
+            assert!(!restored.is_null());
+            assert!(!nono_capability_set_dns_enabled(restored));
+            assert!(nono_capability_set_is_network_blocked(restored));
+
+            nono_capability_set_free(restored);
             nono_sandbox_state_free(state2);
             crate::nono_string_free(json_ptr);
             nono_sandbox_state_free(state);

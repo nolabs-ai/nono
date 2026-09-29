@@ -1,0 +1,80 @@
+name: Nix flake
+
+# Validates the flake (flake.nix) on Linux and macOS.
+# Runs on PRs that touch flake files and on manual dispatch.
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    branches: [main]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "**/*.nix"
+      - ".github/workflows/nix.yml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: nix flake check (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-latest: x86_64-linux + aarch64-linux (cross-eval)
+        # macos-26-intel: x86_64-darwin (Intel, retires ~Nov 2028)
+        # macos-26: aarch64-darwin (Apple Silicon)
+        runner: [ubuntu-latest, macos-26-intel, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      # The Determinate Nix Installer dropped Intel macOS support
+      # (DeterminateSystems/nix-src#224), so use the official Nix
+      # installer on macos-26-intel. Other runners keep the Determinate
+      # installer for its magic-nix-cache integration.
+      - name: Install Nix (Intel macOS)
+        if: matrix.runner == 'macos-26-intel'
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+
+      - name: Install Nix (other platforms)
+        if: matrix.runner != 'macos-26-intel'
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      # Linux-only: the v14 static binary fails on arm64-darwin (libc++ symbol
+      # mismatch). Gated to non-PR events to prevent cache poisoning from forks.
+      - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        with:
+          use-flakehub: false
+
+      - name: nix flake check
+        run: nix flake check --no-build
+
+      - name: nix build (source)
+        run: nix build . --print-build-logs
+
+      # The prebuilt target fetches a release tarball by version from
+      # Cargo.toml. On release-prep PRs the tag may not exist yet, so
+      # only exercise this path outside PRs (main pushes, tags, manual).
+      - name: nix build (prebuilt)
+        if: github.event_name != 'pull_request'
+        run: nix build .#prebuilt --print-build-logs
+
+      - name: nix run -- --version
+        if: github.event_name != 'pull_request'
+        run: nix run . -- --version
+
+      - name: nix run .#prebuilt -- --version
+        if: github.event_name != 'pull_request'
+        run: nix run .#prebuilt -- --version

@@ -1,4 +1,4 @@
-# GitHub CLI Tool-Sandbox Demo
+# GitHub CLI Command-Policy Demo
 
 Author: [@lukehinds](https://github.com/lukehinds)
 
@@ -16,7 +16,7 @@ credential upstream to `https://api.github.com`.
 - issue comments, issue creation, issue closure, release upload, and destructive
   API calls are denied.
 - wrapped attempts such as `sh -c 'gh issue comment ...'` are denied because
-  the command policy controls child tool execution, not only the top-level
+  the command policy controls mediated command execution, not only the top-level
   command line.
 - `gh auth token` returns a nono phantom token, not the real GitHub token.
 
@@ -291,7 +291,7 @@ denied by endpoint policy.
 
 ## Troubleshooting
 
-`tool-sandbox proxy credential 'github-api' is unavailable to the proxy`
+`command sandbox proxy credential 'github-api' is unavailable to the proxy`
 
 The parent nono process could not load the real GitHub token. Check the
 credential source in the profile. For Linux keyring, verify the login and that

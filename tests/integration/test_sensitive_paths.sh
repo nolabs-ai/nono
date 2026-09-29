@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2088 # User-facing test descriptions intentionally use ~ notation.
 # Sensitive Path Protection Tests
 # Verifies that credential and secret paths are blocked by default
 
@@ -6,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
 
 echo ""
-echo -e "${BLUE}=== Sensitive Path Protection Tests ===${NC}"
+echo -e "${BLUE}Sensitive Path Protection Tests${NC}"
 
 verify_nono_binary
 if ! require_working_sandbox "sensitive path suite"; then
@@ -23,11 +24,9 @@ echo "Testing sensitive path protection..."
 echo "(These tests verify paths are blocked even with broad grants)"
 echo ""
 
-# =============================================================================
 # SSH Keys
-# =============================================================================
 
-echo "--- SSH Keys ---"
+echo "SSH Keys"
 
 if [[ -d ~/.ssh ]]; then
     expect_failure "~/.ssh directory blocked with ~ grant" \
@@ -46,12 +45,10 @@ else
     skip_test "SSH directory tests" "~/.ssh not found"
 fi
 
-# =============================================================================
 # Cloud Credentials
-# =============================================================================
 
 echo ""
-echo "--- Cloud Credentials ---"
+echo "Cloud Credentials"
 
 if [[ -d ~/.aws ]]; then
     expect_failure "~/.aws directory blocked" \
@@ -104,12 +101,10 @@ else
     skip_test "GCP credentials test" "~/.gcloud not found"
 fi
 
-# =============================================================================
 # Shell Configurations
-# =============================================================================
 
 echo ""
-echo "--- Shell Configurations ---"
+echo "Shell Configurations"
 
 if [[ -f ~/.zshrc ]]; then
     expect_failure "~/.zshrc blocked" \
@@ -153,12 +148,10 @@ else
     skip_test "envrc test" "~/.envrc not found"
 fi
 
-# =============================================================================
 # Password Managers & GPG
-# =============================================================================
 
 echo ""
-echo "--- Password Managers & GPG ---"
+echo "Password Managers & GPG"
 
 if [[ -d ~/.gnupg ]]; then
     expect_failure "~/.gnupg directory blocked" \
@@ -174,12 +167,10 @@ else
     skip_test "password-store test" "~/.password-store not found"
 fi
 
-# =============================================================================
 # History Files
-# =============================================================================
 
 echo ""
-echo "--- History Files ---"
+echo "History Files"
 
 if [[ -f ~/.zsh_history ]]; then
     expect_failure "~/.zsh_history blocked" \
@@ -195,12 +186,10 @@ else
     skip_test "bash_history test" "~/.bash_history not found"
 fi
 
-# =============================================================================
 # macOS Specific
-# =============================================================================
 
 echo ""
-echo "--- macOS Specific ---"
+echo "macOS Specific"
 
 if is_macos; then
     if [[ -d ~/Library/Keychains ]]; then
@@ -229,12 +218,10 @@ else
     skip_test "Chrome profile test" "not macOS"
 fi
 
-# =============================================================================
 # Explicit Grant Override
-# =============================================================================
 
 echo ""
-echo "--- Explicit Grant Override ---"
+echo "Explicit Grant Override"
 
 # Sensitive paths remain denied even if explicitly granted by CLI flags.
 # Note: These tests use --allow /tmp which triggers Landlock EBADFD on Linux CI containers.
@@ -255,12 +242,10 @@ else
     fi
 fi
 
-# =============================================================================
 # Internal State Protection
-# =============================================================================
 
 echo ""
-echo "--- Internal State Protection ---"
+echo "Internal State Protection"
 
 expect_output_contains "--allow ~ is rejected when it overlaps protected nono state" \
     "overlaps protected nono state root" \
@@ -270,12 +255,10 @@ expect_output_contains "explicit ~/.nono subtree grant is rejected" \
     "overlaps protected nono state root" \
     "$NONO_BIN" run --allow "$HOME/.nono/rollbacks" -- true
 
-# =============================================================================
 # Path Collision Bypass Prevention (Security Regression Tests)
-# =============================================================================
 
 echo ""
-echo "--- Path Collision Bypass Prevention ---"
+echo "Path Collision Bypass Prevention"
 echo "(These tests verify the fix for string-based starts_with vulnerability)"
 echo ""
 
@@ -323,8 +306,6 @@ fi
 expect_success "collision directory itself is readable when granted" \
     "$NONO_BIN" run --read "$COLLISION_DIR_SSH" --allow "$TMPDIR" -- cat "$COLLISION_DIR_SSH/fake"
 
-# =============================================================================
 # Summary
-# =============================================================================
 
 print_summary

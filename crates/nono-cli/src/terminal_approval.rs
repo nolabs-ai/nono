@@ -4,8 +4,7 @@
 //! additional filesystem access. This is the default approval backend
 //! for `nono run`.
 
-use nono::{AccessMode, ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result};
-use std::io::{BufRead, IsTerminal, Write};
+use nono::{AccessMode, ApprovalBackend, ApprovalDecision, ApprovalRequest, Result};
 
 /// Interactive terminal approval backend.
 ///
@@ -17,8 +16,9 @@ pub struct TerminalApproval;
 
 impl ApprovalBackend for TerminalApproval {
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
-        let stderr = std::io::stderr();
-        if !stderr.is_terminal() {
+        // Check the controlling terminal itself, in the same read/write mode
+        // used to prompt, so we don't print a prompt we cannot safely answer.
+        if !crate::terminal_prompt::consent_prompt_available() {
             return Ok(ApprovalDecision::Denied {
                 reason: "No terminal available for interactive approval".to_string(),
             });
@@ -65,7 +65,7 @@ impl ApprovalBackend for TerminalApproval {
                 reason,
                 ..
             } => {
-                eprintln!("[nono] tool-sandbox command launch requires approval:");
+                eprintln!("[nono] command-policy launch requires approval:");
                 eprintln!("[nono]   Command: {}", sanitize_for_terminal(command));
                 let display_args: Vec<String> = args
                     .iter()
@@ -110,33 +110,21 @@ impl ApprovalBackend for TerminalApproval {
         // suppresses re-prompting for the rest of the session. Every other
         // request type keeps the one-shot [y/N] prompt.
         let is_network = matches!(request, ApprovalRequest::Network { .. });
-        if is_network {
+        let prompt = if is_network {
             eprintln!("[nono]   1) Allow once");
             eprintln!("[nono]   2) Always allow (this session)");
             eprintln!("[nono]   3) Deny once");
             eprintln!("[nono]   4) Always deny (this session)");
-            eprint!("[nono] Choose [1-4, default 3]: ");
+            "[nono] Choose [1-4, default 3]: "
         } else {
-            eprint!("[nono] Grant access? [y/N] ");
-        }
-        let _ = std::io::stderr().flush();
-
-        // Read from /dev/tty, not stdin (which belongs to the sandboxed child)
-        let tty = std::fs::File::open("/dev/tty").map_err(|e| {
-            NonoError::SandboxInit(format!("Failed to open /dev/tty for approval prompt: {e}"))
-        })?;
-        let mut reader = std::io::BufReader::new(tty);
-        let mut input = String::new();
-        reader.read_line(&mut input).map_err(|e| {
-            NonoError::SandboxInit(format!("Failed to read approval response: {e}"))
-        })?;
-
-        let input = input.trim().to_lowercase();
+            "[nono] Grant access? [y/N] "
+        };
+        let input = crate::terminal_prompt::read_consent_line(prompt)?;
 
         if is_network {
             // Fail secure: an empty line (EOF), whitespace, or any unrecognized
             // answer denies this one request without persisting the decision.
-            match input.as_str() {
+            match input.trim().to_ascii_lowercase().as_str() {
                 "1" | "y" | "yes" => {
                     eprintln!("[nono] Access granted.");
                     Ok(ApprovalDecision::Granted)
@@ -156,7 +144,7 @@ impl ApprovalBackend for TerminalApproval {
                     })
                 }
             }
-        } else if input == "y" || input == "yes" {
+        } else if is_affirmative_response(&input) {
             eprintln!("[nono] Access granted.");
             Ok(ApprovalDecision::Granted)
         } else {
@@ -170,6 +158,10 @@ impl ApprovalBackend for TerminalApproval {
     fn backend_name(&self) -> &str {
         "terminal"
     }
+}
+
+fn is_affirmative_response(response: &str) -> bool {
+    matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Strip control characters and ANSI escape sequences from untrusted input
@@ -236,6 +228,7 @@ fn format_access_mode(access: &AccessMode) -> &'static str {
 mod tests {
     use super::*;
     use nono::{AccessMode, ApprovalRequest};
+    use std::io::IsTerminal;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -296,6 +289,15 @@ mod tests {
     fn test_terminal_approval_backend_name() {
         let backend = TerminalApproval;
         assert_eq!(backend.backend_name(), "terminal");
+    }
+
+    #[test]
+    fn terminal_approval_requires_explicit_yes() {
+        assert!(is_affirmative_response("y"));
+        assert!(is_affirmative_response(" YES \n"));
+        assert!(!is_affirmative_response(""));
+        assert!(!is_affirmative_response("n"));
+        assert!(!is_affirmative_response("anything else"));
     }
 
     // ── non-TTY auto-deny (all three variants) ────────────────────────────────
@@ -424,7 +426,7 @@ mod tests {
 
     #[test]
     fn sanitize_caller_strips_control_chars() {
-        // Caller name from tool-sandbox IPC — must not contain control characters
+        // Caller name from command-mediation IPC — must not contain control characters
         let malicious_caller = "session\x01\x02\x03injected";
         let sanitized = sanitize_for_terminal(malicious_caller);
         assert!(!sanitized.chars().any(|c| c.is_control()));

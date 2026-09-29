@@ -23,8 +23,6 @@ mod config;
 #[cfg(unix)]
 mod connect_client;
 mod credential_runtime;
-mod deprecated_policy;
-mod deprecated_schema;
 mod deprecation_warnings;
 mod diagnostic;
 mod exec_strategy;
@@ -34,7 +32,6 @@ mod hook_runtime;
 mod instruction_deny;
 mod jsonc;
 mod launch_runtime;
-mod legacy_cleanup;
 #[cfg(target_os = "linux")]
 mod lineage_cgroup;
 #[cfg(target_os = "macos")]
@@ -78,7 +75,9 @@ mod startup_prompt;
 mod startup_runtime;
 mod state_paths;
 mod supervised_runtime;
+mod temp_keepalive;
 mod terminal_approval;
+mod terminal_prompt;
 mod theme;
 mod timeouts;
 #[path = "tool-sandbox/mod.rs"]
@@ -98,10 +97,7 @@ mod test_env;
 use app_runtime::run as run_cli;
 use clap::Parser;
 use cli::Cli;
-use cli_bootstrap::{
-    collect_legacy_network_warnings, init_theme, init_tracing, normalize_legacy_flag_env_vars,
-    print_legacy_network_warnings,
-};
+use cli_bootstrap::{init_theme, init_tracing};
 use command_blocking_deprecation::{
     collect_cli_warnings, print_warnings as print_deprecation_warnings,
 };
@@ -119,18 +115,9 @@ fn main() {
     }
     tool_sandbox::record_main_start();
 
-    let os_args: Vec<_> = std::env::args_os().collect();
-
-    let legacy_network_warnings = collect_legacy_network_warnings(&os_args);
-    normalize_legacy_flag_env_vars();
-    // Emit one deprecation warning per distinct legacy long flag before clap
-    // parses. clap's `alias` rebinds `--override-deny` to `--bypass-protection`
-    // silently; without this scan the user would never see a removal notice.
-    deprecated_schema::warn_for_deprecated_flags(&os_args);
     let cli = Cli::parse();
     init_tracing(&cli);
     init_theme(&cli);
-    print_legacy_network_warnings(&legacy_network_warnings, cli.silent);
     let command_blocking_warnings = collect_cli_warnings(&cli);
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 

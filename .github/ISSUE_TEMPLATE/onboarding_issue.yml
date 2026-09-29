@@ -1,6 +1,6 @@
 name: Onboarding / setup issue
 description: You couldn't get nono installed or running for the first time
-labels: ["onboarding", "triage"]
+labels: ["onboarding"]
 body:
   - type: markdown
     attributes:

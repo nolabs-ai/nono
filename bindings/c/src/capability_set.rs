@@ -165,6 +165,50 @@ pub unsafe extern "C" fn nono_capability_set_set_network_blocked(
     NonoErrorCode::Ok
 }
 
+/// Disable the implicit macOS DNS resolver grants in blocked and proxy-only modes.
+///
+/// Does not change the network mode or revoke explicit socket, localhost, proxy,
+/// or platform-rule grants. Has no enforcement effect on Linux or in allow-all
+/// mode, and is not a general DNS filter. The setting survives network-mode
+/// changes and sandbox-state serialization.
+///
+/// Returns `Ok` on success, or `ErrInvalidArg` if `caps` is NULL.
+///
+/// # Safety
+///
+/// `caps` must be a valid pointer from `nono_capability_set_new()` or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nono_capability_set_block_dns(
+    caps: *mut NonoCapabilitySet,
+) -> NonoErrorCode {
+    if caps.is_null() {
+        set_last_error("caps pointer is NULL");
+        return NonoErrorCode::ErrInvalidArg;
+    }
+    // SAFETY: The caller guarantees a valid pointer, and NULL was checked above.
+    let caps = unsafe { &mut *caps };
+    caps.inner = std::mem::take(&mut caps.inner).block_dns();
+    NonoErrorCode::Ok
+}
+
+/// Whether implicit macOS DNS resolver grants are enabled (the default).
+///
+/// This queries the capability setting, not whether DNS is reachable under the
+/// effective sandbox policy. Returns false if `caps` is NULL.
+///
+/// # Safety
+///
+/// `caps` must be a valid pointer or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nono_capability_set_dns_enabled(caps: *const NonoCapabilitySet) -> bool {
+    if caps.is_null() {
+        return false;
+    }
+    // SAFETY: The caller guarantees a valid pointer, and NULL was checked above.
+    let caps = unsafe { &*caps };
+    caps.inner.dns_enabled()
+}
+
 /// Set the network mode.
 ///
 /// Use `NONO_NETWORK_MODE_BLOCKED`, `NONO_NETWORK_MODE_ALLOW_ALL`, or
@@ -475,6 +519,50 @@ mod tests {
         unsafe {
             let rc = nono_capability_set_set_network_blocked(std::ptr::null_mut(), true);
             assert_eq!(rc, NonoErrorCode::ErrInvalidArg);
+        }
+    }
+
+    #[test]
+    fn test_dns_blocking_preserves_network_mode_and_grants() {
+        let caps = nono_capability_set_new();
+        // SAFETY: caps is a live allocation from nono_capability_set_new().
+        unsafe {
+            assert!(nono_capability_set_dns_enabled(caps));
+            assert_eq!(
+                nono_capability_set_set_proxy_port(caps, 8080),
+                NonoErrorCode::Ok
+            );
+            assert_eq!(
+                nono_capability_set_allow_path(
+                    caps,
+                    c"/tmp".as_ptr(),
+                    crate::types::NONO_ACCESS_MODE_READ
+                ),
+                NonoErrorCode::Ok
+            );
+            assert_eq!(nono_capability_set_block_dns(caps), NonoErrorCode::Ok);
+            assert!(!nono_capability_set_dns_enabled(caps));
+            assert_eq!(nono_capability_set_proxy_port(caps), 8080);
+            assert_eq!((*caps).inner.fs_capabilities().len(), 1);
+            assert_eq!(nono_capability_set_block_dns(caps), NonoErrorCode::Ok);
+            assert_eq!(
+                nono_capability_set_set_network_blocked(caps, true),
+                NonoErrorCode::Ok
+            );
+            assert!(!nono_capability_set_dns_enabled(caps));
+            nono_capability_set_free(caps);
+        }
+    }
+
+    #[test]
+    fn test_dns_null_safe() {
+        // SAFETY: Both functions explicitly accept NULL.
+        unsafe {
+            assert_eq!(
+                nono_capability_set_block_dns(std::ptr::null_mut()),
+                NonoErrorCode::ErrInvalidArg
+            );
+            assert!(!nono_capability_set_dns_enabled(std::ptr::null()));
         }
     }
 

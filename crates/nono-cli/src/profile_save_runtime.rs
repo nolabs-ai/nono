@@ -2,13 +2,14 @@ use crate::command_display::format_command_line;
 use crate::diagnostic::{ErrorObservation, PolicyExplanation};
 use crate::exec_strategy::ProfileSaveOffer;
 use crate::theme;
-use crate::{profile, query_ext};
+use crate::{profile, protected_paths, query_ext};
 use colored::Colorize;
 use nono::SandboxViolation;
 use nono::{AccessMode, CapabilitySet, NonoError, Result, UrlDenialReason, UrlDenialRecord};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Clone, Copy)]
 pub(crate) enum SaveAction {
@@ -133,6 +134,7 @@ enum DenialItem {
 }
 
 const DENIAL_SELECTOR_MAX_VISIBLE_ITEMS: usize = 15;
+const DENIAL_SELECTOR_INPUT_DELAY: Duration = Duration::from_secs(1);
 
 fn denial_selector_visible_range(
     item_count: usize,
@@ -158,6 +160,7 @@ fn denial_selector_visible_range(
 fn extract_denial_items(patch: &profile::Profile) -> Vec<DenialItem> {
     let mut items = Vec::new();
     let fs = &patch.filesystem;
+    let protected_roots = protected_paths::ProtectedRoots::from_defaults().ok();
 
     let sections: &[(&[String], ProfileSection)] = &[
         (&fs.allow, ProfileSection::Allow),
@@ -170,6 +173,24 @@ fn extract_denial_items(patch: &profile::Profile) -> Vec<DenialItem> {
 
     for (paths, section) in sections {
         for path in *paths {
+            let is_file = matches!(
+                section,
+                ProfileSection::AllowFile | ProfileSection::ReadFile | ProfileSection::WriteFile
+            );
+            let overlaps_protected_root = protected_roots.as_ref().is_none_or(|roots| {
+                profile::expand_vars(path, Path::new("."))
+                    .ok()
+                    .is_none_or(|expanded| {
+                        protected_paths::profile_save_target_overlaps_protected_root(
+                            &expanded,
+                            is_file,
+                            roots.as_paths(),
+                        )
+                    })
+            });
+            if overlaps_protected_root {
+                continue;
+            }
             let is_bypass = fs.bypass_protection.contains(path);
             items.push(DenialItem::Fs {
                 path: path.clone(),
@@ -225,9 +246,15 @@ pub(crate) fn terminal_prompts_available() -> bool {
     ) {
         return false;
     }
-    std::io::stdin().is_terminal()
-        || std::io::stderr().is_terminal()
-        || std::fs::File::open("/dev/tty").is_ok()
+    // stdin/stderr being a tty doesn't mean we have a controlling terminal
+    // (e.g. a new session can inherit a tty stdin with none). Check /dev/tty
+    // directly, in the same read+write mode the prompt itself needs, so we
+    // don't promise a prompt we can't open later.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .is_ok()
 }
 
 pub(crate) fn offer_save_run_profile(offer: &ProfileSaveOffer<'_>) -> Result<()> {
@@ -1087,13 +1114,76 @@ pub(crate) fn configure_prompt_termios(termios: &mut nix::sys::termios::Termios)
 
 // ─── Raw terminal mode for interactive selector ───────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Key {
     Up,
     Down,
     Space,
     Enter,
     CtrlC,
+    CtrlD,
+    Esc,
     Char(char),
+    /// An input sequence the selector does not act on (left/right arrows,
+    /// Home/End, function keys, Alt-modified keys, mouse reports).
+    Unknown,
+}
+
+fn decode_plain_byte(byte: u8) -> Key {
+    match byte {
+        b' ' => Key::Space,
+        b'\r' | b'\n' => Key::Enter,
+        0x03 => Key::CtrlC,
+        0x04 => Key::CtrlD,
+        c => Key::Char(c as char),
+    }
+}
+
+/// Decode an escape sequence after its leading `ESC` byte.
+///
+/// `reader` must be in a short-timeout mode, where a zero-byte read means
+/// nothing more arrived; that is what distinguishes a bare Esc keypress from
+/// the start of a sequence.
+fn decode_escape_sequence<R: std::io::Read>(reader: &mut R) -> Key {
+    let Some(second) = read_one(reader) else {
+        // Nothing followed: a bare Esc.
+        return Key::Esc;
+    };
+
+    match second {
+        // CSI and SS3 introducers.
+        b'[' | b'O' => match read_csi_final_byte(reader) {
+            Some(b'A') => Key::Up,
+            Some(b'B') => Key::Down,
+            _ => Key::Unknown,
+        },
+        // `ESC <char>` is Alt+<char>.
+        _ => Key::Unknown,
+    }
+}
+
+/// Consume a CSI/SS3 body and return its final byte, skipping parameter and
+/// intermediate bytes so sequences like `ESC [ 1 ; 5 C` are swallowed whole
+/// rather than leaving a tail to be misread as further keypresses.
+fn read_csi_final_byte<R: std::io::Read>(reader: &mut R) -> Option<u8> {
+    // Bounded so a malformed sequence cannot spin forever.
+    const MAX_SEQUENCE_BYTES: usize = 32;
+    for _ in 0..MAX_SEQUENCE_BYTES {
+        let byte = read_one(reader)?;
+        if (0x40..=0x7e).contains(&byte) {
+            return Some(byte);
+        }
+    }
+    None
+}
+
+/// Read one byte, treating a timeout, EOF, or error as "no byte".
+fn read_one<R: std::io::Read>(reader: &mut R) -> Option<u8> {
+    let mut buf = [0u8; 1];
+    match reader.read(&mut buf) {
+        Ok(1) => Some(buf[0]),
+        _ => None,
+    }
 }
 
 struct RawTtyGuard {
@@ -1119,38 +1209,23 @@ impl RawTtyGuard {
         self.tty
             .read_exact(&mut buf)
             .map_err(|e| NonoError::LearnError(format!("tty read: {e}")))?;
-        match buf[0] {
-            0x1b => {
-                // Switch to short-timeout non-blocking to detect escape sequences
-                self.set_vmin_vtime(0, 1)?;
-                let key = self.try_read_escape_sequence();
-                let _ = self.set_vmin_vtime(1, 0);
-                key
-            }
-            b' ' => Ok(Key::Space),
-            b'\r' | b'\n' => Ok(Key::Enter),
-            0x03 => Ok(Key::CtrlC),
-            c => Ok(Key::Char(c as char)),
+        if buf[0] != 0x1b {
+            return Ok(decode_plain_byte(buf[0]));
         }
+        // Short-timeout non-blocking, so a bare Esc is distinguishable from
+        // the start of an escape sequence.
+        self.set_vmin_vtime(0, 1)?;
+        let key = decode_escape_sequence(&mut self.tty);
+        let _ = self.set_vmin_vtime(1, 0);
+        Ok(key)
     }
 
-    fn try_read_escape_sequence(&mut self) -> Result<Key> {
-        use std::io::Read;
-        let mut buf = [0u8; 1];
-        if self.tty.read(&mut buf).unwrap_or(0) == 0 {
-            return Ok(Key::Char('\x1b'));
-        }
-        if buf[0] != b'[' {
-            return Ok(Key::Char('\x1b'));
-        }
-        if self.tty.read(&mut buf).unwrap_or(0) == 0 {
-            return Ok(Key::Char('\x1b'));
-        }
-        Ok(match buf[0] {
-            b'A' => Key::Up,
-            b'B' => Key::Down,
-            _ => Key::Char('\x1b'),
-        })
+    /// Wait for the selector's input guard, then discard any type-ahead that
+    /// arrived before the operator had time to read the prompt.
+    fn arm_input_after(&self, delay: Duration) -> Result<()> {
+        std::thread::sleep(delay);
+        nix::sys::termios::tcflush(&self.tty, nix::sys::termios::FlushArg::TCIFLUSH)
+            .map_err(|e| NonoError::LearnError(format!("tcflush: {e}")))
     }
 
     fn set_vmin_vtime(&self, vmin: u8, vtime: u8) -> Result<()> {
@@ -1194,6 +1269,7 @@ fn render_denial_selector(
     cursor: usize,
     line_count: &mut usize,
     first_render: bool,
+    input_armed: bool,
 ) -> Result<()> {
     if !first_render && *line_count > 0 {
         write!(tty, "\x1b[{}A", line_count)
@@ -1233,11 +1309,18 @@ fn render_denial_selector(
             theme::fg(" [nono] Review denied paths", t.brand).bold()
         );
     }
-    tty_ln!(
-        "  {}",
-        "↑/↓ move  ·  Space cycle  ·  a grant-all  ·  d deny-all  ·  Enter confirm  ·  Esc cancel"
-            .dimmed()
-    );
+    if input_armed {
+        tty_ln!(
+            "  {}",
+            "↑/↓ move  ·  Space cycle  ·  a grant-all  ·  d deny-all  ·  Enter confirm  ·  Esc cancel"
+                .dimmed()
+        );
+    } else {
+        tty_ln!(
+            "  {}",
+            "Input enables in 1 second · early keys ignored".dimmed()
+        );
+    }
     tty_ln!("");
 
     for (offset, item) in items[start..end].iter().enumerate() {
@@ -1380,11 +1463,13 @@ fn interactive_denial_selector(patch: &profile::Profile) -> Result<Option<Vec<De
 
     let mut cursor: usize = 0;
     let mut line_count: usize = 0;
-    let mut first_render = true;
+    let mut cancelled = false;
+
+    render_denial_selector(&mut raw.tty, &items, cursor, &mut line_count, true, false)?;
+    raw.arm_input_after(DENIAL_SELECTOR_INPUT_DELAY)?;
 
     loop {
-        render_denial_selector(&mut raw.tty, &items, cursor, &mut line_count, first_render)?;
-        first_render = false;
+        render_denial_selector(&mut raw.tty, &items, cursor, &mut line_count, false, true)?;
 
         match raw.read_key()? {
             Key::Up => {
@@ -1436,21 +1521,44 @@ fn interactive_denial_selector(patch: &profile::Profile) -> Result<Option<Vec<De
                 }
             }
             Key::Enter => break,
-            Key::CtrlC | Key::Char('\x1b') => {
+            Key::CtrlC | Key::CtrlD | Key::Esc => {
                 for item in &mut items {
                     match item {
                         DenialItem::Fs { action, .. } => *action = ItemAction::Skip,
                         DenialItem::Url { action, .. } => *action = UrlItemAction::Skip,
                     }
                 }
+                cancelled = true;
                 break;
             }
-            Key::Char(_) => {}
+            // Ignored, so a stray keypress cannot discard the review.
+            Key::Char(_) | Key::Unknown => {}
         }
     }
 
     erase_selector(&mut raw.tty, line_count)?;
+    if cancelled {
+        print_selector_cancelled_hint(&mut raw.tty);
+    }
     Ok(Some(items))
+}
+
+/// Report that nothing was saved and how to bring the review back. Written to
+/// the selector's tty, so the hint survives stdout or stderr redirection.
+fn print_selector_cancelled_hint(tty: &mut std::fs::File) {
+    let t = theme::current();
+    let _ = writeln!(
+        tty,
+        "\r{} {}",
+        theme::fg(" [nono]", t.brand).bold(),
+        "Review cancelled - no profile changes were saved.".dimmed()
+    );
+    let _ = writeln!(
+        tty,
+        "\r        {}",
+        "Re-run the same command to review the denied paths again.".dimmed()
+    );
+    let _ = tty.flush();
 }
 
 // ─── Build patch from per-item decisions ──────────────────────────────────
@@ -1635,6 +1743,7 @@ fn build_run_profile_patch(
     ignored_denial_paths: &[PathBuf],
 ) -> Result<Option<profile::Profile>> {
     let mut grants: BTreeMap<PathBuf, PatchGrant> = BTreeMap::new();
+    let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
 
     for explanation in policy_explanations {
         add_patch_grant(
@@ -1643,6 +1752,7 @@ fn build_run_profile_patch(
             explanation.access,
             &explanation.reason,
             ignored_denial_paths,
+            protected_roots.as_paths(),
         );
     }
 
@@ -1660,6 +1770,7 @@ fn build_run_profile_patch(
                     hint.access,
                     &reason,
                     ignored_denial_paths,
+                    protected_roots.as_paths(),
                 );
             }
             _ => {}
@@ -1796,6 +1907,7 @@ fn add_patch_grant(
     access: AccessMode,
     reason: &str,
     ignored_denial_paths: &[PathBuf],
+    protected_roots: &[PathBuf],
 ) {
     let (flag, target) = query_ext::suggested_flag_parts(path, access);
     if !ignored_denial_paths.is_empty()
@@ -1806,6 +1918,13 @@ fn add_patch_grant(
     }
 
     let is_file = matches!(flag, "--read-file" | "--write-file" | "--allow-file");
+    if protected_paths::profile_save_target_overlaps_protected_root(
+        &target,
+        is_file,
+        protected_roots,
+    ) {
+        return;
+    }
 
     match grants.get_mut(&target) {
         Some(existing) => {
@@ -2073,6 +2192,106 @@ mod tests {
         .expect("build patch");
 
         assert!(patch.is_none());
+    }
+
+    #[test]
+    fn build_run_profile_patch_omits_protected_root_denial() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let state_home = temp_home.path().join("state");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            ("XDG_STATE_HOME", state_home.to_str().expect("state path")),
+        ]);
+
+        let protected = temp_home.path().join(".nono");
+        std::fs::create_dir_all(&protected).expect("mkdir");
+        let explanation = PolicyExplanation {
+            path: protected,
+            access: AccessMode::Read,
+            reason: "path_not_granted".to_string(),
+        };
+
+        let patch = build_run_profile_patch(
+            &[explanation],
+            &ErrorObservation::default(),
+            &CapabilitySet::new(),
+            &[],
+            &[],
+        )
+        .expect("build patch");
+
+        assert!(patch.is_none());
+    }
+
+    #[test]
+    fn build_run_profile_patch_omits_xdg_protected_root_denial() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let state_home = temp_home.path().join("state");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            ("XDG_STATE_HOME", state_home.to_str().expect("state path")),
+        ]);
+
+        let protected = state_home.join("nono");
+        std::fs::create_dir_all(&protected).expect("mkdir");
+        let explanation = PolicyExplanation {
+            path: protected,
+            access: AccessMode::Read,
+            reason: "path_not_granted".to_string(),
+        };
+
+        let patch = build_run_profile_patch(
+            &[explanation],
+            &ErrorObservation::default(),
+            &CapabilitySet::new(),
+            &[],
+            &[],
+        )
+        .expect("build patch");
+
+        assert!(patch.is_none());
+    }
+
+    #[test]
+    fn build_run_profile_patch_omits_protected_root_ancestor_but_keeps_valid_denial() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let state_home = temp_home.path().join("state");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            ("XDG_STATE_HOME", state_home.to_str().expect("state path")),
+        ]);
+
+        let valid = temp_home.path().join("project");
+        std::fs::create_dir_all(&valid).expect("mkdir");
+        let denials = vec![
+            PolicyExplanation {
+                path: temp_home.path().to_path_buf(),
+                access: AccessMode::Read,
+                reason: "path_not_granted".to_string(),
+            },
+            PolicyExplanation {
+                path: valid,
+                access: AccessMode::Read,
+                reason: "path_not_granted".to_string(),
+            },
+        ];
+
+        let patch = build_run_profile_patch(
+            &denials,
+            &ErrorObservation::default(),
+            &CapabilitySet::new(),
+            &[],
+            &[],
+        )
+        .expect("build patch")
+        .expect("valid denial remains");
+
+        assert_eq!(patch.filesystem.read, vec!["~/project"]);
+        assert!(patch.filesystem.bypass_protection.is_empty());
+        assert!(patch.filesystem.suppress_save_prompt.is_empty());
     }
 
     #[test]
@@ -2948,5 +3167,114 @@ mod tests {
         let urls = base.open_urls.expect("open_urls preserved");
         assert_eq!(urls.allow_origins, vec!["https://keep.example.com"]);
         assert!(urls.allow_localhost);
+    }
+
+    // ─── Interactive selector key decoding ────────────────────────────────
+
+    /// Decode a byte sequence the way `read_key` does. An exhausted buffer
+    /// stands in for the tty's VTIME timeout.
+    fn decode(bytes: &[u8]) -> Key {
+        let (first, rest) = bytes.split_first().expect("non-empty input");
+        if *first == 0x1b {
+            decode_escape_sequence(&mut std::io::Cursor::new(rest))
+        } else {
+            decode_plain_byte(*first)
+        }
+    }
+
+    #[test]
+    fn bare_esc_decodes_as_cancel() {
+        assert_eq!(decode(b"\x1b"), Key::Esc);
+    }
+
+    #[test]
+    fn up_and_down_arrows_still_decode() {
+        assert_eq!(decode(b"\x1b[A"), Key::Up);
+        assert_eq!(decode(b"\x1b[B"), Key::Down);
+        // SS3 form emitted by some terminals in application cursor mode.
+        assert_eq!(decode(b"\x1bOA"), Key::Up);
+        assert_eq!(decode(b"\x1bOB"), Key::Down);
+    }
+
+    #[test]
+    fn unhandled_escape_sequences_are_not_cancel() {
+        // Issue #1845: right arrow used to decode as Esc and close the menu.
+        for seq in [
+            &b"\x1b[C"[..],    // right arrow
+            &b"\x1b[D"[..],    // left arrow
+            &b"\x1b[H"[..],    // home
+            &b"\x1b[F"[..],    // end
+            &b"\x1b[5~"[..],   // page up
+            &b"\x1b[6~"[..],   // page down
+            &b"\x1b[1;5C"[..], // ctrl+right
+            &b"\x1b[200~"[..], // bracketed paste start
+            &b"\x1bOP"[..],    // F1 (SS3)
+            &b"\x1bx"[..],     // alt+x
+        ] {
+            assert_eq!(
+                decode(seq),
+                Key::Unknown,
+                "sequence {seq:?} must be ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_byte_sequence_is_consumed_whole() {
+        // Ctrl+Right then Enter: only the Enter may be left to read.
+        let mut input = std::io::Cursor::new(&b"[1;5C\r"[..]);
+        assert_eq!(decode_escape_sequence(&mut input), Key::Unknown);
+
+        let mut remaining = Vec::new();
+        std::io::Read::read_to_end(&mut input, &mut remaining).expect("read remainder");
+        assert_eq!(remaining, b"\r");
+    }
+
+    #[test]
+    fn malformed_escape_sequence_terminates() {
+        // No final byte ever arrives; the scan must stop.
+        let mut input = std::io::Cursor::new(vec![b';'; 4096]);
+        assert_eq!(
+            decode_escape_sequence_with_introducer(&mut input),
+            Key::Unknown
+        );
+    }
+
+    fn decode_escape_sequence_with_introducer<R: std::io::Read>(reader: &mut R) -> Key {
+        decode_escape_sequence(&mut std::io::Read::chain(&b"["[..], reader))
+    }
+
+    #[test]
+    fn control_keys_decode_as_cancel_or_confirm() {
+        assert_eq!(decode(b"\x03"), Key::CtrlC);
+        assert_eq!(decode(b"\x04"), Key::CtrlD);
+        assert_eq!(decode(b"\r"), Key::Enter);
+        assert_eq!(decode(b"\n"), Key::Enter);
+        assert_eq!(decode(b" "), Key::Space);
+        assert_eq!(decode(b"a"), Key::Char('a'));
+    }
+
+    #[test]
+    fn input_guard_discards_queued_keys_before_arming() {
+        use nix::pty::{OpenptyResult, openpty};
+
+        let OpenptyResult { master, slave } = openpty(None, None).expect("openpty");
+        let saved = nix::sys::termios::tcgetattr(&slave).expect("tcgetattr");
+        let mut raw_termios = saved.clone();
+        configure_raw_termios(&mut raw_termios);
+        nix::sys::termios::tcsetattr(&slave, nix::sys::termios::SetArg::TCSANOW, &raw_termios)
+            .expect("tcsetattr");
+
+        nix::unistd::write(&master, b"\r").expect("queue early Enter");
+        let mut guard = RawTtyGuard {
+            tty: std::fs::File::from(slave),
+            saved,
+        };
+        guard
+            .arm_input_after(Duration::ZERO)
+            .expect("arm selector input");
+
+        nix::unistd::write(&master, b"d").expect("write key after arming");
+        assert_eq!(guard.read_key().expect("read key"), Key::Char('d'));
     }
 }

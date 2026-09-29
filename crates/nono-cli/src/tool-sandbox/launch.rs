@@ -52,7 +52,7 @@ pub(crate) fn write_launch_spec(
     let path = unique_runtime_path(runtime_dir, "launch", "json");
     let json = serde_json::to_vec(spec).map_err(|err| {
         NonoError::ConfigParse(format!(
-            "failed to serialize tool-sandbox launch spec: {err}"
+            "failed to serialize command-mediation launch spec: {err}"
         ))
     })?;
     let mut file = OpenOptions::new()

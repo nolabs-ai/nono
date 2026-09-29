@@ -371,7 +371,7 @@ async fn handle_h2_stream(
         ctx.managed_auth.as_ref().map(|auth| match auth.as_ref() {
             crate::auth::ManagedUpstreamAuth::SpiffeJwt(src) => src.inject_header.to_lowercase(),
         });
-    // Resolve tool-sandbox broker nonces (`nono_<64hex>`) in forwarded header
+    // Resolve command-mediation broker nonces (`nono_<64hex>`) in forwarded header
     // values, mirroring the HTTP/1.1 path. Without this, an h2/gRPC request that
     // carries a broker nonce in a header would forward the raw nonce upstream
     // instead of the resolved credential.
@@ -2064,7 +2064,7 @@ mod tests {
                 env_var: None,
                 endpoint_rules: vec![EndpointRule {
                     method: "*".to_string(),
-                    path: "/v1/*".to_string(),
+                    path: "/v1/**".to_string(),
                 }],
                 tls_ca: None,
                 tls_client_cert: None,
@@ -2091,7 +2091,7 @@ mod tests {
                 env_var: None,
                 endpoint_rules: vec![EndpointRule {
                     method: "*".to_string(),
-                    path: "/v1/*".to_string(),
+                    path: "/v1/**".to_string(),
                 }],
                 tls_ca: None,
                 tls_client_cert: None,

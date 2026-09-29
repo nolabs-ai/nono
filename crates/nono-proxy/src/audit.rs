@@ -63,6 +63,25 @@ pub fn new_audit_log() -> SharedAuditLog {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+/// Clone the collected events without clearing the log.
+///
+/// Used for read-only views (e.g. the end-of-session diagnostic footer)
+/// taken before the session finalizer performs the destructive
+/// [`drain_audit_events`] that feeds the persistent audit record.
+#[must_use]
+pub fn snapshot_audit_events(audit_log: &SharedAuditLog) -> Vec<NetworkAuditEvent> {
+    match audit_log.lock() {
+        Ok(events) => events.clone(),
+        Err(e) => {
+            warn!(
+                "Network audit log mutex poisoned while snapshotting events: {}",
+                e
+            );
+            Vec::new()
+        }
+    }
+}
+
 #[must_use]
 pub fn drain_audit_events(audit_log: &SharedAuditLog) -> Vec<NetworkAuditEvent> {
     match audit_log.lock() {

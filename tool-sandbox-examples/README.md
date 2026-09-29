@@ -1,4 +1,4 @@
-# nono Tool-Sandbox Demo Package
+# nono Sandboxed Tool Execution Demos
 
 This package contains practical demos for nono command policy, brokered
 credentials, endpoint policy, local approval policy, and approval webhooks.
@@ -17,6 +17,7 @@ github-cli/                    GitHub CLI credential and policy demo
 kubernetes/                    kubectl credential and policy demo
 kubernetes-with-approval/      kubectl demo variant with approval webhook
 npm/                           npm env-var credential-brokering demo
+docker-tool-sandbox/           Docker plus nono command-policy prototype
 ```
 
 Each demo directory has its own README with full setup and troubleshooting.
@@ -51,6 +52,16 @@ kubectl version --client
 
 The AWS CLI, git-ssh, and npm demos also need `aws`, `git`/`ssh`, and `npm`
 respectively.
+
+The Docker command-policy prototype also needs Docker or a compatible container
+runtime. See [docker-tool-sandbox/README.md](docker-tool-sandbox/README.md).
+
+Run its scripted walkthrough from the example directory:
+
+```bash
+cd docker-tool-sandbox
+demonator -c docker-tool-sandbox.yaml
+```
 
 ## GitHub CLI Demo
 

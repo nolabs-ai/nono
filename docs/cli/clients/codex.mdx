@@ -59,10 +59,14 @@ The first time you run `nono run --profile nolabs-ai/codex -- codex`, nono promp
      Provenance   Sigstore cryptographic supply chain (verified on pull)
      Installs     sandbox profile + Codex hooks + diagnostic skill
 
-  Continue? [Y/n]
+  Continue? [y/N]
 ```
 
-Press `Y`. nono pulls the pack, verifies its Sigstore provenance, and writes Codex's plugin wiring directly to the files Codex actually reads (verified against `openai/codex` source — not the `~/.agents/plugins/marketplace.json` that some external docs hint at).
+After the one-second input guard enables the prompt, press `Y`. Pressing Enter
+uses the safe default and skips installation. nono pulls the pack, verifies its
+Sigstore provenance, and writes Codex's plugin wiring directly to the files
+Codex actually reads (verified against `openai/codex` source — not the
+`~/.agents/plugins/marketplace.json` that some external docs hint at).
 
 ### What the pull writes
 

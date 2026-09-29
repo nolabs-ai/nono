@@ -12,6 +12,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: "1"
 
 jobs:
   actionlint:
@@ -22,6 +23,24 @@ jobs:
 
       - name: Run actionlint
         uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Lint tracked shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' scripts < <(git ls-files -z -- '*.sh' '*.bash' '*.zsh')
+          if ((${#scripts[@]})); then
+            shellcheck --external --severity=warning "${scripts[@]}"
+          fi
 
   changes:
     name: Classify Changes
@@ -142,10 +161,10 @@ jobs:
           echo "OK: no libdbus dependency"
 
       - name: Run tests
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --verbose --no-fail-fast
 
       - name: Run doc tests
-        run: cargo test --doc --workspace --verbose
+        run: cargo test --doc --workspace --verbose --no-fail-fast
 
   fmt:
     name: Rustfmt
@@ -238,12 +257,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run integration tests
-        run: |
-          if [[ -f ./tests/run_integration_tests.sh ]]; then
-            ./tests/run_integration_tests.sh
-          else
-            echo "No integration tests found, skipping"
-          fi
+        run: ./scripts/run_all_tests.sh
 
   audit:
     name: Cargo Audit

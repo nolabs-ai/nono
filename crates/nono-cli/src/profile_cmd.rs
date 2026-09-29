@@ -252,9 +252,7 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
     );
     root.insert("workdir".to_string(), serde_json::Value::Object(workdir));
 
-    // filesystem (minimal has allow + read; full adds all fields, including
-    // the canonical replacements for the legacy `policy` patch keys —
-    // see deprecated_schema.rs for the migration mapping).
+    // filesystem (minimal has allow + read; full adds all fields).
     let mut filesystem = serde_json::Map::new();
     filesystem.insert("allow".to_string(), serde_json::Value::Array(vec![]));
     filesystem.insert("read".to_string(), serde_json::Value::Array(vec![]));
@@ -857,13 +855,9 @@ fn print_profile_line(name: &str, result: &Result<Profile>, t: &theme::Theme) {
 pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
     // Order matters: `load_profile_extends` opens an internal
     // `WarningSuppressionGuard` for its preview parse, so deprecation
-    // warnings fire only on the subsequent real `load_profile` call —
-    // exactly once per legacy key per file (the design's contract,
-    // line 141). DO NOT swap or merge these two calls without
-    // preserving that suppression scope, or warnings will double-emit.
-    // See the regression test `legacy_all_keys_shows_byte_equal_canonical_equivalent`
-    // in tests/deprecated_schema.rs which asserts the exact 9-warning
-    // count on `legacy_all_keys.json`.
+    // warnings fire only on the subsequent real `load_profile` call.
+    // DO NOT swap or merge these two calls without preserving that
+    // suppression scope, or warnings will double-emit.
     let raw_extends = profile::load_profile_extends(&args.profile);
     let profile = profile::load_profile_no_migrate(&args.profile)?;
 
@@ -979,6 +973,27 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             theme::fg("Linux AF_UNIX mediation:", t.subtext),
             theme::fg(&format!("{mode:?}"), t.text)
         );
+    }
+
+    // Session lifecycle hooks. These are merged through `extends`, so show
+    // the resolved before/after values rather than the profile's raw input.
+    if profile.session_hooks.before.is_some() || profile.session_hooks.after.is_some() {
+        println!();
+        println!("  {}", theme::fg("Session hooks:", t.subtext).bold());
+        for (name, hook) in [
+            ("before", profile.session_hooks.before.as_ref()),
+            ("after", profile.session_hooks.after.as_ref()),
+        ] {
+            if let Some(hook) = hook {
+                println!(
+                    "    {}: {}{}",
+                    theme::fg(name, t.subtext),
+                    theme::fg(&hook.script.display().to_string(), t.text),
+                    hook.timeout_secs
+                        .map_or_else(String::new, |timeout| { format!(" (timeout: {timeout}s)") })
+                );
+            }
+        }
     }
 
     // Filesystem
@@ -1130,7 +1145,7 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         }
     }
 
-    // Command policies (merged tool-sandbox mediation config).
+    // Command policies (merged command-mediation configuration).
     if let Some(cp) = &profile.command_policies
         && (!cp.commands.is_empty() || cp.has_non_command_fields())
     {
@@ -1281,8 +1296,7 @@ fn profile_to_json(
         val["linux"] = serde_json::json!({ "af_unix_mediation": v });
     }
 
-    // Filesystem (canonical schema). Legacy keys deserialize into these fields
-    // via `deprecated_schema::LegacyPolicyPatch` before reaching `Profile`.
+    // Filesystem (canonical schema).
     val["filesystem"] = serde_json::json!({
         "allow": profile.filesystem.allow,
         "read": profile.filesystem.read,
@@ -1365,6 +1379,10 @@ fn profile_to_json(
         val["hooks"] = serde_json::Value::Object(hooks);
     }
 
+    if profile.session_hooks.before.is_some() || profile.session_hooks.after.is_some() {
+        val["session_hooks"] = serde_json::json!(profile.session_hooks);
+    }
+
     // Open URLs
     if let Some(ref urls) = profile.open_urls {
         val["open_urls"] = serde_json::json!({
@@ -1386,7 +1404,7 @@ fn profile_to_json(
         val["unsafe_macos_seatbelt_rules"] = serde_json::json!(profile.unsafe_macos_seatbelt_rules);
     }
 
-    // Resolved tool-sandbox mediation config (merged through extends).
+    // Resolved command-mediation configuration (merged through extends).
     if let Some(ref cp) = profile.command_policies
         && let Ok(v) = serde_json::to_value(cp)
     {
@@ -3737,9 +3755,8 @@ mod tests {
         assert!(!minimal_obj.contains_key("network"));
         assert!(!minimal_obj.contains_key("hooks"));
 
-        // Full filesystem has all canonical fields, including the new
-        // `deny` and `bypass_protection` (canonical replacements for the
-        // legacy `policy` patch — see deprecated_schema.rs).
+        // Full filesystem has all canonical fields, including `deny` and
+        // `bypass_protection`.
         let full_fs = full_obj["filesystem"].as_object().expect("fs object");
         assert!(full_fs.contains_key("write"));
         assert!(full_fs.contains_key("allow_file"));

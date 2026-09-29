@@ -9,8 +9,9 @@ use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
     PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
 };
+use nix::fcntl::{OFlag, open};
+use nix::sys::stat::Mode;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
@@ -119,7 +120,8 @@ enum StaticNetworkFilter {
 }
 
 /// A Landlock ruleset whose allocation and path opening happened in the
-/// parent, before a raw-cloned child exists.
+/// parent. A synchronized child can use the resulting kernel ruleset without
+/// accessing the parent's allocation-dependent state.
 ///
 /// `apply_raw()` creates the ruleset, adds the already-opened path/port rules,
 /// and restricts the calling task using raw syscalls only.  It neither
@@ -139,9 +141,26 @@ impl PreparedLandlockSandbox {
         &self.fallback
     }
 
-    /// Apply this prepared policy without heap allocation or libc coordination
-    /// wrappers.  This is intended for the child side of raw `clone(2)`.
-    pub fn apply_raw(&self) -> std::result::Result<(), RawSandboxError> {
+    /// Create the kernel ruleset without restricting the calling process.
+    ///
+    /// This lets a supervisor prepare rules for a known child PID and share the
+    /// resulting descriptor during a synchronized `CLONE_FILES` bootstrap.
+    /// The caller must still set no_new_privs, restrict the child with this
+    /// ruleset, and install the matching static network filter.
+    #[must_use = "the prepared ruleset must be applied to the child"]
+    pub fn create_ruleset(&self) -> Result<OwnedFd> {
+        let fd = self.create_ruleset_raw().map_err(|error| {
+            NonoError::SandboxInit(format!(
+                "prepared Landlock ruleset {:?}: {}",
+                error.stage(),
+                std::io::Error::from_raw_os_error(error.errno())
+            ))
+        })?;
+        // SAFETY: create_ruleset_raw returned a fresh, uniquely owned fd.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn create_ruleset_raw(&self) -> std::result::Result<RawFd, RawSandboxError> {
         // SAFETY: all pointers below refer to fixed-size stack values or data
         // owned by `self`, which remains live for the duration of each syscall.
         unsafe {
@@ -202,6 +221,25 @@ impl PreparedLandlockSandbox {
                 }
             }
 
+            Ok(ruleset_fd)
+        }
+    }
+
+    /// Install only the prepared static network filter, without allocation.
+    ///
+    /// This does not enforce filesystem or Landlock port rules. Callers using
+    /// `create_ruleset` must separately restrict the child with that ruleset.
+    #[must_use = "a failed filter installation must prevent exec"]
+    pub fn apply_static_network_raw(&self) -> std::result::Result<(), RawSandboxError> {
+        install_static_network_filter_raw(self.static_network_filter)
+    }
+
+    /// Apply this prepared policy without heap allocation or libc coordination
+    /// wrappers. This is intended for the child side of raw `clone(2)`.
+    pub fn apply_raw(&self) -> std::result::Result<(), RawSandboxError> {
+        let ruleset_fd = self.create_ruleset_raw()?;
+        // SAFETY: ruleset_fd is newly owned and all syscall arguments are scalar.
+        unsafe {
             if libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
                 let errno = raw_errno();
                 libc::syscall(libc::SYS_close, ruleset_fd);
@@ -272,7 +310,7 @@ impl DetectedAbi {
         AccessFs::from_all(self.abi).contains(AccessFs::Truncate)
     }
 
-    /// Whether execute access control is supported strongly enough for Tool Sandbox Execution.
+    /// Whether execute access control is supported strongly enough for command sandbox execution.
     #[must_use]
     pub fn has_execute(&self) -> bool {
         matches!(self.abi, ABI::V3 | ABI::V4 | ABI::V5 | ABI::V6)
@@ -643,17 +681,22 @@ fn normalize_path_access(
 /// Returning the same descriptor used for metadata validation prevents a path
 /// replacement between type/device classification and rule installation.
 fn open_path_rule(cap: &crate::capability::FsCapability, abi: ABI) -> Result<OpenedPathRule> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-        .open(&cap.resolved)
-        .map_err(|e| {
-            NonoError::SandboxInit(format!(
-                "Cannot open Landlock rule path {}: {}",
-                cap.resolved.display(),
-                e
-            ))
-        })?;
+    // Do not use std::fs::OpenOptions::custom_flags here. On musl, O_ACCMODE
+    // includes O_PATH, so Rust's standard-library access-mode mask strips the
+    // flag and turns this into an ordinary permission-checked read open.
+    let path_fd = open(
+        &cap.resolved,
+        OFlag::O_PATH | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "Cannot open Landlock rule path {}: {}",
+            cap.resolved.display(),
+            e
+        ))
+    })?;
+    let file = std::fs::File::from(path_fd);
     let metadata = file.metadata().map_err(|e| {
         NonoError::SandboxInit(format!(
             "Cannot inspect opened Landlock rule path {}: {}",
@@ -789,6 +832,15 @@ pub fn apply_landlock(caps: &CapabilitySet) -> Result<()> {
 /// Same contract as `apply_landlock` but avoids re-probing the kernel ABI.
 pub fn apply_landlock_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<()> {
     apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly).map(|_| ())
+}
+
+/// Prepare Landlock-only enforcement without installing a seccomp fallback.
+#[must_use = "preparation failure must prevent sandbox launch"]
+pub fn prepare_landlock_with_abi(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+) -> Result<PreparedLandlockSandbox> {
+    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly)
 }
 
 /// Apply Landlock filesystem/process sandboxing and use seccomp for TCP
@@ -1363,7 +1415,7 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
     let abi = detect_abi()?;
     if !abi.has_execute() {
         return Err(NonoError::SandboxInit(format!(
-            "Tool Sandbox  execute restriction requires Landlock ABI V3+; detected {}",
+            "Command sandbox execute restriction requires Landlock ABI V3+; detected {}",
             abi.version_string()
         )));
     }
@@ -1373,20 +1425,20 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
         .handle_access(AccessFs::Execute)
         .map_err(|e| {
             NonoError::SandboxInit(format!(
-                "Tool Sandbox  execute restriction: kernel does not support Landlock Execute: {e}"
+                "Command sandbox execute restriction: kernel does not support Landlock Execute: {e}"
             ))
         })?
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::Refer)
         .map_err(|e| {
             NonoError::SandboxInit(format!(
-                "Tool Sandbox  execute restriction: cannot handle Refer: {e}"
+                "Command sandbox execute restriction: cannot handle Refer: {e}"
             ))
         })?
         .create()
         .map_err(|e| {
             NonoError::SandboxInit(format!(
-                "Tool Sandbox  execute restriction: ruleset create failed: {e}"
+                "Command sandbox execute restriction: ruleset create failed: {e}"
             ))
         })?;
 
@@ -1394,7 +1446,7 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
         let p = path.as_ref();
         let fd = PathFd::new(p).map_err(|e| {
             NonoError::SandboxInit(format!(
-                "Tool Sandbox  execute restriction: cannot open {}: {e}",
+                "Command sandbox execute restriction: cannot open {}: {e}",
                 p.display()
             ))
         })?;
@@ -1402,7 +1454,7 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
             .add_rule(PathBeneath::new(fd, AccessFs::Execute))
             .map_err(|e| {
                 NonoError::SandboxInit(format!(
-                    "Tool Sandbox  execute restriction: add_rule for {}: {e}",
+                    "Command sandbox execute restriction: add_rule for {}: {e}",
                     p.display()
                 ))
             })?;
@@ -1411,21 +1463,21 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
     if abi.has_refer() {
         let root_fd = PathFd::new("/").map_err(|e| {
             NonoError::SandboxInit(format!(
-                "Tool Sandbox  execute restriction: cannot open / for Refer grant: {e}"
+                "Command sandbox execute restriction: cannot open / for Refer grant: {e}"
             ))
         })?;
         ruleset = ruleset
             .add_rule(PathBeneath::new(root_fd, AccessFs::Refer))
             .map_err(|e| {
                 NonoError::SandboxInit(format!(
-                    "Tool Sandbox  execute restriction: add_rule for / (Refer): {e}"
+                    "Command sandbox execute restriction: add_rule for / (Refer): {e}"
                 ))
             })?;
     }
 
     let status = ruleset.restrict_self().map_err(|e| {
         NonoError::SandboxInit(format!(
-            "Tool Sandbox  execute restriction: restrict_self failed: {e}"
+            "Command sandbox execute restriction: restrict_self failed: {e}"
         ))
     })?;
 
@@ -1438,10 +1490,10 @@ fn ensure_execute_restriction_fully_enforced(status: landlock::RulesetStatus) ->
     match status {
         landlock::RulesetStatus::FullyEnforced => Ok(()),
         landlock::RulesetStatus::PartiallyEnforced => Err(NonoError::SandboxInit(
-            "Tool Sandbox  execute restriction: Landlock was only partially enforced".to_string(),
+            "Command sandbox execute restriction: Landlock was only partially enforced".to_string(),
         )),
         landlock::RulesetStatus::NotEnforced => Err(NonoError::SandboxInit(
-            "Tool Sandbox  execute restriction: Landlock was not enforced".to_string(),
+            "Command sandbox execute restriction: Landlock was not enforced".to_string(),
         )),
     }
 }
@@ -2934,9 +2986,11 @@ fn selected_static_network_filter(
 /// - `AF_INET`/`AF_INET6`: allow connect/send destinations to
 ///   `localhost:proxy_port`; allow bind on ports in the configured bind-ports
 ///   list; deny others.
-/// - pathname `AF_UNIX`: route to the supervisor, which checks the explicit
-///   Unix socket capability allowlist against the requested path.
-/// - abstract/unnamed `AF_UNIX`: deny (see `decide_network_notification`).
+/// - `AF_UNIX`: route to the supervisor. When the client has opted in to
+///   pathname AF_UNIX mediation, the supervisor checks pathname sockets
+///   against the explicit Unix socket capability allowlist and denies
+///   abstract/unnamed ones; otherwise it resumes them untouched, since the
+///   proxy filter only exists to force TCP through the proxy.
 ///
 /// `has_bind_ports` is retained for API compatibility but no longer
 /// influences filter routing — a previous version routed bind directly to
@@ -3385,6 +3439,45 @@ pub struct PreparedSeccompNotifyFilter {
 }
 
 impl PreparedSeccompNotifyFilter {
+    /// Add filesystem notifications to this network notification program.
+    ///
+    /// Linux permits only one NEW_LISTENER filter per thread. A combined
+    /// supervisor must dispatch this listener by syscall number. The original
+    /// network program and its relative jumps are retained unchanged.
+    #[must_use]
+    pub fn with_openat_notifications(self) -> Self {
+        let mut filter = vec![
+            SockFilterInsn {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_DATA_NR_OFFSET,
+            },
+            SockFilterInsn {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 1,
+                jf: 0,
+                k: SYS_OPENAT as u32,
+            },
+            SockFilterInsn {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 0,
+                jf: 1,
+                k: SYS_OPENAT2 as u32,
+            },
+            SockFilterInsn {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_USER_NOTIF,
+            },
+        ];
+        filter.extend_from_slice(self.filter.as_slice());
+        Self {
+            filter: prepend_seccomp_arch_guard_vec(filter, SECCOMP_RET_ERRNO | libc::EPERM as u32),
+        }
+    }
+
     /// Install the prepared filter and return the listener as a borrowed raw
     /// slot.  The caller must establish private fd-table ownership before
     /// constructing `OwnedFd` or running Rust destructors for this slot.
@@ -3841,6 +3934,44 @@ mod tests {
                     .contains(AccessFs::IoctlDev)
             );
         }
+    }
+
+    #[test]
+    fn test_open_path_rule_retains_o_path_flag() {
+        let cap = crate::capability::FsCapability::new_file("/dev/null", AccessMode::Read)
+            .expect("device capability");
+        let rule = open_path_rule(&cap, ABI::V1).expect("open path rule");
+        let flags = nix::fcntl::fcntl(&rule.path_fd, nix::fcntl::FcntlArg::F_GETFL)
+            .expect("inspect path fd flags");
+
+        assert_ne!(flags & libc::O_PATH, 0, "Landlock rule fd must use O_PATH");
+    }
+
+    /// `open_path_rule` opens `cap.resolved` with `O_PATH`, so the kernel
+    /// resolves the whole chain before Landlock sees a literal path.
+    #[test]
+    fn test_open_path_rule_resolves_multi_hop_symlink_through_symlinked_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize");
+
+        let hosts = canonical_dir.join("hosts");
+        let mymac = hosts.join("mymac");
+        std::fs::create_dir_all(&mymac).expect("mkdir mymac");
+        let real_gitconfig = mymac.join("gitconfig");
+        std::fs::write(&real_gitconfig, "[user]\n").expect("write gitconfig");
+
+        let current = hosts.join("current");
+        std::os::unix::fs::symlink(&mymac, &current).expect("symlink dir");
+
+        let gitconfig_link = canonical_dir.join(".gitconfig");
+        std::os::unix::fs::symlink(current.join("gitconfig"), &gitconfig_link)
+            .expect("symlink leaf");
+
+        let cap = crate::capability::FsCapability::new_file(&gitconfig_link, AccessMode::Read)
+            .expect("gitconfig capability");
+
+        let rule = open_path_rule(&cap, ABI::V5).expect("open multi-hop symlink rule");
+        assert!(rule.access.effective.contains(AccessFs::ReadFile));
     }
 
     #[test]
@@ -5172,6 +5303,56 @@ mod tests {
         assert_eq!(proxy.filter.len(), 37);
         let unix = prepare_seccomp_af_unix_filter();
         assert_eq!(unix.filter.len(), 14);
+    }
+
+    #[test]
+    fn combined_notifications_preserve_network_filter_decisions() {
+        for original in [
+            prepare_seccomp_proxy_filter(false),
+            prepare_seccomp_proxy_filter(true),
+            prepare_seccomp_af_unix_filter(),
+        ] {
+            let network = original.filter.as_slice().to_vec();
+            let combined = original.with_openat_notifications();
+            for syscall in [SYS_OPENAT, SYS_OPENAT2] {
+                assert_eq!(
+                    evaluate_static_bpf(combined.filter.as_slice(), syscall, [0; 6]),
+                    SECCOMP_RET_USER_NOTIF
+                );
+            }
+            for syscall in [
+                SYS_SOCKET,
+                SYS_SOCKETPAIR,
+                SYS_CONNECT,
+                SYS_BIND,
+                SYS_SENDTO,
+                SYS_SENDMSG,
+                SYS_SENDMMSG,
+                libc::SYS_read as i32,
+                libc::SYS_write as i32,
+                libc::SYS_execve as i32,
+                SYS_IO_URING_SETUP,
+            ] {
+                for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
+                    for kind in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_RAW] {
+                        let args = [family as u64, kind as u64, 0, 0, 0, 0];
+                        assert_eq!(
+                            evaluate_static_bpf(combined.filter.as_slice(), syscall, args),
+                            evaluate_static_bpf(&network, syscall, args)
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                evaluate_static_bpf_with_arch(
+                    combined.filter.as_slice(),
+                    NATIVE_AUDIT_ARCH ^ 1,
+                    SYS_OPENAT as u32,
+                    [0; 6]
+                ),
+                SECCOMP_RET_ERRNO | libc::EPERM as u32
+            );
+        }
     }
 
     #[test]

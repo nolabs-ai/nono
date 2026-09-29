@@ -1,4 +1,4 @@
-# Kubernetes Tool-Sandbox Demo
+# Kubernetes Command-Sandbox Demo
 
 Author: [@lukehinds](https://github.com/lukehinds)
 
@@ -223,7 +223,7 @@ Expected validation warnings:
   remove the writable-executable trust downgrade.
 - `allow_all_network` for `kubectl`: the command-policy child allows broad
   network because macOS Seatbelt cannot express the narrow local proxy-port
-  grant inside the child sandbox. The demo still uses the fixed nono proxy route
+  grant inside the command sandbox. The demo still uses the fixed nono proxy route
   and endpoint policy for Kubernetes API traffic.
 - `writable_executable_trust_downgrade` for `nono-kube-token-helper`: the helper
   is a local demo script. Users should inspect it before running the demo. For a
@@ -381,7 +381,7 @@ nono run --no-audit --silent --allow-cwd \
 Expected result:
 
 ```text
-nono: tool-sandbox denied kubectl: Command 'kubectl' is blocked: kubectl delete namespace is blocked in the staging admin profile
+nono: command policy denied kubectl: Command 'kubectl' is blocked: kubectl delete namespace is blocked in the staging admin profile
 ```
 
 Endpoint-policy denial for namespace deletion is also configured as a second
@@ -405,7 +405,7 @@ kubectl
 ```
 
 The `kubectl` command-policy edge allows `network.allow_all` because macOS
-Seatbelt cannot express per-port TCP grants inside the child command sandbox.
+Seatbelt cannot express per-port TCP grants inside the command sandbox.
 The outer nono run still uses the proxy route and fixed port, so the intended
 reachable path is the local broker.
 

@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
 
 echo ""
-echo -e "${BLUE}=== Binary Execution Tests ===${NC}"
+echo -e "${BLUE}Binary Execution Tests${NC}"
 
 verify_nono_binary
 if ! require_working_sandbox "binary execution suite"; then
@@ -27,11 +27,9 @@ echo ""
 echo "Test directory: $TMPDIR"
 echo ""
 
-# =============================================================================
 # Basic Commands
-# =============================================================================
 
-echo "--- Basic Commands ---"
+echo "Basic Commands"
 
 expect_success "echo executes" \
     "$NONO_BIN" run --allow "$TMPDIR" -- echo "hello world"
@@ -48,12 +46,10 @@ run_test "exit code 42 preserved" 42 \
 run_test "exit code 127 preserved" 127 \
     "$NONO_BIN" run --allow "$TMPDIR" -- sh -c "exit 127"
 
-# =============================================================================
 # File Operations
-# =============================================================================
 
 echo ""
-echo "--- File Operation Commands ---"
+echo "File Operation Commands"
 
 expect_success "ls executes" \
     "$NONO_BIN" run --allow "$TMPDIR" -- ls "$TMPDIR"
@@ -85,12 +81,10 @@ expect_success "touch executes" \
 expect_success "mkdir executes" \
     "$NONO_BIN" run --allow "$TMPDIR" -- mkdir "$TMPDIR/newdir"
 
-# =============================================================================
 # Shell and Subshells
-# =============================================================================
 
 echo ""
-echo "--- Shell Commands ---"
+echo "Shell Commands"
 
 expect_success "sh -c executes" \
     "$NONO_BIN" run --allow "$TMPDIR" -- sh -c 'echo "from sh"'
@@ -111,12 +105,10 @@ expect_success "env executes" \
 expect_success "printenv executes" \
     "$NONO_BIN" run --allow "$TMPDIR" -- printenv >/dev/null
 
-# =============================================================================
 # Text Processing
-# =============================================================================
 
 echo ""
-echo "--- Text Processing Commands ---"
+echo "Text Processing Commands"
 
 expect_success "sort executes" \
     "$NONO_BIN" run --allow "$TMPDIR" -- sort "$TMPDIR/multiline.txt"
@@ -137,12 +129,10 @@ if command_exists awk; then
         "$NONO_BIN" run --allow "$TMPDIR" -- awk '{print $1}' "$TMPDIR/file.txt"
 fi
 
-# =============================================================================
 # Language Runtimes
-# =============================================================================
 
 echo ""
-echo "--- Language Runtimes ---"
+echo "Language Runtimes"
 
 # Note: Language runtimes installed via Homebrew (at /opt/homebrew/) may not
 # be accessible in the sandbox since Homebrew paths aren't in the system allowlist.
@@ -208,7 +198,7 @@ expect_success "printf executes" \
 if command_exists go && command_exists gofmt; then
     if can_run_in_sandbox gofmt -h; then
         expect_success "gofmt executes" \
-            "$NONO_BIN" run --allow "$TMPDIR" -- gofmt -h 2>&1 >/dev/null
+            "$NONO_BIN" run --allow "$TMPDIR" -- gofmt -h >/dev/null 2>&1
     else
         skip_test "go tools execute" "gofmt not accessible in sandbox"
     fi
@@ -216,12 +206,10 @@ else
     skip_test "go tools execute" "go not installed"
 fi
 
-# =============================================================================
 # Output Verification
-# =============================================================================
 
 echo ""
-echo "--- Output Verification ---"
+echo "Output Verification"
 
 expect_output_contains "echo output is correct" "hello world" \
     "$NONO_BIN" run --allow "$TMPDIR" -- echo "hello world"
@@ -232,8 +220,6 @@ expect_output_contains "cat output contains file content" "test content" \
 expect_output_contains "wc counts lines correctly" "3" \
     "$NONO_BIN" run --allow "$TMPDIR" -- wc -l "$TMPDIR/multiline.txt"
 
-# =============================================================================
 # Summary
-# =============================================================================
 
 print_summary

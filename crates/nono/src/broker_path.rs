@@ -37,6 +37,12 @@ pub fn sanitize_broker_path(path_value: &str, outer_caps: &CapabilitySet) -> Str
 /// Every real broker call site knows the binary name it's about to resolve
 /// (`open`, `xdg-open`, `op`, `bw`, `security`, or a profile-configured
 /// command), so this is the check they should use.
+///
+/// This low-level function may return an empty string when every entry is
+/// removed. Do not pass that value to [`std::process::Command`]: on Unix an
+/// empty `PATH` can resolve a bare command name from the current directory.
+/// Host-side command brokers should use [`safe_broker_path_for_binary`],
+/// which represents that case as `None`, instead.
 #[must_use]
 pub fn sanitize_broker_path_for_binary(
     path_value: &str,
@@ -50,6 +56,20 @@ pub fn sanitize_broker_path_for_binary(
                 Some(false)
             )
     })
+}
+
+/// Return a sanitized, non-empty `PATH` for a host-side bare-name lookup.
+///
+/// `None` means no search directory can be proven read-only to the sandbox.
+/// Callers must fail closed without spawning the command in that case.
+#[must_use]
+pub fn safe_broker_path_for_binary(
+    path_value: &str,
+    binary_name: &str,
+    outer_caps: &CapabilitySet,
+) -> Option<String> {
+    let safe_path = sanitize_broker_path_for_binary(path_value, binary_name, outer_caps);
+    (!safe_path.is_empty()).then_some(safe_path)
 }
 
 /// Return every `PATH` entry the sandbox can write to, whole directories and
@@ -450,6 +470,38 @@ mod tests {
 
         let path = bin.display().to_string();
         assert_eq!(sanitize_broker_path_for_binary(&path, "ocm", &caps), path);
+    }
+
+    #[test]
+    fn safe_path_for_binary_rejects_empty_sanitized_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        let caps = caps_with_write(&bin);
+
+        assert_eq!(
+            safe_broker_path_for_binary(&bin.display().to_string(), "ocm", &caps),
+            None
+        );
+    }
+
+    #[test]
+    fn safe_path_for_binary_returns_remaining_safe_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writable = dir.path().join("writable");
+        let safe = dir.path().join("safe");
+        std::fs::create_dir_all(&writable).expect("mkdir writable");
+        std::fs::create_dir_all(&safe).expect("mkdir safe");
+        let caps = caps_with_write(&writable);
+        let path = std::env::join_paths([&writable, &safe])
+            .expect("join PATH")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            safe_broker_path_for_binary(&path, "ocm", &caps),
+            Some(safe.display().to_string())
+        );
     }
 
     #[cfg(unix)]

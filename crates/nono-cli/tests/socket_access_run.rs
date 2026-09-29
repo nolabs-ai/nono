@@ -229,3 +229,47 @@ print(os.read(r, 200).decode(), flush=True)
         // Fingerprint of the ancestry-gated /proc/<pid>/mem read failing.
         .assert_stderr_lacks("Failed to read sockaddr");
 }
+
+/// Regression test for issue #1901: a profile that only sets
+/// `network.allow_domain` (proxy-only mode, `linux.af_unix_mediation` left at
+/// its default of off) must not deny `bind(2)` on AF_UNIX sockets. Pre-fix,
+/// the proxy seccomp filter routed every AF_UNIX operation to the supervisor,
+/// which treated them as allowlist-mediated even without the opt-in, so both
+/// pathname and abstract binds failed with `EACCES`. This broke the JVM attach
+/// mechanism (`jcmd`, `jstack`, Mockito test suites).
+#[test]
+#[cfg(target_os = "linux")]
+fn proxy_only_without_af_unix_mediation_allows_af_unix_bind() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("af-unix-proxy-only");
+    let sock_tmp = short_tempdir();
+    let sock_dir = sock_tmp.path().to_string_lossy().into_owned();
+    let socket_path = sock_tmp.path().join("p.sock");
+    let socket_arg = socket_path.to_string_lossy().into_owned();
+
+    let profile = t.write_profile(
+        "af-unix-proxy-only",
+        &format!(
+            r#"{{"meta":{{"name":"af-unix-proxy-only"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"allow":["{sock_dir}"]}},"network":{{"allow_domain":["example.com"]}}}}"#
+        ),
+    );
+
+    // Pathname bind (the reporter's reproducer) plus an abstract-namespace
+    // bind, which proved the denial was not a filesystem grant issue.
+    let py_script = format!(
+        "import socket\n\
+         socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).bind({socket_arg:?})\n\
+         socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).bind('\\0nono-1901-abstract')\n\
+         print('ok')"
+    );
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(&py_script))
+        .assert_success("AF_UNIX bind must succeed with only allow_domain set (#1901)")
+        .assert_stdout_contains("ok");
+}

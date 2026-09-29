@@ -34,7 +34,7 @@ Sandbox::apply_auto(&caps)?;
 
 - **Landlock** (Linux 5.13+) - Filesystem access control
 - **Seatbelt** (macOS) - Filesystem and network restrictions
-- **Child process inheritance** - All spawned processes inherit restrictions and individual policy may be applied to child processes (tool sandboxing)
+- **Child process inheritance** - All spawned processes inherit restrictions, and command policies may apply separate command sandboxes to mediated commands
 
 ## Platform Support
 

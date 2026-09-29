@@ -325,7 +325,7 @@ fn print_list_json(sessions: &[SessionInfo]) -> Result<()> {
                 "disk_size": s.disk_size,
                 "is_alive": s.is_alive,
                 "is_stale": s.is_stale,
-                // Whether the session had a Tool Sandbox at all: mediation was
+                // Whether the session had command mediation at all: mediation was
                 // configured, or a command reached mediation. Deliberately not
                 // the summary's own `mediation_active`, which reports only the
                 // first of those.
@@ -700,6 +700,28 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
 // nono audit cleanup
 // ---------------------------------------------------------------------------
 
+/// Finds the split point in `to_remove_sizes` (disk sizes of removal
+/// candidates, newest-first) past which sessions must be removed to keep the
+/// total under `budget_bytes`. `already_kept_size` is the disk size of
+/// removable sessions excluded from `to_remove_sizes` by earlier filters
+/// (`--keep`, `--older-than`) — it still counts against the budget because
+/// those sessions remain on disk. Returns `to_remove_sizes.len()` if the
+/// budget is never exceeded, i.e. nothing further needs removing.
+fn max_total_size_split_at(
+    to_remove_sizes: &[u64],
+    already_kept_size: u64,
+    budget_bytes: u64,
+) -> usize {
+    let mut cumulative = already_kept_size;
+    for (i, size) in to_remove_sizes.iter().enumerate() {
+        cumulative = cumulative.saturating_add(*size);
+        if cumulative > budget_bytes {
+            return i;
+        }
+    }
+    to_remove_sizes.len()
+}
+
 fn cmd_cleanup(args: AuditCleanupArgs) -> Result<()> {
     reject_if_sandboxed("audit cleanup")?;
 
@@ -719,6 +741,8 @@ fn cmd_cleanup(args: AuditCleanupArgs) -> Result<()> {
         eprintln!("{} No removable audit sessions found.", prefix());
         return Ok(());
     }
+
+    let removable_total_size: u64 = removable.iter().map(|s| s.disk_size).sum();
 
     let mut to_remove: Vec<&SessionInfo> = if args.all {
         removable
@@ -743,6 +767,19 @@ fn cmd_cleanup(args: AuditCleanupArgs) -> Result<()> {
         } else {
             to_remove.clear();
         }
+    }
+
+    // The budget bounds the total size of every removable session, not just
+    // the ones still in `to_remove`: sessions already excluded by `--keep`
+    // or `--older-than` are still on disk afterward, so their size counts
+    // against the budget too.
+    if let Some(max_mb) = args.max_total_size {
+        let budget = max_mb.saturating_mul(1024 * 1024);
+        let to_remove_size: u64 = to_remove.iter().map(|s| s.disk_size).sum();
+        let already_kept_size = removable_total_size.saturating_sub(to_remove_size);
+        let sizes: Vec<u64> = to_remove.iter().map(|s| s.disk_size).collect();
+        let split_at = max_total_size_split_at(&sizes, already_kept_size, budget);
+        to_remove = to_remove.split_off(split_at);
     }
 
     if to_remove.is_empty() {
@@ -921,7 +958,7 @@ fn change_symbol(ct: &nono::undo::ChangeType) -> colored::ColoredString {
     }
 }
 
-fn network_mode_label(mode: &nono::undo::NetworkAuditMode) -> &'static str {
+pub(crate) fn network_mode_label(mode: &nono::undo::NetworkAuditMode) -> &'static str {
     match mode {
         nono::undo::NetworkAuditMode::Connect => "connect",
         nono::undo::NetworkAuditMode::ConnectIntercept => "connect_intercept",
@@ -1271,7 +1308,38 @@ mod tool_summary_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_for_terminal, sanitize_reason_for_terminal};
+    use super::{max_total_size_split_at, sanitize_for_terminal, sanitize_reason_for_terminal};
+
+    #[test]
+    fn max_total_size_split_at_noop_when_under_budget() {
+        let sizes = [10, 10, 10];
+        let split_at = max_total_size_split_at(&sizes, 0, 100);
+        assert_eq!(split_at, sizes.len());
+    }
+
+    #[test]
+    fn max_total_size_split_at_removes_oldest_until_under_budget() {
+        // Newest-first; budget only fits the first two.
+        let sizes = [40, 40, 40];
+        let split_at = max_total_size_split_at(&sizes, 0, 100);
+        assert_eq!(split_at, 2);
+    }
+
+    #[test]
+    fn max_total_size_split_at_counts_sessions_already_kept_by_other_filters() {
+        // 80 already kept (e.g. by --keep) leaves only 20 of budget, so only
+        // the first two of the three 10-sized candidates still fit.
+        let sizes = [10, 10, 10];
+        let split_at = max_total_size_split_at(&sizes, 80, 100);
+        assert_eq!(split_at, 2);
+    }
+
+    #[test]
+    fn max_total_size_split_at_removes_everything_when_already_kept_exceeds_budget() {
+        let sizes = [10, 10, 10];
+        let split_at = max_total_size_split_at(&sizes, 200, 100);
+        assert_eq!(split_at, 0);
+    }
 
     #[test]
     fn sanitize_for_terminal_removes_carriage_return() {

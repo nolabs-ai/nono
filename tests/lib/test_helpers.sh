@@ -4,8 +4,10 @@
 
 set -euo pipefail
 
-# Binary location (can be overridden)
-NONO_BIN="${NONO_BIN:-./target/release/nono}"
+# Binary location (can be overridden). Resolved to an absolute path so it
+# still works after a test `cd`s into a tmpdir before invoking it.
+_TEST_HELPERS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NONO_BIN="${NONO_BIN:-$_TEST_HELPERS_DIR/../../target/release/nono}"
 
 # Test tracking
 TESTS_RUN=0
@@ -20,6 +22,7 @@ SANDBOX_UNAVAILABLE_REASON=""
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+# shellcheck disable=SC2034 # Used by integration scripts that source this helper.
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
@@ -122,7 +125,7 @@ expect_output_contains() {
     exit_code=$?
     set -e
 
-    if echo "$output" | grep -q "$expected_str"; then
+    if grep -q "$expected_str" <<<"$output"; then
         echo -e "  ${GREEN}PASS${NC}: $name"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -153,7 +156,7 @@ expect_output_not_contains() {
     output=$("$@" </dev/null 2>&1)
     set -e
 
-    if echo "$output" | grep -q "$unexpected_str"; then
+    if grep -q "$unexpected_str" <<<"$output"; then
         echo -e "  ${RED}FAIL${NC}: $name"
         echo "       Output should NOT contain: '$unexpected_str'"
         TESTS_FAILED=$((TESTS_FAILED + 1))

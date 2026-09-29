@@ -214,10 +214,12 @@
           "/etc/hosts",
           "/etc/nsswitch.conf",
           "/etc/gai.conf",
+          "/etc/group",
           "/etc/ssl",
           "/etc/pki",
           "/etc/ca-certificates",
           "/etc/crypto-policies",
+          "/etc/fonts",
           "/etc/ld.so.cache",
           "/etc/ld.so.conf",
           "/etc/ld.so.conf.d",
@@ -227,7 +229,13 @@
           "/etc/locale.gen",
           "/etc/alternatives",
           "/etc/os-release",
+          "/etc/passwd",
           "/etc/services",
+          "/etc/mime.types",
+          "/etc/manpath.config",
+          "/etc/man_db.conf",
+          "/var/cache/man",
+          "/run/systemd/userdb",
           "/usr/share",
           "/usr/share/locale",
           "/usr/share/locale-langpack",
@@ -485,6 +493,16 @@
         ]
       }
     },
+    "snap_linux": {
+      "description": "Installed Snap package contents on Linux",
+      "platform": "linux",
+      "allow": {
+        "read": [
+          "/snap",
+          "/var/lib/snapd/snap"
+        ]
+      }
+    },
     "claude_code_macos": {
       "description": "Claude Code macOS-specific state and credential paths",
       "platform": "macos",
@@ -680,10 +698,16 @@
       "security": {
         "signal_mode": "isolated"
       },
-      "filesystem": {},
+      "filesystem": {
+        "unix_socket_dir": [
+          {
+            "path": "/run/systemd/userdb",
+            "when": "linux"
+          }
+        ]
+      },
       "network": { "block": false },
-      "workdir": { "access": "none" },
-      "interactive": false
+      "workdir": { "access": "none" }
     },
     "linux-host-compat": {
       "extends": "default",
@@ -705,8 +729,7 @@
       },
       "filesystem": {},
       "network": { "block": false },
-      "workdir": { "access": "none" },
-      "interactive": false
+      "workdir": { "access": "none" }
     },
     "mise-dev": {
       "extends": "default",
@@ -724,8 +747,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "python-dev": {
       "extends": "default",
@@ -744,8 +766,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "node-dev": {
       "extends": "default",
@@ -763,8 +784,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "bun-dev": {
       "extends": "default",
@@ -782,8 +802,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "go-dev": {
       "extends": "default",
@@ -801,8 +820,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "java-dev": {
       "extends": "default",
@@ -823,8 +841,7 @@
       ],
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     },
     "rust-dev": {
       "extends": "default",
@@ -842,8 +859,7 @@
       },
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
-      "workdir": { "access": "readwrite" },
-      "interactive": false
+      "workdir": { "access": "readwrite" }
     }
   }
 }

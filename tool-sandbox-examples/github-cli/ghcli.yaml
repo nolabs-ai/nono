@@ -27,7 +27,7 @@ steps:
       nono run --allow-cwd --allow ~/allowed -- cat ~/denied/secret.txt
 
   # ------------------------------------------------------------------
-  # The profile: a tool sandbox built specifically for the gh CLI.
+  # The profile: a command sandbox policy built specifically for the gh CLI.
   # ------------------------------------------------------------------
   - pause
   - comment: "Credential config: the real token is read from the OS keyring and injected upstream by the proxy -- the sandbox only ever sees a phantom."
@@ -36,7 +36,7 @@ steps:
       jq '{credentials: .command_policies.credentials}' ./ghcli-profile-macos.json
 
   - pause
-  - comment: "A tool sandbox configured just for gh: pinned binary, filesystem reads, L7 endpoint policy, and argv policy."
+  - comment: "A command sandbox configured just for gh: pinned binary, filesystem reads, L7 endpoint policy, and argv policy."
     style: blue
   - text: >-
       jq '.command_policies.commands.gh | { executable, sandbox_reads: .from.session.sandbox.fs_read, sandbox_config_files: .from.session.sandbox.fs_read_file, l7_endpoint_policy: (.from.session.sandbox.credentials[0].endpoint_policy | {default, allow: [.allow[] | "\(.method) \(.path)"], deny: [.deny[] | "\(.method) \(.path)"]}), argv_policy: (.from.session.invocation_policy | {default, allow: [.allow[].argv | (.prefix // .exact) | join(" ")], deny: [.deny[].argv | (.prefix // .exact) | join(" ")]}) }' ./ghcli-profile-macos.json
@@ -157,7 +157,7 @@ steps:
       nono run -s --allow-cwd --profile ./ghcli-profile-macos.json -- claude 'Use gh to fetch the title and state of issue 1052 in the nolabs-ai/nono repo, then report just those.' --dangerously-skip-permissions --allowedTools Bash
 
   - pause
-  - comment: "Agent write: Claude tries to comment -- nono blocks the gh mutation at the tool boundary."
+  - comment: "Agent write: Claude tries to comment -- nono blocks the gh mutation at the command-policy boundary."
     style: blue
   - text: >-
       nono run -s --allow-cwd --profile ./ghcli-profile-macos.json -- claude 'Use gh to post a comment saying hello on issue 1052 in the nolabs-ai/nono repo. If it fails, tell me exactly why.' --dangerously-skip-permissions --allowedTools Bash

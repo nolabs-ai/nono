@@ -1,4 +1,4 @@
-//! The `decision` vocabulary the tool sandbox writes into command policy audit
+//! The `decision` vocabulary command mediation writes into command-policy audit
 //! events.
 //!
 //! Emitters name a variant rather than a string literal, so a new decision

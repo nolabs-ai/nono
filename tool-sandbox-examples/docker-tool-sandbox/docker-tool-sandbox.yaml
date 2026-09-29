@@ -1,0 +1,148 @@
+speed: 80
+delay: 35
+clear: true
+show_exit_status: true
+
+steps:
+  - pause
+  - comment: "The image contains a small demo tool. nono pins its exact executable and gives it a narrow filesystem sandbox."
+    style: blue
+  - text: >-
+      jq '{executable: .command_policies.commands["demo-tool"].executable,
+      fs_read_file: .command_policies.commands["demo-tool"].from.session.sandbox.fs_read_file,
+      fs_write: .command_policies.commands["demo-tool"].from.session.sandbox.fs_write,
+      invocation: .command_policies.commands["demo-tool"].from.session.invocation_policy}'
+      profile.json
+  - comment: "The docker command has --cap-drop and --security-opt flags to minimize privileges."
+    style: blue
+  - text: |-
+      docker run --rm --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        agent-tool read /work/allowed.txt
+
+  - pause
+  - comment: "The tool can write to its dedicated output directory."
+    style: blue
+  - text: >-
+      jq '{write_capability: .command_policies.commands["demo-tool"].from.session.sandbox.fs_write,
+      write_invocation: [.command_policies.commands["demo-tool"].from.session.invocation_policy.allow[]
+      | select(.argv.prefix[0] == "write")]}' profile.json
+  - text: |-
+      docker run --rm --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        agent-tool write /work/output/result.txt 'created by demo-tool'
+
+  - pause
+  - comment: "The same tool cannot read the secret fixture because it is outside its nested fs_read_file grant."
+    style: blue
+  - text: >-
+      jq '{read_files: .command_policies.commands["demo-tool"].from.session.sandbox.fs_read_file,
+      invocation_default: .command_policies.commands["demo-tool"].from.session.invocation_policy.default}'
+      profile.json
+  - text: |-
+      docker run --rm --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        agent-tool read /work/secret.txt
+
+  - pause
+  - comment: "A tool operation that is not allowlisted is rejected before demo-tool starts."
+    style: blue
+  - text: >-
+      jq '{default: .command_policies.commands["demo-tool"].from.session.invocation_policy.default,
+      allowed_operations: [.command_policies.commands["demo-tool"].from.session.invocation_policy.allow[].argv.prefix[0]]}'
+      profile.json
+  - text: |-
+      docker run --rm --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        agent-tool fetch example.com:80
+
+  - pause
+  - comment: "The delete operation has an explicit argv deny, so the tool cannot remove even a file it could otherwise access."
+    style: blue
+  - text: >-
+      jq '{deny: .command_policies.commands["demo-tool"].from.session.invocation_policy.deny}'
+      profile.json
+  - text: |-
+      docker run --rm --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        agent-tool delete /work/allowed.txt
+
+  - pause
+  - comment: "Real Linux tools can use the same profile. cat is pinned and may read only the approved fixture."
+    style: blue
+  - text: >-
+      jq '{executable: .command_policies.commands.cat.executable,
+      fs_read_file: .command_policies.commands.cat.from.session.sandbox.fs_read_file,
+      invocation: .command_policies.commands.cat.from.session.invocation_policy}' profile.json
+  - text: |-
+      docker run --rm --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        --entrypoint /usr/bin/nono agent-tool \
+        run --no-audit --profile /opt/nono-tool/profile.json -- \
+        cat /work/allowed.txt
+
+  - pause
+  - comment: "sed receives its own command policy and can inspect the same approved input."
+    style: blue
+  - text: >-
+      jq '{executable: .command_policies.commands.sed.executable,
+      fs_read_file: .command_policies.commands.sed.from.session.sandbox.fs_read_file,
+      invocation: .command_policies.commands.sed.from.session.invocation_policy}' profile.json
+  - text: |-
+      docker run --rm --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        --entrypoint /usr/bin/nono agent-tool \
+        run --no-audit --profile /opt/nono-tool/profile.json -- \
+        sed -n '1p' /work/allowed.txt
+
+  - pause
+  - comment: "The network policy allows example.com but only permits GET /. The domain and endpoint rules are visible here before curl runs."
+    style: blue
+  - text: >-
+      jq '{allow_domain: .network.allow_domain,
+      deny_domain: .network.deny_domain,
+      curl_invocation: .command_policies.commands.curl.from.session.invocation_policy}' profile.json
+  - text: |-
+      docker run --rm --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        --entrypoint /usr/bin/nono agent-tool \
+        run --no-audit --profile /opt/nono-tool/profile.json -- \
+        curl https://example.com/
+
+  - pause
+  - comment: "The domain is allowed, but POST / is denied by the L7 method policy."
+    style: blue
+  - text: >-
+      jq '{domain: "example.com", allowed_endpoints: .network.allow_domain[0].endpoints,
+      attempted: {method: "POST", path: "/"}}' profile.json
+  - text: |-
+      docker run --rm --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        --entrypoint /usr/bin/nono agent-tool \
+        run --no-audit --profile /opt/nono-tool/profile.json -- \
+        curl -X POST https://example.com/
+
+  - pause
+  - comment: "The domain is allowed, but GET /private is denied because the L7 path does not match /."
+    style: blue
+  - text: >-
+      jq '{domain: "example.com", allowed_paths: [.network.allow_domain[0].endpoints[].path],
+      attempted: {method: "GET", path: "/private"}}' profile.json
+  - text: |-
+      docker run --rm --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        --entrypoint /usr/bin/nono agent-tool \
+        run --no-audit --profile /opt/nono-tool/profile.json -- \
+        curl https://example.com/private
+
+  - pause
+  - comment: "example.org is denied at the domain layer, before any L7 endpoint rule can allow it."
+    style: blue
+  - text: >-
+      jq '{deny_domain: .network.deny_domain, attempted_domain: "example.org"}' profile.json
+  - text: |-
+      docker run --rm --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        --entrypoint /usr/bin/nono agent-tool \
+        run --no-audit --profile /opt/nono-tool/profile.json -- \
+        curl https://example.org/

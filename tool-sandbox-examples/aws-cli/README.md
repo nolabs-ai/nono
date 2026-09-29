@@ -34,9 +34,9 @@ network-level model — see [Known limitation](#known-limitation) below for why.
 ## Known limitation
 
 `aws_auth` SigV4 signing is currently only wired into nono's **TLS-interception** path (matching
-the real AWS hostname), not the per-command `command_policies` tool-sandbox model that `github-cli`
+the real AWS hostname), not the per-command `command_policies` model that `github-cli`
 uses — so this profile has no per-subcommand `invocation_policy` (argv) layer the way `github-cli` does
-for `gh`. Separately, the per-command tool-sandbox exec gate on macOS does not currently grant exec
+for `gh`. Separately, the command-sandbox exec gate on macOS does not currently grant exec
 of a shebang-script interpreter chain (as used by the Python-based `aws` CLI) even when the
 interpreter path is explicitly declared via `fs_read`/`fs_read_file` — only the top-level session
 sandbox handles this automatically. Both are nono limitations, not profile bugs; the L7

@@ -131,7 +131,7 @@ nono run --profile my-claude -- claude
 
 - **Lists** (filesystem paths, security groups, rollback patterns): appended and deduplicated
 - **HashMaps** (credentials, hooks): merged, child wins on same key
-- **Booleans** (`network.block`, `interactive`): OR — either activates
+- **Booleans** (`network.block`): OR — either activates
 - **Scalars** (`meta`): child overrides
 - **Nullable scalars** (`network_profile`): absent inherits, `null` clears, string overrides
 
@@ -177,8 +177,8 @@ EOF
 nono run --profile my-profile -- rm /tmp/old-file.txt
 ```
 
-Prefer resource-based controls instead: narrower filesystem grants,
-`filesystem.deny`, `unlink_protection`, and network policy.
+Prefer filesystem, network, and command policies instead: narrower filesystem
+grants, `filesystem.deny`, `unlink_protection`, and network policy.
 
 ## Documentation
 

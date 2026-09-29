@@ -3,7 +3,7 @@
 //! Defines the configuration for the proxy server, including allowed hosts,
 //! credential routes, and external proxy settings.
 
-use globset::Glob;
+use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -1099,6 +1099,7 @@ struct CompiledPolicyRule {
 }
 
 /// Result of evaluating a compiled endpoint policy.
+#[derive(Debug)]
 pub enum EndpointPolicyOutcome<'a> {
     Allow {
         rule_label: String,
@@ -1164,9 +1165,12 @@ impl CompiledUpgradeRules {
     /// `true` if `protocol`+`method`+`path` matches one of the compiled
     /// rules. `path` is normalized (query string stripped, percent-decoded,
     /// trailing slash removed) before comparison so callers can pass the raw
-    /// request path.
+    /// request path. Ambiguous paths (see [`path_is_ambiguous`]) never match.
     #[must_use]
     pub fn matches(&self, path: &str) -> bool {
+        if path_is_ambiguous(path) {
+            return false;
+        }
         let normalized = normalize_path(path);
         self.rules.iter().any(|r| r.path == normalized)
     }
@@ -1183,7 +1187,9 @@ impl CompiledEndpointRules {
     pub fn compile(rules: &[EndpointRule]) -> Result<Self, String> {
         let mut compiled = Vec::with_capacity(rules.len());
         for rule in rules {
-            let glob = Glob::new(&rule.path)
+            let glob = GlobBuilder::new(&rule.path)
+                .literal_separator(true)
+                .build()
                 .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
             compiled.push(CompiledRule {
                 method: rule.method.clone(),
@@ -1200,10 +1206,14 @@ impl CompiledEndpointRules {
     }
 
     /// `true` if method+path matches a rule, or if no rules are defined.
+    /// Ambiguous paths (see [`path_is_ambiguous`]) never match.
     #[must_use]
     pub fn is_allowed(&self, method: &str, path: &str) -> bool {
         if self.rules.is_empty() {
             return true;
+        }
+        if path_is_ambiguous(path) {
+            return false;
         }
         let normalized = normalize_path(path);
         self.rules.iter().any(|r| {
@@ -1281,8 +1291,20 @@ impl CompiledEndpointPolicy {
     }
 
     /// Evaluate method+path using deny, approve, allow, default precedence.
+    /// Ambiguous paths (see [`path_is_ambiguous`]) are denied whenever the
+    /// policy constrains endpoints at all.
     #[must_use]
     pub fn evaluate<'a>(&'a self, method: &str, path: &str) -> EndpointPolicyOutcome<'a> {
+        if !self.allows_all_without_l7() && path_is_ambiguous(path) {
+            return EndpointPolicyOutcome::Deny {
+                reason: Some(
+                    "request path contains segments an upstream may resolve differently \
+                     than the endpoint policy matcher (path parameters, encoded \
+                     separators, or double-encoding); refusing to forward",
+                ),
+                rule_label: "endpoint_policy.ambiguous_path".to_string(),
+            };
+        }
         let normalized = normalize_path(path);
         if let Some(rule) = first_policy_match(&self.deny, method, &normalized) {
             return EndpointPolicyOutcome::Deny {
@@ -1325,7 +1347,9 @@ impl CompiledEndpointPolicy {
 fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPolicyRule>, String> {
     let mut compiled = Vec::with_capacity(rules.len());
     for rule in rules {
-        let glob = Glob::new(&rule.path)
+        let glob = GlobBuilder::new(&rule.path)
+            .literal_separator(true)
+            .build()
             .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
         compiled.push(CompiledPolicyRule {
             method: rule.method.clone(),
@@ -1383,7 +1407,9 @@ fn endpoint_allowed(rules: &[EndpointRule], method: &str, path: &str) -> bool {
     let normalized = normalize_path(path);
     rules.iter().any(|r| {
         (r.method == "*" || r.method.eq_ignore_ascii_case(method))
-            && Glob::new(&r.path)
+            && GlobBuilder::new(&r.path)
+                .literal_separator(true)
+                .build()
                 .ok()
                 .map(|g| g.compile_matcher())
                 .is_some_and(|m| m.is_match(&normalized))
@@ -1427,6 +1453,29 @@ fn normalize_path(path: &str) -> String {
     } else {
         format!("/{}", segments.join("/"))
     }
+}
+
+/// `true` if an upstream could resolve `path` to a different resource than
+/// the form [`normalize_path`] produces for policy matching
+/// (GHSA-8r33-hr9m-69wh). The raw path is what gets forwarded, and no single
+/// normalization matches every upstream, so divergent paths are rejected
+/// rather than normalized: `;` (servlet path parameters turn `..;x` into a
+/// dot-segment), `\` (alternate separator), residual `%` after one decode
+/// (double-decoding upstreams), raw `%2e`/`%2f` (segment-boundary
+/// disagreement), and control characters (NUL truncation). The query string
+/// is exempt, and literal `.`/`..` segments are resolved consistently by
+/// both sides.
+fn path_is_ambiguous(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2e") || lower.contains("%2f") {
+        return true;
+    }
+    let binary = urlencoding::decode_binary(path.as_bytes());
+    let decoded = String::from_utf8_lossy(&binary);
+    decoded
+        .chars()
+        .any(|c| c == ';' || c == '\\' || c == '%' || c.is_control())
 }
 
 fn default_inject_header() -> String {
@@ -1789,6 +1838,37 @@ mod tests {
         assert!(!check(&rule, "GET", "/api/v4/projects/merge_requests"));
     }
 
+    // Regression test for https://github.com/nolabs-ai/nono/issues/1824:
+    // `*` must not cross a `/` segment boundary the way `**` does.
+    #[test]
+    fn test_endpoint_rule_single_wildcard_rejects_multi_segment() {
+        let rule = EndpointRule {
+            method: "GET".to_string(),
+            path: "/api/v4/projects/*/merge_requests".to_string(),
+        };
+        assert!(!check(
+            &rule,
+            "GET",
+            "/api/v4/projects/123/456/merge_requests"
+        ));
+
+        let one_star = EndpointRule {
+            method: "*".to_string(),
+            path: "/repos/*".to_string(),
+        };
+        assert!(check(&one_star, "GET", "/repos/one"));
+        assert!(!check(&one_star, "GET", "/repos/one/two"));
+        assert!(!check(&one_star, "GET", "/repos/a/b/c/d"));
+
+        let two_star = EndpointRule {
+            method: "*".to_string(),
+            path: "/repos/**".to_string(),
+        };
+        assert!(check(&two_star, "GET", "/repos/one"));
+        assert!(check(&two_star, "GET", "/repos/one/two"));
+        assert!(check(&two_star, "GET", "/repos/a/b/c/d"));
+    }
+
     #[test]
     fn test_endpoint_rule_double_wildcard() {
         let rule = EndpointRule {
@@ -1942,6 +2022,150 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // Regression test for https://github.com/nolabs-ai/nono/issues/1824:
+    // policy-config paths (allow/deny/approve) must honor the same
+    // one-segment `*` semantics as legacy EndpointRule.
+    #[test]
+    fn test_compiled_endpoint_policy_single_wildcard_rejects_multi_segment() {
+        let policy = EndpointPolicyConfig {
+            allow: vec![EndpointPolicyRule {
+                method: "GET".to_string(),
+                path: "/repos/*".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+
+        assert!(matches!(
+            compiled.evaluate("GET", "/repos/one"),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("GET", "/repos/one/two"),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("GET", "/repos/a/b/c/d"),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn path_is_ambiguous_flags_upstream_divergent_paths() {
+        // GHSA-8r33-hr9m-69wh: servlet stacks strip `;...` path parameters,
+        // turning `..;x` into a dot-segment the policy matcher never saw.
+        assert!(path_is_ambiguous(
+            "/v1/public/..;jsessionid=1/secrets/token"
+        ));
+        assert!(path_is_ambiguous("/a/b;v=1/c"));
+        // Encoded dots and slashes: upstream may route on the encoded form.
+        assert!(path_is_ambiguous("/a/%2e%2e/b"));
+        assert!(path_is_ambiguous("/a/%2E%2E/b"));
+        assert!(path_is_ambiguous("/a%2fb"));
+        // Double-encoding: a double-decoding upstream sees `..`.
+        assert!(path_is_ambiguous("/a/%252e%252e/b"));
+        assert!(path_is_ambiguous("/a/%253b/b"));
+        // Alternate separators and truncation.
+        assert!(path_is_ambiguous("/a/b\\c"));
+        assert!(path_is_ambiguous("/a/%5c/b"));
+        assert!(path_is_ambiguous("/a/%00/b"));
+    }
+
+    #[test]
+    fn path_is_ambiguous_allows_normal_paths() {
+        assert!(!path_is_ambiguous("/v1/chat/completions"));
+        // Benign percent-encoding decodes cleanly in one pass.
+        assert!(!path_is_ambiguous("/repos/myrepo/%69ssues"));
+        assert!(!path_is_ambiguous("/a/x%20y/b"));
+        // Plain dot-segments resolve identically on both sides.
+        assert!(!path_is_ambiguous("/a/../b"));
+        // `;` and `%` in the query string are legitimate and never affect
+        // upstream path routing.
+        assert!(!path_is_ambiguous("/v1/tasks?filter=a;b&x=%2e"));
+    }
+
+    // Regression test for GHSA-8r33-hr9m-69wh: the policy matched a
+    // normalized path while the raw path was forwarded, so a `..;param`
+    // segment (opaque to the normalizer, a dot-segment to servlet
+    // upstreams) escaped a deny rule. Ambiguous paths must be denied
+    // outright, not normalized.
+    #[test]
+    fn test_endpoint_policy_denies_path_parameter_traversal() {
+        let policy = EndpointPolicyConfig {
+            default: EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            },
+            deny: vec![EndpointPolicyRule {
+                method: "*".to_string(),
+                path: "/v1/secrets/**".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+
+        // Control: the deny rule itself works, and clean paths still pass.
+        assert!(matches!(
+            compiled.evaluate("GET", "/v1/secrets/token"),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("GET", "/v1/public/info"),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+
+        // The advisory PoC path and its encoded relatives.
+        for exploit in [
+            "/v1/public/..;jsessionid=1/secrets/token",
+            "/v1/public/%2e%2e/secrets/token",
+            "/v1/public/%252e%252e/secrets/token",
+            "/v1/public%2f../secrets/token",
+        ] {
+            match compiled.evaluate("GET", exploit) {
+                EndpointPolicyOutcome::Deny { rule_label, .. } => {
+                    assert_eq!(rule_label, "endpoint_policy.ambiguous_path");
+                }
+                other => panic!("expected Deny for {exploit}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_endpoint_policy_without_l7_rules_ignores_ambiguity() {
+        // A route with no endpoint constraints has no path boundary to
+        // bypass; raw pass-through behavior is preserved for upstream APIs
+        // that legitimately use path parameters.
+        let compiled = CompiledEndpointPolicy::compile(None, &[]).unwrap();
+        assert!(compiled.allows_all_without_l7());
+        assert!(matches!(
+            compiled.evaluate("GET", "/a/..;x/b"),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn test_endpoint_rules_reject_ambiguous_paths() {
+        let rules = vec![EndpointRule {
+            method: "GET".to_string(),
+            path: "/repos/**".to_string(),
+        }];
+        let compiled = CompiledEndpointRules::compile(&rules).unwrap();
+        assert!(compiled.is_allowed("GET", "/repos/myrepo/issues"));
+        assert!(!compiled.is_allowed("GET", "/repos/..;x/admin"));
+        assert!(!compiled.is_allowed("GET", "/repos/%252e%252e/admin"));
+
+        // Empty rules remain allow-all (no boundary to bypass).
+        let empty = CompiledEndpointRules::compile(&[]).unwrap();
+        assert!(empty.is_allowed("GET", "/repos/..;x/admin"));
     }
 
     #[test]
@@ -2359,5 +2583,17 @@ mod tests {
         .unwrap();
         assert!(compiled.matches("/backend-api/codex/../codex/responses"));
         assert!(!compiled.matches("/backend-api/codex/../other/responses"));
+    }
+
+    #[test]
+    fn websocket_rules_do_not_match_ambiguous_paths() {
+        let compiled = CompiledUpgradeRules::compile(&[WebSocketRuleConfig {
+            path: "/backend-api/codex/responses".to_string(),
+        }])
+        .unwrap();
+        // Would normalize to the allowed path, but an upstream may resolve
+        // the raw form elsewhere (GHSA-8r33-hr9m-69wh).
+        assert!(!compiled.matches("/backend-api/%2e%2e/backend-api/codex/responses"));
+        assert!(!compiled.matches("/backend-api/codex/responses;v=1"));
     }
 }

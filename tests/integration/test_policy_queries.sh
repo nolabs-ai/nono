@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2088 # User-facing test descriptions intentionally use ~ notation.
 # Policy Query Tests
 # Verifies `nono why` decisions for filesystem and network policy evaluation.
 
@@ -6,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
 
 echo ""
-echo -e "${BLUE}=== Policy Query Tests ===${NC}"
+echo -e "${BLUE}Policy Query Tests${NC}"
 
 verify_nono_binary
 
@@ -24,7 +25,7 @@ echo ""
 echo "Test directory: $TMPDIR"
 echo ""
 
-echo "--- Path Policy Queries ---"
+echo "Path Policy Queries"
 
 expect_output_contains "sensitive path is denied" "\"reason\": \"filesystem_deny\"" \
     "$NONO_BIN" --silent why --json --path ~/.ssh --op read
@@ -68,7 +69,7 @@ else
 fi
 
 echo ""
-echo "--- Network Policy Queries ---"
+echo "Network Policy Queries"
 
 expect_output_contains "network allowed by default" "\"reason\": \"network_allowed\"" \
     "$NONO_BIN" --silent why --json --host example.com --port 443

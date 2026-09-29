@@ -20,6 +20,16 @@ The security goal is therefore:
 
 nono answers this question "how do I limit the execution path of a single spawned process and its children?" It does not answer "how do I create a separate kernel or single monolithic hardware boundary?" nono provides the former, and it can be combined with the latter when the deployment requires it.
 
+### Policy taxonomy
+
+nono uses three top-level policy categories:
+
+- **Filesystem policy** controls which paths a sandbox can read or write.
+- **Network policy** controls network access. Direct network policy governs connections outside the proxy; proxy policy governs proxied domain and endpoint rules plus credential routes.
+- **Command policy** controls which commands may run, who may invoke them, and which command sandbox policy an invocation receives.
+
+The initial workload runs in the **session sandbox**. A policy-controlled command runs in a fresh **command sandbox**, whose policy may contain its own filesystem and network policies, environment rules, credentials, and resource limits. A sandbox is the enforced runtime boundary; a policy is the configuration used to build that boundary.
+
 ### Capability model vs. isolation model
 
 ```mermaid
@@ -72,8 +82,8 @@ nono does the opposite: it does not add a perimeter around the whole box, but it
 1. The agent invokes a selected command such as `git`, `kubectl`, or `curl`.
 2. The shim sends the invocation and caller identity to the trusted supervisor.
 3. The supervisor resolves the applicable command or caller-to-command policy.
-4. nono launches the tool in a fresh child sandbox containing a minimal runtime baseline plus that policy's filesystem, network, environment, credential, argument, output, and resource grants.
-5. A chained command crosses the broker again and receives its own policy.
+4. nono launches the tool in a fresh command sandbox containing a minimal runtime baseline plus the selected command sandbox policy's filesystem, network, environment, credential, argument, output, and resource grants.
+5. A chained command crosses the broker again and receives its own command sandbox policy.
 
 This makes the **tool invocation** the main capability boundary. A build tool and a deployment tool do not need to share authority merely because the same agent invokes both.
 
@@ -84,13 +94,13 @@ See [Sandboxed Tool Execution](/cli/features/tool-sandbox) for the policy schema
 | Component | Trust assumption | Responsibility |
 |---|---|---|
 | Host kernel | Trusted | Enforces Landlock, seccomp, and Seatbelt restrictions applied to sandboxed processes. |
-| nono supervisor and broker | Trusted | Resolves command policy, launches tool sandboxes, mediates approvals, proxy access, credentials, audit recording, and other runtime services. |
+| nono supervisor and broker | Trusted | Resolves command policy, launches command sandboxes, mediates approvals, proxy access, credentials, audit recording, and other runtime services. |
 | Profile and command policy | Trusted configuration | Defines which commands and invocation paths receive authority. A broad or unsafe policy produces a broad or unsafe sandbox. |
-| Selected tool process | Restricted workload | Receives the capabilities in its effective command policy and can exercise all of them. It need not cooperate with policy enforcement. |
+| Selected tool process | Restricted workload | Receives the capabilities in its effective command sandbox and can exercise all of them. It need not cooperate with policy enforcement. |
 | Agent and tool inputs | Not trusted to choose policy | May request operations, but do not directly decide which capabilities the broker grants. |
-| Container or microVM, when used | Optional outer boundary | Limits the effect of a nono, policy, kernel, or tool-sandbox bypass. |
+| Container or microVM, when used | Optional outer boundary | Limits the effect of a nono, policy, kernel, or command-mediation bypass. |
 
-The supervisor is deliberately outside the child sandboxes and runs with the invoking user's host permissions. It is part of nono's trusted computing base, not a less-privileged peer of the agent.
+The supervisor is deliberately outside the command sandboxes and runs with the invoking user's host permissions. It is part of nono's trusted computing base, not a less-privileged peer of the agent.
 
 Profiles are security-sensitive code. Command resolution, writable executable exceptions, direct-exec bypasses, raw credentials, unsafe Seatbelt rules, broad filesystem grants, and permissive approval rules all change the effective boundary.
 
@@ -101,7 +111,7 @@ Landlock and Seatbelt restrictions applied to an individual child are not remova
 That does **not** make the nono session as a whole irreversible:
 
 - The trusted supervisor remains outside the child's sandbox.
-- The supervisor can launch a new tool child with the capabilities selected by a command policy.
+- The supervisor can launch a new command sandbox with the capabilities selected by a command policy.
 - On supported Linux systems, explicit capability elevation can let the supervisor open an approved file and inject its file descriptor into a child.
 - Brokered network access, credential injection, URL opening, and approval backends intentionally perform operations the child cannot perform directly.
 
@@ -158,7 +168,7 @@ The audit subsystem has a narrower security claim than the sandbox itself.
 - The keyed audit attestation is only as strong as the signing key distribution model. If the verifier does not pin the expected public key, a rewritten session could also rewrite the embedded public key and remain self-consistent.
 - `nono audit verify --public-key-file <FILE>` is the path that pins verification to an expected signer key. Without that, attestation verification checks the keyed signature against the public key recorded in session metadata.
 - Filesystem Merkle roots under `--audit-integrity` or `--rollback` commit tracked writable paths, not the full machine state.
-- Session metadata carries a denormalized rollup of Tool Sandbox command-policy decisions so that session listings do not have to parse event logs. That rollup is derived data, not a second record: it is covered by the session digest committed to the ledger, so editing it fails `nono audit verify`, but it is not independently recomputed from the events during verification. A rollup read without verifying is only as trustworthy as the file it came from, and `nono audit show` is the authoritative per-decision record.
+- Session metadata carries a denormalized rollup of command-policy decisions so that session listings do not have to parse event logs. That rollup is derived data, not a second record: it is covered by the session digest committed to the ledger, so editing it fails `nono audit verify`, but it is not independently recomputed from the events during verification. A rollup read without verifying is only as trustworthy as the file it came from, and `nono audit show` is the authoritative per-decision record.
 
 The correct way to read the feature today is:
 
@@ -339,7 +349,7 @@ For higher-assurance or multi-tenant deployments, put nono inside a stronger out
 | Standard container | Namespaces, cgroups, and the shared host kernel | Coarse mounts and network namespace policy |
 | Hardened container runtime | Runtime-specific isolation, often stronger than a standard container | Coarse outer boundary |
 | microVM | Separate guest kernel and hardware virtualization | Coarse virtual devices, mounts, and network |
-| nono inside a container or microVM | Container or VM perimeter around nono and the workload | Fine-grained tool policy inside the outer boundary |
+| nono inside a container or microVM | Container or VM perimeter around nono and the workload | Fine-grained command policy inside the outer boundary |
 
 A container and a microVM are not equivalent: a standard container still shares the host kernel, while a microVM supplies a separate guest kernel and hardware-backed isolation. Hardened runtimes occupy different points between those models.
 

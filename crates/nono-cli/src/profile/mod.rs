@@ -180,9 +180,7 @@ pub struct FilesystemConfig {
     /// bound. Recursive. Implies read+write access on the directory.
     #[serde(default, deserialize_with = "deserialize_conditional_path_vec")]
     pub unix_socket_subtree_bind: Vec<String>,
-    /// Paths denied filesystem access. Canonical location for deny entries
-    /// in the #594 schema; the legacy deny-access key drains here via
-    /// `deprecated_schema::LegacyPolicyPatch`.
+    /// Paths denied filesystem access.
     #[serde(default, deserialize_with = "deserialize_conditional_path_vec")]
     pub deny: Vec<String>,
     /// Paths exempted from group-level deny rules.
@@ -201,12 +199,7 @@ pub struct FilesystemConfig {
     /// prompt. This does not grant access, remove deny rules, or hide the
     /// diagnostic footer; it only suppresses repeated save suggestions for
     /// paths the user has decided not to grant.
-    /// ALIAS(canonical="suppress_save_prompt", introduced="v0.52.0", remove_by="indefinite", issue="#875")
-    #[serde(
-        default,
-        alias = "ignore",
-        deserialize_with = "deserialize_conditional_path_vec"
-    )]
+    #[serde(default, deserialize_with = "deserialize_conditional_path_vec")]
     pub suppress_save_prompt: Vec<String>,
 }
 
@@ -226,25 +219,25 @@ pub struct GroupsConfig {
 /// startup command. They are not enforced for child processes, so they
 /// cannot serve as a security boundary. Configured values still parse and
 /// are surfaced via runtime warnings (see [`crate::command_blocking_deprecation`]).
-/// Prefer resource-based controls: filesystem deny rules, narrower filesystem
-/// grants, `unlink_protection`, and network policy.
+/// Prefer filesystem, network, and command policies: filesystem deny rules,
+/// narrower filesystem grants, `unlink_protection`, and network policy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandsConfig {
     /// Startup-only command allowlist override. Not enforced for child
-    /// processes; prefer resource-based controls.
+    /// processes; prefer filesystem, network, and command policies.
     #[serde(default)]
     #[deprecated(
         since = "0.33.0",
-        note = "startup-only, not enforced for child processes; prefer resource-based controls"
+        note = "startup-only, not enforced for child processes; prefer filesystem, network, and command policies"
     )]
     pub allow: Vec<String>,
     /// Startup-only command denylist extension. Not enforced for child
-    /// processes; prefer resource-based controls.
+    /// processes; prefer filesystem, network, and command policies.
     #[serde(default)]
     #[deprecated(
         since = "0.33.0",
-        note = "startup-only, not enforced for child processes; prefer resource-based controls"
+        note = "startup-only, not enforced for child processes; prefer filesystem, network, and command policies"
     )]
     pub deny: Vec<String>,
 }
@@ -523,7 +516,9 @@ fn is_http_token_char(c: char) -> bool {
 /// - A 1Password `op://` URI (validated by `nono::keystore::validate_op_uri`)
 /// - A Bitwarden `bw://` URI (validated by `nono::keystore::validate_bw_uri`)
 /// - An Apple Passwords `apple-password://` URI
+/// - A `keyring://service/account` URI (validated by `nono::keystore::validate_keyring_uri`)
 /// - A `file://` URI pointing to an absolute path (validated by `nono::keystore::validate_file_uri`)
+/// - A `cmd://name` URI backed by a `credential_capture` entry (validated by `nono::keystore::validate_cmd_uri`)
 /// - An `env://` URI referencing a host environment variable (validated by `nono::keystore::validate_env_uri`)
 fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
     if key.is_empty() {
@@ -555,6 +550,13 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
                 context_name, e
             ))
         })
+    } else if nono::keystore::is_keyring_uri(key) {
+        nono::keystore::validate_keyring_uri(key).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "invalid keyring URI for custom credential '{}': {}",
+                context_name, e
+            ))
+        })
     } else if nono::keystore::is_file_uri(key) {
         nono::keystore::validate_file_uri(key).map_err(|e| {
             NonoError::ProfileParse(format!(
@@ -581,7 +583,8 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
         if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(NonoError::ProfileParse(format!(
                 "credential_key '{}' for custom credential '{}' must contain only \
-                 alphanumeric characters and underscores (or use op:// / bw:// / apple-password:// / file:// / env:// / cmd:// URI)",
+                 alphanumeric characters and underscores (or use op:// / bw:// / \
+                 apple-password:// / keyring:// / file:// / env:// / cmd:// URI)",
                 key, context_name
             )));
         }
@@ -593,7 +596,8 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///
 /// Checks:
 /// - `credential_key` must be alphanumeric + underscores only, or a valid
-///   `op://` / `bw://` / `apple-password://` / `file://` / `env://` / `cmd://` URI
+///   `op://` / `bw://` / `apple-password://` / `keyring://` / `file://` / `env://`
+///   / `cmd://` URI
 /// - `upstream` must be HTTPS (or HTTP for loopback only)
 /// - Mode-specific validation:
 ///   - `header`: inject_header must be valid HTTP token; effective format (see field doc) must not contain CR/LF
@@ -697,14 +701,15 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         if (nono::keystore::is_op_uri(key)
             || nono::keystore::is_bw_uri(key)
             || nono::keystore::is_apple_password_uri(key)
+            || nono::keystore::is_keyring_uri(key)
             || nono::keystore::is_file_uri(key)
             || nono::keystore::is_cmd_uri(key))
             && cred.env_var.is_none()
         {
             return Err(NonoError::ProfileParse(format!(
                 "env_var is required for custom credential '{}' when credential_key is a URI \
-                 manager reference (op://, bw://, apple-password://, file://, or cmd://); \
-                 set it to the SDK API key env var name (e.g., \"OPENAI_API_KEY\")",
+                 manager reference (op://, bw://, apple-password://, keyring://, file://, or \
+                 cmd://); set it to the SDK API key env var name (e.g., \"OPENAI_API_KEY\")",
                 name
             )));
         }
@@ -1781,42 +1786,25 @@ pub struct NetworkConfig {
     pub network_profile: InheritableValue<String>,
     /// Additional domains to allow through the proxy (on top of profile hosts).
     /// Entries can be plain hostname strings or objects with endpoint rules.
-    /// Canonical profile key: `allow_domain` (legacy `proxy_allow` and
-    /// `allow_proxy` are also accepted).
-    /// ALIAS(canonical="allow_domain", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[serde(
-        default,
-        rename = "allow_domain",
-        alias = "proxy_allow",
-        alias = "allow_proxy"
-    )]
+    #[serde(default, rename = "allow_domain")]
     pub allow_domain: Vec<AllowDomainEntry>,
     /// Domains to deny through the proxy regardless of the allowlist.
     /// Supports the same wildcard syntax as `allow_domain` (e.g. `*.ads.example.com`).
     #[serde(default)]
     pub deny_domain: Vec<String>,
     /// Credential services to enable via reverse proxy.
-    /// Canonical profile key: `credentials` (legacy `proxy_credentials` accepted).
     ///
     /// When `None` (absent from profile), inherits parent credentials during merge.
     /// When `Some([])` (explicitly set to empty array), overrides parent to disable
     /// all inherited credential routes.
-    /// ALIAS(canonical="credentials", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(
         default,
         rename = "credentials",
-        alias = "proxy_credentials",
         skip_serializing_if = "Option::is_none"
     )]
     pub credentials: Option<Vec<String>>,
     /// Localhost TCP IPC (`--open-port`). **`0`**: macOS only, means `localhost:*` outbound.
-    /// ALIAS(canonical="open_port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[serde(
-        default,
-        rename = "open_port",
-        alias = "port_allow",
-        alias = "allow_port"
-    )]
+    #[serde(default, rename = "open_port")]
     pub open_port: Vec<u16>,
     /// Inclusive port ranges for bidirectional localhost TCP IPC (connect + bind).
     /// Multiple ranges are supported. Example: `[[3000, 3010], [8000, 8100]]`.
@@ -1856,16 +1844,10 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub tls_intercept: Option<TlsInterceptConfig>,
     /// Upstream proxy address (host:port) for enterprise proxy passthrough.
-    /// Canonical profile key: `upstream_proxy` (legacy `external_proxy`
-    /// accepted).
-    /// ALIAS(canonical="upstream_proxy", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[serde(default, rename = "upstream_proxy", alias = "external_proxy")]
+    #[serde(default, rename = "upstream_proxy")]
     pub upstream_proxy: Option<String>,
     /// Hosts to bypass the upstream proxy and route directly.
-    /// Canonical profile key: `upstream_bypass` (legacy
-    /// `external_proxy_bypass` accepted).
-    /// ALIAS(canonical="upstream_bypass", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[serde(default, rename = "upstream_bypass", alias = "external_proxy_bypass")]
+    #[serde(default, rename = "upstream_bypass")]
     pub upstream_bypass: Vec<String>,
     /// Where runtime host-approval prompts are sent when a CONNECT target is not
     /// on the allowlist.
@@ -2253,12 +2235,9 @@ pub struct WorkdirConfig {
 
 /// Security configuration — process-level isolation knobs.
 ///
-/// The legacy `groups` and `allowed_commands` fields were removed in phase 2
-/// of #594. Policy group membership now lives in `Profile.groups.include`
-/// (written by `merge_implicit_default_groups` at load time). Command
-/// allowlists live in `Profile.commands.allow`. Legacy JSON keys still
-/// deserialize via `deprecated_schema::RawSecurityConfig` and drain into
-/// those canonical sections.
+/// Policy group membership lives in `Profile.groups.include` (written by
+/// `merge_implicit_default_groups` at load time). Command allowlists live
+/// in `Profile.commands.allow`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
@@ -2286,7 +2265,7 @@ pub struct SecurityConfig {
     ///
     /// A named backend here (e.g. a `webhook`) answers the prompts instead of
     /// the terminal. This is kept separate from `command_policies` on purpose:
-    /// setting it does NOT switch on the tool-sandbox runtime. Empty (default)
+    /// setting it does NOT activate the command-mediation runtime. Empty (default)
     /// keeps the interactive terminal prompt. Uses the same
     /// [`ApprovalBackendConfig`] shape as `command_policies.approval_backends`.
     #[serde(default)]
@@ -2478,8 +2457,7 @@ pub struct Profile {
     pub diagnostics: DiagnosticsConfig,
     #[serde(default)]
     pub linux: LinuxConfig,
-    /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
-    #[serde(default, alias = "secrets")]
+    #[serde(default)]
     pub env_credentials: SecretsConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentConfig>,
@@ -2500,8 +2478,7 @@ pub struct Profile {
     /// `before` can export env vars via NONO_ENV_FILE.
     #[serde(default)]
     pub session_hooks: SessionHooks,
-    /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
-    #[serde(default, alias = "undo")]
+    #[serde(default)]
     pub rollback: RollbackConfig,
     /// Supervisor-delegated URL opening (e.g., for OAuth2 login flows).
     /// When `None` (absent from JSON), inherits from the base profile.
@@ -2524,10 +2501,6 @@ pub struct Profile {
     /// rules protect `~/.nono`. Ignored on Linux. Default is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_parent_of_protected: Option<bool>,
-    /// Deprecated: Parsed for backward compatibility but ignored.
-    /// Supervised mode preserves TTY by default, making this unnecessary.
-    #[serde(default)]
-    pub interactive: bool,
     /// Directory names to skip during trust scanning and rollback preflight.
     /// Treated like built-in heavy directories (for example `target`).
     #[serde(default)]
@@ -2634,7 +2607,7 @@ struct ProfileDeserialize {
     #[serde(default)]
     meta: ProfileMeta,
     #[serde(default)]
-    security: crate::deprecated_schema::RawSecurityConfig,
+    security: SecurityConfig,
     #[serde(default)]
     groups: GroupsConfig,
     #[serde(default)]
@@ -2642,15 +2615,12 @@ struct ProfileDeserialize {
     #[serde(default)]
     filesystem: FilesystemConfig,
     #[serde(default)]
-    policy: crate::deprecated_schema::LegacyPolicyPatch,
-    #[serde(default)]
     network: NetworkConfig,
     #[serde(default)]
     diagnostics: DiagnosticsConfig,
     #[serde(default)]
     linux: LinuxConfig,
-    /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
-    #[serde(default, alias = "secrets")]
+    #[serde(default)]
     env_credentials: SecretsConfig,
     #[serde(default)]
     environment: Option<EnvironmentConfig>,
@@ -2668,8 +2638,7 @@ struct ProfileDeserialize {
     hooks: HooksConfig,
     #[serde(default)]
     session_hooks: SessionHooks,
-    /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
-    #[serde(default, alias = "undo")]
+    #[serde(default)]
     rollback: RollbackConfig,
     #[serde(default)]
     open_urls: Option<OpenUrlConfig>,
@@ -2679,16 +2648,12 @@ struct ProfileDeserialize {
     allow_gpu: Option<bool>,
     allow_parent_of_protected: Option<bool>,
     #[serde(default)]
-    interactive: bool,
-    #[serde(default)]
     skipdirs: Vec<String>,
     #[serde(default)]
     packs: Vec<String>,
     #[serde(default)]
     binary: Option<String>,
-    /// ALIAS(canonical="command_args", introduced="v0.0.0", remove_by="indefinite", issue="N/A")
     #[serde(default)]
-    #[serde(alias = "brokered_commands")]
     command_args: Vec<String>,
     #[serde(default)]
     unsafe_macos_seatbelt_rules: Vec<String>,
@@ -2698,15 +2663,10 @@ struct ProfileDeserialize {
 
 impl From<ProfileDeserialize> for Profile {
     fn from(raw: ProfileDeserialize) -> Self {
-        // NOTE: During the transition, `SecurityConfig::from(&raw.security)` also
-        // copies legacy_groups/legacy_allowed_commands into the canonical
-        // SecurityConfig fields (removed in C2). The drains below extend
-        // canonical sections so both views carry the data until C2 narrows
-        // SecurityConfig.
-        let mut profile = Self {
+        Self {
             extends: raw.extends,
             meta: raw.meta,
-            security: crate::profile::SecurityConfig::from(&raw.security),
+            security: raw.security,
             groups: raw.groups,
             commands: raw.commands,
             filesystem: raw.filesystem,
@@ -2727,23 +2687,13 @@ impl From<ProfileDeserialize> for Profile {
             allow_launch_services: raw.allow_launch_services,
             allow_gpu: raw.allow_gpu,
             allow_parent_of_protected: raw.allow_parent_of_protected,
-            interactive: raw.interactive,
             skipdirs: raw.skipdirs,
             packs: raw.packs,
             binary: raw.binary,
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
             platform_overrides: raw.platform_overrides,
-        };
-
-        // Drain legacy keys into canonical sections (no-op unless the legacy
-        // keys are populated). Each populated key emits one deprecation
-        // warning to stderr and extends (does not replace) the canonical
-        // section.
-        crate::deprecated_schema::drain_legacy_security_into_canonical(&raw.security, &mut profile);
-        crate::deprecated_schema::drain_legacy_policy_into_canonical(&raw.policy, &mut profile);
-
-        profile
+        }
     }
 }
 
@@ -2986,15 +2936,6 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         if !profile.packs.contains(&pack_key) {
             profile.packs.push(pack_key);
         }
-        // If we just resolved through `nolabs-ai/claude`, also offer
-        // to strip pre-0.43 inbuilt-hook leftovers. Catches the path
-        // where users `nono pull nolabs-ai/claude` directly,
-        // bypassing the post-pull cleanup hook in `migration::check_and_run`.
-        // Idempotent: silent no-op when no legacy artifacts exist, so safe
-        // to fire on every claude resolution.
-        if is_official_claude_pack(&profile_path) {
-            crate::legacy_cleanup::check_and_offer_cleanup()?;
-        }
         return Ok(Some(profile));
     }
     if cli_extends.is_empty() {
@@ -3012,38 +2953,6 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         }
     }
     Ok(None)
-}
-
-/// Returns `true` when `profile_path` lives inside `<package_store>/<ns>/claude/` for one of the
-/// namespaces the official claude pack has been published under. Used to gate legacy-cleanup
-/// invocation on the canonical claude pack rather than any pack that happens to publish a profile
-/// named `claude` or `claude-code`.
-///
-/// The namespace list comes from `package_status` so both modules agree on what counts as the
-/// official pack.
-fn is_official_claude_pack(profile_path: &Path) -> bool {
-    let Ok(store) = crate::package::package_store_dir() else {
-        return false;
-    };
-    crate::package_status::official_claude_pack_namespaces()
-        .any(|ns| profile_path_is_in_pack(profile_path, &store, ns, "claude"))
-}
-
-/// Pure path-component matcher: does `profile_path` live under
-/// `<store>/<ns>/<name>/...`? Split out of `is_always_further_claude_pack`
-/// so it can be tested without touching `XDG_CONFIG_HOME` / `HOME`.
-fn profile_path_is_in_pack(profile_path: &Path, store: &Path, ns: &str, name: &str) -> bool {
-    let Ok(rel) = profile_path.strip_prefix(store) else {
-        return false;
-    };
-    let mut components = rel.components();
-    matches!(
-        (components.next(), components.next()),
-        (
-            Some(std::path::Component::Normal(got_ns)),
-            Some(std::path::Component::Normal(got_name)),
-        ) if got_ns == ns && got_name == name
-    )
 }
 
 /// Scan installed packs for a profile artifact whose `install_as` matches
@@ -4048,7 +3957,6 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         allow_parent_of_protected: child
             .allow_parent_of_protected
             .or(base.allow_parent_of_protected),
-        interactive: base.interactive || child.interactive,
         skipdirs: dedup_append(&base.skipdirs, &child.skipdirs),
         packs: dedup_append(&base.packs, &child.packs),
         binary: child.binary.or(base.binary),
@@ -4541,76 +4449,6 @@ mod tests {
     }
 
     #[test]
-    fn profile_path_is_in_pack_matches_canonical_layout() {
-        let store = Path::new("/store");
-        let claude_profile = Path::new("/store/always-further/claude/profile/claude.json");
-        assert!(profile_path_is_in_pack(
-            claude_profile,
-            store,
-            "always-further",
-            "claude"
-        ));
-
-        // Different namespace must not match — guards against a third-
-        // party pack that publishes a `claude` profile triggering
-        // legacy cleanup.
-        let third_party = Path::new("/store/some-other/claude/profile/claude.json");
-        assert!(!profile_path_is_in_pack(
-            third_party,
-            store,
-            "always-further",
-            "claude"
-        ));
-
-        // Different pack name in the same namespace must not match.
-        let codex = Path::new("/store/always-further/codex/profile/codex.json");
-        assert!(!profile_path_is_in_pack(
-            codex,
-            store,
-            "always-further",
-            "claude"
-        ));
-
-        // Path outside the store entirely must not match.
-        let outside = Path::new("/elsewhere/always-further/claude/profile.json");
-        assert!(!profile_path_is_in_pack(
-            outside,
-            store,
-            "always-further",
-            "claude"
-        ));
-    }
-
-    /// Wrapped in `with_config_env` so `package_store_dir()` returns the same
-    /// path here and inside `is_official_claude_pack`. It reads
-    /// `XDG_CONFIG_HOME` live on every call, so without holding `ENV_LOCK` a
-    /// parallel test swapping the env between the two reads would make them
-    /// disagree.
-    #[test]
-    fn official_claude_pack_matches_both_published_namespaces() {
-        with_config_env(|_config_dir| {
-            let store = crate::package::package_store_dir().expect("package store dir");
-
-            for ns in ["nolabs-ai", "always-further"] {
-                let path = store.join(ns).join("claude").join("profiles/claude.json");
-                assert!(
-                    is_official_claude_pack(&path),
-                    "{ns}/claude is the official claude pack"
-                );
-            }
-
-            let third_party = store
-                .join("someone-else")
-                .join("claude")
-                .join("profiles/claude.json");
-            assert!(
-                !is_official_claude_pack(&third_party),
-                "a third-party pack publishing a `claude` profile must not trigger legacy cleanup"
-            );
-        });
-    }
-
-    #[test]
     fn test_groups_config_deserializes() {
         let json = r#"{
             "meta": {"name": "t"},
@@ -4695,21 +4533,6 @@ mod tests {
         let profile: Profile = serde_json::from_str(json).expect("parse");
         assert_eq!(profile.filesystem.deny, vec!["/blocked"]);
         assert_eq!(profile.filesystem.bypass_protection, vec!["$HOME/.docker"]);
-        assert_eq!(
-            profile.filesystem.suppress_save_prompt,
-            vec!["$HOME/.copilot/settings.json"]
-        );
-    }
-
-    #[test]
-    fn test_filesystem_config_ignore_alias_drains_to_suppress_save_prompt() {
-        let json = r#"{
-            "meta": {"name": "t"},
-            "filesystem": {
-                "ignore": ["$HOME/.copilot/settings.json"]
-            }
-        }"#;
-        let profile: Profile = serde_json::from_str(json).expect("parse");
         assert_eq!(
             profile.filesystem.suppress_save_prompt,
             vec!["$HOME/.copilot/settings.json"]
@@ -4909,7 +4732,7 @@ mod tests {
             &profile_path,
             r#"{
                 "meta": { "name": "custom-test" },
-                "security": { "groups": ["node_runtime"] },
+                "groups": { "include": ["node_runtime"] },
                 "network": { "block": true }
             }"#,
         )
@@ -5655,28 +5478,6 @@ mod tests {
         let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
         let err = validate_env_credential_keys(&profile).expect_err("should reject");
         assert!(err.to_string().contains("keyring URI"));
-    }
-
-    #[test]
-    fn test_secrets_alias_backward_compat() {
-        // "secrets" should still work as an alias for "env_credentials"
-        let json_str = r#"{
-            "meta": { "name": "test-profile" },
-            "secrets": {
-                "openai_api_key": "OPENAI_API_KEY"
-            }
-        }"#;
-
-        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
-        assert_eq!(profile.env_credentials.mappings.len(), 1);
-        assert_eq!(
-            profile
-                .env_credentials
-                .mappings
-                .get("openai_api_key")
-                .map(|s| s.as_str()),
-            Some("OPENAI_API_KEY")
-        );
     }
 
     #[test]
@@ -7032,11 +6833,6 @@ mod tests {
         assert!(err.contains("mutually exclusive"));
     }
 
-    // Note: the legacy `allowed_commands` placement (under the security
-    // section) is covered by an in-process unit test in
-    // `deprecated_schema::tests::legacy_security_allowed_commands_drains_to_canonical_commands_allow`,
-    // keeping legacy JSON literals confined to that module.
-
     #[test]
     fn test_security_config_allowed_commands_defaults_empty() {
         let json = r#"{
@@ -7138,7 +6934,6 @@ mod tests {
             allow_launch_services: Some(false),
             allow_gpu: Some(false),
             allow_parent_of_protected: None,
-            interactive: false,
             skipdirs: vec!["vendor".to_string()],
             packs: vec![],
             binary: None,
@@ -7232,7 +7027,6 @@ mod tests {
             allow_launch_services: Some(true),
             allow_gpu: Some(true),
             allow_parent_of_protected: Some(true),
-            interactive: false,
             skipdirs: vec!["dist".to_string()],
             packs: vec![],
             binary: None,
@@ -7316,6 +7110,7 @@ mod tests {
                 timeout_secs: None,
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
         base.security.approval_defaults = Some(ApprovalDefaultsConfig {
@@ -7332,6 +7127,7 @@ mod tests {
                 timeout_secs: Some(30),
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
 
@@ -7371,6 +7167,7 @@ mod tests {
                 timeout_secs: None,
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
         base.network.approval_defaults = Some(ApprovalDefaultsConfig {
@@ -7387,6 +7184,7 @@ mod tests {
                 timeout_secs: Some(30),
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
 
@@ -8177,25 +7975,6 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_profiles_interactive_or_semantics() {
-        // base=false, child=false -> false
-        let merged = merge_profiles(base_profile(), child_profile());
-        assert!(!merged.interactive);
-
-        // base=true, child=false -> true
-        let mut base = base_profile();
-        base.interactive = true;
-        let merged = merge_profiles(base, child_profile());
-        assert!(merged.interactive);
-
-        // base=false, child=true -> true
-        let mut child = child_profile();
-        child.interactive = true;
-        let merged = merge_profiles(base_profile(), child);
-        assert!(merged.interactive);
-    }
-
-    #[test]
     fn test_merge_profiles_extends_consumed() {
         let child = child_profile(); // has extends = Some(vec!["base"])
         let merged = merge_profiles(base_profile(), child);
@@ -8576,7 +8355,6 @@ mod tests {
             workdir: WorkdirConfig {
                 access: WorkdirAccess::Read,
             },
-            interactive: false,
             ..Default::default()
         };
 
@@ -8589,7 +8367,6 @@ mod tests {
             workdir: WorkdirConfig {
                 access: WorkdirAccess::ReadWrite,
             },
-            interactive: true,
             ..Default::default()
         };
 
@@ -8605,7 +8382,6 @@ mod tests {
             WorkdirAccess::ReadWrite,
             "later base should override workdir"
         );
-        assert!(merged.interactive, "interactive should be OR'd");
     }
 
     #[test]
@@ -8895,37 +8671,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_removed_interactive_field_is_rejected() {
+        let json = r#"{
+            "meta": { "name": "removed-interactive" },
+            "interactive": true
+        }"#;
+        let result: std::result::Result<Profile, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "removed top-level field 'interactive' must be rejected"
+        );
+    }
+
     // Note: legacy `policy` patch deserialization (the full set of
     // `add_allow_*`, `add_deny_*`, `override_deny`, `exclude_groups`)
     // draining into canonical sections is covered by integration tests in
     // `tests/legacy_drain_unit_tests.rs`.
-
-    #[test]
-    fn test_network_config_accepts_verb_noun_collection_aliases() {
-        let profile: Profile = serde_json::from_str(
-            r#"{
-                "meta": { "name": "aliases" },
-                "network": {
-                    "block": true,
-                    "allow_proxy": ["api.openai.com"],
-                    "allow_port": [3000],
-                    "external_proxy": "squid.corp:3128"
-                }
-            }"#,
-        )
-        .expect("parse profile with supported aliases");
-
-        assert!(profile.network.block);
-        assert_eq!(
-            profile.network.allow_domain,
-            vec![AllowDomainEntry::Plain("api.openai.com".to_string())]
-        );
-        assert_eq!(profile.network.open_port, vec![3000]);
-        assert_eq!(
-            profile.network.upstream_proxy.as_deref(),
-            Some("squid.corp:3128")
-        );
-    }
 
     #[test]
     fn test_network_config_serializes_new_names() {
@@ -9464,11 +9226,11 @@ mod tests {
             "network": {
                 "block": false,
                 "network_profile": "anthropic",
-                "proxy_allow": ["extra.example.com"],
-                "allow_port": [8080]
+                "allow_domain": ["extra.example.com"],
+                "open_port": [8080]
             },
             "workdir": { "access": "readwrite" },
-            "undo": {
+            "rollback": {
                 "exclude_patterns": ["node_modules"],
                 "exclude_globs": ["*.tmp"]
             }
@@ -9565,9 +9327,9 @@ mod tests {
             }
         }"#;
         validate_against_schema(json)
-            .expect("documented tool-sandbox edge policy should pass schema validation");
+            .expect("documented command-policy edge should pass schema validation");
         serde_json::from_str::<Profile>(json)
-            .expect("documented tool-sandbox edge policy should parse as a profile");
+            .expect("documented command-policy edge should parse as a profile");
     }
 
     #[test]
@@ -9631,6 +9393,129 @@ mod tests {
                 result.expect_err("already checked is_ok")
             );
         }
+    }
+
+    // ============================================================================
+    // keyring:// credential key validation tests
+    //
+    // Regression coverage for issue #1759: the docs advertise `keyring://` for
+    // custom credentials, but `validate_credential_key` had no branch for it,
+    // so the key fell through to the bare-account-name rule and was rejected.
+    // Structural validation is delegated to `nono::keystore::validate_keyring_uri`.
+    // ============================================================================
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_accepted() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://my_service/my_account".to_string());
+        cred.env_var = Some("EXAMPLE_TOKEN".to_string());
+        assert!(
+            validate_custom_credential("krtest", &cred).is_ok(),
+            "keyring:// URI with env_var should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_with_decode_accepted() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://gh:github.com/alice?decode=go-keyring".to_string());
+        cred.env_var = Some("GH_TOKEN".to_string());
+        assert!(
+            validate_custom_credential("github", &cred).is_ok(),
+            "keyring:// URI with ?decode=go-keyring should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_requires_env_var() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://my_service/my_account".to_string());
+        cred.env_var = None;
+        let err = validate_custom_credential("krtest", &cred)
+            .expect_err("keyring:// URI without env_var should be rejected");
+        assert!(
+            err.to_string().contains("env_var is required"),
+            "expected env_var requirement error, got: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("keyring://"),
+            "error should list keyring:// among URI manager references, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_missing_account_rejected() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://my_service".to_string());
+        cred.env_var = Some("EXAMPLE_TOKEN".to_string());
+        let err = validate_custom_credential("krtest", &cred)
+            .expect_err("keyring:// URI without an account segment should be rejected");
+        assert!(
+            err.to_string().contains("keyring URI"),
+            "expected keyring-specific error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_injection_rejected() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://my_service/alice;rm -rf".to_string());
+        cred.env_var = Some("EXAMPLE_TOKEN".to_string());
+        let err = validate_custom_credential("krtest", &cred)
+            .expect_err("keyring:// URI with a shell metacharacter should be rejected");
+        assert!(
+            err.to_string().contains("forbidden character"),
+            "expected forbidden-character error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_keyring_uri_unknown_query_rejected() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("keyring://my_service/alice?foo=bar".to_string());
+        cred.env_var = Some("EXAMPLE_TOKEN".to_string());
+        let err = validate_custom_credential("krtest", &cred)
+            .expect_err("keyring:// URI with an unknown query parameter should be rejected");
+        assert!(
+            err.to_string().contains("unknown query parameter"),
+            "expected unknown-query-parameter error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_profile_with_keyring_credential_key_accepted() {
+        // The exact profile from issue #1759.
+        let json = br#"{
+            "meta": { "name": "krtest" },
+            "network": {
+                "credentials": ["krtest"],
+                "custom_credentials": {
+                    "krtest": {
+                        "upstream": "https://example.com",
+                        "credential_key": "keyring://my_service/my_account",
+                        "inject_header": "Authorization",
+                        "credential_format": "{}",
+                        "env_var": "EXAMPLE_TOKEN"
+                    }
+                }
+            }
+        }"#;
+
+        let profile = parse_profile_bytes(json).expect("keyring:// credential_key should parse");
+        let cred = profile
+            .network
+            .custom_credentials
+            .get("krtest")
+            .expect("custom credential 'krtest' should be present");
+        assert_eq!(
+            cred.credential_key.as_deref(),
+            Some("keyring://my_service/my_account")
+        );
     }
 
     // ============================================================================
@@ -11713,7 +11598,7 @@ mod tests {
     #[test]
     fn platform_overrides_merge_adds_command_daemon_pid_source() {
         // `daemon_pid_source` declared only in the current platform's override must
-        // land on the command's effective policy, alongside the base's fields.
+        // land on the effective command sandbox policy, alongside the base's fields.
         let current_os = crate::platform::current_os_name();
         let json = format!(
             r#"{{

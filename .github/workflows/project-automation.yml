@@ -16,8 +16,8 @@ on:
     - cron: "30 6 * * 1" # weekly backlog grooming (Mondays 06:30 UTC)
   workflow_dispatch:
 
-permissions:
-  issues: write
+# Jobs use PROJECTS_TOKEN for all GitHub API calls.
+permissions: {}
 
 env:
   PROJECT_ORG: nolabs-ai

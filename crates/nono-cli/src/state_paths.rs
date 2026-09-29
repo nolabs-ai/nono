@@ -7,6 +7,7 @@
 use nono::{NonoError, Result, try_canonicalize};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 const LEGACY_HOME_SUBDIR: &str = ".nono";
 const LEGACY_REMOVE_BY: &str = "v1.0.0";
@@ -290,6 +291,50 @@ pub fn maybe_migrate_legacy_audit_ledger() -> Result<()> {
     Ok(())
 }
 
+/// Calculate total size of regular files under `dir`.
+///
+/// Hardened against symlink-based double-counting and silent undercount:
+/// - `follow_links(false)` so symlinked directories are not descended
+/// - `file_type().is_file()` pre-filter so symlink-to-file entries are not
+///   counted via `metadata()` (which would follow the symlink)
+/// - `max_open(128)` to bound FD usage on deep trees
+/// - `tracing::warn` on I/O errors instead of silent `filter_map(ok)`
+pub(crate) fn calculate_dir_size(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    for entry in WalkDir::new(dir)
+        .follow_links(false)
+        .max_open(128)
+        .into_iter()
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("skipping dir size entry for {}: {e}", dir.display());
+                continue;
+            }
+        };
+        // Skip symlinks and non-files before following metadata (which would
+        // resolve symlink targets and count external files).
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "skipping dir size metadata for {}: {e}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -418,5 +463,69 @@ mod tests {
         let content = fs::read_to_string(&migrated).unwrap();
         assert_eq!(content, "{\"sequence\":0}\n");
         let _ = home;
+    }
+
+    #[test]
+    fn calculate_dir_size_counts_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        fs::write(dir.path().join("b.txt"), b"world!").unwrap();
+        assert_eq!(calculate_dir_size(dir.path()), 11);
+    }
+
+    #[test]
+    fn calculate_dir_size_empty_dir_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(calculate_dir_size(dir.path()), 0);
+    }
+
+    #[test]
+    fn calculate_dir_size_does_not_follow_symlinked_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_sub = dir.path().join("real");
+        fs::create_dir_all(&real_sub).unwrap();
+        fs::write(real_sub.join("file.txt"), b"hello").unwrap();
+        let link = dir.path().join("link_to_real");
+        std::os::unix::fs::symlink(&real_sub, &link).unwrap();
+        // With follow_links(false) the symlink itself is seen but not
+        // descended into, so only the file in real/ counts.
+        assert_eq!(calculate_dir_size(dir.path()), 5);
+    }
+
+    #[test]
+    fn calculate_dir_size_handles_broken_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("real.txt"), b"hello").unwrap();
+        let broken = dir.path().join("broken.txt");
+        std::os::unix::fs::symlink(dir.path().join("nonexistent"), &broken).unwrap();
+        // Broken symlink is skipped; only real.txt counts.
+        assert_eq!(calculate_dir_size(dir.path()), 5);
+    }
+
+    #[test]
+    fn calculate_dir_size_handles_symlink_cycle_without_looping() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("file.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink(&b, a.join("link_to_b")).unwrap();
+        std::os::unix::fs::symlink(&a, b.join("link_to_a")).unwrap();
+        // Must terminate and not double-count; only the one real file.
+        assert_eq!(calculate_dir_size(dir.path()), 5);
+    }
+
+    #[test]
+    fn calculate_dir_size_ignores_symlink_to_file_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        fs::write(&outside_file, b"hello").unwrap();
+        fs::write(dir.path().join("real.txt"), b"hello").unwrap();
+        let link = dir.path().join("link_to_outside.txt");
+        std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+        // Symlink-to-file must not be counted via metadata() follow.
+        assert_eq!(calculate_dir_size(dir.path()), 5);
     }
 }

@@ -170,6 +170,8 @@ fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
         let name = line.split(':').next().unwrap_or("").trim();
         if name.eq_ignore_ascii_case("proxy-connection")
             || name.eq_ignore_ascii_case("proxy-authorization")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
         {
             continue;
         }
@@ -230,6 +232,8 @@ fn strip_and_redeem_proxy_headers(
         let trimmed_name = name.trim();
         if trimmed_name.eq_ignore_ascii_case("proxy-connection")
             || trimmed_name.eq_ignore_ascii_case("proxy-authorization")
+            || trimmed_name.eq_ignore_ascii_case("content-length")
+            || trimmed_name.eq_ignore_ascii_case("transfer-encoding")
         {
             continue;
         }
@@ -308,6 +312,22 @@ impl ProxyHandle {
         let _ = self.shutdown_tx.send(true);
     }
 
+    /// Clone the collected network audit events without clearing them.
+    ///
+    /// Read-only view for the end-of-session diagnostic footer. The events
+    /// stay queued so the subsequent [`Self::drain_audit_events`] in session
+    /// finalization still delivers every event to the persistent audit
+    /// record — the snapshot must never reduce audit coverage.
+    ///
+    /// Returns an empty vec when network audit was disabled at start.
+    #[must_use]
+    pub fn snapshot_audit_events(&self) -> Vec<nono::undo::NetworkAuditEvent> {
+        match self.audit_log.as_ref() {
+            Some(audit_log) => audit::snapshot_audit_events(audit_log),
+            None => Vec::new(),
+        }
+    }
+
     /// Drain and return collected network audit events.
     ///
     /// Returns an empty vec when network audit was disabled at start.
@@ -380,19 +400,10 @@ impl ProxyHandle {
     /// the handle doesn't keep a copy, so the CLI passes it back in.
     #[must_use]
     pub fn route_diagnostics(&self, config: &ProxyConfig) -> Vec<String> {
-        // Reconstruct the same host filter the server applies (see `start`).
-        // A credential/endpoint route only injects or filters; traffic still
-        // has to clear the allowlist to reach the upstream at all. A route
-        // whose upstream is not allow-listed is dead config (the proxy 403s
-        // it), so skip it here rather than advertise an unreachable route.
-        let filter = if config.strict_filter {
-            crate::filter::ProxyFilter::new_strict(&config.allowed_hosts)
-        } else if config.allowed_hosts.is_empty() {
-            crate::filter::ProxyFilter::allow_all()
-        } else {
-            crate::filter::ProxyFilter::new(&config.allowed_hosts)
-        }
-        .with_denied_hosts(&config.denied_hosts);
+        // Explicit reverse routes have their own allowlist and do not inherit
+        // the general forward-proxy allowlist. Session deny rules still apply.
+        let filter =
+            crate::filter::ProxyFilter::allow_all().with_denied_hosts(&config.denied_hosts);
         // Hostname-only reachability: pass no resolved IPs so the link-local
         // SSRF check is skipped (that is a runtime DNS concern, not a config
         // one) and only the deny-list / allowlist hostname rules apply.
@@ -892,7 +903,11 @@ fn connect_target_from_normalized_authority(host_port: &str) -> Option<(String, 
 
 /// Shared state for the proxy server.
 struct ProxyState {
+    /// General forward-proxy policy selected by the sandbox/session.
     filter: ProxyFilter,
+    /// Explicit upstream authority carried by configured reverse routes.
+    /// Keeping this separate prevents a credential route from widening CONNECT.
+    route_filter: ProxyFilter,
     session_token: Zeroizing<String>,
     /// Route-level configuration (upstream, L7 filtering, custom TLS CA) for all routes.
     route_store: Arc<RouteStore>,
@@ -939,7 +954,7 @@ struct ProxyState {
     network_session_id: String,
     /// Optional supervisor-backed capture backend for command-backed credentials.
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
-    /// Optional resolver for tool-sandbox broker nonces found in request headers.
+    /// Optional resolver for command-mediation broker nonces found in request headers.
     /// Resolves `nono_<hex>` values in `Authorization` and similar headers before
     /// forwarding upstream. Consumer IDs use the form `"proxy.<route_id>"`.
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
@@ -1220,6 +1235,10 @@ pub async fn start_with_network_approval(
         ProxyFilter::new(&config.allowed_hosts)
     }
     .with_denied_hosts(&config.denied_hosts);
+    let mut route_allowed_hosts: Vec<String> = route_hosts.iter().cloned().collect();
+    route_allowed_hosts.extend(oauth_capture_store.host_ports());
+    let route_filter =
+        ProxyFilter::new_strict(&route_allowed_hosts).with_denied_hosts(&config.denied_hosts);
 
     // Build bypass matcher from external proxy config (once, not per-request)
     let bypass_matcher = config
@@ -1373,6 +1392,7 @@ pub async fn start_with_network_approval(
     let intercept_ca_env_vars = config.intercept_ca_env_vars.clone();
     let state = Arc::new(ProxyState {
         filter,
+        route_filter,
         session_token: session_token.clone(),
         route_store: Arc::new(route_store),
         credential_store: Arc::new(credential_store),
@@ -1799,7 +1819,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 .get_or_probe(
                                     &host,
                                     port,
-                                    &state.filter,
+                                    &state.route_filter,
                                     &tls_connector_h2,
                                     upstream_proxy.as_ref(),
                                     &h2_connector_cache_key,
@@ -1819,7 +1839,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             cert_cache: Arc::clone(cache),
                             tls_connector: &state.tls_connector,
                             tls_connector_h2: &tls_connector_h2,
-                            filter: &state.filter,
+                            filter: &state.route_filter,
                             audit_log: state.audit_log.as_ref(),
                             upstream_proxy,
                             approval_backends: state.approval_backends.clone(),
@@ -1970,7 +1990,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             credential_store: &state.credential_store,
             session_token: &state.session_token,
             require_auth: state.config.require_auth,
-            filter: &state.filter,
+            filter: &state.route_filter,
             tls_connector: &state.tls_connector,
             default_tls_config: &state.default_tls_config,
             upstream_pool: &state.upstream_pool,
@@ -2106,7 +2126,7 @@ async fn handle_forward_http(
             credential_store: &state.credential_store,
             session_token: &state.session_token,
             require_auth: state.config.require_auth,
-            filter: &state.filter,
+            filter: &state.route_filter,
             tls_connector: &state.tls_connector,
             default_tls_config: &state.default_tls_config,
             upstream_pool: &state.upstream_pool,
@@ -2138,8 +2158,16 @@ async fn handle_forward_http(
         return Ok(());
     }
 
-    // 3. Build the origin-form request bytes: rewritten request line +
-    //    proxy-header-stripped header block + terminating CRLF.
+    // 3. Read the request body before building upstream headers so chunked
+    //    framing can be decoded and re-written with Content-Length.
+    let body = match reverse::read_request_body(stream, header_bytes, buffered).await? {
+        Some(body) => body,
+        None => return Ok(()), // send_error already written (e.g. 413 / 400)
+    };
+
+    // Build the origin-form request bytes: rewritten request line +
+    // proxy-header-stripped header block + optional Content-Length +
+    // terminating CRLF.
     let origin_line = rewrite_absolute_to_origin_form(first_line)?;
     let inbound_path = origin_line
         .split_whitespace()
@@ -2178,18 +2206,16 @@ async fn handle_forward_http(
             }
             _ => (strip_proxy_headers(header_bytes), false),
         };
-    let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 2);
+
+    let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 64);
     request_bytes.extend_from_slice(origin_line.as_bytes());
     request_bytes.extend_from_slice(&filtered_headers);
+    // Always re-frame when the client declared a body (CL or chunked TE),
+    // including empty bodies — otherwise upstreams may answer 411 or hang.
+    if reverse::should_reframe_with_content_length(header_bytes) {
+        request_bytes.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    }
     request_bytes.extend_from_slice(b"\r\n");
-
-    // Read the request body honoring Content-Length. `buffered` holds any
-    // bytes the BufReader already read past the header terminator.
-    let content_length = reverse::extract_content_length(header_bytes);
-    let body = match reverse::read_request_body(stream, content_length, buffered).await? {
-        Some(body) => body,
-        None => return Ok(()), // send_error already written (e.g. 413)
-    };
 
     // 4. Choose the upstream strategy: chain through the external/enterprise
     //    proxy when configured (unless the host is a bypass host), else
@@ -2546,6 +2572,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reverse_route_authority_does_not_widen_forward_allowlist() {
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["allowed.invalid".to_string()],
+            strict_filter: true,
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+
+        let reverse = unauthenticated_reverse_request(handle.port).await;
+        assert!(
+            reverse.contains("200"),
+            "an explicit reverse route must reach its configured upstream: {reverse:?}"
+        );
+
+        let forward = unauthenticated_forward_request(handle.port, &upstream).await;
+        assert!(
+            forward.contains("403"),
+            "the same upstream must remain unavailable as ordinary forward traffic: {forward:?}"
+        );
+        assert_eq!(handle.route_diagnostics(&config).len(), 1);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
     async fn reverse_proxy_rate_limit_rejects_after_burst() {
         // A route with a RouteRateLimiter of burst 1 and no delay budget lets
         // the first request through to the upstream (200) and rejects the
@@ -2765,6 +2818,140 @@ mod tests {
         assert!(
             handle.drain_audit_events().is_empty(),
             "disabled network audit must not accumulate events"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Servlet-style mock origin: strips `;...` path parameters from each
+    /// segment and resolves dot-segments, the way Tomcat/Jetty/Spring route
+    /// requests. Records every raw request-target it receives.
+    async fn spawn_servlet_upstream() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hits_handle = std::sync::Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let hits_handle = std::sync::Arc::clone(&hits_handle);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let raw_target = head
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    hits_handle.lock().unwrap().push(raw_target);
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("127.0.0.1:{}", addr.port()), hits)
+    }
+
+    /// Regression for GHSA-8r33-hr9m-69wh: the endpoint policy matched a
+    /// normalized path while the raw path was forwarded upstream. A segment
+    /// like `..;jsessionid=1` is an opaque literal to the normalizer but a
+    /// dot-segment to servlet upstreams (which strip `;` path parameters),
+    /// so a deny rule on `/v1/secrets/**` could be escaped via an allowed
+    /// sibling prefix. Ambiguous paths must now be denied at the proxy.
+    #[tokio::test]
+    async fn test_endpoint_policy_denies_path_parameter_traversal_end_to_end() {
+        use crate::config::{
+            EndpointPolicyConfig, EndpointPolicyDecision, EndpointPolicyDefault, EndpointPolicyRule,
+        };
+
+        let (upstream, hits) = spawn_servlet_upstream().await;
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.endpoint_policy = Some(EndpointPolicyConfig {
+            default: EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            },
+            deny: vec![EndpointPolicyRule {
+                method: "*".to_string(),
+                path: "/v1/secrets/**".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+            ..EndpointPolicyConfig::default()
+        });
+        let config = ProxyConfig {
+            routes: vec![route],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        // Control 1: the deny rule works on the direct path.
+        let response = send_raw_request(
+            handle.port,
+            b"GET /svc/v1/secrets/token HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "direct denied path must get 403, got: {response:?}"
+        );
+
+        // Control 2: a clean allowed path still reaches the upstream.
+        let response = send_raw_request(
+            handle.port,
+            b"GET /svc/v1/public/info HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "clean allowed path must reach the upstream, got: {response:?}"
+        );
+
+        // The advisory PoC path and encoded relatives: each must be refused
+        // by the proxy, not forwarded for the upstream to reinterpret.
+        for exploit in [
+            "/svc/v1/public/..;jsessionid=1/secrets/token".to_string(),
+            "/svc/v1/public/%2e%2e/secrets/token".to_string(),
+            "/svc/v1/public/%252e%252e/secrets/token".to_string(),
+        ] {
+            let request = format!("GET {exploit} HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+            let response = send_raw_request(handle.port, request.as_bytes()).await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "ambiguous path {exploit} must get 403, got: {response:?}"
+            );
+        }
+
+        // The upstream must have seen only the clean allowed request.
+        let seen = hits.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec!["/v1/public/info".to_string()],
+            "no ambiguous path may reach the upstream"
+        );
+
+        // The audit log must record the ambiguity denials.
+        let events = handle.drain_audit_events();
+        assert!(
+            events.iter().any(|e| {
+                e.endpoint_policy_rule.as_deref() == Some("endpoint_policy.ambiguous_path")
+            }),
+            "expected an ambiguous_path policy denial in the audit log, got: {events:?}"
         );
 
         handle.shutdown();
@@ -3406,11 +3593,10 @@ mod tests {
         handle.shutdown();
     }
 
-    /// A credential route whose upstream is not in the host allowlist is dead
-    /// config — traffic to it would be denied by the filter regardless of the
-    /// injected credential — so it is omitted from the diagnostics entirely.
+    /// Explicit reverse routes are independent from the general forward
+    /// allowlist, so diagnostics include both configured upstreams.
     #[tokio::test]
-    async fn test_route_diagnostics_omits_unreachable_upstream() {
+    async fn test_route_diagnostics_ignore_forward_allowlist() {
         let dir = tempfile::tempdir().unwrap();
         let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
             redeem_phantoms: Vec::new(),
@@ -3441,7 +3627,7 @@ mod tests {
                 route("github_api", "https://api.github.com"),
                 route("datadog", "https://api.datadoghq.com"),
             ],
-            // Only github is allow-listed; datadog's upstream is unreachable.
+            // This allowlist controls only ordinary forward traffic.
             allowed_hosts: vec!["api.github.com".to_string()],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -3449,20 +3635,17 @@ mod tests {
         let handle = start(config.clone()).await.unwrap();
         let rows = handle.route_diagnostics(&config);
 
-        assert_eq!(rows.len(), 1, "unreachable upstream must be omitted");
-        assert!(rows[0].contains("api.github.com"));
-        assert!(
-            !rows.iter().any(|s| s.contains("datadoghq.com")),
-            "non-allow-listed upstream must not be listed, got: {rows:?}"
-        );
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.contains("api.github.com")));
+        assert!(rows.iter().any(|row| row.contains("datadoghq.com")));
 
         handle.shutdown();
     }
 
-    /// Strict mode with a non-empty allowlist behaves the same: a route to a
-    /// non-allow-listed upstream is omitted, an allow-listed one is shown.
+    /// Strict forward filtering does not hide explicit routes, but the shared
+    /// deny list still makes a route unreachable and omits its diagnostic.
     #[tokio::test]
-    async fn test_route_diagnostics_respects_wildcard_allowlist() {
+    async fn test_route_diagnostics_respect_route_denies() {
         let dir = tempfile::tempdir().unwrap();
         let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
             redeem_phantoms: Vec::new(),
@@ -3495,6 +3678,7 @@ mod tests {
             ],
             // Wildcard covers the githubusercontent subdomain but not evil.
             allowed_hosts: vec!["*.githubusercontent.com".to_string()],
+            denied_hosts: vec!["evil.example.com".to_string()],
             strict_filter: true,
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -3502,12 +3686,12 @@ mod tests {
         let handle = start(config.clone()).await.unwrap();
         let rows = handle.route_diagnostics(&config);
 
-        assert_eq!(rows.len(), 1, "only the wildcard-covered upstream remains");
-        assert!(rows[0].contains("raw.githubusercontent.com"));
+        assert_eq!(rows.len(), 1);
         assert!(
-            !rows.iter().any(|s| s.contains("evil.example.com")),
-            "upstream outside the wildcard must be omitted, got: {rows:?}"
+            rows.iter()
+                .any(|row| row.contains("raw.githubusercontent.com"))
         );
+        assert!(!rows.iter().any(|row| row.contains("evil.example.com")));
 
         handle.shutdown();
     }

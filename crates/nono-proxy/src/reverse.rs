@@ -27,6 +27,7 @@ use crate::token;
 use base64::Engine as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -1358,12 +1359,20 @@ async fn enforce_endpoint_policy(
     }
 }
 
-fn endpoint_approval_request_id(service: &str) -> String {
+/// Build a unique request id for an endpoint approval.
+///
+/// Approval backends (the platform in particular) key requests by id and
+/// reject a reused id, so every approval needs its own. The sequence number
+/// keeps concurrent requests from the same client distinct even when they
+/// share a timestamp.
+pub(crate) fn endpoint_approval_request_id(service: &str) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("proxy-endpoint-approval-{service}-{nanos}")
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("proxy-endpoint-approval-{service}-{nanos}-{seq}")
 }
 
 /// Handle a reverse proxy request using an OAuth2 token cache.
@@ -2859,6 +2868,18 @@ pub(crate) fn injected_credential_header_names(cred: Option<&LoadedCredential>) 
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_endpoint_approval_request_id_is_unique() {
+        let ids: std::collections::HashSet<String> = (0..1000)
+            .map(|_| endpoint_approval_request_id("172.19.0.2-6443"))
+            .collect();
+        assert_eq!(ids.len(), 1000);
+        assert!(
+            ids.iter()
+                .all(|id| id.starts_with("proxy-endpoint-approval-172.19.0.2-6443-"))
+        );
+    }
 
     #[test]
     fn test_parse_request_line() {

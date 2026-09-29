@@ -454,18 +454,19 @@ fn load_command_credential_source(
              no remaining PATH entry is safe for this sandbox"
         ))
     })?;
-    let mut child = std::process::Command::new(command)
-        .args(args)
-        .env("PATH", &safe_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            nono::NonoError::SandboxInit(format!(
-                "failed to start supervisor credential source '{command}': {err}"
-            ))
-        })?;
+    let mut child = crate::owned_children::spawn(
+        std::process::Command::new(command)
+            .args(args)
+            .env("PATH", &safe_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .map_err(|err| {
+        nono::NonoError::SandboxInit(format!(
+            "failed to start supervisor credential source '{command}': {err}"
+        ))
+    })?;
 
     let start = std::time::Instant::now();
     loop {

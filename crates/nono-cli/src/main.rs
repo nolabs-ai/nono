@@ -40,6 +40,7 @@ mod migration;
 mod network_policy;
 mod open_url_runtime;
 mod output;
+mod owned_children;
 mod pack_update_hint;
 mod package;
 mod package_cmd;

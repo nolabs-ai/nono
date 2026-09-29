@@ -21,6 +21,8 @@ use crate::startup_prompt::{notify_startup_termination_for_child, print_terminal
 use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
 use nix::sys::signal::{self, Signal};
+#[cfg(target_os = "linux")]
+use nix::sys::wait::{Id, waitid};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
 use nono::supervisor::{ApprovalDecision, AuditEntry, SupervisorMessage, SupervisorResponse};
@@ -2800,25 +2802,47 @@ type SupervisorLoopResult = (
 /// Reap descendants that reparented onto this supervisor (a child-subreaper),
 /// so short-lived detached processes don't linger as zombies for the session.
 ///
-/// `waitpid(-1, WNOHANG)` returns only terminated children, so a live child is
-/// never consumed. If the primary `child` is reaped here, its status is
-/// returned rather than dropped.
+/// Each terminated child is first observed with `WNOWAIT` and only then reaped
+/// by pid. Children registered in [`crate::owned_children`] belong to another
+/// supervisor thread that waits on them itself, so they are left alone;
+/// consuming their status here would make that thread's wait fail with
+/// `ECHILD`. If the primary `child` is reaped here, its status is returned
+/// rather than dropped.
 #[cfg(target_os = "linux")]
 fn reap_reparented_orphans(child: Pid) -> Option<WaitStatus> {
+    // Held for the whole drain so a concurrent spawn cannot produce a child
+    // that is terminated but not yet registered.
+    let owned = crate::owned_children::lock();
     loop {
-        match waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
-            Ok(status @ (WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _))) => {
+        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+        let pid = match waitid(Id::All, flags) {
+            Ok(WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)) => pid,
+            // Nothing reapable now; no WSTOPPED/WCONTINUED, so ignore stop/continue.
+            Ok(_) => return None,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::ECHILD) => return None,
+            Err(e) => {
+                debug!("waitid(P_ALL) during orphan reap failed: {}", e);
+                return None;
+            }
+        };
+        // `waitid(P_ALL)` keeps reporting the same terminated child until it
+        // is reaped, so stop draining and let its owner collect it. Remaining
+        // orphans are reaped on a later supervisor loop iteration.
+        if pid != child && u32::try_from(pid.as_raw()).is_ok_and(|raw| owned.contains(&raw)) {
+            return None;
+        }
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
                 if pid == child {
                     return Some(status);
                 }
                 debug!("Reaped reparented orphan {}", pid);
             }
-            // Nothing reapable now; no WUNTRACED/WCONTINUED, so ignore stop/continue.
             Ok(_) => return None,
             Err(nix::errno::Errno::EINTR) => continue,
-            Err(nix::errno::Errno::ECHILD) => return None,
             Err(e) => {
-                debug!("waitpid(-1) during orphan reap failed: {}", e);
+                debug!("waitpid({}) during orphan reap failed: {}", pid, e);
                 return None;
             }
         }
@@ -6039,5 +6063,116 @@ mod tests {
 
         let result = validate_url("data:text/html,<script>alert(1)</script>", &config);
         assert!(result.is_err(), "data: URLs must be rejected");
+    }
+}
+
+/// These tests call the wildcard orphan reaper, which would steal children
+/// from tests running concurrently in the same process. Each one re-runs
+/// itself alone in a fresh test process.
+#[cfg(all(test, target_os = "linux"))]
+mod orphan_reap_tests {
+    use super::*;
+
+    const ISOLATED_ENV: &str = "NONO_ORPHAN_REAP_TEST";
+
+    fn isolated(name: &str, test: impl FnOnce()) {
+        if std::env::var(ISOLATED_ENV).ok().as_deref() == Some(name) {
+            test();
+            return;
+        }
+        let executable = std::env::current_exe().expect("test executable");
+        let status = Command::new(executable)
+            .args([
+                "--exact",
+                &format!("exec_strategy::orphan_reap_tests::{name}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ISOLATED_ENV, name)
+            .status()
+            .expect("run isolated test");
+        assert!(status.success(), "isolated {name}: {status}");
+    }
+
+    /// Block until `pid` has terminated, without reaping it.
+    fn wait_until_terminated(pid: u32) {
+        let pid = Pid::from_raw(i32::try_from(pid).expect("pid fits i32"));
+        waitid(Id::Pid(pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT)
+            .expect("observe child exit");
+    }
+
+    fn not_a_child() -> Pid {
+        Pid::from_raw(i32::MAX)
+    }
+
+    #[test]
+    fn reaper_leaves_owned_children_to_their_owner() {
+        isolated("reaper_leaves_owned_children_to_their_owner", || {
+            let mut owned = crate::owned_children::spawn(Command::new("sh").args(["-c", "exit 3"]))
+                .expect("spawn owned child");
+            wait_until_terminated(owned.id());
+
+            assert!(reap_reparented_orphans(not_a_child()).is_none());
+
+            let status = owned.wait().expect("owner still reaps its child");
+            assert_eq!(status.code(), Some(3));
+        });
+    }
+
+    #[test]
+    // The reaper under test collects this child; it must not be waited on here.
+    #[allow(clippy::zombie_processes)]
+    fn reaper_collects_unowned_orphans() {
+        isolated("reaper_collects_unowned_orphans", || {
+            let orphan = Command::new("true").spawn().expect("spawn unowned child");
+            let pid = Pid::from_raw(i32::try_from(orphan.id()).expect("pid fits i32"));
+            wait_until_terminated(orphan.id());
+
+            assert!(reap_reparented_orphans(not_a_child()).is_none());
+
+            assert_eq!(
+                waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+                Err(nix::errno::Errno::ECHILD),
+                "unowned zombie must be reaped"
+            );
+        });
+    }
+
+    #[test]
+    // The reaper under test collects this child; it must not be waited on here.
+    #[allow(clippy::zombie_processes)]
+    fn reaper_returns_primary_child_status() {
+        isolated("reaper_returns_primary_child_status", || {
+            let primary = Command::new("sh")
+                .args(["-c", "exit 7"])
+                .spawn()
+                .expect("spawn primary child");
+            let pid = Pid::from_raw(i32::try_from(primary.id()).expect("pid fits i32"));
+            wait_until_terminated(primary.id());
+
+            assert_eq!(
+                reap_reparented_orphans(pid),
+                Some(WaitStatus::Exited(pid, 7))
+            );
+        });
+    }
+
+    #[test]
+    fn reaper_returns_primary_child_status_even_if_it_is_registered() {
+        isolated(
+            "reaper_returns_primary_child_status_even_if_it_is_registered",
+            || {
+                let primary =
+                    crate::owned_children::spawn(Command::new("sh").args(["-c", "exit 5"]))
+                        .expect("spawn primary child");
+                let pid = Pid::from_raw(i32::try_from(primary.id()).expect("pid fits i32"));
+                wait_until_terminated(primary.id());
+
+                assert_eq!(
+                    reap_reparented_orphans(pid),
+                    Some(WaitStatus::Exited(pid, 5))
+                );
+            },
+        );
     }
 }

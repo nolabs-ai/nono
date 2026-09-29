@@ -3324,7 +3324,8 @@ fn extend_scoped_proxy_env(
 }
 
 fn is_scoped_proxy_reserved_env(name: &str) -> bool {
-    matches!(
+    // Proxy transport vars the scoped proxy always owns.
+    if matches!(
         name,
         "HTTP_PROXY"
             | "HTTPS_PROXY"
@@ -3337,12 +3338,17 @@ fn is_scoped_proxy_reserved_env(name: &str) -> bool {
             | "NONO_NO_PROXY"
             | "NONO_PROXY_TOKEN"
             | "NODE_USE_ENV_PROXY"
-            | "SSL_CERT_FILE"
-            | "CURL_CA_BUNDLE"
-            | "NODE_EXTRA_CA_CERTS"
-            | "REQUESTS_CA_BUNDLE"
-            | "GIT_SSL_CAINFO"
-    )
+    ) {
+        return true;
+    }
+    // TLS-intercept CA vars are read from the proxy's own default list rather
+    // than duplicated here: a second hardcoded copy silently drifts (it was
+    // already missing `AWS_CA_BUNDLE`), and a credential route that reuses one
+    // of these names would then collide with the intercept CA path instead of
+    // being rejected.
+    nono_proxy::config::default_intercept_ca_env_vars()
+        .iter()
+        .any(|reserved| reserved == name)
 }
 
 fn scoped_intercept_ca_dir(
@@ -3350,10 +3356,36 @@ fn scoped_intercept_ca_dir(
     scope_index: usize,
     has_routes: bool,
 ) -> Result<Option<PathBuf>> {
-    let Some(base) = base.filter(|_| has_routes) else {
+    // `base` is only read as a signal that session-level TLS interception is
+    // enabled at all; the scoped bundle deliberately does NOT live under it.
+    if base.is_none() || !has_routes {
         return Ok(None);
-    };
-    let dir = base.join(format!("scope-{scope_index}"));
+    }
+    // Write the scoped proxy's CA bundle under `/tmp` rather than under the
+    // session dir (`~/.local/state/nono/sessions/intercept-*/`). The session
+    // dir is inside the protected-root deny (`deny file-read-data (subpath
+    // "~/.local/state/nono")`), and on macOS Seatbelt a deny CANNOT be
+    // overridden by a later allow — even a more specific `literal` allow
+    // (verified with sandbox-exec). So a CA written there is unreadable by
+    // any sandboxed process, regardless of what allow rules are emitted.
+    //
+    // `/tmp` is granted `system_write_macos` and is readable via explicit
+    // grants that `add_proxy_trust_bundle_caps` adds for the child. The
+    // session-level intercept CA path (when active) still lives under the
+    // session dir because the session proxy handles its own Seatbelt grants
+    // before the protected-root deny is emitted.
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // Use /private/tmp explicitly, NOT std::env::temp_dir(). On macOS,
+    // $TMPDIR resolves to /var/folders/<hash>/T/ which only has
+    // file-read-metadata, not file-read-data. /private/tmp has system_write
+    // and the tool sandbox grants explicit file-read-data for trust bundles.
+    let dir = PathBuf::from("/private/tmp").join(format!(
+        "nono-scoped-intercept-{pid}-{nanos}-scope-{scope_index}"
+    ));
     std::fs::create_dir_all(&dir).map_err(|err| {
         NonoError::SandboxInit(format!(
             "failed to create scoped TLS-intercept dir '{}': {err}",

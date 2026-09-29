@@ -3807,6 +3807,19 @@ fn add_proxy_trust_bundle_caps(
     }
     for path in &state.proxy_trust_bundle_paths {
         caps.add_fs(FsCapability::new_file(path, AccessMode::Read)?);
+        // On macOS, the nono state root (~/.local/state/nono) is protected by a
+        // Seatbelt `(deny file-read-data (subpath ...))` rule. A generic FS cap
+        // is shadowed by this action-specific deny: Seatbelt's action specificity
+        // beats path specificity. The session-level code (proxy_runtime.rs) handles
+        // this by emitting action-matching `file-read-data` / `file-read-metadata`
+        // allows, which are appended after the deny and win by both specificity and
+        // last-match. The child's Seatbelt profile needs the same override.
+        let path_str = crate::policy::path_to_utf8(path)?;
+        let escaped = crate::policy::escape_seatbelt_path(path_str)?;
+        caps.add_platform_rule(format!("(allow file-read-data (literal \"{escaped}\"))"))?;
+        caps.add_platform_rule(format!(
+            "(allow file-read-metadata (literal \"{escaped}\"))"
+        ))?;
     }
     Ok(())
 }

@@ -14,7 +14,7 @@ use crate::audit;
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
 use crate::token;
-use nono::net_filter::FilterResult;
+use nono::net_filter::{FilterResult, HostFilter};
 use nono::supervisor::{ApprovalDecision, ApprovalRequest};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -370,6 +370,13 @@ async fn maybe_approve_host(
     let Some(approval) = network_approval else {
         return Ok(ApprovalOutcome::NotApplicable);
     };
+
+    // Hostnames are case-insensitive and may carry a trailing dot. Normalize
+    // before building cache/coalescing keys and the approval request, so a
+    // re-cased or dotted variant (`API.EXAMPLE.COM.`) cannot sidestep a cached
+    // "Always deny" or open a second concurrent prompt for the same host.
+    let normalized_host = HostFilter::normalize_authority_host(host);
+    let host = normalized_host.as_str();
 
     let backend_name = approval.backend.backend_name().to_string();
     let key = (host.to_string(), port);
@@ -1027,6 +1034,46 @@ mod tests {
             approval.cached_decision(&("blocked.example.com".to_string(), 443)),
             Some(false),
             "DeniedForSession must be remembered for the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_approve_session_deny_covers_case_and_trailing_dot_variants() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let decisions = Mutex::new(HashMap::new());
+        let backend: Arc<dyn nono::ApprovalBackend> = Arc::new(CountingBackend {
+            decision: ApprovalDecision::DeniedForSession,
+            calls: Arc::clone(&calls),
+        });
+        let in_flight = empty_in_flight();
+        let approval = NetworkApproval {
+            backend: &backend,
+            session_decisions: &decisions,
+            in_flight: &in_flight,
+            session_id: "test",
+        };
+        let filter = ProxyFilter::new(&[]);
+
+        for host in [
+            "blocked.example.com",
+            "BLOCKED.Example.COM",
+            "blocked.example.com.",
+        ] {
+            let out =
+                maybe_approve_host(host, 443, &deny_not_allowed(host), Some(&approval), &filter)
+                    .await
+                    .unwrap();
+            assert!(out.is_denied(), "{host} must be denied");
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "re-cased or dotted variants must hit the cached session deny"
+        );
+        assert_eq!(
+            approval.cached_decision(&("blocked.example.com".to_string(), 443)),
+            Some(false)
         );
     }
 

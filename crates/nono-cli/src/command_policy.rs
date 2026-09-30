@@ -2607,6 +2607,12 @@ fn validate_credential(
                     format!("local-socket credential '{name}' cannot define HTTP proxy fields"),
                 );
             }
+            if credential.aws_auth.is_some() {
+                report.error(
+                    "invalid_credential",
+                    format!("local-socket credential '{name}' cannot define aws_auth (only proxy credentials support it)"),
+                );
+            }
         }
         CommandCredentialType::RawFile => {
             if credential.path.as_deref().unwrap_or_default().is_empty() {
@@ -2639,6 +2645,12 @@ fn validate_credential(
                 report.error(
                     "invalid_credential",
                     format!("raw-file credential '{name}' cannot define HTTP proxy fields"),
+                );
+            }
+            if credential.aws_auth.is_some() {
+                report.error(
+                    "invalid_credential",
+                    format!("raw-file credential '{name}' cannot define aws_auth (only proxy credentials support it)"),
                 );
             }
         }
@@ -2704,6 +2716,47 @@ fn validate_credential(
                         "proxy credential '{name}' must define tls_client_cert and tls_client_key together"
                     ),
                 );
+            }
+            // Replicate the session-level validate_aws_auth checks so malformed
+            // profile/region/service values don't propagate to the signing path.
+            if let Some(ref aws) = credential.aws_auth {
+                if let Some(ref profile) = aws.profile
+                    && (profile.is_empty() || profile.contains(char::is_whitespace))
+                {
+                    report.error(
+                        "invalid_credential",
+                        format!(
+                            "proxy credential '{name}' aws_auth.profile must be non-empty \
+                             with no whitespace; omit the field to use the default chain"
+                        ),
+                    );
+                }
+                if let Some(ref region) = aws.region
+                    && (region.is_empty()
+                        || region.contains(char::is_whitespace)
+                        || region.chars().any(|c| c.is_uppercase()))
+                {
+                    report.error(
+                        "invalid_credential",
+                        format!(
+                            "proxy credential '{name}' aws_auth.region must be non-empty, \
+                             lowercase, no whitespace (e.g., \"us-east-1\")"
+                        ),
+                    );
+                }
+                if let Some(ref service) = aws.service
+                    && (service.is_empty()
+                        || service.contains(char::is_whitespace)
+                        || service.chars().any(|c| c.is_uppercase()))
+                {
+                    report.error(
+                        "invalid_credential",
+                        format!(
+                            "proxy credential '{name}' aws_auth.service must be non-empty, \
+                             lowercase, no whitespace (e.g., \"sts\", \"s3\")"
+                        ),
+                    );
+                }
             }
         }
         CommandCredentialType::Ambient => {

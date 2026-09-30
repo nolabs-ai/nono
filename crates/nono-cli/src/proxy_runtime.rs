@@ -3358,9 +3358,9 @@ fn scoped_intercept_ca_dir(
 ) -> Result<Option<PathBuf>> {
     // `base` is only read as a signal that session-level TLS interception is
     // enabled at all; the scoped bundle deliberately does NOT live under it.
-    if base.is_none() || !has_routes {
+    let Some(_base) = base.filter(|_| has_routes) else {
         return Ok(None);
-    }
+    };
     // Write the scoped proxy's CA bundle under `/tmp` rather than under the
     // session dir (`~/.local/state/nono/sessions/intercept-*/`). The session
     // dir is inside the protected-root deny (`deny file-read-data (subpath
@@ -3374,26 +3374,30 @@ fn scoped_intercept_ca_dir(
     // session-level intercept CA path (when active) still lives under the
     // session dir because the session proxy handles its own Seatbelt grants
     // before the protected-root deny is emitted.
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    // Use /private/tmp explicitly, NOT std::env::temp_dir(). On macOS,
-    // $TMPDIR resolves to /var/folders/<hash>/T/ which only has
-    // file-read-metadata, not file-read-data. /private/tmp has system_write
-    // and the tool sandbox grants explicit file-read-data for trust bundles.
-    let dir = PathBuf::from("/private/tmp").join(format!(
-        "nono-scoped-intercept-{pid}-{nanos}-scope-{scope_index}"
-    ));
-    std::fs::create_dir_all(&dir).map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "failed to create scoped TLS-intercept dir '{}': {err}",
-            dir.display()
-        ))
-    })?;
-    set_intercept_ca_dir_permissions(&dir)?;
-    Ok(Some(dir))
+    // Use tempfile::Builder for atomic secure directory creation (0o700 from
+    // the start, no TOCTOU window). The prefix is unpredictable (tempfile adds
+    // random chars), closing the symlink pre-create vector that a PID+nanos
+    // name would have in a world-writable directory.
+    //
+    // On macOS, use /private/tmp (NOT std::env::temp_dir(), which resolves to
+    // /var/folders/<hash>/T/ — only file-read-metadata, not file-read-data).
+    // On Linux, /tmp is the standard world-writable temp dir.
+    let tmp_root: &str = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("nono-scoped-intercept-scope-{scope_index}-"))
+        .tempdir_in(tmp_root)
+        .map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "failed to create scoped TLS-intercept dir in {tmp_root}: {err}"
+            ))
+        })?;
+    let dir_path = dir.keep();
+    set_intercept_ca_dir_permissions(&dir_path)?;
+    Ok(Some(dir_path))
 }
 
 fn command_proxy_scopes(

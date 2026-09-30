@@ -295,7 +295,7 @@ Use `filesystem.deny` as the enforcement mechanism. `commands.deny` remains depr
 }
 ```
 
-On macOS, `filesystem.deny` on a socket path also emits a `network-outbound` deny — Seatbelt classifies `connect(2)` as a network operation, so a file deny alone won't block it. Prefer path- and network-based controls; `commands.deny` is not enforced for child processes.
+On macOS, `filesystem.deny` also emits a `network-outbound` deny — exact socket paths are blocked directly, while denied directories recursively block sockets beneath them. Seatbelt classifies `connect(2)` as a network operation, so a file deny alone won't block it. Prefer path- and network-based controls; `commands.deny` is not enforced for child processes.
 
 #### Adding Write-Only Access
 

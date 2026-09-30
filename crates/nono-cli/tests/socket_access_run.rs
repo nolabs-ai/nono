@@ -149,6 +149,46 @@ fn filesystem_deny_blocks_unix_socket_connect_on_macos() {
         .assert_stdout_lacks("connected");
 }
 
+#[test]
+#[cfg(target_os = "macos")]
+fn filesystem_directory_deny_blocks_nested_unix_socket_connect_on_macos() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("macos-socket-directory-deny");
+    let sock_tmp = short_tempdir();
+    let nested = sock_tmp.path().join("nested");
+    std::fs::create_dir(&nested).expect("create nested socket directory");
+    let socket_path = nested.join("d.sock");
+    let _listener = UnixListener::bind(&socket_path).expect("bind nested test socket");
+    let control_tmp = short_tempdir();
+    let control_path = control_tmp.path().join("control.sock");
+    let _control_listener = UnixListener::bind(&control_path).expect("bind control socket");
+
+    let denied_dir = sock_tmp.path().to_string_lossy().into_owned();
+    let socket_arg = socket_path.to_string_lossy().into_owned();
+    let control_arg = control_path.to_string_lossy().into_owned();
+    let profile = t.write_profile(
+        "macos-socket-directory-deny",
+        &format!(
+            r#"{{"meta":{{"name":"macos-socket-directory-deny"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"deny":["{denied_dir}"]}}}}"#
+        ),
+    );
+
+    let py_script = format!(
+        "import socket; c=socket.socket(socket.AF_UNIX); c.connect({control_arg:?}); print('control-connected', flush=True); s=socket.socket(socket.AF_UNIX); s.connect({socket_arg:?}); print('denied-connected')"
+    );
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(&py_script))
+        .assert_failure("connect to a socket below a denied directory is blocked")
+        .assert_stdout_contains("control-connected")
+        .assert_stdout_lacks("denied-connected");
+}
+
 /// Yama `ptrace_scope`, or `None` if it can't be read (non-Yama kernel).
 #[cfg(target_os = "linux")]
 fn yama_ptrace_scope() -> Option<i32> {

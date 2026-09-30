@@ -2184,6 +2184,10 @@ pub struct RedactionConfig {
     /// Uses the same glob syntax as `environment.deny_vars` (`"DEPLOY_TOKEN"`,
     /// `"ACME_*"`, `"*_SECRET"`) and is matched case-insensitively against the
     /// whole variable name. Inherited additively through `extends`.
+    ///
+    /// Sharing the grammar with `deny_vars` does not mean sharing entries:
+    /// only an exact `deny_vars` name is derived as a redaction, so a wildcard
+    /// deny whose matches should also be scrubbed belongs here as well.
     #[serde(default)]
     pub extra_env_vars: Vec<String>,
 }
@@ -8126,6 +8130,22 @@ mod tests {
 
         let err = validate_profile_env_var_patterns(&profile)
             .expect_err("an empty pattern must be rejected, not silently ignored");
+
+        assert!(
+            err.to_string()
+                .contains("diagnostics.redaction.extra_env_vars"),
+            "error should name the offending field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_redaction_rejects_whitespace_only_pattern() {
+        let mut profile = base_profile();
+        profile.diagnostics.redaction.extra_env_vars = vec!["  ".to_string()];
+
+        let err = validate_profile_env_var_patterns(&profile).expect_err(
+            "a whitespace-only pattern trims away to no rule and must be rejected here",
+        );
 
         assert!(
             err.to_string()

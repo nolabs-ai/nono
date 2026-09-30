@@ -3,10 +3,18 @@
 //! Environment variable name patterns appear in more than one place: the
 //! allow/deny lists that decide which variables a sandboxed child inherits,
 //! and the redaction patterns that decide which names and values are scrubbed
-//! from diagnostics and audit output. Those two must agree — a pattern that
-//! denies a variable in one place and fails to redact it in the other is a
-//! silent hole — so the grammar lives here once rather than being
-//! reimplemented per call site.
+//! from diagnostics and audit output. The grammar lives here once rather than
+//! being reimplemented per call site, so that identical pattern text selects
+//! the identical set of variable names wherever it is configured: an author
+//! who writes `ACME_*` in two lists cannot be surprised by one of them
+//! matching a name the other misses.
+//!
+//! Sharing a matcher is not sharing policy. Denying a variable does not
+//! redact it and redacting one does not deny it — the lists are configured
+//! independently, and the only guarantee made here is that the same pattern
+//! matches the same way in each. Which pattern belongs in which list, and
+//! which entries one list derives from another, is the caller's decision;
+//! see `diagnostics.redaction.extra_env_vars` in `nono-cli`.
 //!
 //! The grammar is deliberately minimal: `*` is the only wildcard, it matches
 //! any run of zero or more characters, and the match is anchored to the full

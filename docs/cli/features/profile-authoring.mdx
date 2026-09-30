@@ -529,15 +529,21 @@ outside the profile — is not something nono can infer. List those under
 
 Entries use the same glob syntax as `environment.deny_vars` — `*` matches any
 run of characters and is anchored to the whole variable name — and are matched
-case-insensitively. Both features resolve patterns through one matcher, so a
-pattern that denies a variable also redacts it. Values merge additively across profile inheritance, so a
-child profile widens the inherited list rather than replacing it.
+case-insensitively. Both features resolve patterns through one matcher, so the
+same pattern text selects the same set of variable names in either place. That
+is a guarantee about matching, not about policy: writing a pattern under
+`deny_vars` does not redact it. Only an exact `deny_vars` name is derived as a
+redaction, so a wildcard deny such as `ACME_*` whose matches should also be
+scrubbed has to be repeated here.
+
+Values merge additively across profile inheritance, so a child profile widens
+the inherited list rather than replacing it.
 
 This is output hygiene, not enforcement: it changes what nono writes, never
 what the sandboxed process can read. To stop a variable from reaching the child
-at all, use `environment.deny_vars` — which, per the derivation above, also
-redacts it. A variable you deliberately pass through is the case this key
-exists for.
+at all, use `environment.deny_vars` — which, when the entry is an exact name,
+also redacts it per the derivation above. A wildcard deny, and a variable you
+deliberately pass through, are the cases this key exists for.
 
 The list is add-only. A profile can widen redaction but cannot stop a secure
 default from being redacted; removing a default still requires

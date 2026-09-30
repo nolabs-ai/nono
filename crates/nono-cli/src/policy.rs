@@ -1117,8 +1117,7 @@ pub(crate) fn add_deny_access_rules(
     }
 
     // Seatbelt deny rules only apply on macOS.
-    #[cfg(target_os = "macos")]
-    {
+    if cfg!(target_os = "macos") {
         // Emit deny rules for the original path
         emit_macos_deny_rules_for_path(&path, caps)?;
 
@@ -1157,16 +1156,16 @@ pub(crate) fn add_deny_access_rules(
 /// network denial must also use `subpath`; an exact `path` rule on the
 /// directory does not cover sockets below it. Non-existent targets retain the
 /// existing fail-secure directory interpretation. Existing non-directories,
-/// including socket nodes, use an exact network path.
-#[cfg(target_os = "macos")]
+/// including socket nodes, use exact file and network paths.
 pub(crate) fn emit_macos_deny_rules_for_path(path: &Path, caps: &mut CapabilitySet) -> Result<()> {
     let escaped = escape_seatbelt_path(path_to_utf8(path)?)?;
-    let file_filter = if path.exists() && path.is_file() {
+    let is_existing_leaf = path.exists() && !path.is_dir();
+    let file_filter = if is_existing_leaf {
         format!("literal \"{}\"", escaped)
     } else {
         format!("subpath \"{}\"", escaped)
     };
-    let network_filter = if path.exists() && !path.is_dir() {
+    let network_filter = if is_existing_leaf {
         format!("path \"{}\"", escaped)
     } else {
         format!("subpath \"{}\"", escaped)
@@ -2753,7 +2752,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn test_deny_access_socket_uses_exact_network_path() {
+    fn test_deny_access_socket_uses_exact_file_and_network_paths() {
         let dir = tempfile::Builder::new()
             .prefix("nono-deny-sock-")
             .tempdir_in("/tmp")
@@ -2771,13 +2770,26 @@ mod tests {
         )
         .expect("add socket deny rules");
 
-        let expected = format!(
+        let expected_file = format!(
+            "(deny file-read-data (literal \"{}\"))",
+            socket_path.display()
+        );
+        let expected_network = format!(
             "(deny network-outbound (path \"{}\"))",
             socket_path.display()
         );
         assert!(
-            caps.platform_rules().iter().any(|rule| rule == &expected),
-            "socket deny must remain exact: {:?}",
+            caps.platform_rules()
+                .iter()
+                .any(|rule| rule == &expected_file),
+            "socket file deny must be exact: {:?}",
+            caps.platform_rules()
+        );
+        assert!(
+            caps.platform_rules()
+                .iter()
+                .any(|rule| rule == &expected_network),
+            "socket network deny must be exact: {:?}",
             caps.platform_rules()
         );
     }

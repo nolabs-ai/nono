@@ -36,12 +36,25 @@ The profile provides:
 - **Read+write access** to `~/.vscode` (VS Code extensions directory)
 - **Read+write access** to the OS-specific VS Code app data directory:
   `~/Library/Application Support/Code` on macOS, `~/.config/Code` on Linux
-- **Read+write access** to Claude Code's OS-specific credential storage:
-  macOS login keychain files required for OAuth persistence/refresh, or `~/.local/share/claude` on Linux
+- **Read+write grants** for Claude Code's OS-specific credential storage:
+  macOS login keychain files, or `~/.local/share/claude` on Linux. On macOS,
+  the keychain deny remains active until you also add a matching
+  `filesystem.bypass_protection` entry (or `--bypass-protection` flag) for the
+  keychain path you intend to use.
 - **Network access** enabled (required for Anthropic API)
 - **Interactive mode** enabled (preserves TTY for Claude's terminal UI)
 - **Automatic hook installation** for sandbox-aware error handling
 - **OAuth2 login support** via supervised URL opening (allows `claude /login` to work)
+
+If Claude needs the macOS login keychain, explicitly lift the deny for that
+existing file. The profile already supplies the matching filesystem grant:
+
+```bash
+nono run --profile nolabs-ai/claude \
+  --bypass-protection "$HOME/Library/Keychains/login.keychain-db" -- claude
+```
+
+Add a separate bypass only for another keychain file that Claude actually needs.
 
 ## Custom Profile
 

@@ -71,5 +71,5 @@ whoever merges second renumbering their file.
 |------|---------------------------|----------|
 | 0000 | NEP process               | accepted |
 | 0001 | Pre-1.0.0 tech debt, deprecation, and API-freeze cleanup | proposed |
-| 0003 | Move macOS keychain authorisation to `nono-cli`          | draft    |
+| 0003 | Move macOS keychain authorisation to `nono-cli`          | accepted |
 | 0004 | Opt-in Linux namespace isolation                          | draft    |

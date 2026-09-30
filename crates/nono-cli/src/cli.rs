@@ -131,11 +131,15 @@ pub enum Commands {
 
 \x1b[1mUSAGE\x1b[0m
   nono run [flags] <program>...
+  nono run --remote --agent <agent> [--workspace <name-or-id>] [prompt]
 
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono run --allow . claude                    # Read/write current dir, run claude
+  nono run --remote --agent claude             # Choose a workspace and attach
+  nono run --remote --agent claude --workspace my-project --detached
+                                               # Launch remotely without attaching
   nono run --profile nolabs-ai/claude claude        # Use a profile
   nono run --profile nolabs-ai/claude --allow-domain api.openai.com claude
                                                # Restrict outbound access to listed domains
@@ -427,6 +431,9 @@ IN-BAND DETACH:
 
     # Escape hatch: use a complete WebSocket attach URL
     nono connect wss://console.example.com/api/v1/sessions/local:host:abc123/terminal
+
+SESSION PICKER:
+    Use Up/Down or j/k to move, Enter to connect, and q or Esc to cancel.
 "
     )]
     Connect(ConnectArgs),
@@ -1901,12 +1908,16 @@ impl From<WrapSandboxArgs> for SandboxArgs {
 #[command(disable_help_flag = true)]
 pub struct RunArgs {
     #[command(flatten)]
+    pub remote_options: RemoteRunArgs,
+
+    #[command(flatten)]
     pub sandbox: SandboxArgs,
 
     /// Start the session without attaching the current terminal.
     /// The supervisor keeps the sandboxed process running in the background;
     /// use `nono attach <session>` later to inspect or interact with it.
-    #[arg(long, help_heading = "OPTIONS")]
+    /// ALIAS(canonical="--detached", introduced="unreleased", remove_by="indefinite", issue="N/A")
+    #[arg(long, alias = "detach", help_heading = "OPTIONS")]
     pub detached: bool,
 
     /// How long (seconds) to wait for a detached session to become attachable.
@@ -2045,6 +2056,35 @@ pub struct RunArgs {
     pub help: Option<bool>,
 }
 
+#[derive(clap::Args, Debug, Default)]
+pub struct RemoteRunArgs {
+    /// Launch a persistent agent in a remote workspace and attach this terminal
+    #[arg(long, requires = "agent", help_heading = "REMOTE")]
+    pub remote: bool,
+    /// Server-managed agent to launch (for example claude)
+    #[arg(long, requires = "remote", help_heading = "REMOTE")]
+    pub agent: Option<String>,
+    /// Remote workspace name or ID; prompts when omitted in a terminal
+    #[arg(long, requires = "remote", help_heading = "REMOTE")]
+    pub workspace: Option<String>,
+    /// Platform origin; defaults to the enrolled platform
+    #[arg(long = "platform-url", requires = "remote", help_heading = "REMOTE")]
+    pub platform_url: Option<String>,
+    /// Console origin; defaults to enrolled console discovery
+    #[arg(long, requires = "remote", help_heading = "REMOTE")]
+    pub console: Option<String>,
+    /// Protected Run API personal access token file (or NONO_RUN_TOKEN)
+    #[arg(long = "run-token-file", requires = "remote", help_heading = "REMOTE")]
+    pub run_token_file: Option<PathBuf>,
+    /// Console token file override; normally browser authorization is automatic
+    #[arg(
+        long = "connect-token-file",
+        requires = "remote",
+        help_heading = "REMOTE"
+    )]
+    pub connect_token_file: Option<PathBuf>,
+}
+
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct ShellArgs {
@@ -2135,6 +2175,10 @@ pub struct WhyArgs {
     /// Path to check
     #[arg(long, help_heading = "QUERY")]
     pub path: Option<PathBuf>,
+
+    /// Match absolute literal paths against profile rules without resolving them on this host
+    #[arg(long, requires_all = ["path", "profile"], help_heading = "QUERY")]
+    pub lexical_profile_path: bool,
 
     /// Operation to check: read, write, or readwrite
     #[arg(long, value_enum, help_heading = "QUERY")]

@@ -189,6 +189,12 @@ The client offers `nono.terminal.v1` as the WebSocket subprotocol. A server that
 does not support v1 rejects the upgrade rather than silently selecting another
 protocol.
 
+The WebSocket upgrade URL carries the initial terminal dimensions as non-zero
+`cols` and `rows` query parameters. The server applies these dimensions before
+opening the backend attachment or replaying PTY output. Clients still send a
+`resize` control frame after connection for compatibility and whenever the
+local terminal changes size.
+
 ## Frames
 
 Binary frames are raw PTY bytes:

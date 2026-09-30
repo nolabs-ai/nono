@@ -562,9 +562,21 @@ pub(crate) struct PreparedSandbox {
     pub(crate) proc_comm_notify: bool,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
-    pub(crate) bypass_protection_paths: Vec<PathBuf>,
+    pub(crate) bypass_protection_paths: Vec<crate::policy::AppliedBypass>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
+    /// `diagnostics.redaction.extra_env_vars` from the profile: extra
+    /// environment-variable name globs to redact in diagnostics and audit
+    /// records. Add-only; never removes a secure default.
+    pub(crate) redaction_extra_env_vars: Vec<String>,
+    /// Environment variable names the profile itself marks as secret: exact
+    /// `environment.deny_vars` entries, `env_credentials` destinations,
+    /// `command_policies.credentials` destinations, and
+    /// `network.custom_credentials` phantom destinations. Derived, not
+    /// authored — declaring a variable as a credential is what makes the name
+    /// secret, so an author does not have to repeat it under
+    /// `diagnostics.redaction.extra_env_vars`. Exact names, never globs.
+    pub(crate) redaction_derived_env_vars: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
     pub(crate) case_insensitive_env_vars: bool,
@@ -1544,6 +1556,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 bypass_protection_paths: Vec::new(),
                 ignored_denial_paths: Vec::new(),
                 suppressed_system_service_operations: Vec::new(),
+                redaction_extra_env_vars: Vec::new(),
+                redaction_derived_env_vars: Vec::new(),
                 allowed_env_vars: None,
                 denied_env_vars: None,
                 case_insensitive_env_vars: false,
@@ -1594,9 +1608,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allow_launch_services: profile_allow_launch_services,
         allow_gpu: profile_allow_gpu,
         allow_parent_of_protected: profile_allow_parent_of_protected,
-        bypass_protection_paths,
         ignored_denial_paths,
         suppressed_system_service_operations,
+        redaction_extra_env_vars,
+        redaction_derived_env_vars,
         allowed_env_vars: profile_allowed_env_vars,
         denied_env_vars: profile_denied_env_vars,
         case_insensitive_env_vars: profile_case_insensitive_env_vars,
@@ -1714,6 +1729,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     // User grants silently blocked by deny groups (macOS); folded into the
     // capability summary instead of emitting one warning per path.
     let blocked_grants = prepared.blocked_grants;
+    // SECURITY: the bypasses `apply_deny_overrides` actually applied, with
+    // their access modes, not the profile's raw list. A bypass naming a path
+    // absent from this host is dropped and must not reappear as authority.
+    let bypass_protection_paths = prepared.applied_bypass_paths;
 
     // Apply raw Seatbelt rules from the profile (macOS only).
     #[cfg(target_os = "macos")]
@@ -1941,6 +1960,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             bypass_protection_paths,
             ignored_denial_paths,
             suppressed_system_service_operations,
+            redaction_extra_env_vars,
+            redaction_derived_env_vars,
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
             case_insensitive_env_vars: profile_case_insensitive_env_vars,
@@ -2924,6 +2945,8 @@ mod tests {
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
+            redaction_extra_env_vars: Vec::new(),
+            redaction_derived_env_vars: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
             case_insensitive_env_vars: false,

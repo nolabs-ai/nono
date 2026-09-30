@@ -29,9 +29,10 @@ pub struct SandboxState {
     pub allowed_commands: Vec<String>,
     /// Commands explicitly blocked
     pub blocked_commands: Vec<String>,
-    /// Paths exempted from deny groups via bypass_protection (canonicalized)
+    /// Applied bypasses with the access modes Seatbelt actually reopens.
+    /// Older state files without mode data default to no bypass authority.
     #[serde(default)]
-    pub bypass_protection_paths: Vec<String>,
+    pub applied_bypasses: Vec<crate::policy::AppliedBypass>,
     /// Resolved filesystem deny paths enforced by the active profile.
     ///
     /// These are not filesystem capabilities: on macOS they are explicit
@@ -126,7 +127,7 @@ impl SandboxState {
     #[cfg(test)]
     pub fn from_caps(
         caps: &CapabilitySet,
-        bypass_protection_paths: &[PathBuf],
+        bypass_protection_paths: &[crate::policy::AppliedBypass],
         allowed_domains: &[String],
         domain_endpoints: &[DomainEndpointState],
     ) -> Self {
@@ -143,7 +144,7 @@ impl SandboxState {
     /// Create sandbox state including explicit filesystem deny paths.
     pub fn from_caps_with_denies(
         caps: &CapabilitySet,
-        bypass_protection_paths: &[PathBuf],
+        bypass_protection_paths: &[crate::policy::AppliedBypass],
         deny_paths: &[PathBuf],
         allowed_domains: &[String],
         denied_domains: &[String],
@@ -173,24 +174,13 @@ impl SandboxState {
             net_blocked: caps.is_network_blocked(),
             allowed_commands: caps.allowed_commands().to_vec(),
             blocked_commands: caps.blocked_commands().to_vec(),
-            bypass_protection_paths: bypass_protection_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect(),
+            applied_bypasses: bypass_protection_paths.to_vec(),
             deny_paths: deny_paths.iter().map(|p| p.display().to_string()).collect(),
             allowed_domains: allowed_domains.to_vec(),
             denied_domains: denied_domains.to_vec(),
             domain_endpoints: domain_endpoints.to_vec(),
             resource_limits: caps.resource_limits().copied(),
         }
-    }
-
-    /// Get bypass_protection paths as PathBufs for query use
-    pub fn bypass_protection_as_paths(&self) -> Vec<PathBuf> {
-        self.bypass_protection_paths
-            .iter()
-            .map(PathBuf::from)
-            .collect()
     }
 
     /// Get resolved filesystem deny paths for query use.
@@ -714,6 +704,34 @@ mod tests {
     }
 
     #[test]
+    fn test_sandbox_state_roundtrip_preserves_bypass_access() {
+        let bypass = crate::policy::AppliedBypass {
+            path: PathBuf::from("/workspace/blocked.txt"),
+            access: AccessMode::Read,
+            is_file: true,
+            removed_denies: vec![PathBuf::from("/workspace/blocked.txt")],
+        };
+        let state = SandboxState::from_caps_with_denies(
+            &CapabilitySet::new(),
+            std::slice::from_ref(&bypass),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let json = serde_json::to_string(&state).expect("serialize state");
+        let restored: SandboxState = serde_json::from_str(&json).expect("deserialize state");
+        assert_eq!(restored.applied_bypasses.len(), 1);
+        assert_eq!(restored.applied_bypasses[0].access, AccessMode::Read);
+        assert!(restored.applied_bypasses[0].is_file);
+        assert_eq!(
+            restored.applied_bypasses[0].removed_denies,
+            bypass.removed_denies
+        );
+    }
+
+    #[test]
     fn test_legacy_sandbox_state_without_deny_paths_still_loads() {
         let caps = CapabilitySet::new();
         let state = SandboxState::from_caps(&caps, &[], &[], &[]);
@@ -918,7 +936,7 @@ mod tests {
             net_blocked: false,
             allowed_commands: vec![],
             blocked_commands: vec![],
-            bypass_protection_paths: vec![],
+            applied_bypasses: vec![],
             deny_paths: vec![],
             allowed_domains: vec![],
             denied_domains: vec![],

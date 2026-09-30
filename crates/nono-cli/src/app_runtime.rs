@@ -167,6 +167,14 @@ fn run_command_with_banner_and_update<T>(
 }
 
 fn run_or_detach(args: RunArgs, silent: bool) -> Result<()> {
+    if args.remote_options.remote {
+        #[cfg(unix)]
+        return crate::remote_run::run(args);
+        #[cfg(not(unix))]
+        return Err(nono::NonoError::UnsupportedPlatform(
+            "remote launch currently requires Unix".to_string(),
+        ));
+    }
     if args.detached && std::env::var_os(DETACHED_LAUNCH_ENV).is_none() {
         run_detached_launch(args, silent)
     } else {

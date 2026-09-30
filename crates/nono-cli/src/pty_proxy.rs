@@ -1507,14 +1507,39 @@ fn control_key_candidates(expected_key: u8) -> Option<[u32; 2]> {
     }
 }
 
-/// Reset terminal input-reporting modes after a terminal-native attach client.
+/// Restore the screen and input modes after a remote terminal attachment.
 ///
 /// A hosted application may enable kitty CSI-u keyboard reporting, mouse
 /// tracking, or bracketed paste. Termios restoration alone does not disable
 /// those terminal-emulator modes, so a returning shell would otherwise receive
 /// encoded input such as `\x1b[99;5u` for Ctrl-C.
-pub(crate) fn restore_terminal_modes_after_attach() {
-    let _ = write_all_fd(libc::STDOUT_FILENO, TERMINAL_RESTORE_NORMAL);
+pub(crate) fn restore_terminal_modes_after_attach(in_alt_screen: bool, rows: u16) {
+    let _ = write_all_fd(
+        libc::STDOUT_FILENO,
+        &remote_terminal_restore_escape(in_alt_screen, rows),
+    );
+    drain_terminal_output(libc::STDOUT_FILENO);
+}
+
+fn remote_terminal_restore_escape(in_alt_screen: bool, rows: u16) -> Vec<u8> {
+    // End synchronized rendering and reset drawing attributes/margins before
+    // restoring the shell. A normal-screen TUI may leave a coloured background
+    // or a restricted scroll region behind.
+    let mut bytes = b"\x1b[?2026l\x1b[0m\x1b[r\x1b[?6l".to_vec();
+    bytes.extend_from_slice(TERMINAL_RESTORE_NORMAL);
+    if in_alt_screen {
+        // Return to the shell buffer before cleaning the viewport. Replay and
+        // remote cursor-save sequences can leave its restored cursor above the
+        // connection banner, so that cursor is not a safe place for a notice.
+        bytes.extend_from_slice(EXIT_ALT_SCREEN.as_bytes());
+    }
+    // Reset again after switching buffers: restoring the saved cursor can
+    // restore attributes too. Move the old viewport into native scrollback,
+    // explicitly erase the visible display, and place the shell at its top.
+    // ED 2 leaves scrollback intact; never send ED 3 here.
+    bytes.extend_from_slice(b"\x1b[0m\x1b[r\x1b[?6l");
+    bytes.extend_from_slice(format!("\x1b[{}S\x1b[2J\x1b[H", rows.max(1)).as_bytes());
+    bytes
 }
 
 fn compose_replay_body(
@@ -1745,8 +1770,8 @@ fn set_nonblocking(fd: RawFd) -> bool {
 /// protocol) keeps the change self-contained and also copes with the case
 /// where the socket closes unexpectedly.
 #[derive(Default)]
-struct AltScreenTracker {
-    in_alt_screen: bool,
+pub(crate) struct AltScreenTracker {
+    pub(crate) in_alt_screen: bool,
     /// Trailing bytes retained from the previous chunk so a 7-byte escape
     /// split across two reads is still matched.
     tail: Vec<u8>,
@@ -1756,7 +1781,7 @@ const ALT_SCREEN_ENTER_SEQ: &[u8] = ENTER_ALT_SCREEN.as_bytes();
 const ALT_SCREEN_EXIT_SEQ: &[u8] = EXIT_ALT_SCREEN.as_bytes();
 
 impl AltScreenTracker {
-    fn observe(&mut self, bytes: &[u8]) {
+    pub(crate) fn observe(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
@@ -2733,6 +2758,7 @@ fn run_attach_loop(
 
 #[cfg(test)]
 mod tests {
+    use super::remote_terminal_restore_escape;
     use super::{
         ATTACH_HANDSHAKE_MAGIC, ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE,
         AltScreenTracker, AttachedClient, CprReplyParse, DEFAULT_DETACH_SEQUENCE,
@@ -2948,6 +2974,41 @@ mod tests {
         edit(&mut attrs);
         nix::sys::termios::tcsetattr(slave, nix::sys::termios::SetArg::TCSANOW, &attrs)
             .expect("tcsetattr slave");
+    }
+
+    #[test]
+    fn remote_restore_clears_normal_viewport_and_retains_scrollback() {
+        let mut parser = vt100::Parser::new(6, 30, 30);
+        parser.process(b"foo\r\nbar\x1b[41m\x1b[2;4r\x1b[?6h");
+        parser.process(&remote_terminal_restore_escape(false, 6));
+        assert_eq!(parser.screen().contents(), "");
+        assert_eq!(parser.screen().cursor_position(), (0, 0));
+        assert!(!parser.screen().alternate_screen());
+        parser.process(b"Detached\r\n$ ");
+        assert_eq!(parser.screen().contents(), "Detached\n$ ");
+        parser.screen_mut().set_scrollback(6);
+        assert!(parser.screen().contents().contains("foo"));
+        assert!(parser.screen().contents().contains("bar"));
+    }
+
+    #[test]
+    fn remote_restore_moves_saved_banner_out_of_the_prompt_area() {
+        let mut parser = vt100::Parser::new(6, 30, 30);
+        parser.process(b"$ nono connect\r\nconnected\r\ndetach keys\r\n");
+        // Reproduce a saved cursor above the connection banner. Restoring only
+        // the alternate buffer would put the next prompt over that banner.
+        parser.process(b"\x1b[H");
+        parser.process(b"\x1b[?1049h\x1b[2J\x1b[Hfoo\r\nbar");
+        parser.process(&remote_terminal_restore_escape(true, 6));
+        assert!(!parser.screen().alternate_screen());
+        assert_eq!(parser.screen().contents(), "");
+        assert_eq!(parser.screen().cursor_position(), (0, 0));
+        parser.process(b"Detached\r\n$ ");
+        assert_eq!(parser.screen().contents(), "Detached\n$ ");
+        parser.screen_mut().set_scrollback(6);
+        assert!(parser.screen().contents().contains("$ nono connect"));
+        assert!(parser.screen().contents().contains("connected"));
+        assert!(parser.screen().contents().contains("detach keys"));
     }
 
     #[test]

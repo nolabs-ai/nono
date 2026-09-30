@@ -64,6 +64,25 @@ pub(crate) fn run_detached_launch(args: RunArgs, silent: bool) -> Result<()> {
     let deadline = std::time::Instant::now() + detach_timeout;
     while std::time::Instant::now() < deadline {
         if session_path.exists() && attach_path.exists() {
+            // The supervisor publishes its session metadata and socket before
+            // the sandboxed command has necessarily survived its first exec.
+            // Without a short stability check, a child that fails during that
+            // handoff can be reported as successfully detached and its startup
+            // log is deleted; callers then observe only an opaque exited/126
+            // record. Keep monitoring briefly so genuine startup failures retain
+            // their diagnostic while long-running sessions remain fast to start.
+            let stability_deadline = std::time::Instant::now()
+                + crate::timeouts::SESSION_READY_POLL_INTERVAL.saturating_mul(3);
+            while std::time::Instant::now() < stability_deadline {
+                if let Some(status) = launched.try_wait().map_err(|e| {
+                    NonoError::SandboxInit(format!(
+                        "Failed to monitor detached launch during readiness check: {e}"
+                    ))
+                })? {
+                    return detached_startup_failure(status, &startup_log_path);
+                }
+                std::thread::sleep(crate::timeouts::SESSION_READY_POLL_INTERVAL);
+            }
             cleanup_startup_log(&startup_log_path);
             print_detached_launch_banner(&session_id, args.name.as_deref(), silent);
             return Ok(());
@@ -72,15 +91,7 @@ pub(crate) fn run_detached_launch(args: RunArgs, silent: bool) -> Result<()> {
         if let Some(status) = launched.try_wait().map_err(|e| {
             NonoError::SandboxInit(format!("Failed to monitor detached launch: {e}"))
         })? {
-            let detail = read_startup_log_summary(&startup_log_path);
-            cleanup_startup_log(&startup_log_path);
-            return Err(NonoError::SandboxInit(format!(
-                "Detached session failed to start (exit status: {}){}",
-                status,
-                detail
-                    .map(|summary| format!(": {summary}"))
-                    .unwrap_or_default()
-            )));
+            return detached_startup_failure(status, &startup_log_path);
         }
 
         std::thread::sleep(crate::timeouts::SESSION_READY_POLL_INTERVAL);
@@ -91,6 +102,21 @@ pub(crate) fn run_detached_launch(args: RunArgs, silent: bool) -> Result<()> {
     Err(NonoError::SandboxInit(
         "Detached session failed to become attachable within startup timeout".to_string(),
     ))
+}
+
+fn detached_startup_failure(
+    status: std::process::ExitStatus,
+    startup_log_path: &Path,
+) -> Result<()> {
+    let detail = read_startup_log_summary(startup_log_path);
+    cleanup_startup_log(startup_log_path);
+    Err(NonoError::SandboxInit(format!(
+        "Detached session failed to start (exit status: {}){}",
+        status,
+        detail
+            .map(|summary| format!(": {summary}"))
+            .unwrap_or_default()
+    )))
 }
 
 pub(crate) fn show_update_notification(

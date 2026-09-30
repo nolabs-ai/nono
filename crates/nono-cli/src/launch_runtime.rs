@@ -250,7 +250,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) proc_comm_notify: bool,
-    pub(crate) bypass_protection_paths: Vec<PathBuf>,
+    pub(crate) bypass_protection_paths: Vec<crate::policy::AppliedBypass>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) profile_display_name: Option<String>,
@@ -319,7 +319,10 @@ impl ExecutionFlags {
                 ..TrustLaunchOptions::default()
             },
             network: NetworkIntent::default(),
-            redaction_policy: nono::ScrubPolicy::secure_default(),
+            redaction_policy: profile_redaction_policy(
+                &prepared.redaction_extra_env_vars,
+                &prepared.redaction_derived_env_vars,
+            )?,
             session_hooks: prepared.session_hooks.clone(),
             allowed_env_vars: prepared.allowed_env_vars.clone(),
             denied_env_vars: prepared.denied_env_vars.clone(),
@@ -341,7 +344,6 @@ pub(crate) fn prepare_run_launch_plan(
     silent: bool,
 ) -> Result<LaunchPlan> {
     let detach_sequence = load_configured_detach_sequence()?;
-    let redaction_policy = load_configured_redaction_policy()?;
     let args = run_args.sandbox;
     let no_diagnostics = run_args.no_diagnostics;
     let diagnostics_json = run_args.diagnostics_json;
@@ -471,7 +473,6 @@ pub(crate) fn prepare_run_launch_plan(
         },
         trust,
         network,
-        redaction_policy,
         startup_timeout_secs,
         ..ExecutionFlags::from_prepared(&prepared, silent)?
     };
@@ -489,6 +490,33 @@ pub(crate) fn load_configured_detach_sequence() -> Result<Option<Vec<u8>>> {
     Ok(config::user::load_user_config()?
         .and_then(|user_config| user_config.ui.detach_sequence)
         .map(|sequence| sequence.bytes().to_vec()))
+}
+
+/// Build the redaction policy for a run: the user-configured policy, widened
+/// by the profile's `diagnostics.redaction.extra_env_vars` and by the
+/// destination variables of the credentials the profile declares.
+///
+/// Profile entries are applied last and are add-only, so a profile can only
+/// widen redaction. In particular a profile entry re-redacts a name that user
+/// config dropped via `[redaction].unsafe_redaction_overrides`, which is the
+/// fail-secure direction.
+///
+/// `derived_env_vars` are added as exact names, not patterns: they are read
+/// out of the profile rather than authored as redaction rules, so they must
+/// cover exactly the variables the profile named and never a family around
+/// them.
+pub(crate) fn profile_redaction_policy(
+    extra_env_vars: &[String],
+    derived_env_vars: &[String],
+) -> Result<nono::ScrubPolicy> {
+    let mut redactions = load_configured_redaction_policy()?;
+    for pattern in extra_env_vars {
+        redactions.add_env_var_pattern(pattern);
+    }
+    for name in derived_env_vars {
+        redactions.add_env_var(name);
+    }
+    Ok(redactions)
 }
 
 pub(crate) fn load_configured_redaction_policy() -> Result<nono::ScrubPolicy> {
@@ -701,6 +729,7 @@ mod tests {
 
     fn run_args_with_sandbox(sandbox: SandboxArgs) -> RunArgs {
         RunArgs {
+            remote_options: Default::default(),
             sandbox,
             detached: false,
             detach_timeout_secs: None,

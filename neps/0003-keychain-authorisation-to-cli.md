@@ -3,7 +3,7 @@ nep: 0003
 title: Move macOS keychain authorisation to `nono-cli`
 authors:
   - Kurtis Charnock
-status: draft
+status: accepted
 created: 2026-09-23
 superseded-by:
 ---

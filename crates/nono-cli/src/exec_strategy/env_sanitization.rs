@@ -6,6 +6,7 @@
 //! - All sandbox execution strategies must share one allow/deny implementation
 //!   to avoid drift in security behavior across code paths.
 
+use nono::env_glob::env_var_glob_matches;
 use std::borrow::Cow;
 
 /// Returns true if an environment variable is unsafe to inherit into a sandboxed child.
@@ -62,48 +63,17 @@ pub(crate) fn is_loader_injection_env_var(key: &str) -> bool {
     key.starts_with("LD_") || key.starts_with("DYLD_")
 }
 
-/// Whether `text` matches `pattern`, where `*` in `pattern` matches any run of
-/// zero or more characters (including none), anchored to the full string.
-/// `*` is the only wildcard; every other character is matched literally.
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    // An empty pattern is invalid and must never act as an implicit match-all
-    // (every branch below treats "" as "no constraint").
-    if pattern.is_empty() {
-        return false;
-    }
-    // `split('*')` always yields at least one item, so an empty `parts` here
-    // is impossible; a pattern with no `*` is just an exact match.
-    let mut parts = pattern.split('*').peekable();
-    let first = parts.next().unwrap_or_default();
-    let Some(mut rest) = text.strip_prefix(first) else {
-        return false;
-    };
-    if parts.peek().is_none() {
-        // No `*`: exact full-string match.
-        return rest.is_empty();
-    }
-    while let Some(part) = parts.next() {
-        if parts.peek().is_none() {
-            // Last segment: must match the remaining text as a suffix.
-            return rest.ends_with(part);
-        }
-        if part.is_empty() {
-            continue;
-        }
-        match rest.find(part) {
-            Some(idx) => rest = &rest[idx + part.len()..],
-            None => return false,
-        }
-    }
-    true
-}
-
 /// Returns true if `key` matches any pattern in `patterns`.
 ///
-/// `*` may appear anywhere in a pattern — leading, trailing, or infix — and
-/// matches any run of characters: `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`, and
-/// `"AWS_*_TOKEN"` are all valid. A bare `"*"` matches everything. Matching
-/// is anchored to the full variable name.
+/// The pattern grammar is [`env_var_glob_matches`], shared with diagnostics
+/// and audit redaction so that one pattern text cannot mean two different
+/// sets of names: `*` may appear anywhere in a pattern — leading, trailing,
+/// or infix — and matches any run of characters, so `"AWS_*"`, `"*_TOKEN"`,
+/// `"*SECRET*"`, and `"AWS_*_TOKEN"` are all valid. A bare `"*"` matches
+/// everything. Matching is anchored to the full variable name.
+///
+/// Sharing the grammar says nothing about policy: a pattern here denies a
+/// variable and does not redact it, and redaction is configured separately.
 ///
 /// When `case_insensitive` is true, both `key` and every pattern are
 /// lowercased (ASCII-only) before comparison.
@@ -119,9 +89,9 @@ pub(crate) fn matches_env_var_patterns(
     };
     patterns.iter().any(|pattern| {
         if case_insensitive {
-            glob_matches(&pattern.to_ascii_lowercase(), &key)
+            env_var_glob_matches(&pattern.to_ascii_lowercase(), &key)
         } else {
-            glob_matches(pattern, &key)
+            env_var_glob_matches(pattern, &key)
         }
     })
 }
@@ -135,10 +105,17 @@ pub(crate) fn is_env_var_allowed(key: &str, allowed_env_vars: &[String]) -> bool
 /// Validates env var patterns before they are used for matching.
 /// `field_name` is used in the error message (e.g. `"allow_vars"` or `"deny_vars"`).
 /// Returns an error message describing the first invalid pattern, or None if valid.
+///
+/// A whitespace-only pattern is rejected alongside an empty one. Downstream
+/// consumers normalize a pattern by trimming it — `ScrubPolicy` drops an entry
+/// that trims to nothing — so accepting `"  "` here would turn an authoring
+/// mistake into a silently absent rule rather than an error.
 pub(crate) fn validate_env_var_patterns(patterns: &[String], field_name: &str) -> Option<String> {
     for pattern in patterns {
-        if pattern.is_empty() {
-            return Some(format!("Invalid {field_name} pattern: empty pattern"));
+        if pattern.trim().is_empty() {
+            return Some(format!(
+                "Invalid {field_name} pattern: empty or whitespace-only pattern"
+            ));
         }
         if pattern.contains('\0') {
             return Some(format!(
@@ -334,6 +311,53 @@ mod tests {
     // these tests will catch it.
     // ============================================================================
 
+    /// One pattern configured in both the deny list and the redaction list
+    /// must select the same names in each. This is a claim about the grammar,
+    /// not about policy: denying a variable does not by itself redact it, and
+    /// the two lists are configured separately. Both paths resolve the pattern
+    /// through `env_var_glob_matches`, and this pins that they stay wired to
+    /// it — if either side grows its own matcher, one of these rows will
+    /// disagree. Names are chosen to sit outside the secure default's
+    /// exact-match list so only the pattern decides.
+    #[test]
+    fn one_pattern_matches_identically_in_deny_and_redaction_lists() {
+        let patterns = [
+            "ACME_*",
+            "*_TOKEN",
+            "*SECRET*",
+            "ACME_*_TOKEN",
+            "EXACT_NAME",
+            "*",
+        ];
+        let names = [
+            "ACME_API_KEY",
+            "XACME_API_KEY",
+            "MY_ACME_API_KEY",
+            "ACME_",
+            "DEPLOY_TOKEN",
+            "DEPLOY_TOKEN_ID",
+            "MY_SECRET_VALUE",
+            "ACME_ROTATE_TOKEN",
+            "GCP_ROTATE_TOKEN",
+            "EXACT_NAME",
+            "EXACT_NAME_2",
+            "UNRELATED",
+        ];
+
+        for pattern in patterns {
+            let mut redactions = nono::ScrubPolicy::secure_default();
+            redactions.add_env_var_pattern(pattern);
+            for name in names {
+                let denied = matches_env_var_patterns(name, &[pattern.to_string()], true);
+                let redacted = nono::scrub_env_name_with_policy(name, &redactions) != name;
+                assert_eq!(
+                    denied, redacted,
+                    "pattern '{pattern}' vs '{name}': deny={denied} redact={redacted}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_blocks_op_service_account_token() {
         assert!(is_dangerous_env_var("OP_SERVICE_ACCOUNT_TOKEN"));
@@ -519,6 +543,41 @@ mod tests {
         let patterns: Vec<String> = vec!["".into()];
         let err = validate_env_var_patterns(&patterns, "allow_vars");
         assert!(err.is_some());
+    }
+
+    #[test]
+    fn test_validate_rejects_whitespace_only_pattern() {
+        // `ScrubPolicy` normalizes by trimming and drops what trims to
+        // nothing, so a whitespace-only pattern that validated here would
+        // silently redact nothing. It has to fail at authoring time instead.
+        for pattern in [" ", "\t", "  \n ", "\u{000b}"] {
+            let patterns: Vec<String> = vec![pattern.into()];
+            let err = validate_env_var_patterns(&patterns, "diagnostics.redaction.extra_env_vars");
+            let message = err.unwrap_or_else(|| {
+                panic!("whitespace-only pattern {pattern:?} must be rejected");
+            });
+            assert!(
+                message.contains("whitespace-only"),
+                "error should name the cause, got: {message}"
+            );
+            assert!(
+                message.contains("diagnostics.redaction.extra_env_vars"),
+                "error should name the field, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_still_reports_nul_in_an_otherwise_blank_pattern() {
+        // NUL is not whitespace, so the trim check must not swallow it and
+        // report the wrong reason.
+        let patterns: Vec<String> = vec![" \0 ".into()];
+        let message =
+            validate_env_var_patterns(&patterns, "deny_vars").expect("NUL must be rejected");
+        assert!(
+            message.contains("NUL"),
+            "error should name the NUL byte, got: {message}"
+        );
     }
 
     #[test]

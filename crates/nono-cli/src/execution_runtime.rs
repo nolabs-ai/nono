@@ -480,6 +480,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 blocked_commands: caps.blocked_commands(),
                 outer_caps: &caps,
                 deny_paths: &deny_paths,
+                bypass_protection_paths: &flags.bypass_protection_paths,
                 policy_root: &requested_workdir,
                 proxy_credentials: &tool_sandbox_proxy_credentials,
                 reserved_proxy_ports: &reserved_proxy_ports,
@@ -846,7 +847,7 @@ fn validate_command_policy_execution_support() -> Result<()> {
 
 fn write_capability_state_file(
     caps: &CapabilitySet,
-    bypass_protection_paths: &[std::path::PathBuf],
+    bypass_protection_paths: &[crate::policy::AppliedBypass],
     deny_paths: &[std::path::PathBuf],
     allowed_domains: &[String],
     denied_domains: &[String],

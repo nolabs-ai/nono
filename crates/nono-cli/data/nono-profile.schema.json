@@ -1570,6 +1570,12 @@
         ]
       }
     },
+    "EnvVarPattern": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\u0000]*[^\\u0000\\s][^\\u0000]*$",
+      "description": "Environment variable name or glob pattern. Must contain at least one non-whitespace character and no NUL byte; an empty or whitespace-only entry is rejected because it would normalize away to no rule at all."
+    },
     "EnvironmentConfig": {
       "type": "object",
       "description": "Controls which environment variables are passed to the sandboxed process. By default all variables are inherited. Precedence (highest to lowest): 1. Hardcoded dangerous vars (always stripped), 2. deny_vars (stripped even if in allow_vars), 3. allow_vars (if non-empty, only matching vars pass).",
@@ -1577,12 +1583,12 @@
       "properties": {
         "allow_vars": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$" },
+          "items": { "$ref": "#/$defs/EnvVarPattern" },
           "description": "Allow-list of environment variable names passed to the sandboxed process. Supports exact names (\"PATH\") and glob patterns where * may appear anywhere in the name (\"AWS_*\", \"*_TOKEN\", \"*SECRET*\"). A bare \"*\" matches everything. When empty or absent, all variables are allowed."
         },
         "deny_vars": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$" },
+          "items": { "$ref": "#/$defs/EnvVarPattern" },
           "description": "Deny-list of environment variable names stripped from the sandboxed process. Supports the same glob syntax as allow_vars (\"GH_TOKEN\", \"GITHUB_*\", \"*_TOKEN\", \"*SECRET*\"). Denied vars are stripped even if they also match allow_vars."
         },
         "case_insensitive_vars": {
@@ -2342,6 +2348,22 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Non-filesystem sandbox operation names to hide from diagnostic footers, such as forbidden-exec-sugid."
+        },
+        "redaction": {
+          "$ref": "#/$defs/RedactionConfig",
+          "description": "Extra redaction applied to diagnostic and audit output. Add-only: a profile can widen redaction but cannot stop a secure default from being redacted."
+        }
+      }
+    },
+    "RedactionConfig": {
+      "type": "object",
+      "description": "Profile-supplied additions to the output redaction policy. This is output hygiene, not enforcement: it changes what nono writes, never what the sandboxed process can read.",
+      "additionalProperties": false,
+      "properties": {
+        "extra_env_vars": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EnvVarPattern" },
+          "description": "Environment variable name patterns whose values are replaced with [REDACTED] in diagnostics and audit records. Same glob syntax as environment.deny_vars (\"DEPLOY_TOKEN\", \"ACME_*\", \"*_SECRET\"), matched case-insensitively against the whole name. Only exact environment.deny_vars names are redacted automatically, so a wildcard deny that should also be redacted must be repeated here. Inherited additively through extends."
         }
       }
     },

@@ -58,6 +58,8 @@ mod pty_proxy;
 mod pull_ui;
 mod query_ext;
 mod registry_client;
+#[cfg(unix)]
+mod remote_run;
 #[cfg(target_os = "linux")]
 mod resource_cgroup;
 mod rollback_commands;
@@ -95,7 +97,9 @@ mod wiring;
 mod test_env;
 
 use app_runtime::run as run_cli;
+#[cfg(test)]
 use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use cli::Cli;
 use cli_bootstrap::{init_theme, init_tracing};
 use command_blocking_deprecation::{
@@ -115,12 +119,16 @@ fn main() {
     }
     tool_sandbox::record_main_start();
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     init_tracing(&cli);
     init_theme(&cli);
     let command_blocking_warnings = collect_cli_warnings(&cli);
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
+    #[cfg(unix)]
+    let cli_result = remote_run::validate_matches(&matches).and_then(|()| run_cli(cli));
+    #[cfg(not(unix))]
     let cli_result = run_cli(cli);
     tool_sandbox::log_main_total();
     #[cfg(unix)]
@@ -320,6 +328,8 @@ mod tests {
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
+            redaction_extra_env_vars: Vec::new(),
+            redaction_derived_env_vars: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
             case_insensitive_env_vars: false,
@@ -398,6 +408,8 @@ mod tests {
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
+            redaction_extra_env_vars: Vec::new(),
+            redaction_derived_env_vars: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
             case_insensitive_env_vars: false,

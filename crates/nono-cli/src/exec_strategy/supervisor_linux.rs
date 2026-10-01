@@ -733,8 +733,10 @@ pub(super) fn network_notification_out_of_scope(policy: SeccompPolicy, family: u
 ///    (addrlen == 2) have no path to check.
 ///
 /// 2. For `AF_INET`/`AF_INET6` in proxy-only mode:
-///    - `connect()` is allowed only to `127.0.0.1:proxy_port` (the nono proxy).
-///    - `bind()` is allowed on ports in `proxy_bind_ports` or within any range in `proxy_bind_port_ranges`.
+///    - `connect()` is allowed to `127.0.0.1:proxy_port` (the nono proxy) or
+///      to an explicitly granted localhost IPC port.
+///    - `bind()` is allowed on ports in `proxy_bind_ports` or explicitly
+///      granted localhost IPC ports and ranges.
 ///    - Everything else is denied.
 pub(super) fn decide_network_notification(
     child_pid: u32,
@@ -786,10 +788,18 @@ pub(super) fn decide_network_notification(
 
     match syscall {
         SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => {
-            // Allow connect/sendto/sendmsg/sendmmsg only to loopback + proxy port.
+            // Allow connect/sendto/sendmsg/sendmmsg only to loopback + proxy port
+            // or an explicit bidirectional localhost IPC grant (`--open-port`).
             // sendto/sendmsg/sendmmsg with a destination address is semantically
             // equivalent to connect for network reach-out (issue #1089).
-            if sockaddr.is_loopback && sockaddr.port == config.proxy_port {
+            let allowed_port = sockaddr.port == config.proxy_port
+                || config.caps.localhost_ports().contains(&sockaddr.port)
+                || config
+                    .caps
+                    .localhost_port_ranges()
+                    .iter()
+                    .any(|&(start, end)| sockaddr.port >= start && sockaddr.port <= end);
+            if sockaddr.is_loopback && allowed_port {
                 debug!(
                     "Proxy seccomp: allowing network syscall nr={} to loopback:{}",
                     syscall, sockaddr.port
@@ -806,6 +816,7 @@ pub(super) fn decide_network_notification(
         SYS_BIND => {
             let port = sockaddr.port;
             let allowed = config.proxy_bind_ports.contains(&port)
+                || config.caps.localhost_ports().contains(&port)
                 || config
                     .proxy_bind_port_ranges
                     .iter()
@@ -2148,6 +2159,58 @@ mod tests {
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(3000), &config),
                 NetworkDecision::Allow
+            );
+        }
+
+        /// Regression test for OSS-363: seccomp proxy fallback must preserve
+        /// bidirectional localhost grants that Landlock already honors.
+        #[test]
+        fn proxy_only_allows_explicit_localhost_ports_and_ranges() {
+            let backend = DenyAllBackend;
+            let mut caps = nono::CapabilitySet::default();
+            caps.add_localhost_port(3001);
+            caps.add_localhost_port_range(4000, 4002)
+                .expect("valid localhost port range");
+            let mut config = make_proxy_only_config(&backend, 8080, Vec::new());
+            config.caps = &caps;
+
+            for port in [3001, 4000, 4002] {
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        SYS_CONNECT,
+                        &inet_loopback(port),
+                        &config
+                    ),
+                    NetworkDecision::Allow,
+                    "loopback connect to explicitly open port {port} must be allowed"
+                );
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        SYS_BIND,
+                        &inet_loopback(port),
+                        &config
+                    ),
+                    NetworkDecision::Allow,
+                    "bind to explicitly open port {port} must be allowed"
+                );
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        SYS_CONNECT,
+                        &inet_external(port),
+                        &config
+                    ),
+                    NetworkDecision::Deny,
+                    "open-port must not authorize an external destination on port {port}"
+                );
+            }
+
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(4003), &config),
+                NetworkDecision::Deny,
+                "a port outside the explicit range must remain denied"
             );
         }
 

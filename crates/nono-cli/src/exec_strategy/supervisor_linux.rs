@@ -818,6 +818,11 @@ pub(super) fn decide_network_notification(
             let allowed = config.proxy_bind_ports.contains(&port)
                 || config.caps.localhost_ports().contains(&port)
                 || config
+                    .caps
+                    .localhost_port_ranges()
+                    .iter()
+                    .any(|&(start, end)| port >= start && port <= end)
+                || config
                     .proxy_bind_port_ranges
                     .iter()
                     .any(|&(s, e)| port >= s && port <= e);
@@ -2162,7 +2167,7 @@ mod tests {
             );
         }
 
-        /// Regression test for OSS-363: seccomp proxy fallback must preserve
+        /// Regression test for issue #2020: seccomp proxy fallback must preserve
         /// bidirectional localhost grants that Landlock already honors.
         #[test]
         fn proxy_only_allows_explicit_localhost_ports_and_ranges() {

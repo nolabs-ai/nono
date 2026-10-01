@@ -64,6 +64,8 @@ fn test_schema_network_config_matches_rust_model() {
         "NetworkConfig",
         &[
             "block",
+            "block_loopback",
+            "loopback_allow",
             "allow_http2",
             "network_profile",
             "allow_domain",

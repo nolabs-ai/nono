@@ -1604,6 +1604,8 @@ pub(crate) fn prepare_proxy_launch_options(
         allow_bind_ports,
         proxy_port: args.proxy_port,
         strict_filter,
+        block_loopback: prepared.profile_block_loopback,
+        loopback_allow: prepared.profile_loopback_allow.clone(),
         proxy_leaf_validity: tls_options.leaf_validity,
         command_policies: prepared.command_policies.clone(),
         proxy_source_env_vars,
@@ -1633,6 +1635,21 @@ pub(crate) fn prepare_proxy_launch_options(
             return Err(NonoError::ConfigParse(
                 "--proxy-port requires a proxy feature (--allow-domain, --credential, \
                  or --upstream-proxy)"
+                    .to_string(),
+            ));
+        }
+        // Fail closed rather than silently running unrestricted. `block_loopback`
+        // is enforced by the proxy, so without an activating feature there is no
+        // proxy to enforce it and the child would get full direct loopback
+        // access — the opposite of what the profile asks for.
+        if opts.block_loopback {
+            return Err(NonoError::ConfigParse(
+                "network.block_loopback requires a feature that starts the nono proxy \
+                 (for example network_profile, allow_domain, deny_domain, credentials, \
+                 or upstream_proxy): it is enforced by the proxy, so with no proxy \
+                 running it would leave loopback fully reachable instead of \
+                 restricted.\n\n\
+                 To block all network access instead, set network.block."
                     .to_string(),
             ));
         }
@@ -2504,6 +2521,8 @@ pub(crate) fn build_proxy_config_from_flags(
     let mut proxy_config =
         network_policy::build_proxy_config(&resolved, &plain_hosts, &denied_hosts);
     proxy_config.strict_filter = strict_filter;
+    proxy_config.block_loopback = proxy.block_loopback;
+    proxy_config.loopback_allow = proxy.loopback_allow.clone();
 
     if let Some(ref upstream) = proxy.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {
@@ -4034,6 +4053,45 @@ mod tests {
         ));
     }
 
+    /// Profile `network.block_loopback` / `network.loopback_allow` must reach
+    /// `ProxyConfig`, which is what arms the filter's loopback policy.
+    #[test]
+    fn test_build_proxy_config_propagates_loopback_restriction() {
+        let proxy = ProxyLaunchOptions {
+            block_loopback: true,
+            loopback_allow: vec![8080],
+            ..ProxyLaunchOptions::default()
+        };
+        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        assert!(config.block_loopback);
+        assert_eq!(config.loopback_allow, vec![8080]);
+    }
+
+    /// Off unless a profile asks for it: loopback stays reachable by default.
+    #[test]
+    fn test_build_proxy_config_loopback_unrestricted_by_default() {
+        let proxy = ProxyLaunchOptions::default();
+        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        assert!(!config.block_loopback);
+        assert!(config.loopback_allow.is_empty());
+    }
+
+    /// The two switches are orthogonal: restricting loopback must not turn on
+    /// the strict host allowlist (that is `network.block`'s job).
+    #[test]
+    fn test_loopback_restriction_is_independent_of_strict_filter() {
+        let proxy = ProxyLaunchOptions {
+            block_loopback: true,
+            ..ProxyLaunchOptions::default()
+        };
+        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        assert!(config.block_loopback);
+        assert!(
+            !config.strict_filter,
+            "block_loopback must not imply strict host filtering"
+        );
+    }
+
     #[test]
     fn test_build_proxy_config_network_audit_on_by_default() {
         let proxy = ProxyLaunchOptions::default();
@@ -4323,6 +4381,8 @@ mod tests {
             case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
+            profile_block_loopback: false,
+            profile_loopback_allow: Vec::new(),
             allow_http2_requested: false,
         };
 
@@ -4404,6 +4464,8 @@ mod tests {
             case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
+            profile_block_loopback: false,
+            profile_loopback_allow: Vec::new(),
             allow_http2_requested: false,
         };
         let args = crate::cli::SandboxArgs {
@@ -4480,6 +4542,8 @@ mod tests {
             case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
+            profile_block_loopback: false,
+            profile_loopback_allow: Vec::new(),
             allow_http2_requested: false,
         };
         let args = crate::cli::SandboxArgs::default();

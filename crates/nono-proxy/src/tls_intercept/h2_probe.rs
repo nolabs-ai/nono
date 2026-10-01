@@ -91,7 +91,9 @@ async fn probe_upstream_h2(
     tls_connector_h2: &tokio_rustls::TlsConnector,
     upstream_proxy: Option<&InterceptUpstreamProxy<'_>>,
 ) -> bool {
-    let check = match filter.check_host(host, port).await {
+    // Route-scoped ALPN probe against a route's own upstream — see
+    // `resolve_upstream_or_deny` for why the loopback policy is exempted here.
+    let check = match filter.check_route_upstream(host, port).await {
         Ok(c) if c.result.is_allowed() => c,
         _ => return false,
     };

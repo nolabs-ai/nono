@@ -78,8 +78,59 @@ impl RateLimiter {
     }
 }
 
+/// Keep command transport traffic independent from capability expansion and
+/// other network decisions, while bounding both sources of supervisor work.
+pub(super) struct NotificationRateLimiter {
+    general: RateLimiter,
+    control: RateLimiter,
+}
+
+impl NotificationRateLimiter {
+    pub(super) fn new() -> Self {
+        Self {
+            general: RateLimiter::new(10, 5),
+            // A command burst routinely opens one control connection per
+            // mediation. Keep it separate from unrelated socket decisions,
+            // but retain the established sustained notification pressure.
+            control: RateLimiter::new(10, 32),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn unlimited_for_tests() -> Self {
+        Self {
+            general: RateLimiter::new(10_000, 10_000),
+            control: RateLimiter::new(10_000, 10_000),
+        }
+    }
+
+    fn try_acquire(&mut self) -> bool {
+        self.general.try_acquire()
+    }
+
+    fn try_acquire_network(
+        &mut self,
+        child_pid: u32,
+        syscall: i32,
+        sockaddrs: &[nono::sandbox::SockaddrInfo],
+        tool_sandbox_runtime: Option<&crate::tool_sandbox::PreparedToolSandboxRuntime>,
+    ) -> bool {
+        self.try_acquire_network_class(tool_sandbox_runtime.is_some_and(|runtime| {
+            runtime.is_control_socket_connect(child_pid, syscall, sockaddrs)
+        }))
+    }
+
+    fn try_acquire_network_class(&mut self, control_socket: bool) -> bool {
+        if control_socket {
+            self.control.try_acquire()
+        } else {
+            self.general.try_acquire()
+        }
+    }
+}
+
 pub(super) struct SeccompNotificationState<'a> {
-    pub(super) rate_limiter: &'a mut RateLimiter,
+    pub(super) rate_limiter: &'a mut NotificationRateLimiter,
     pub(super) denials: &'a mut Vec<DenialRecord>,
     pub(super) trust_interceptor: Option<&'a mut TrustInterceptor>,
     pub(super) pty: Option<&'a mut crate::pty_proxy::PtyProxy>,
@@ -1025,7 +1076,7 @@ pub(super) fn handle_combined_notification(
 pub(super) fn handle_network_notification(
     notify_fd: std::os::fd::RawFd,
     config: &SupervisorConfig<'_>,
-    rate_limiter: &mut RateLimiter,
+    rate_limiter: &mut NotificationRateLimiter,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) -> nono::error::Result<()> {
@@ -1043,7 +1094,7 @@ pub(super) fn handle_network_notification(
 fn handle_received_network_notification(
     notify_fd: std::os::fd::RawFd,
     config: &SupervisorConfig<'_>,
-    rate_limiter: &mut RateLimiter,
+    rate_limiter: &mut NotificationRateLimiter,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
     notif: nono::sandbox::SeccompNotif,
@@ -1205,17 +1256,25 @@ fn handle_received_network_notification(
         return Ok(());
     }
 
-    // Rate limit: guard AF_UNIX mediation decisions and proxy-mode decisions
-    // against notification flooding from a compromised child.
-    if !rate_limiter.try_acquire() {
-        debug!("Rate limited network seccomp notification, denying");
-        let _ = deny_notif(notify_fd, notif.id);
-        return Ok(());
-    }
-
     // TOCTOU check
     if !notif_id_valid(notify_fd, notif.id)? {
         debug!("Network seccomp notification expired (TOCTOU check)");
+        return Ok(());
+    }
+
+    // Every mediated command connects to the runtime's control socket. Do not
+    // charge that transport against the expansion/notification budget, or a
+    // burst of already-authorized commands fails before command policy runs.
+    // Its separate bounded budget does not grant access: the control socket
+    // must still pass the normal allowlist decision below.
+    if !rate_limiter.try_acquire_network(
+        notif.pid,
+        notif.data.nr,
+        &sockaddrs,
+        config.tool_sandbox_runtime,
+    ) {
+        debug!("Rate limited network seccomp notification, denying");
+        let _ = deny_notif(notify_fd, notif.id);
         return Ok(());
     }
 
@@ -1551,6 +1610,23 @@ mod tests {
         assert!(!limiter.try_acquire());
         limiter.last_refill -= std::time::Duration::from_millis(500);
         assert!(limiter.try_acquire());
+    }
+
+    #[test]
+    fn command_transport_budget_is_separate_and_bounded() {
+        // Exhaust each budget first, proving isolation in both directions.
+        for order in [[(false, 5), (true, 32)], [(true, 32), (false, 5)]] {
+            let mut limiter = NotificationRateLimiter::new();
+            for (control_socket, burst) in order {
+                for _ in 0..burst {
+                    assert!(limiter.try_acquire_network_class(control_socket));
+                }
+                assert!(
+                    !limiter.try_acquire_network_class(control_socket),
+                    "the {burst}-request budget must remain bounded",
+                );
+            }
+        }
     }
 
     #[test]

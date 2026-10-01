@@ -70,6 +70,13 @@ To prevent prompt flooding, the supervisor uses a token bucket rate limiter:
 
 Requests exceeding the rate limit are automatically denied.
 
+On Linux, connections to nono's own command-mediation socket use a separate
+budget of 10 connections per second with a burst capacity of 32. This lets a
+burst of mediated commands reach command policy evaluation without consuming
+the budget for capability expansion or other network notifications. The socket
+allowlist and command authorization still apply; other Unix sockets do not use
+this budget.
+
 ### Minimum Requirements
 
 - Linux kernel 5.14+ (for `SECCOMP_ADDFD_FLAG_SEND`)

@@ -406,6 +406,51 @@ fn command_policies_profile(t: &NonoTest, name: &str) -> Profile {
     )
 }
 
+/// Every mediated command first connects to the runtime-owned control socket.
+/// The generic seccomp-notification burst is five, so this needs a distinct
+/// command-transport budget for normal parallel tool use.
+#[test]
+#[cfg(target_os = "linux")]
+fn command_mediation_accepts_a_burst_of_32_control_connects() {
+    let t = nono_test!("cmd-mediation-control-burst");
+    fs::write(t.workspace().join("marker"), "command mediation\n").expect("write command input");
+    let profile = t.write_profile(
+        "cmd-mediation-control-burst",
+        &format!(
+            r#"{{
+                "meta": {{ "name": "cmd-mediation-control-burst-test" }},
+                "filesystem": {{ "allow": ["{workspace}"] }},
+                "linux": {{ "af_unix_mediation": "pathname" }},
+                "command_policies": {{
+                    "commands": {{
+                        "cat": {{
+                            "executable": "/bin/cat",
+                            "sandbox": {{ "fs_read": ["."] }}
+                        }}
+                    }}
+                }}
+            }}"#,
+            workspace = t.workspace().display(),
+        ),
+    );
+
+    let completed =
+        t.run()
+            .profile(&profile)
+            .no_rollback()
+            .exec(Argv::new("/bin/sh").arg("-c").arg(
+                "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32; do (: > \"ready.$i\"; while [ ! -f release ]; do :; done; cat marker) & done; while :; do set -- ready.*; [ \"$#\" -eq 32 ] && break; done; : > release; wait; printf 'burst complete\\n'",
+            ))
+            .assert_success("32 simultaneous mediated commands complete");
+    assert_eq!(
+        completed.stdout().matches("command mediation").count(),
+        32,
+        "each mediated command must run\nstdout: {}\nstderr: {}",
+        completed.stdout(),
+        completed.stderr(),
+    );
+}
+
 /// A granted project directory to hand the child via `--workdir`, plus a launch
 /// directory that is deliberately outside the capability set.
 struct WorkdirCase {

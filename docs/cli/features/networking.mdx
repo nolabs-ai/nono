@@ -541,9 +541,12 @@ Notes:
 
 - `block_loopback` is independent of `block`. It governs what the proxy will
   reach, not whether the sandbox permits outbound at all.
-- It applies to the proxy, so it has no effect on a session where no proxy is
-  running. With no proxy, no outbound TCP is possible anyway under
-  `--block-net`, and unrestricted otherwise.
+- It is enforced by the proxy, so it needs a feature that starts the proxy
+  (`network_profile`, `allow_domain`, `deny_domain`, `credentials` or
+  `upstream_proxy`). Setting it without one is a launch error, not a silent
+  no-op. To block all network access, use `network.block` instead.
+- `--allow-net` forces unrestricted networking for the run and turns
+  `block_loopback` off along with the other proxy settings.
 - Matching is on the destination, not its spelling: `127.0.0.1`, `[::1]`,
   `localhost` and names under `.localhost` are all loopback, as is any address
   in `127.0.0.0/8`. The unspecified addresses `0.0.0.0` and `::` count too,

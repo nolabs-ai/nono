@@ -433,7 +433,9 @@ nono why --scope abstract-unix-socket --profile my-agent
 ```
 
 <Note>
-  `filesystem.bypass_protection` only removes the deny rule. You must also grant access via `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant) for the path to be accessible.
+  `filesystem.bypass_protection` only removes the deny rule. A matching
+  filesystem or Unix socket field must also grant the requested access. The
+  `unix_socket*` fields add their required filesystem grant automatically.
 </Note>
 
 ### Suppressing Repeated Save Suggestions

@@ -117,10 +117,11 @@ nono explicitly denies data access to credential storage:
 | History Files | `~/.zsh_history`, `~/.bash_history` (read-blocked; may contain secrets) |
 | Credential Files | `~/.git-credentials`, `~/.netrc`, `~/.npmrc` |
 
-To access a protected path, provide both a filesystem grant (`--allow`,
-`--read`, or `--write`) and a matching `--bypass-protection` path. A grant alone
-does not lift a deny rule. The bypass reopens only the access modes granted for
-that path; a read-only grant does not permit writes.
+To access a protected path, provide both a matching filesystem or Unix socket
+grant and a `--bypass-protection` path. A grant alone does not lift a deny rule.
+The bypass reopens only the access modes and socket scope granted for that
+path; a read-only grant does not permit writes, and an exact socket exception
+does not reopen sibling sockets.
 
 ## System Operations
 

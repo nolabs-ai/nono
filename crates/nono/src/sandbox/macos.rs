@@ -455,6 +455,11 @@ fn emit_unix_socket_rules(profile: &mut String, caps: &CapabilitySet) -> Result<
     Ok(())
 }
 
+fn is_network_platform_rule(rule: &str) -> bool {
+    let rule = rule.trim_start();
+    rule.starts_with("(allow network") || rule.starts_with("(deny network")
+}
+
 fn push_localhost_tcp_outbound_seatbelt_rules(
     profile: &mut String,
     localhost_ports: &[u16],
@@ -703,9 +708,14 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         }
     }
 
-    // Emit platform rules last so targeted denies win under Seatbelt's
-    // last-rule-wins semantics. See #970.
-    for rule in caps.platform_rules() {
+    // Emit filesystem and other platform rules after their broad grants.
+    // Network rules are emitted after the network section below so socket
+    // denies and their narrower bypasses retain the same ordering.
+    for rule in caps
+        .platform_rules()
+        .iter()
+        .filter(|rule| !is_network_platform_rule(rule))
+    {
         profile.push_str(rule);
         profile.push('\n');
     }
@@ -891,6 +901,15 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             profile.push_str("(allow network-inbound)\n");
             profile.push_str("(allow network-bind)\n");
         }
+    }
+
+    for rule in caps
+        .platform_rules()
+        .iter()
+        .filter(|rule| is_network_platform_rule(rule))
+    {
+        profile.push_str(rule);
+        profile.push('\n');
     }
 
     // Per-port TCP rules are not supported on macOS (Seatbelt cannot filter by port alone).
@@ -1819,6 +1838,38 @@ mod tests {
             "ConnectBind must also allow network-bind on original path"
         );
         assert!(!profile.contains("(allow network-outbound)\n"));
+    }
+
+    #[test]
+    fn test_generate_profile_socket_deny_and_bypass_follow_socket_grant() {
+        let mut caps = CapabilitySet::new().block_network();
+        caps.add_unix_socket(crate::UnixSocketCapability {
+            original: PathBuf::from("/tmp/sockets"),
+            resolved: PathBuf::from("/private/tmp/sockets"),
+            scope: crate::SocketScope::DirSubtree,
+            mode: crate::UnixSocketMode::Connect,
+            source: CapabilitySource::User,
+        });
+        caps.add_platform_rule("(deny network-outbound (subpath \"/private/tmp/sockets\"))")
+            .unwrap();
+        caps.add_platform_rule(
+            "(allow network-outbound (path \"/private/tmp/sockets/allowed.sock\"))",
+        )
+        .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+        let grant = profile
+            .find("(allow network-outbound (subpath \"/private/tmp/sockets\"))")
+            .expect("socket grant");
+        let deny = profile
+            .find("(deny network-outbound (subpath \"/private/tmp/sockets\"))")
+            .expect("socket deny");
+        let bypass = profile
+            .find("(allow network-outbound (path \"/private/tmp/sockets/allowed.sock\"))")
+            .expect("socket bypass");
+
+        assert!(grant < deny, "targeted deny must follow broad socket grant");
+        assert!(deny < bypass, "socket bypass must follow targeted deny");
     }
 
     /// Regression: Connect-only mode must emit `network-outbound` but

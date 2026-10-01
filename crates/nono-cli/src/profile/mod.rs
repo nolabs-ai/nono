@@ -159,6 +159,7 @@ pub struct FilesystemConfig {
     /// Implies read+write access on the socket path when it exists, or
     /// on its parent directory when it does not yet exist (the normal
     /// `bind(2)` workflow — the syscall creates the socket file).
+    /// A covering deny therefore requires bypassing the parent directory.
     /// Dangling symlinks are rejected at grant time. For runtime-generated
     /// filenames (e.g. PID-suffixed paths) prefer `unix_socket_dir_bind`
     /// so the implied fs grant stays scoped to a dedicated directory.
@@ -186,10 +187,8 @@ pub struct FilesystemConfig {
     /// Paths exempted from group-level deny rules.
     ///
     /// **This flag does not implicitly grant access** — `bypass_protection`
-    /// only removes the deny rule. Each path must also appear in
-    /// `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the
-    /// matching `*_file` variant) to become accessible. CLI equivalent:
-    /// `--bypass-protection`.
+    /// only removes the deny rule. A matching filesystem or Unix socket grant
+    /// must also provide the requested access. CLI equivalent: `--bypass-protection`.
     ///
     /// Renamed from the legacy deny-override key in the #594 schema;
     /// the new name makes the "does not grant access" semantics explicit.

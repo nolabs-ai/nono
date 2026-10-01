@@ -1086,8 +1086,8 @@ pub struct SandboxArgs {
     /// If the path exists, implies --allow-file on the socket. If it
     /// does not yet exist (the typical bind(2) case), implies --allow
     /// on the parent directory so the kernel can create the socket
-    /// file. Prefer --allow-unix-socket-dir-bind for runtime-generated
-    /// filenames.
+    /// file. A covering deny therefore requires bypassing the parent.
+    /// Prefer --allow-unix-socket-dir-bind for runtime-generated filenames.
     #[arg(long, value_name = "SOCKET", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_bind: Vec<PathBuf>,
 
@@ -1114,7 +1114,7 @@ pub struct SandboxArgs {
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
 
-    /// Override a deny rule for a path. Pair with --allow/--read/--write grant
+    /// Override a deny rule. Pair with a filesystem or Unix socket grant
     #[arg(
         long = "bypass-protection",
         value_name = "PATH",
@@ -1674,8 +1674,8 @@ pub struct WrapSandboxArgs {
     /// If the path exists, implies --allow-file on the socket. If it
     /// does not yet exist (the typical bind(2) case), implies --allow
     /// on the parent directory so the kernel can create the socket
-    /// file. Prefer --allow-unix-socket-dir-bind for runtime-generated
-    /// filenames.
+    /// file. A covering deny therefore requires bypassing the parent.
+    /// Prefer --allow-unix-socket-dir-bind for runtime-generated filenames.
     #[arg(long, value_name = "SOCKET", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_bind: Vec<PathBuf>,
 
@@ -1702,7 +1702,7 @@ pub struct WrapSandboxArgs {
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
 
-    /// Override a deny rule for a path. Pair with --allow/--read/--write grant
+    /// Override a deny rule. Pair with a filesystem or Unix socket grant
     #[arg(
         long = "bypass-protection",
         value_name = "PATH",

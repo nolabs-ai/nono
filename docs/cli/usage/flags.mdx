@@ -282,7 +282,9 @@ nono run --block-net --allow-unix-socket /tmp/.s.PGSQL.5432 -- psql
 Allow `connect(2)` and `bind(2)` on an AF_UNIX socket at this path. Use when
 the sandboxed program creates the socket itself. If the path doesn't exist
 yet (the typical `bind(2)` case), the CLI auto-grants write on the parent
-directory so the kernel can create the socket file.
+directory so the kernel can create the socket file. If that parent is covered
+by a filesystem deny, bypass the parent directory rather than only the future
+socket path; creating a new directory entry is a parent-directory operation.
 
 ```bash
 # Server that binds its own IPC socket
@@ -716,7 +718,10 @@ nono run --allow-cwd --block-command my-dangerous-tool -- my-script.sh
 
 Bypass a deny group rule for a specific path. Required groups like `deny_credentials` block access to paths such as `~/.aws`, `~/.config/gcloud`, etc. This flag punches a targeted hole through the deny without removing the entire group.
 
-The bypass path must also be explicitly granted via `--allow`, `--read`, `--write`, or their file equivalents. `--bypass-protection` only removes the deny rule — it does not implicitly grant access.
+The bypass path must also have a matching filesystem or Unix socket grant.
+`--bypass-protection` only removes the deny rule — it does not implicitly
+grant access. The `--allow-unix-socket*` flags provide their required
+filesystem grant automatically.
 
 ```bash
 # Allow an AWS agent to access credentials
@@ -725,6 +730,13 @@ nono run --bypass-protection ~/.aws --allow ~/.aws -- my-aws-agent
 # Allow read-only access to GCP config
 nono run --bypass-protection ~/.config/gcloud --read ~/.config/gcloud -- gcloud-agent
 
+# Given the deny-private.json profile below, allow one existing socket while
+# the rest of its denied parent directory stays inaccessible
+nono run --profile ./deny-private.json --block-net \
+  --allow-unix-socket ~/.private/agent.sock \
+  --bypass-protection ~/.private/agent.sock \
+  -- my-agent
+
 # Multiple bypasses
 nono run \
   --bypass-protection ~/.aws \
@@ -732,6 +744,16 @@ nono run \
   --allow ~/.aws \
   --read ~/.config/gcloud \
   -- multi-cloud-agent
+```
+
+```json deny-private.json
+{
+  "meta": { "name": "deny-private" },
+  "workdir": { "access": "readwrite" },
+  "filesystem": {
+    "deny": ["$HOME/.private"]
+  }
+}
 ```
 
 Can be specified multiple times.
@@ -744,7 +766,9 @@ Can be specified multiple times.
 </Warning>
 
 <Note>
-  `--bypass-protection` without a matching grant (`--allow`, `--read`, `--write`, etc.) is a hard error. This prevents silent no-ops on Linux and unintended implicit grants on macOS.
+  `--bypass-protection` without a matching filesystem or Unix socket grant is
+  a hard error. This prevents silent no-ops on Linux and unintended implicit
+  grants on macOS.
 </Note>
 
 ### Credential Options

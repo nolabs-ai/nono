@@ -338,9 +338,15 @@ All filesystem grants, denials, and deny-rule exemptions live under this single 
 | `allow_file`        | array of string | Single files with read+write access. |
 | `read_file`         | array of string | Single files with read-only access. |
 | `write_file`        | array of string | Single files with write-only access. |
+| `unix_socket`       | array of string | Exact existing AF_UNIX socket paths, connect only. Implies read access. |
+| `unix_socket_bind`  | array of string | Exact AF_UNIX socket paths, connect and bind. A future path implies read+write access on its parent directory. |
+| `unix_socket_dir`   | array of string | Connect to direct-child sockets in a directory. Non-recursive. |
+| `unix_socket_dir_bind` | array of string | Connect or bind direct-child sockets in a directory. Non-recursive. |
+| `unix_socket_subtree` | array of string | Connect to descendant sockets recursively. |
+| `unix_socket_subtree_bind` | array of string | Connect or bind descendant sockets recursively. |
 | `deny`              | array of string | Paths denied filesystem access. Supports glob patterns (see below). |
-| `bypass_protection` | array of string | Paths exempted from deny groups. **This flag does not implicitly grant access** — `bypass_protection` only removes the deny rule; each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant) to become accessible. Supports glob patterns (see below). |
-| `ignore`            | array of string | Paths whose runtime denials should not be offered in save-profile prompts. Does not grant access or hide diagnostics. |
+| `bypass_protection` | array of string | Paths exempted from deny groups. **This flag does not implicitly grant access** — a matching filesystem or Unix socket field must also grant access. Supports glob patterns (see below). |
+| `suppress_save_prompt` | array of string | Paths whose runtime denials should not be offered in save-profile prompts. Does not grant access or hide diagnostics. |
 
 All path fields support variable expansion (see Section 6).
 
@@ -971,7 +977,7 @@ On Linux, the built-in `default` profile keeps host runtime, sysfs, and shared t
 
 ### Profile with deny overrides
 
-When a deny group blocks a path you need access to, use `filesystem.bypass_protection` together with an explicit grant. Remember: `bypass_protection` only removes the deny rule — it does not grant access on its own.
+When a deny group blocks a path you need access to, use `filesystem.bypass_protection` together with an explicit filesystem or Unix socket grant. Remember: `bypass_protection` only removes the deny rule — it does not grant access on its own.
 
 ```json
 {
@@ -1090,6 +1096,16 @@ Use `filesystem.deny` on the socket path. Seatbelt treats `connect(2)` as a netw
   }
 }
 ```
+
+Denying a directory blocks socket connections recursively below it. To reopen
+one existing socket, pair an exact `unix_socket` entry with the same exact
+`bypass_protection` path; sibling sockets remain denied. Directory socket
+grants preserve their scope when bypassed: `unix_socket_dir` remains
+direct-child-only and `unix_socket_subtree` remains recursive.
+
+Creating a new exact socket with `unix_socket_bind` requires write access to
+its parent directory. If that parent is denied, bypass the parent directory or,
+preferably, use `unix_socket_dir_bind` with a dedicated directory.
 
 #### Linux
 
@@ -1330,7 +1346,7 @@ Supported predicate forms include `linux`, `macos`, `linux:fedora`, `linux:rhel-
 ## 9. Key Rules
 
 - A profile with no `groups.include` has no deny rules. Always include appropriate deny groups for untrusted workloads.
-- `filesystem.bypass_protection` only removes the deny rule. It does not grant access. You must also add the path via `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant).
+- `filesystem.bypass_protection` only removes the deny rule. It does not grant access. A matching filesystem or Unix socket field must also grant the requested access.
 - `filesystem.suppress_save_prompt` only suppresses save-profile suggestions. It does not grant access, remove deny rules, or hide diagnostics.
 - `groups.exclude` removes groups from the resolved set. This weakens the sandbox. Use it only when you understand which protections you are removing.
 - `extends` chains resolve recursively up to depth 10. Circular inheritance is an error.

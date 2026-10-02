@@ -1661,7 +1661,7 @@
         },
         "env_var": {
           "type": "string",
-          "description": "Environment variable mapped into the child. For local-socket this receives the resolved socket path; for proxy this receives the phantom token."
+          "description": "Environment variable mapped into the child. For local-socket this receives the resolved socket path; for ordinary proxy credentials this receives the phantom token. Optional for aws_auth proxy credentials, which sign requests host-side without delivering a credential variable."
         },
         "upstream": {
           "type": "string",
@@ -1702,6 +1702,13 @@
         "format": {
           "type": "string",
           "description": "Optional literal template for the visible phantom the sandbox sees, with '{}' standing in for a freshly minted random body (e.g. 'sk-ant-oat01-{}'). Lets a client that classifies a credential by sniffing a literal token prefix recognise the phantom. Only valid for ambient credentials."
+        },
+        "aws_auth": {
+          "oneOf": [
+            { "$ref": "#/$defs/AwsAuthConfig" },
+            { "type": "null" }
+          ],
+          "description": "Optional AWS SigV4 signing configuration for proxy credentials. Mutually exclusive with source and credential_key. Does not require env_var."
         }
       }
     },

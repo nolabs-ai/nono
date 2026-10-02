@@ -649,12 +649,14 @@ This is useful for mode selection. It is not a substitute for sandbox grants; fi
 
 ## Credentials
 
-Command sandbox policies support two credential types:
+Command sandbox policies support four credential types:
 
 | Type | Typical use |
 |---|---|
 | `local-socket` | Grant one selected child access to a local IPC socket and optionally map it into an env var |
 | `raw-file` | Grant direct-session tools exact read access to a file credential |
+| `proxy` | Route one selected child's requests through a command-scoped credential proxy with endpoint enforcement |
+| `ambient` | Hold a captured credential in the broker and expose only a resolvable phantom to selected consumers |
 
 A Git profile can model SSH agent as a local socket credential. A raw TCP/22
 rule currently requires Linux Landlock; use a proxy-backed policy for
@@ -678,6 +680,70 @@ such as `"$XDG_RUNTIME_DIR/sccache.sock"`. Variables are expanded anywhere in
 the string; if a referenced variable is unset, a command that selects the 
 credential fails before launch with a command-sandbox error naming the variable.
 Prefer the agent socket over raw private-key file grants.
+
+### Command-scoped AWS authentication
+
+A `proxy` credential may use `aws_auth` instead of `credential_key` or `source`.
+The scoped proxy resolves the selected AWS profile on the host and signs permitted
+outbound requests with SigV4. The real AWS credentials never enter the command
+sandbox, and `env_var` is not required for an `aws_auth` route.
+
+```json
+{
+  "command_policies": {
+    "credentials": {
+      "bedrock": {
+        "type": "proxy",
+        "upstream": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        "aws_auth": {
+          "profile": "production"
+        }
+      }
+    },
+    "commands": {
+      "aws": {
+        "sandbox": {
+          "environment": {
+            "set_vars": {
+              "AWS_ACCESS_KEY_ID": "nono-placeholder",
+              "AWS_SECRET_ACCESS_KEY": "nono-placeholder",
+              "AWS_CONFIG_FILE": "/dev/null",
+              "AWS_SHARED_CREDENTIALS_FILE": "/dev/null"
+            }
+          },
+          "credentials": [
+            {
+              "name": "bedrock",
+              "endpoint_policy": {
+                "default": "deny",
+                "allow": [
+                  { "method": "POST", "path": "/model/**" }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+The AWS CLI requires credentials before sending a signed request. Non-secret
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` placeholders satisfy that client-side
+check; the proxy removes their signature and re-signs the request with host-side
+credentials. Pointing `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` at
+`/dev/null` prevents the sandboxed CLI from probing `~/.aws`. These variables affect
+only the command sandbox: `aws_auth.profile` is still resolved by the host supervisor.
+For an SSO profile, run `aws sso login --profile <name>` outside the sandbox first.
+Do not grant the command sandbox access to `~/.aws`.
+
+`aws_auth` is valid only on `proxy` credentials and cannot be combined with
+`credential_key` or `source`. As with every command-scoped proxy credential, each
+grant must include an `endpoint_policy`. See
+[AWS SigV4 Signing](/cli/features/credential-injection#aws-sigv4-signing) for the
+profile, region, service, and credential-resolution behavior shared with
+session-level routes.
 
 ### Shaping an ambient credential's phantom
 

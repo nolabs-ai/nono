@@ -2666,10 +2666,14 @@ fn validate_credential(
                     format!("proxy credential '{name}' must define upstream"),
                 );
             }
-            if credential.env_var.as_deref().unwrap_or_default().is_empty() {
+            if credential.env_var.as_deref().is_some_and(str::is_empty)
+                || (credential.env_var.is_none() && credential.aws_auth.is_none())
+            {
                 report.error(
                     "invalid_credential",
-                    format!("proxy credential '{name}' must define env_var"),
+                    format!(
+                        "proxy credential '{name}' must define a non-empty env_var unless using aws_auth"
+                    ),
                 );
             }
             if credential.path.is_some() || credential.mode.is_some() {
@@ -2771,6 +2775,7 @@ fn validate_credential(
                 || credential.tls_ca.is_some()
                 || credential.tls_client_cert.is_some()
                 || credential.tls_client_key.is_some()
+                || credential.aws_auth.is_some()
             {
                 report.error(
                     "invalid_credential",
@@ -6613,6 +6618,55 @@ mod tests {
                 .iter()
                 .any(|e| e.message.contains("must not contain control characters")),
             "expected control-character error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ambient_credential_with_aws_auth_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Ambient,
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+            ..Default::default()
+        };
+        let errors = validate_one(&cred).errors;
+        assert!(
+            errors.iter().any(|e| e
+                .message
+                .contains("cannot define transport or proxy fields")),
+            "expected ambient aws_auth error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_credential_with_aws_auth_accepted() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: Some("production".to_string()),
+                region: Some("us-east-1".to_string()),
+                service: Some("bedrock".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred).errors.is_empty(),
+            "well-formed proxy aws_auth should validate"
+        );
+    }
+
+    #[test]
+    fn ordinary_proxy_credential_without_env_var_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://api.example.com".to_string()),
+            credential_key: Some("api-token".to_string()),
+            ..Default::default()
+        };
+        let errors = validate_one(&cred).errors;
+        assert!(
+            errors.iter().any(|e| e.message.contains("env_var")),
+            "expected missing env_var error, got {errors:?}"
         );
     }
 

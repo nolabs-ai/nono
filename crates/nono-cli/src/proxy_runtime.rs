@@ -1881,18 +1881,20 @@ fn collect_tool_sandbox_proxy_grants(
                 grant.name
             ))
         })?;
-        let env_var = credential.env_var.clone().ok_or_else(|| {
-            NonoError::ConfigParse(format!(
+        let env_var = credential.env_var.clone();
+        if let Some(env_var) = &env_var {
+            nono::validate_destination_env_var(env_var).map_err(|err| {
+                NonoError::ConfigParse(format!(
+                    "command sandbox proxy credential '{}' has invalid env_var: {err}",
+                    grant.name
+                ))
+            })?;
+        } else if credential.aws_auth.is_none() {
+            return Err(NonoError::ConfigParse(format!(
                 "command sandbox proxy credential '{}' missing env_var",
                 grant.name
-            ))
-        })?;
-        nono::validate_destination_env_var(&env_var).map_err(|err| {
-            NonoError::ConfigParse(format!(
-                "command sandbox proxy credential '{}' has invalid env_var: {err}",
-                grant.name
-            ))
-        })?;
+            )));
+        }
         if let Some(base_url_env_var) = &credential.base_url_env_var {
             nono::validate_destination_env_var(base_url_env_var).map_err(|err| {
                 NonoError::ConfigParse(format!(
@@ -1926,7 +1928,7 @@ fn collect_tool_sandbox_proxy_grants(
             path_replacement: None,
             query_param_name: None,
             proxy: None,
-            env_var: Some(env_var),
+            env_var,
             endpoint_rules: Vec::new(),
             endpoint_policy: Some(endpoint_policy),
             tls_ca: credential
@@ -3483,22 +3485,23 @@ fn tool_sandbox_proxy_credential_env_vars(
                 "command sandbox proxy credential '{credential_name}' did not produce a proxy route"
             ))
         })?;
-    let env_var = route.env_var.as_ref().ok_or_else(|| {
-        NonoError::ConfigParse(format!(
+    let mut env_vars = Vec::new();
+    if let Some(env_var) = &route.env_var {
+        let token_value = credential_env_vars
+            .iter()
+            .find(|(key, _)| key == env_var)
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| {
+                NonoError::SandboxInit(format!(
+                    "command sandbox proxy credential '{credential_name}' is unavailable to the proxy"
+                ))
+            })?;
+        env_vars.push((env_var.clone(), token_value));
+    } else if route.aws_auth.is_none() {
+        return Err(NonoError::ConfigParse(format!(
             "command sandbox proxy credential '{credential_name}' missing env_var"
-        ))
-    })?;
-    let token_value = credential_env_vars
-        .iter()
-        .find(|(key, _)| key == env_var)
-        .map(|(_, value)| value.clone())
-        .ok_or_else(|| {
-            NonoError::SandboxInit(format!(
-                "command sandbox proxy credential '{credential_name}' is unavailable to the proxy"
-            ))
-        })?;
-
-    let mut env_vars = vec![(env_var.clone(), token_value)];
+        )));
+    }
     if let Some(base_url_env_var) = proxy.tool_sandbox_base_url_env_vars.get(credential_name) {
         env_vars.push((
             base_url_env_var.clone(),
@@ -4422,6 +4425,68 @@ mod tests {
     }
 
     #[test]
+    fn tool_sandbox_aws_auth_route_does_not_require_env_var() -> Result<()> {
+        let mut policies = CommandPoliciesConfig::default();
+        policies.credentials.insert(
+            "bedrock".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
+                aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                    profile: Some("production".to_string()),
+                    region: Some("us-east-1".to_string()),
+                    service: Some("bedrock".to_string()),
+                }),
+                ..CommandCredentialConfig::default()
+            },
+        );
+        policies.commands.insert(
+            "aws".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    credentials: vec![CommandCredentialGrantConfig::Policy(
+                        CommandCredentialGrantPolicyConfig {
+                            name: "bedrock".to_string(),
+                            endpoint_policy: Some(EndpointPolicyConfig::default()),
+                        },
+                    )],
+                    ..CommandSandboxConfig::default()
+                }),
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        let mut credentials = Vec::new();
+        let mut custom_credentials = HashMap::new();
+        let mut proxy_source_env_vars = HashMap::new();
+        let mut base_url_env_vars = HashMap::new();
+        let mut tool_sandbox_proxy_credentials = HashSet::new();
+        extend_proxy_settings_with_tool_sandbox_credentials(
+            Some(&policies),
+            &nono::CapabilitySet::default(),
+            &mut credentials,
+            &mut custom_credentials,
+            &mut proxy_source_env_vars,
+            &mut base_url_env_vars,
+            &mut tool_sandbox_proxy_credentials,
+        )?;
+
+        let route = custom_credentials
+            .get("bedrock")
+            .ok_or_else(|| NonoError::ConfigParse("missing bedrock route".to_string()))?;
+        assert!(route.env_var.is_none());
+        assert_eq!(
+            route
+                .aws_auth
+                .as_ref()
+                .and_then(|aws| aws.profile.as_deref()),
+            Some("production")
+        );
+        assert!(tool_sandbox_proxy_credentials.contains("bedrock"));
+        Ok(())
+    }
+
+    #[test]
     fn tool_sandbox_proxy_credentials_require_policy_grants() -> Result<()> {
         let mut policies = CommandPoliciesConfig::default();
         policies.credentials.insert(
@@ -4710,6 +4775,24 @@ mod tests {
         );
         assert_eq!(proxy_config.routes.len(), 1);
         assert_eq!(proxy_config.routes[0].prefix, "session-api");
+        Ok(())
+    }
+
+    #[test]
+    fn tool_sandbox_aws_auth_env_vars_allow_missing_route_env_var() -> Result<()> {
+        let proxy = ProxyLaunchOptions::default();
+        let mut proxy_config = nono_proxy::config::ProxyConfig::default();
+        proxy_config.routes.push(nono_proxy::config::RouteConfig {
+            prefix: "bedrock".to_string(),
+            upstream: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+            ..nono_proxy::config::RouteConfig::default()
+        });
+
+        let vars =
+            tool_sandbox_proxy_credential_env_vars(&proxy, &proxy_config, &[], 7777, "bedrock")?;
+
+        assert!(vars.is_empty());
         Ok(())
     }
 

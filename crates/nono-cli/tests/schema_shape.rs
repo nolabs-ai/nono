@@ -597,6 +597,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
         &schema,
         "CommandCredentialConfig",
         &[
+            "aws_auth",
             "base_url_env_var",
             "credential_format",
             "credential_key",
@@ -737,6 +738,31 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
                 == Some("#/$defs/CommandEdgeConfig")),
         "CommandPolicyConfig.from must allow edge objects with sandbox and invocation_policy"
     );
+}
+
+#[test]
+fn test_schema_validates_command_proxy_credential_with_aws_auth() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "command_policies": {
+            "credentials": {
+                "bedrock": {
+                    "type": "proxy",
+                    "upstream": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                    "aws_auth": {
+                        "profile": "production",
+                        "region": "us-east-1",
+                        "service": "bedrock"
+                    }
+                }
+            }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("command proxy credential with aws_auth should validate");
 }
 
 #[test]

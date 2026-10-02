@@ -80,11 +80,6 @@ impl RateLimiter {
     }
 }
 
-/// Sustained rate of individually recorded network denials.
-const NETWORK_DENIAL_RECORD_RATE: u32 = 20;
-/// Burst of individually recorded network denials.
-const NETWORK_DENIAL_RECORD_BURST: u32 = 50;
-
 /// Bounds the bookkeeping a flood of policy-denied network syscalls can create.
 ///
 /// This never influences enforcement: a denied syscall is always denied with
@@ -99,9 +94,9 @@ pub(super) struct NetworkDenialThrottle {
 }
 
 impl NetworkDenialThrottle {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(limits: crate::profile::NetworkDenialAuditLimits) -> Self {
         Self {
-            limiter: RateLimiter::new(NETWORK_DENIAL_RECORD_RATE, NETWORK_DENIAL_RECORD_BURST),
+            limiter: RateLimiter::new(limits.rate_per_sec, limits.burst),
             suppressed: 0,
         }
     }
@@ -1662,8 +1657,9 @@ mod tests {
 
     #[test]
     fn test_network_denial_throttle_records_burst_then_counts_suppressed() {
-        let mut throttle = NetworkDenialThrottle::new();
-        for _ in 0..NETWORK_DENIAL_RECORD_BURST {
+        let mut throttle =
+            NetworkDenialThrottle::new(crate::profile::NetworkDenialAuditLimits::default());
+        for _ in 0..crate::profile::NETWORK_DENIAL_AUDIT_DEFAULT_BURST {
             assert!(throttle.admit());
         }
         assert!(!throttle.admit());
@@ -1675,8 +1671,9 @@ mod tests {
 
     #[test]
     fn test_network_denial_throttle_admits_again_after_refill() {
-        let mut throttle = NetworkDenialThrottle::new();
-        for _ in 0..NETWORK_DENIAL_RECORD_BURST {
+        let mut throttle =
+            NetworkDenialThrottle::new(crate::profile::NetworkDenialAuditLimits::default());
+        for _ in 0..crate::profile::NETWORK_DENIAL_AUDIT_DEFAULT_BURST {
             assert!(throttle.admit());
         }
         assert!(!throttle.admit());
@@ -1918,6 +1915,7 @@ mod tests {
                 proxy_port,
                 proxy_bind_ports,
                 proxy_bind_port_ranges,
+                network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
                 unix_socket_allowlist,
                 // Combined mode: proxy-only TCP enforcement plus pathname
                 // AF_UNIX mediation. AF_UNIX allowlist checks only apply
@@ -1957,7 +1955,9 @@ mod tests {
             let mut config = make_proxy_only_config(&backend, 8080, vec![]);
             config.network_audit_events = Some(&events);
 
-            let mut throttle = super::super::NetworkDenialThrottle::new();
+            let mut throttle = super::super::NetworkDenialThrottle::new(
+                crate::profile::NetworkDenialAuditLimits::default(),
+            );
 
             // Nothing suppressed: no event.
             super::super::flush_suppressed_network_denials(&config, &mut throttle);

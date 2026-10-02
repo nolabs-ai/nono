@@ -1117,8 +1117,34 @@ fn test_schema_diagnostics_config_matches_rust_model() {
     assert_schema_properties(
         &schema,
         "DiagnosticsConfig",
-        &["suppress_system_services", "redaction"],
+        &[
+            "suppress_system_services",
+            "redaction",
+            "network_denial_audit",
+        ],
     );
+}
+
+#[test]
+fn test_schema_network_denial_audit_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "NetworkDenialAuditConfig",
+        &["rate_per_sec", "burst"],
+    );
+}
+
+/// The schema bounds must equal the ceilings `NetworkDenialAuditLimits`
+/// enforces, so an editor accepting a value never disagrees with nono.
+#[test]
+fn test_schema_network_denial_audit_bounds_match_runtime_ceilings() {
+    let schema = load_schema();
+    let props = &schema["$defs"]["NetworkDenialAuditConfig"]["properties"];
+    assert_eq!(props["rate_per_sec"]["minimum"], 1);
+    assert_eq!(props["rate_per_sec"]["maximum"], 1000);
+    assert_eq!(props["burst"]["minimum"], 1);
+    assert_eq!(props["burst"]["maximum"], 10000);
 }
 
 #[test]

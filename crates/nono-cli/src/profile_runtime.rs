@@ -50,6 +50,10 @@ pub(crate) struct PreparedProfile {
     /// environment-variable name globs to redact in diagnostics and audit
     /// records. Add-only; never removes a secure default.
     pub(crate) redaction_extra_env_vars: Vec<String>,
+    /// `diagnostics.network_denial_audit` from the profile: budget for
+    /// recording denied network syscalls individually. Validated again when
+    /// resolved against any CLI override.
+    pub(crate) network_denial_audit: crate::profile::NetworkDenialAuditConfig,
     /// Environment variable names the profile itself marks as secret,
     /// derived from the profile rather than authored. See
     /// [`collect_derived_redaction_env_vars`].
@@ -936,6 +940,10 @@ fn prepare_profile_with_options(
         redaction_extra_env_vars: loaded_profile
             .as_ref()
             .map(|profile| profile.diagnostics.redaction.extra_env_vars.clone())
+            .unwrap_or_default(),
+        network_denial_audit: loaded_profile
+            .as_ref()
+            .map(|profile| profile.diagnostics.network_denial_audit)
             .unwrap_or_default(),
         redaction_derived_env_vars: loaded_profile
             .as_ref()

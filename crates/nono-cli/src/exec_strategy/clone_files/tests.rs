@@ -135,6 +135,7 @@ fn supervise(
         proxy_port: port,
         proxy_bind_ports: vec![bind],
         proxy_bind_port_ranges: vec![],
+        network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
         unix_socket_allowlist: caps.unix_socket_capabilities(),
         tool_sandbox_runtime: None,
     };
@@ -151,7 +152,9 @@ fn supervise(
         })
         .collect();
     let mut limiter = supervisor_linux::RateLimiter::new(10000, 10000);
-    let mut network_throttle = supervisor_linux::NetworkDenialThrottle::new();
+    let mut network_throttle = supervisor_linux::NetworkDenialThrottle::new(
+        crate::profile::NetworkDenialAuditLimits::default(),
+    );
     let mut denials = vec![];
     let mut ipc_denials = vec![];
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -804,6 +807,7 @@ fn full_cli_supervisor_combined_path() -> Result<()> {
             proxy_port: port,
             proxy_bind_ports: vec![34568],
             proxy_bind_port_ranges: vec![],
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             unix_socket_allowlist: &[],
             tool_sandbox_runtime: None,
         };

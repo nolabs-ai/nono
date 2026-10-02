@@ -1177,6 +1177,21 @@ NONO_STARTUP_TIMEOUT=10 nono run --allow-cwd -- opencode
 
 No timeout is applied by default. When a known built-in profile exists for the binary (e.g. `opencode`, `claude`), the warning message also suggests the recommended profile.
 
+#### `--network-denial-audit-rate` and `--network-denial-audit-burst`
+
+Set how many denied network syscalls nono records individually in the audit trail and diagnostics, for this run only. `--network-denial-audit-rate` is the sustained number per second (default `20`, maximum `1000`). `--network-denial-audit-burst` is how many may be recorded at once (default `50`, maximum `10000`). Both must be at least `1`.
+
+Denials past the budget are still denied. They are counted and reported in a single summary audit event, so nothing is dropped silently. Allowed connections never consume the budget. This only affects Linux seccomp network mediation (proxy mode and pathname AF_UNIX mediation).
+
+Each flag overrides the matching `diagnostics.network_denial_audit` profile field, and the other field keeps its profile value. See [Tuning How Many Network Denials Are Recorded](/cli/features/profile-authoring#tuning-how-many-network-denials-are-recorded).
+
+```bash
+# Record every denial from a noisy run
+nono run --network-denial-audit-burst 5000 --allow-domain example.com -- ./agent
+```
+
+Applies to `nono run`.
+
 #### `--no-diagnostics`
 
 Suppress the diagnostic footer when the command exits non-zero. Useful for scripts that parse stderr and need stable output.

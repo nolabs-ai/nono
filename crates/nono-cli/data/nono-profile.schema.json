@@ -2340,6 +2340,29 @@
         "redaction": {
           "$ref": "#/$defs/RedactionConfig",
           "description": "Extra redaction applied to diagnostic and audit output. Add-only: a profile can widen redaction but cannot stop a secure default from being redacted."
+        },
+        "network_denial_audit": {
+          "$ref": "#/$defs/NetworkDenialAuditConfig",
+          "description": "Budget for recording denied network syscalls individually (Linux seccomp mediation). Does not change enforcement."
+        }
+      }
+    },
+    "NetworkDenialAuditConfig": {
+      "type": "object",
+      "description": "Budget for recording denied network syscalls individually in the audit trail and diagnostics. This is output hygiene, not enforcement: a denied syscall is always denied and an allowed one never consumes budget. Denials beyond the budget are counted and reported in one summary audit event. Overridden per run by --network-denial-audit-rate and --network-denial-audit-burst.",
+      "additionalProperties": false,
+      "properties": {
+        "rate_per_sec": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "Sustained number of denials recorded individually per second. Default 20."
+        },
+        "burst": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Number of denials that may be recorded individually in one burst. Default 50."
         }
       }
     },

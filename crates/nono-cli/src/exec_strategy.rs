@@ -387,6 +387,9 @@ pub struct SupervisorConfig<'a> {
     /// Inclusive bind port ranges allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub proxy_bind_port_ranges: Vec<(u16, u16)>,
+    /// Budget for recording denied network syscalls individually.
+    #[cfg(target_os = "linux")]
+    pub network_denial_audit: crate::profile::NetworkDenialAuditLimits,
     /// Pathname AF_UNIX socket grants enforced by the seccomp supervisor when
     /// `linux.af_unix_mediation = "pathname"` is enabled. Unused in proxy-only
     /// mode without that opt-in, where AF_UNIX passes through (issue #1901).
@@ -2882,7 +2885,8 @@ fn run_supervisor_loop(
     url_listener: Option<&SupervisorListener>,
     killed_by_timeout: &mut bool,
 ) -> Result<SupervisorLoopResult> {
-    let mut network_throttle = supervisor_linux::NetworkDenialThrottle::new();
+    let mut network_throttle =
+        supervisor_linux::NetworkDenialThrottle::new(config.network_denial_audit);
     let result = run_supervisor_loop_inner(
         child,
         sock,
@@ -5274,6 +5278,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5403,6 +5409,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5498,6 +5506,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5545,6 +5555,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5600,6 +5612,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5672,6 +5686,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5703,6 +5719,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5754,6 +5772,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5911,6 +5931,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5971,6 +5993,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -6019,6 +6043,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -6087,6 +6113,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]

@@ -105,9 +105,46 @@ impl ApprovalBackend for TerminalApproval {
             }
         }
         eprintln!("[nono]");
-        let input = crate::terminal_prompt::read_consent_line("[nono] Grant access? [y/N] ")?;
 
-        if is_affirmative_response(&input) {
+        // Network prompts offer session-scoped choices so an "always" answer
+        // suppresses re-prompting for the rest of the session. Every other
+        // request type keeps the one-shot [y/N] prompt.
+        let is_network = matches!(request, ApprovalRequest::Network { .. });
+        let prompt = if is_network {
+            eprintln!("[nono]   1) Allow once");
+            eprintln!("[nono]   2) Always allow (this session)");
+            eprintln!("[nono]   3) Deny once");
+            eprintln!("[nono]   4) Always deny (this session)");
+            "[nono] Choose [1-4, default 3]: "
+        } else {
+            "[nono] Grant access? [y/N] "
+        };
+        let input = crate::terminal_prompt::read_consent_line(prompt)?;
+
+        if is_network {
+            // Fail secure: an empty line (EOF), whitespace, or any unrecognized
+            // answer denies this one request without persisting the decision.
+            match input.trim().to_ascii_lowercase().as_str() {
+                "1" | "y" | "yes" => {
+                    eprintln!("[nono] Access granted.");
+                    Ok(ApprovalDecision::Granted)
+                }
+                "2" => {
+                    eprintln!("[nono] Access granted for this session.");
+                    Ok(ApprovalDecision::GrantedForSession)
+                }
+                "4" => {
+                    eprintln!("[nono] Access denied for this session.");
+                    Ok(ApprovalDecision::DeniedForSession)
+                }
+                _ => {
+                    eprintln!("[nono] Access denied.");
+                    Ok(ApprovalDecision::Denied {
+                        reason: "User denied the request".to_string(),
+                    })
+                }
+            }
+        } else if is_affirmative_response(&input) {
             eprintln!("[nono] Access granted.");
             Ok(ApprovalDecision::Granted)
         } else {

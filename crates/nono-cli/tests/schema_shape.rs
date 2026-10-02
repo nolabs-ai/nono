@@ -79,6 +79,8 @@ fn test_schema_network_config_matches_rust_model() {
             "tls_intercept",
             "upstream_proxy",
             "upstream_bypass",
+            "approval_backends",
+            "approval_defaults",
         ],
     );
 }

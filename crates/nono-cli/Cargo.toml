@@ -113,7 +113,7 @@ security-framework = "3"
 security-framework-sys = "2"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
-x509-parser = "0.18"
+x509-parser = { version = "0.18", features = ["verify"] }
 
 [build-dependencies]
 toml.workspace = true

@@ -143,18 +143,10 @@ pub fn write_bundle(inputs: BundleInputs<'_>) -> Result<PathBuf> {
 fn write_with_restrictive_perms(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
 
-    // Remove any pre-existing file so we don't inherit permissions from a
-    // previous session (defence in depth — the parent dir should be 0o700
-    // anyway).
-    if path.exists() {
-        std::fs::remove_file(path).map_err(|e| {
-            ProxyError::Config(format!(
-                "tls_intercept: cannot remove stale bundle '{}': {}",
-                path.display(),
-                e
-            ))
-        })?;
-    }
+    // Rename over the target: a child reading SSL_CERT_FILE during a mid-session
+    // rewrite must never see a missing or partial bundle.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
 
     #[cfg(unix)]
     {
@@ -163,33 +155,48 @@ fn write_with_restrictive_perms(path: &Path, contents: &[u8]) -> Result<()> {
             .write(true)
             .create_new(true)
             .mode(0o400)
-            .open(path)
+            .open(&tmp)
             .map_err(|e| {
                 ProxyError::Config(format!(
                     "tls_intercept: cannot create bundle '{}': {}",
-                    path.display(),
+                    tmp.display(),
                     e
                 ))
             })?;
         file.write_all(contents).map_err(|e| {
             ProxyError::Config(format!(
                 "tls_intercept: cannot write bundle '{}': {}",
-                path.display(),
+                tmp.display(),
                 e
             ))
         })?;
-        file.flush().ok();
+        file.flush().map_err(|e| {
+            ProxyError::Config(format!(
+                "tls_intercept: cannot flush bundle '{}': {}",
+                tmp.display(),
+                e
+            ))
+        })?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, contents).map_err(|e| {
+        std::fs::write(&tmp, contents).map_err(|e| {
             ProxyError::Config(format!(
                 "tls_intercept: cannot write bundle '{}': {}",
-                path.display(),
+                tmp.display(),
                 e
             ))
         })?;
     }
+
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        ProxyError::Config(format!(
+            "tls_intercept: cannot install bundle '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
     Ok(())
 }
 

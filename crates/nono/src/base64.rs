@@ -7,6 +7,7 @@
 /// Encode bytes as base64url (no padding, URL-safe alphabet).
 ///
 /// Uses `-` and `_` instead of `+` and `/`.
+#[cfg(feature = "sigstore")]
 #[must_use]
 pub fn base64url_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -21,6 +22,7 @@ pub fn base64url_encode(data: &[u8]) -> String {
 /// # Errors
 ///
 /// Returns an error string if the input contains invalid characters.
+#[cfg(feature = "sigstore")]
 pub fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
     decode_impl(input)
 }
@@ -28,6 +30,7 @@ pub fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
 /// Encode bytes as standard base64 (with padding).
 ///
 /// Uses `+` and `/` with `=` padding.
+#[cfg(feature = "sigstore")]
 #[must_use]
 pub fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -46,6 +49,7 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Shared encoding logic for both standard and URL-safe alphabets.
+#[cfg(feature = "sigstore")]
 fn encode_with_alphabet(data: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -105,7 +109,7 @@ fn decode_impl(input: &str) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sigstore"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

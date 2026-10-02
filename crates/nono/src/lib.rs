@@ -46,6 +46,8 @@
 //! - **Other platforms**: Returns `UnsupportedPlatform` error
 
 pub mod audit;
+#[cfg(any(feature = "sigstore", feature = "system-keyring"))]
+pub mod base64;
 pub mod broker_path;
 pub mod capability;
 pub mod diagnostic;
@@ -62,6 +64,7 @@ pub mod sandbox;
 pub mod scrub;
 pub mod state;
 pub mod supervisor;
+#[cfg(feature = "sigstore")]
 pub mod trust;
 pub mod undo;
 
@@ -108,7 +111,30 @@ pub use supervisor::{
     ApprovalBackend, ApprovalDecision, ApprovalRequest, CapabilityRequest, SupervisorListener,
     SupervisorSocket, UrlOpenRequest,
 };
+#[cfg(feature = "sigstore")]
 pub use trust::{
     Enforcement, IncludePatterns, Publisher, SignerIdentity, TrustPolicy, VerificationOutcome,
     VerificationResult,
 };
+
+#[cfg(test)]
+mod sigstore_feature_manifest {
+    #[test]
+    fn sigstore_verify_is_optional_and_on_by_default() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            manifest.contains("default = [\"system-keyring\", \"sigstore\"]"),
+            "sigstore must stay a default feature"
+        );
+        assert!(
+            manifest.contains(
+                "sigstore-verify = { version = \"0.11.0\", default-features = false, optional = true }"
+            ),
+            "sigstore-verify must be optional"
+        );
+        assert!(
+            manifest.contains("sigstore-trust-root = { version = \"=0.11.0\", optional = true }"),
+            "sigstore-trust-root must be optional"
+        );
+    }
+}

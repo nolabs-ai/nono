@@ -36,6 +36,11 @@ Sandbox::apply_auto(&caps)?;
 - **Seatbelt** (macOS) - Filesystem and network restrictions
 - **Child process inheritance** - All spawned processes inherit restrictions, and command policies may apply separate command sandboxes to mediated commands
 
+Cargo features:
+
+- `system-keyring` (default) reads the OS keyring. `default-features = false` turns it off.
+- `sigstore` (default) verifies Sigstore bundles and signs audit attestations. `default-features = false` turns it off and drops `reqwest` and `aws-lc-sys`. Enable it again with `features = ["sigstore"]` when you need `nono::trust`.
+
 ## Platform Support
 
 | Platform | Mechanism | Minimum Version |

@@ -30,7 +30,9 @@ enum InitialCapabilityMatch<'a> {
 /// Token-bucket rate limiter for supervisor expansion requests.
 ///
 /// Prevents a compromised agent from flooding the terminal with approval prompts.
-/// Defaults to 10 requests/second with a burst of 5.
+/// Defaults to 10 requests/second with a burst of 5. It must only gate
+/// decisions that can reach an interactive prompt: applying it to fixed policy
+/// decisions makes allowed operations fail under bursty load.
 pub(super) struct RateLimiter {
     /// Maximum tokens (burst capacity)
     capacity: u32,
@@ -75,6 +77,48 @@ impl RateLimiter {
         } else {
             false
         }
+    }
+}
+
+/// Sustained rate of individually recorded network denials.
+const NETWORK_DENIAL_RECORD_RATE: u32 = 20;
+/// Burst of individually recorded network denials.
+const NETWORK_DENIAL_RECORD_BURST: u32 = 50;
+
+/// Bounds the bookkeeping a flood of policy-denied network syscalls can create.
+///
+/// This never influences enforcement: a denied syscall is always denied with
+/// `EACCES`, and an allowed syscall never consumes budget. It only decides
+/// whether a denial is recorded individually (audit event and AF_UNIX
+/// diagnostics, both of which grow memory). Denials past the budget are
+/// counted and reported as a single summary audit event, so suppression is
+/// itself observable.
+pub(super) struct NetworkDenialThrottle {
+    limiter: RateLimiter,
+    suppressed: u64,
+}
+
+impl NetworkDenialThrottle {
+    pub(super) fn new() -> Self {
+        Self {
+            limiter: RateLimiter::new(NETWORK_DENIAL_RECORD_RATE, NETWORK_DENIAL_RECORD_BURST),
+            suppressed: 0,
+        }
+    }
+
+    /// Returns true if this denial should be recorded individually. Otherwise
+    /// it is counted as suppressed.
+    fn admit(&mut self) -> bool {
+        if self.limiter.try_acquire() {
+            true
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            false
+        }
+    }
+
+    fn take_suppressed(&mut self) -> u64 {
+        std::mem::take(&mut self.suppressed)
     }
 }
 
@@ -1008,6 +1052,7 @@ pub(super) fn handle_combined_notification(
     config: &SupervisorConfig<'_>,
     initial_caps: &[InitialCapability],
     state: SeccompNotificationState<'_>,
+    network_throttle: &mut NetworkDenialThrottle,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) -> Result<()> {
     let notif = nono::sandbox::recv_notif(notify_fd)?;
@@ -1030,7 +1075,7 @@ pub(super) fn handle_combined_notification(
         handle_received_network_notification(
             notify_fd,
             config,
-            state.rate_limiter,
+            network_throttle,
             state.denials,
             ipc_denials,
             notif,
@@ -1041,7 +1086,7 @@ pub(super) fn handle_combined_notification(
 pub(super) fn handle_network_notification(
     notify_fd: std::os::fd::RawFd,
     config: &SupervisorConfig<'_>,
-    rate_limiter: &mut RateLimiter,
+    network_throttle: &mut NetworkDenialThrottle,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) -> nono::error::Result<()> {
@@ -1049,7 +1094,7 @@ pub(super) fn handle_network_notification(
     handle_received_network_notification(
         notify_fd,
         config,
-        rate_limiter,
+        network_throttle,
         denials,
         ipc_denials,
         notif,
@@ -1059,7 +1104,7 @@ pub(super) fn handle_network_notification(
 fn handle_received_network_notification(
     notify_fd: std::os::fd::RawFd,
     config: &SupervisorConfig<'_>,
-    rate_limiter: &mut RateLimiter,
+    network_throttle: &mut NetworkDenialThrottle,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
     notif: nono::sandbox::SeccompNotif,
@@ -1221,14 +1266,6 @@ fn handle_received_network_notification(
         return Ok(());
     }
 
-    // Rate limit: guard AF_UNIX mediation decisions and proxy-mode decisions
-    // against notification flooding from a compromised child.
-    if !rate_limiter.try_acquire() {
-        debug!("Rate limited network seccomp notification, denying");
-        let _ = deny_notif(notify_fd, notif.id);
-        return Ok(());
-    }
-
     // TOCTOU check
     if !notif_id_valid(notify_fd, notif.id)? {
         debug!("Network seccomp notification expired (TOCTOU check)");
@@ -1239,9 +1276,23 @@ fn handle_received_network_notification(
         match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
             NetworkDecision::Allow => {}
             NetworkDecision::Deny => {
-                record_af_unix_ipc_denial(sockaddr, notif.pid, notif.data.nr, denials, ipc_denials);
+                // Enforcement is unconditional: the throttle only bounds how
+                // much bookkeeping this denial may create.
+                let record = network_throttle.admit();
+                if record {
+                    flush_suppressed_network_denials(config, network_throttle);
+                    record_af_unix_ipc_denial(
+                        sockaddr,
+                        notif.pid,
+                        notif.data.nr,
+                        denials,
+                        ipc_denials,
+                    );
+                }
                 respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
-                if let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr) {
+                if record
+                    && let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr)
+                {
                     warn!("Failed to record network denial audit event: {}", err);
                 }
                 return Ok(());
@@ -1374,7 +1425,46 @@ fn record_network_audit_denial(
 ) -> nono::Result<()> {
     let target = network_audit_target(sockaddr);
     let reason = network_audit_denial_reason(sockaddr, syscall);
-    let event = nono::undo::NetworkAuditEvent {
+    let port = if sockaddr.port == 0 {
+        None
+    } else {
+        Some(sockaddr.port)
+    };
+    push_network_audit_event(config, network_denial_event(target, port, reason))
+}
+
+/// Emit one summary event for denials that were enforced but not recorded
+/// individually, then reset the counter. Failures are logged, never fatal.
+pub(super) fn flush_suppressed_network_denials(
+    config: &SupervisorConfig<'_>,
+    throttle: &mut NetworkDenialThrottle,
+) {
+    let count = throttle.take_suppressed();
+    if count == 0 {
+        return;
+    }
+    let event = network_denial_event(
+        "network syscalls (suppressed)".to_string(),
+        None,
+        format!(
+            "{count} network syscall denials were enforced but not individually recorded \
+             (audit rate limit exceeded)"
+        ),
+    );
+    if let Err(err) = push_network_audit_event(config, event) {
+        warn!(
+            "Failed to record suppressed network denial summary: {}",
+            err
+        );
+    }
+}
+
+fn network_denial_event(
+    target: String,
+    port: Option<u16>,
+    reason: String,
+) -> nono::undo::NetworkAuditEvent {
+    nono::undo::NetworkAuditEvent {
         timestamp_unix_ms: current_unix_millis(),
         mode: nono::undo::NetworkAuditMode::Connect,
         decision: nono::undo::NetworkAuditDecision::Deny,
@@ -1403,17 +1493,18 @@ fn record_network_audit_denial(
         spiffe_context: None,
         target,
         upstream: None,
-        port: if sockaddr.port == 0 {
-            None
-        } else {
-            Some(sockaddr.port)
-        },
+        port,
         method: None,
         path: None,
         status: None,
         reason: Some(reason),
-    };
+    }
+}
 
+fn push_network_audit_event(
+    config: &SupervisorConfig<'_>,
+    event: nono::undo::NetworkAuditEvent,
+) -> nono::Result<()> {
     if let Some(events_mutex) = config.network_audit_events {
         let mut events = events_mutex
             .lock()
@@ -1567,6 +1658,30 @@ mod tests {
         assert!(!limiter.try_acquire());
         limiter.last_refill -= std::time::Duration::from_millis(500);
         assert!(limiter.try_acquire());
+    }
+
+    #[test]
+    fn test_network_denial_throttle_records_burst_then_counts_suppressed() {
+        let mut throttle = NetworkDenialThrottle::new();
+        for _ in 0..NETWORK_DENIAL_RECORD_BURST {
+            assert!(throttle.admit());
+        }
+        assert!(!throttle.admit());
+        assert!(!throttle.admit());
+        assert!(!throttle.admit());
+        assert_eq!(throttle.take_suppressed(), 3);
+        assert_eq!(throttle.take_suppressed(), 0, "counter resets after take");
+    }
+
+    #[test]
+    fn test_network_denial_throttle_admits_again_after_refill() {
+        let mut throttle = NetworkDenialThrottle::new();
+        for _ in 0..NETWORK_DENIAL_RECORD_BURST {
+            assert!(throttle.admit());
+        }
+        assert!(!throttle.admit());
+        throttle.limiter.last_refill -= std::time::Duration::from_millis(200);
+        assert!(throttle.admit());
     }
 
     #[test]
@@ -1833,6 +1948,42 @@ mod tests {
                 proc_comm_notify: false,
             };
             config
+        }
+
+        #[test]
+        fn flush_suppressed_network_denials_emits_one_summary_event_and_resets() {
+            let backend = DenyAllBackend;
+            let events = std::sync::Mutex::new(Vec::new());
+            let mut config = make_proxy_only_config(&backend, 8080, vec![]);
+            config.network_audit_events = Some(&events);
+
+            let mut throttle = super::super::NetworkDenialThrottle::new();
+
+            // Nothing suppressed: no event.
+            super::super::flush_suppressed_network_denials(&config, &mut throttle);
+            assert!(events.lock().expect("lock").is_empty());
+
+            // Exhaust the budget, then suppress 4 more denials.
+            while throttle.admit() {}
+            for _ in 0..3 {
+                assert!(!throttle.admit());
+            }
+
+            super::super::flush_suppressed_network_denials(&config, &mut throttle);
+            {
+                let recorded = events.lock().expect("lock");
+                assert_eq!(recorded.len(), 1, "exactly one summary event");
+                assert!(matches!(
+                    recorded[0].decision,
+                    nono::undo::NetworkAuditDecision::Deny
+                ));
+                let reason = recorded[0].reason.as_deref().unwrap_or_default();
+                assert!(reason.starts_with("4 network syscall denials"), "{reason}");
+            }
+
+            // Counter was reset: a second flush adds nothing.
+            super::super::flush_suppressed_network_denials(&config, &mut throttle);
+            assert_eq!(events.lock().expect("lock").len(), 1);
         }
 
         fn unix_pathname(path: &Path) -> SockaddrInfo {

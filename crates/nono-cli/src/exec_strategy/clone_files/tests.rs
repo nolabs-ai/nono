@@ -151,6 +151,7 @@ fn supervise(
         })
         .collect();
     let mut limiter = supervisor_linux::RateLimiter::new(10000, 10000);
+    let mut network_throttle = supervisor_linux::NetworkDenialThrottle::new();
     let mut denials = vec![];
     let mut ipc_denials = vec![];
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -190,6 +191,7 @@ fn supervise(
                     trust_interceptor: None,
                     pty: None,
                 },
+                &mut network_throttle,
                 &mut ipc_denials,
             )?;
         }

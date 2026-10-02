@@ -7,12 +7,14 @@
 //! only for admitted consumers on egress.
 
 mod endpoint;
+#[cfg(target_os = "macos")]
+mod keychain_persist;
 mod persist;
 mod rewrite;
 
 use self::endpoint::{LoadedOAuthEndpoint, load_endpoint, provider_consumer};
 use self::persist::{load_persisted_tokens, persist_tokens};
-use crate::config::OAuthCaptureConfig;
+use crate::config::{OAuthCaptureConfig, OAuthCaptureStoreBackend};
 use crate::error::{ProxyError, Result};
 use crate::token::{NonceResolver, PHANTOM_BODY_HEX_LEN, PhantomTemplate, rewrite_first_phantom};
 use std::collections::{HashMap, HashSet};
@@ -35,13 +37,27 @@ pub struct OAuthCaptureHostPolicy {
     pub force_http1: bool,
 }
 
+/// Where persisted phantom mappings live across restarts.
+///
+/// [`OAuthCaptureStore::load_with_persistence`] always resolves to `File`,
+/// preserving today's cross-platform behaviour for library consumers and
+/// tests. Production macOS callers opt into `Keychain` via
+/// [`OAuthCaptureStore::load_with_runtime_persistence`] instead, which is
+/// the only way a `Keychain` backend gets constructed.
+#[derive(Debug)]
+enum PersistBackend {
+    File(PathBuf),
+    #[cfg(target_os = "macos")]
+    Keychain,
+}
+
 /// In-memory OAuth phantom token store.
 #[derive(Debug, Default)]
 pub struct OAuthCaptureStore {
     endpoints: Vec<LoadedOAuthEndpoint>,
     by_host: HashMap<String, Vec<usize>>,
     phantoms: Mutex<HashMap<String, StoredOAuthToken>>,
-    persist_path: Option<PathBuf>,
+    persist_backend: Option<PersistBackend>,
     /// Distinct visible-phantom templates declared across all endpoints, used
     /// to recognise and replace templated phantoms on egress.
     templates: Vec<PhantomTemplate>,
@@ -55,9 +71,67 @@ impl OAuthCaptureStore {
         Self::load_with_persistence(configs, None)
     }
 
+    /// Load with file-backed persistence at `persist_path`, or in-memory
+    /// only if `None`. Always uses the `File` backend, on every platform —
+    /// production macOS callers that want ACL-restricted Keychain
+    /// persistence must use [`Self::load_with_runtime_persistence`]
+    /// instead. Kept file-backed unconditionally so library consumers and
+    /// this module's own tests get deterministic, platform-independent
+    /// behaviour.
     pub fn load_with_persistence(
         configs: &[OAuthCaptureConfig],
         persist_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        Self::load_with_backend(configs, persist_path.map(PersistBackend::File))
+    }
+
+    /// Load with the persistence backend selected by `preference`.
+    ///
+    /// `file_path` is the location of the file backend and doubles as the
+    /// "persistence enabled" signal: `None` means in-memory only, regardless
+    /// of `preference`. When persistence is enabled, the concrete backend is:
+    ///
+    /// - `Auto`     → Keychain on macOS, file at `file_path` elsewhere.
+    /// - `Keychain` → Keychain on macOS, file at `file_path` elsewhere.
+    /// - `File`     → file at `file_path` on every platform, including macOS.
+    ///
+    /// On macOS the file at `file_path` is opened only when `File` is selected;
+    /// under `Auto`/`Keychain` the Keychain backend needs no path, so callers
+    /// may keep passing the same path unconditionally and let `preference`
+    /// pick the backend.
+    pub fn load_with_runtime_persistence(
+        configs: &[OAuthCaptureConfig],
+        file_path: Option<PathBuf>,
+        preference: OAuthCaptureStoreBackend,
+    ) -> Result<Self> {
+        let backend = file_path.map(|path| Self::resolve_backend(preference, path));
+        Self::load_with_backend(configs, backend)
+    }
+
+    /// Map an [`OAuthCaptureStoreBackend`] preference plus the file-backend
+    /// path to a concrete [`PersistBackend`]. Kept separate so the
+    /// platform-selection logic is unit-testable without touching a real
+    /// Keychain.
+    fn resolve_backend(preference: OAuthCaptureStoreBackend, path: PathBuf) -> PersistBackend {
+        match preference {
+            OAuthCaptureStoreBackend::File => PersistBackend::File(path),
+            OAuthCaptureStoreBackend::Auto | OAuthCaptureStoreBackend::Keychain => {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = path;
+                    PersistBackend::Keychain
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    PersistBackend::File(path)
+                }
+            }
+        }
+    }
+
+    fn load_with_backend(
+        configs: &[OAuthCaptureConfig],
+        persist_backend: Option<PersistBackend>,
     ) -> Result<Self> {
         let mut endpoints = Vec::new();
         let mut by_host: HashMap<String, Vec<usize>> = HashMap::new();
@@ -86,12 +160,19 @@ impl OAuthCaptureStore {
             }
         }
 
-        let phantoms = if let Some(path) = persist_path.as_deref() {
-            let mut phantoms = load_persisted_tokens(path)?;
-            prune_phantoms(&mut phantoms);
-            phantoms
-        } else {
-            HashMap::new()
+        let phantoms = match persist_backend.as_ref() {
+            Some(PersistBackend::File(path)) => {
+                let mut phantoms = load_persisted_tokens(path)?;
+                prune_phantoms(&mut phantoms);
+                phantoms
+            }
+            #[cfg(target_os = "macos")]
+            Some(PersistBackend::Keychain) => {
+                let mut phantoms = keychain_persist::load_persisted_tokens()?;
+                prune_phantoms(&mut phantoms);
+                phantoms
+            }
+            None => HashMap::new(),
         };
 
         let mut templates: Vec<PhantomTemplate> = Vec::new();
@@ -107,7 +188,7 @@ impl OAuthCaptureStore {
             endpoints,
             by_host,
             phantoms: Mutex::new(phantoms),
-            persist_path,
+            persist_backend,
             templates,
         })
     }
@@ -199,10 +280,12 @@ impl OAuthCaptureStore {
     }
 
     fn persist_locked(&self, tokens: &HashMap<String, StoredOAuthToken>) -> Result<()> {
-        let Some(path) = self.persist_path.as_deref() else {
-            return Ok(());
-        };
-        persist_tokens(path, tokens)
+        match self.persist_backend.as_ref() {
+            None => Ok(()),
+            Some(PersistBackend::File(path)) => persist_tokens(path, tokens),
+            #[cfg(target_os = "macos")]
+            Some(PersistBackend::Keychain) => keychain_persist::persist_tokens(tokens),
+        }
     }
 }
 
@@ -362,6 +445,32 @@ mod tests {
         assert!(
             store.resolve(access, "proxy.other").is_none(),
             "unadmitted consumers must not resolve"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_file_preference_forces_file_on_every_platform() {
+        let path = PathBuf::from("/tmp/providers.json");
+        let backend = OAuthCaptureStore::resolve_backend(OAuthCaptureStoreBackend::File, path);
+        assert!(
+            matches!(backend, PersistBackend::File(_)),
+            "File preference must always resolve to the file backend"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_auto_matches_platform_default() {
+        let path = PathBuf::from("/tmp/providers.json");
+        let backend = OAuthCaptureStore::resolve_backend(OAuthCaptureStoreBackend::Auto, path);
+        #[cfg(target_os = "macos")]
+        assert!(
+            matches!(backend, PersistBackend::Keychain),
+            "Auto must resolve to Keychain on macOS"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            matches!(backend, PersistBackend::File(_)),
+            "Auto must resolve to the file backend off macOS"
         );
     }
 

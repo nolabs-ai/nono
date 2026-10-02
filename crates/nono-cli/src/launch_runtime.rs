@@ -161,6 +161,8 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
     /// Declarative OAuth provider route bindings.
     pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
+    /// Persistence backend for the OAuth-capture phantom-token store.
+    pub(crate) oauth_capture_store_backend: nono_proxy::config::OAuthCaptureStoreBackend,
     /// Enable HTTP/2 negotiation for upstream connections.
     pub(crate) enable_h2: bool,
     /// Profile-declared client-side proxy bypass entries for generated

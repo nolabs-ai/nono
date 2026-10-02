@@ -1788,6 +1788,25 @@ pub struct NetworkConfig {
     /// Canonical profile key: `block`.
     #[serde(default)]
     pub block: bool,
+    /// Refuse to proxy to the loopback interface.
+    ///
+    /// Independent of `block`. The OS sandbox already confines the child to
+    /// `loopback:<proxy port>` whenever the proxy is active, so the proxy is
+    /// the only way off the child's loopback interface; this closes the
+    /// remaining path where the child asks the proxy to reach a *different*
+    /// local service, bypassing the credential route meant to mediate it.
+    ///
+    /// Upstreams of configured `credentials` / `custom_credentials` routes stay
+    /// reachable — they are the sanctioned path. Anything else on loopback
+    /// needs an explicit `loopback_allow` entry.
+    #[serde(default)]
+    pub block_loopback: bool,
+    /// Loopback ports that remain reachable under `block_loopback`.
+    ///
+    /// Has no effect unless `block_loopback` is set. Credential-route upstreams
+    /// are exempt automatically and do not need listing.
+    #[serde(default)]
+    pub loopback_allow: Vec<u16>,
     /// Allow HTTP/2 to upstream servers via ALPN negotiation.
     /// When `false` (default), the proxy negotiates HTTP/1.1 with keep-alive
     /// connection pooling. Equivalent to the `--allow-http2` CLI flag.
@@ -3921,6 +3940,13 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         },
         network: NetworkConfig {
             block: base.network.block || child.network.block,
+            // Same direction as `block`: a restriction set by the base profile
+            // is inherited and a child can only tighten, never relax it.
+            block_loopback: base.network.block_loopback || child.network.block_loopback,
+            loopback_allow: dedup_append(
+                &base.network.loopback_allow,
+                &child.network.loopback_allow,
+            ),
             allow_http2: base.network.allow_http2 || child.network.allow_http2,
             network_profile: child
                 .network
@@ -7026,6 +7052,8 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
+                block_loopback: false,
+                loopback_allow: vec![],
                 allow_http2: false,
                 network_profile: InheritableValue::Set("base-net".to_string()),
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
@@ -7117,6 +7145,8 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
+                block_loopback: false,
+                loopback_allow: vec![],
                 allow_http2: false,
                 network_profile: InheritableValue::Inherit,
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
@@ -7527,6 +7557,80 @@ mod tests {
         let merged = merge_profiles(base, child);
         assert!(merged.network.custom_credentials.contains_key("svc_a"));
         assert!(merged.network.custom_credentials.contains_key("svc_b"));
+    }
+
+    // ---- network.block_loopback / network.loopback_allow (issue #605) ----
+
+    #[test]
+    fn test_parse_network_loopback_restriction() {
+        let profile: Profile = serde_json::from_str(
+            r#"{
+                "meta": { "name": "k8s-agent", "description": "d" },
+                "network": {
+                    "block": false,
+                    "block_loopback": true,
+                    "loopback_allow": [8080]
+                }
+            }"#,
+        )
+        .expect("profile with loopback restriction should parse");
+
+        assert!(!profile.network.block);
+        assert!(profile.network.block_loopback);
+        assert_eq!(profile.network.loopback_allow, vec![8080]);
+    }
+
+    /// Absent keys must leave loopback unrestricted — this is opt-in.
+    #[test]
+    fn test_network_loopback_restriction_defaults_off() {
+        let profile: Profile = serde_json::from_str(
+            r#"{ "meta": { "name": "p", "description": "d" }, "network": {} }"#,
+        )
+        .expect("minimal profile should parse");
+
+        assert!(!profile.network.block_loopback);
+        assert!(profile.network.loopback_allow.is_empty());
+    }
+
+    /// Same direction as `block`: a base restriction is inherited and a child
+    /// cannot relax it.
+    #[test]
+    fn test_merge_profiles_block_loopback_cannot_be_relaxed_by_child() {
+        let mut base = base_profile();
+        base.network.block_loopback = true;
+        let child = child_profile(); // block_loopback defaults to false
+
+        let merged = merge_profiles(base, child);
+        assert!(
+            merged.network.block_loopback,
+            "a child must not be able to relax the base's loopback restriction"
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_block_loopback_set_by_child() {
+        let base = base_profile();
+        let mut child = child_profile();
+        child.network.block_loopback = true;
+
+        let merged = merge_profiles(base, child);
+        assert!(merged.network.block_loopback);
+    }
+
+    #[test]
+    fn test_merge_profiles_loopback_allow_unions() {
+        let mut base = base_profile();
+        base.network.block_loopback = true;
+        base.network.loopback_allow = vec![8080, 9090];
+        let mut child = child_profile();
+        child.network.loopback_allow = vec![9090, 7070];
+
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged.network.loopback_allow,
+            vec![8080, 9090, 7070],
+            "loopback_allow must union base and child without duplicating"
+        );
     }
 
     #[test]

@@ -1036,6 +1036,7 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
     // Network
     let net = &profile.network;
     let has_net = net.block
+        || net.block_loopback
         || net.resolved_network_profile().is_some()
         || !net.allow_domain.is_empty()
         || !net.resolved_credentials().is_empty()
@@ -1050,6 +1051,18 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         println!("  {}", theme::fg("Network:", t.subtext).bold());
         if net.block {
             println!("    {}", theme::fg("network blocked", t.red));
+        }
+        if net.block_loopback {
+            let detail = if net.loopback_allow.is_empty() {
+                "loopback blocked (credential-route upstreams exempt)".to_string()
+            } else {
+                let ports: Vec<String> = net.loopback_allow.iter().map(u16::to_string).collect();
+                format!(
+                    "loopback blocked (allowed ports: {}; credential-route upstreams exempt)",
+                    ports.join(", ")
+                )
+            };
+            println!("    {}", theme::fg(&detail, t.red));
         }
         if let Some(np) = net.resolved_network_profile() {
             println!(
@@ -1333,6 +1346,8 @@ fn profile_to_json(
     // Network
     val["network"] = serde_json::json!({
         "block": profile.network.block,
+        "block_loopback": profile.network.block_loopback,
+        "loopback_allow": profile.network.loopback_allow,
         "network_profile": profile.network.resolved_network_profile(),
         "allow_domain": profile.network.allow_domain,
         "credentials": profile.network.resolved_credentials(),
@@ -1572,6 +1587,18 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         net_diffs.push((
             format!("- block: {}", p1.network.block),
             format!("+ block: {}", p2.network.block),
+        ));
+    }
+    if p1.network.block_loopback != p2.network.block_loopback {
+        net_diffs.push((
+            format!("- block_loopback: {}", p1.network.block_loopback),
+            format!("+ block_loopback: {}", p2.network.block_loopback),
+        ));
+    }
+    if p1.network.loopback_allow != p2.network.loopback_allow {
+        net_diffs.push((
+            format!("- loopback_allow: {:?}", p1.network.loopback_allow),
+            format!("+ loopback_allow: {:?}", p2.network.loopback_allow),
         ));
     }
     let np1 = p1.network.resolved_network_profile().unwrap_or("");
@@ -2109,6 +2136,16 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
                 "profile1": p1.network.block,
                 "profile2": p2.network.block,
                 "changed": p1.network.block != p2.network.block,
+            },
+            "block_loopback": {
+                "profile1": p1.network.block_loopback,
+                "profile2": p2.network.block_loopback,
+                "changed": p1.network.block_loopback != p2.network.block_loopback,
+            },
+            "loopback_allow": {
+                "profile1": p1.network.loopback_allow,
+                "profile2": p2.network.loopback_allow,
+                "changed": p1.network.loopback_allow != p2.network.loopback_allow,
             },
             "network_profile": {
                 "profile1": p1.network.resolved_network_profile(),

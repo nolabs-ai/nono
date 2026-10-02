@@ -1177,7 +1177,7 @@ pub async fn start_with_nonce_resolver(
     }
 
     // Build filter. Strict mode treats an empty allowlist as deny-all.
-    let filter = if config.strict_filter {
+    let mut filter = if config.strict_filter {
         ProxyFilter::new_strict(&config.allowed_hosts)
     } else if config.allowed_hosts.is_empty() {
         ProxyFilter::allow_all()
@@ -1189,6 +1189,21 @@ pub async fn start_with_nonce_resolver(
     route_allowed_hosts.extend(oauth_capture_store.host_ports());
     let route_filter =
         ProxyFilter::new_strict(&route_allowed_hosts).with_denied_hosts(&config.denied_hosts);
+
+    // Loopback restriction (opt-in). This gates client-facing paths only.
+    // A configured route's own upstream dial is exempted in `reverse.rs` via
+    // `check_route_upstream`, so the sanctioned credential-injecting path to a
+    // local service keeps working while a client asking the proxy for that
+    // same address directly — which would skip the route's endpoint_policy and
+    // credential injection — is refused.
+    if config.block_loopback {
+        debug!(
+            "loopback restriction active: {} allowed port(s)",
+            config.loopback_allow.len()
+        );
+        filter =
+            filter.with_loopback_policy(crate::filter::LoopbackPolicy::new(&config.loopback_allow));
+    }
 
     // Build bypass matcher from external proxy config (once, not per-request)
     let bypass_matcher = config
@@ -2178,6 +2193,38 @@ async fn handle_forward_http(
         _ => None,
     };
 
+    // Through an upstream proxy, the host named in its CONNECT is pinned to
+    // the checked IP under a loopback policy (see
+    // `ProxyFilter::upstream_proxy_target`). Refuse if there is nothing to pin.
+    let upstream_host = if ext_proxy_addr.is_some() {
+        match state.filter.upstream_proxy_target(&host, &check) {
+            Some(target) => target,
+            None => {
+                let msg = "loopback restriction requires the upstream proxy target to \
+                           resolve locally, and it did not";
+                audit::log_denied(
+                    state.audit_log.as_ref(),
+                    audit::ProxyMode::Reverse,
+                    &audit::EventContext {
+                        denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                        ..audit::EventContext::default()
+                    },
+                    &host,
+                    port,
+                    msg,
+                );
+                let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+                stream.write_all(response.as_bytes()).await?;
+                return Err(ProxyError::UpstreamConnect {
+                    host,
+                    reason: msg.to_string(),
+                });
+            }
+        }
+    } else {
+        host.clone()
+    };
+
     let strategy = match ext_proxy_addr.as_deref() {
         Some(addr) => UpstreamStrategy::ExternalProxy {
             proxy_addr: addr,
@@ -2190,7 +2237,7 @@ async fn handle_forward_http(
 
     let upstream = UpstreamSpec {
         scheme: UpstreamScheme::Http,
-        host: &host,
+        host: &upstream_host,
         port,
         strategy,
         // Unused for the Http scheme (no TLS to the upstream), but the shared

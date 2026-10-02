@@ -583,6 +583,12 @@ pub(crate) struct PreparedSandbox {
     /// flag is read directly from `SandboxArgs` at proxy-launch time, so only
     /// the profile's contribution needs to be carried through.
     pub(crate) profile_network_block: bool,
+    /// Profile `network.block_loopback`: refuse to proxy to the loopback
+    /// interface. Independent of `profile_network_block`.
+    pub(crate) profile_block_loopback: bool,
+    /// Profile `network.loopback_allow`: loopback ports that stay reachable
+    /// under `profile_block_loopback`.
+    pub(crate) profile_loopback_allow: Vec<u16>,
     /// True when the profile or CLI requested HTTP/2 to upstream servers
     /// (`network.allow_http2` or `--allow-http2`).
     pub(crate) allow_http2_requested: bool,
@@ -1559,6 +1565,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 case_insensitive_env_vars: false,
                 set_vars: None,
                 profile_network_block: false,
+                profile_block_loopback: false,
+                profile_loopback_allow: Vec::new(),
                 allow_http2_requested: args.allow_http2,
             },
             &[],
@@ -1888,6 +1896,17 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .map(|p| p.network.block)
         .unwrap_or(false);
 
+    // Loopback restriction is independent of `network.block`: it governs what
+    // the proxy will reach, not whether the sandbox permits outbound at all.
+    let profile_block_loopback = loaded_profile
+        .as_ref()
+        .map(|p| p.network.block_loopback)
+        .unwrap_or(false);
+    let profile_loopback_allow = loaded_profile
+        .as_ref()
+        .map(|p| p.network.loopback_allow.clone())
+        .unwrap_or_default();
+
     // Capture the profile's `network.allow_http2` intent alongside the CLI flag.
     let profile_allow_http2 = loaded_profile
         .as_ref()
@@ -1961,6 +1980,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             case_insensitive_env_vars: profile_case_insensitive_env_vars,
             set_vars: profile_set_vars,
             profile_network_block,
+            profile_block_loopback,
+            profile_loopback_allow,
             allow_http2_requested,
         },
         &blocked_grants,
@@ -2945,6 +2966,8 @@ mod tests {
             case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
+            profile_block_loopback: false,
+            profile_loopback_allow: Vec::new(),
             allow_http2_requested: false,
         }
     }

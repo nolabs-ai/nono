@@ -60,6 +60,24 @@ pub struct PackageManifest {
     /// agent-specific install steps).
     #[serde(default)]
     pub wiring: Vec<WiringDirective>,
+    /// Pack-declared variables usable in `wiring` destinations, on top
+    /// of the built-in set. Lets a pack say "wherever this agent keeps
+    /// its config" without the CLI having to know which agent that is
+    /// — the pack names the environment variable, the CLI resolves and
+    /// validates it. Empty for packs whose destinations are fixed.
+    #[serde(default)]
+    pub wiring_vars: BTreeMap<String, WiringVar>,
+}
+
+/// A pack-declared wiring variable: an environment variable to consult,
+/// plus the value to use when it is unset or rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WiringVar {
+    /// Environment variable read at install time.
+    pub env: String,
+    /// Fallback when `env` is unset, empty, or fails validation.
+    /// Expanded against the built-in variable table only.
+    pub default: String,
 }
 
 impl PackageManifest {

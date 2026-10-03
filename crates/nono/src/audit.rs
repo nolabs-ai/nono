@@ -16,7 +16,7 @@ use crate::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sigstore_verify::types::bundle::SignatureContent;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -25,6 +25,29 @@ use std::path::{Path, PathBuf};
 
 /// Filename used for per-session audit event logs.
 pub const AUDIT_EVENTS_FILENAME: &str = "audit-events.ndjson";
+
+/// Maximum distinct command-policy denial fingerprints tracked for duplicate
+/// suppression.
+///
+/// Bounds memory at a fixed size regardless of how long a session runs. Once
+/// full, a denial with an unseen fingerprint is appended rather than
+/// suppressed, so an unrecorded denial is never silently dropped; only repeats
+/// of an already-recorded denial collapse.
+const COMMAND_POLICY_DENIAL_FINGERPRINT_MAX: usize = 4096;
+
+/// Whether an identical denial seen `count` times should be re-appended.
+///
+/// Powers of two: the first is recorded, then the 2nd, 4th, 8th and so on. A
+/// retry loop therefore contributes a logarithmic number of records instead of
+/// one per attempt, and the last checkpoint in the log states how many
+/// attempts it stands for -- so the magnitude survives in the log itself
+/// rather than in a separate counter.
+fn is_denial_checkpoint(count: u64) -> bool {
+    count.is_power_of_two()
+}
+
+/// Domain separator for command-policy denial fingerprints.
+const COMMAND_POLICY_DENIAL_FINGERPRINT_DOMAIN: &[u8] = b"nono.audit.command-policy.denial.alpha\n";
 
 /// Domain separator for alpha event leaf hashes.
 pub const EVENT_DOMAIN_ALPHA: &[u8] = b"nono.audit.event.alpha\n";
@@ -413,6 +436,9 @@ pub struct AuditRecorder {
     leaf_hashes: Vec<ContentHash>,
     redaction_policy: crate::ScrubPolicy,
     command_policy_summary: CommandPolicySummaryBuilder,
+    /// How many times each denial identity has been observed, for duplicate
+    /// suppression and for deciding when to re-emit a checkpoint.
+    denial_counts: HashMap<[u8; 32], u64>,
 }
 
 impl AuditRecorder {
@@ -444,6 +470,7 @@ impl AuditRecorder {
             leaf_hashes: Vec::new(),
             redaction_policy,
             command_policy_summary: CommandPolicySummaryBuilder::new(),
+            denial_counts: HashMap::new(),
         })
     }
 
@@ -510,16 +537,59 @@ impl AuditRecorder {
     /// append refuses one command but leaves the session alive to finalize, so
     /// folding first would commit a `session.json` rollup claiming events the
     /// log does not hold.
+    ///
+    /// A terminal denial identical to one already appended is folded into the
+    /// rollup but not appended again. A process retrying a blocked operation
+    /// can otherwise emit six figures of byte-identical records, which buries
+    /// every other signal in the log and in downstream log ingestion. Only
+    /// denials are suppressed, and only exact repeats: the fingerprint covers
+    /// the command, the decision, and the reason, so a denial that differs in
+    /// any of those is still recorded. Counts survive suppression via
+    /// `CommandPolicySummary::suppressed_duplicate_count`, so a retry loop
+    /// remains visible as a magnitude even though the log holds one copy.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn record_command_policy_event(
         &mut self,
         event: CommandPolicyAuditEvent,
         outcome: CommandPolicyOutcome,
     ) -> Result<()> {
-        let event = Box::new(event);
+        let mut event = Box::new(event);
+
+        // Counted before the append so a suppressed duplicate costs no log
+        // write, and only committed to the map after a successful append so a
+        // failed append cannot suppress the retry that would have put the
+        // first copy in the log.
+        let mut denial = None;
+        if outcome == CommandPolicyOutcome::Denied {
+            let fingerprint = command_policy_denial_fingerprint(&event);
+            let seen = self.denial_counts.get(&fingerprint).copied().unwrap_or(0);
+            let count = seen.saturating_add(1);
+            let tracked =
+                seen > 0 || self.denial_counts.len() < COMMAND_POLICY_DENIAL_FINGERPRINT_MAX;
+            // An untracked fingerprint is always appended: a full table stops
+            // deduplicating rather than start dropping denials the log has
+            // never recorded.
+            if tracked && !is_denial_checkpoint(count) {
+                self.denial_counts.insert(fingerprint, count);
+                self.command_policy_summary
+                    .observe_suppressed(&event, outcome);
+                return Ok(());
+            }
+            if tracked && count > 1 {
+                // A checkpoint stands for every attempt up to this point, so
+                // it says so rather than reading like a single fresh denial.
+                let reason = event.reason.take().unwrap_or_default();
+                event.reason = Some(format!("{reason} [identical denial #{count}]"));
+            }
+            denial = tracked.then_some((fingerprint, count));
+        }
+
         self.append_event(AuditEventPayload::CommandPolicy {
             event: event.clone(),
         })?;
+        if let Some((fingerprint, count)) = denial {
+            self.denial_counts.insert(fingerprint, count);
+        }
         self.command_policy_summary.observe(&event, outcome);
         Ok(())
     }
@@ -614,7 +684,23 @@ impl CommandPolicySummaryBuilder {
     /// writes the events, so only they can say which strings are terminal.
     pub fn observe(&mut self, event: &CommandPolicyAuditEvent, outcome: CommandPolicyOutcome) {
         self.event_count = self.event_count.saturating_add(1);
+        self.fold_outcome(event, outcome);
+    }
 
+    /// Fold a terminal decision that was deliberately not appended to the log.
+    ///
+    /// Keeps the rollup a faithful account of what happened while the log
+    /// holds one copy: `event_count` still matches the log, and the decision
+    /// is still counted against its command.
+    pub fn observe_suppressed(
+        &mut self,
+        event: &CommandPolicyAuditEvent,
+        outcome: CommandPolicyOutcome,
+    ) {
+        self.fold_outcome(event, outcome);
+    }
+
+    fn fold_outcome(&mut self, event: &CommandPolicyAuditEvent, outcome: CommandPolicyOutcome) {
         if outcome == CommandPolicyOutcome::Pending {
             return;
         }
@@ -660,6 +746,28 @@ impl CommandPolicySummaryBuilder {
             truncated: self.truncated,
         })
     }
+}
+
+/// Fingerprint the identity of a command-policy denial.
+///
+/// Covers the mediated command, the decision, and the reason. Each field is
+/// length-prefixed so no pair of distinct field sets can hash alike by running
+/// together. Volatile per-invocation context (timestamps, pids, argv and cwd
+/// hashes) is deliberately excluded: a retry loop varies those on every
+/// attempt while denying the same thing for the same reason, which is exactly
+/// what should collapse to one record.
+fn command_policy_denial_fingerprint(event: &CommandPolicyAuditEvent) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(COMMAND_POLICY_DENIAL_FINGERPRINT_DOMAIN);
+    for field in [
+        event.command.as_str(),
+        event.decision.as_str(),
+        event.reason.as_deref().unwrap_or(""),
+    ] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hasher.finalize().into()
 }
 
 /// Hash canonical event JSON bytes into an alpha event leaf.
@@ -1817,6 +1925,152 @@ mod tests {
             exit_code: None,
             stdio: None,
         }
+    }
+
+    fn denial_event(command: &str, reason: &str) -> CommandPolicyAuditEvent {
+        let mut event = command_policy_event(command, "denied");
+        event.reason = Some(reason.to_string());
+        event
+    }
+
+    /// Count the command policy events actually appended to the log file.
+    fn logged_command_policy_events(dir: &Path) -> usize {
+        let path = dir.join(AUDIT_EVENTS_FILENAME);
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains(r#""type":"command_policy""#))
+            .count()
+    }
+
+    #[test]
+    fn a_retry_loop_contributes_logarithmically_many_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+
+        // A process retrying one blocked operation. Volatile per-attempt
+        // context differs every time; the denial identity does not.
+        for attempt in 0..1_000 {
+            let mut event = denial_event("git", "Path does not exist: /tmp/sandbox/shims/aws");
+            event.timestamp = format!("2026-04-21T00:00:{:02}Z", attempt % 60);
+            event.shim_pid = Some(1_000 + attempt);
+            recorder
+                .record_command_policy_event(event, CommandPolicyOutcome::Denied)
+                .unwrap();
+        }
+
+        // Checkpoints at 1, 2, 4, ... 512: ten records for a thousand
+        // attempts, so no retry loop can bury the rest of the log.
+        assert_eq!(logged_command_policy_events(dir.path()), 10);
+
+        // The rollup still reports the true magnitude.
+        let summary = recorder.command_policy_summary().unwrap();
+        assert_eq!(summary.event_count, 10);
+        assert_eq!(summary.invocation_count, 1_000);
+        assert_eq!(summary.commands[0].denied, 1_000);
+    }
+
+    #[test]
+    fn a_checkpoint_record_states_how_many_attempts_it_stands_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        for _ in 0..8 {
+            recorder
+                .record_command_policy_event(
+                    denial_event("git", "blocked"),
+                    CommandPolicyOutcome::Denied,
+                )
+                .unwrap();
+        }
+
+        // The magnitude is recoverable from the log itself rather than from a
+        // separate counter: the last checkpoint names the attempt it records.
+        let log = std::fs::read_to_string(dir.path().join(AUDIT_EVENTS_FILENAME)).unwrap();
+        assert!(log.contains("[identical denial #8]"));
+        assert!(log.contains("[identical denial #4]"));
+        // The first occurrence is recorded verbatim, with no annotation.
+        assert!(log.contains(r#""reason":"blocked""#));
+    }
+
+    #[test]
+    fn denials_differing_in_identity_are_each_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+
+        // Same command, different reason.
+        recorder
+            .record_command_policy_event(
+                denial_event("git", "missing shim aws"),
+                CommandPolicyOutcome::Denied,
+            )
+            .unwrap();
+        recorder
+            .record_command_policy_event(
+                denial_event("git", "missing shim kubectl"),
+                CommandPolicyOutcome::Denied,
+            )
+            .unwrap();
+        // Same reason, different command.
+        recorder
+            .record_command_policy_event(
+                denial_event("gh", "missing shim aws"),
+                CommandPolicyOutcome::Denied,
+            )
+            .unwrap();
+
+        assert_eq!(logged_command_policy_events(dir.path()), 3);
+    }
+
+    #[test]
+    fn repeated_allowed_events_are_never_suppressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+
+        // Suppression is scoped to denials: collapsing ordinary successful
+        // mediation would discard the record of what actually ran.
+        for _ in 0..10 {
+            recorder
+                .record_command_policy_event(
+                    command_policy_event("git", "allowed"),
+                    CommandPolicyOutcome::Allowed,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(logged_command_policy_events(dir.path()), 10);
+        let summary = recorder.command_policy_summary().unwrap();
+        assert_eq!(summary.event_count, 10);
+        assert_eq!(summary.commands[0].allowed, 10);
+    }
+
+    #[test]
+    fn an_unseen_denial_is_appended_once_fingerprint_tracking_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+
+        let overflow = 5;
+        let total = COMMAND_POLICY_DENIAL_FINGERPRINT_MAX + overflow;
+        for i in 0..total {
+            recorder
+                .record_command_policy_event(
+                    denial_event("git", &format!("missing shim {i}")),
+                    CommandPolicyOutcome::Denied,
+                )
+                .unwrap();
+        }
+
+        // Every denial was distinct, so none may be suppressed.
+        assert_eq!(logged_command_policy_events(dir.path()), total);
+
+        // The denials past the cap are untracked, so their repeats are also
+        // appended rather than silently vanishing.
+        recorder
+            .record_command_policy_event(
+                denial_event("git", &format!("missing shim {}", total - 1)),
+                CommandPolicyOutcome::Denied,
+            )
+            .unwrap();
+        assert_eq!(logged_command_policy_events(dir.path()), total + 1);
     }
 
     #[test]

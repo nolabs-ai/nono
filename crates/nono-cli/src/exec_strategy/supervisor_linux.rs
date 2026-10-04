@@ -536,6 +536,26 @@ fn handle_received_filesystem_notification(
         Err(_) => {}
     }
 
+    // The procfs deny rules re-run when a granted path is opened, so asking a
+    // reviewer about another process's /proc entry can only end in a denial.
+    // Deny it here instead of sending hundreds of unanswerable approvals.
+    if procfs_access_never_grantable(&resolved_path, procfs_context) {
+        debug!(
+            "Seccomp: procfs path {} is never grantable; denied without approval",
+            resolved_path.display()
+        );
+        record_denial(
+            denials,
+            DenialRecord {
+                path: canonicalized.clone(),
+                access,
+                reason: DenialReason::PolicyBlocked,
+            },
+        );
+        let _ = deny_notif(notify_fd, notif.id);
+        return Ok(());
+    }
+
     if !config.seccomp_policy.capability_elevation {
         debug!(
             "Seccomp: path {} denied because runtime capability elevation is disabled",

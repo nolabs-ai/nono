@@ -4222,6 +4222,19 @@ fn validate_procfs_access(
     Ok(())
 }
 
+/// Whether the procfs deny rules refuse `resolved_path` for this requester
+/// regardless of any grant: another process's `/proc/<pid>`, or one of the
+/// requester's own sensitive entries. An approval cannot change the outcome,
+/// so the supervisor denies these without asking the approval backend.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn procfs_access_never_grantable(
+    resolved_path: &Path,
+    procfs_context: ProcfsAccessContext,
+) -> bool {
+    validate_procfs_access(resolved_path, Some(procfs_context))
+        .is_err_and(|error| error.is_policy_blocked())
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug)]
 struct OpenPathError {
@@ -5155,6 +5168,43 @@ mod tests {
             Some(ProcfsAccessContext::new(4242, Some(4343))),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_procfs_access_never_grantable_for_foreign_or_sensitive_entries() {
+        let context = ProcfsAccessContext::new(4242, Some(4343));
+        // Another process: process enumeration reads like these can never be granted.
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/1015"),
+            context
+        ));
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/1/cmdline"),
+            context
+        ));
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/1/task/2/stat"),
+            context
+        ));
+        // The requester's own sensitive entries stay blocked too.
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/4242/fd/3"),
+            context
+        ));
+        // Everything else still follows the normal grant and approval path.
+        assert!(!procfs_access_never_grantable(
+            Path::new("/proc/4242/status"),
+            context
+        ));
+        assert!(!procfs_access_never_grantable(
+            Path::new("/proc/cpuinfo"),
+            context
+        ));
+        assert!(!procfs_access_never_grantable(Path::new("/proc"), context));
+        assert!(!procfs_access_never_grantable(
+            Path::new("/home/user/file"),
+            context
+        ));
     }
 
     #[test]

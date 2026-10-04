@@ -27,6 +27,8 @@ struct SessionRuntimeState {
 pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) config: &'a exec_strategy::ExecConfig<'a>,
     pub(crate) caps: &'a CapabilitySet,
+    /// Resolved deny paths; the supervisor never grants beneath them.
+    pub(crate) deny_paths: &'a [std::path::PathBuf],
     pub(crate) command: &'a [String],
     pub(crate) session: &'a SessionLaunchOptions,
     pub(crate) rollback: &'a RollbackLaunchOptions,
@@ -214,6 +216,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     let SupervisedRuntimeContext {
         config,
         caps,
+        deny_paths,
         command,
         session,
         rollback,
@@ -327,8 +330,10 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         .as_deref()
         .unwrap_or(&terminal_approval_fallback);
     let supervisor_session_id = build_supervisor_session_id(audit_state.as_ref());
+    let supervisor_deny_paths = exec_strategy::supervisor_deny_paths(deny_paths);
     let supervisor_cfg = exec_strategy::SupervisorConfig {
         protected_roots: protected_roots.as_paths(),
+        deny_paths: &supervisor_deny_paths,
         approval_backend,
         session_id: &supervisor_session_id,
         attach_initial_client: !session.detached_start,

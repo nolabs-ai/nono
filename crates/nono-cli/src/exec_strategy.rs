@@ -344,6 +344,10 @@ pub struct StartupTimeoutConfig<'a> {
 pub struct SupervisorConfig<'a> {
     /// Protected nono state roots that must never be granted dynamically.
     pub protected_roots: &'a [std::path::PathBuf],
+    /// The session's resolved deny paths (deny groups and profile
+    /// `filesystem.deny`, after `bypass_protection`), each also in canonical
+    /// form. No approval may grant access at or beneath one of them.
+    pub deny_paths: &'a [std::path::PathBuf],
     /// Backend for approval decisions (terminal prompt, webhook, policy engine)
     pub approval_backend: &'a dyn ApprovalBackend,
     /// Session identifier used for audit correlation.
@@ -3435,6 +3439,24 @@ fn handle_supervisor_message(
                         request.path.display()
                     ),
                 }
+            } else if is_under_deny_path(&request.path, config.deny_paths)
+                || is_under_deny_path(&nono::try_canonicalize(&request.path), config.deny_paths)
+            {
+                debug!(
+                    "Supervisor: path {} is denied by policy; not sent for approval",
+                    request.path.display()
+                );
+                record_denial(
+                    &mut denials.fs,
+                    DenialRecord {
+                        path: request.path.clone(),
+                        access: request.access,
+                        reason: DenialReason::PolicyBlocked,
+                    },
+                );
+                ApprovalDecision::Denied {
+                    reason: format!("Path is denied by policy: {}", request.path.display()),
+                }
             } else if let Some(trust_result) = trust_interceptor
                 .as_mut()
                 .and_then(|ti| ti.check_path(&request.path))
@@ -3567,6 +3589,7 @@ fn handle_supervisor_message(
                     &request.path,
                     &request.access,
                     config.protected_roots,
+                    config.deny_paths,
                     verified_digest.as_deref(),
                     Some(ProcfsAccessContext::new(child.as_raw() as u32, None)),
                 ) {
@@ -4222,6 +4245,28 @@ fn validate_procfs_access(
     Ok(())
 }
 
+/// Whether `path` is at or beneath one of the session's deny paths. Deny rules
+/// win over approvals: a path they cover is never sent to an approval backend
+/// and never opened on a grant.
+fn is_under_deny_path(path: &Path, deny_paths: &[PathBuf]) -> bool {
+    deny_paths.iter().any(|deny| path.starts_with(deny))
+}
+
+/// Deny paths as configured plus their canonical forms, so a request through
+/// a symlink alias and a request for the symlink itself are both covered.
+pub(crate) fn supervisor_deny_paths(deny_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(deny_paths.len() * 2);
+    for deny in deny_paths {
+        paths.push(deny.clone());
+        if let Ok(canonical) = std::fs::canonicalize(deny)
+            && canonical != *deny
+        {
+            paths.push(canonical);
+        }
+    }
+    paths
+}
+
 /// Whether the procfs deny rules refuse `resolved_path` for this requester
 /// regardless of any grant: another process's `/proc/<pid>`, or one of the
 /// requester's own sensitive entries. An approval cannot change the outcome,
@@ -4305,6 +4350,7 @@ fn open_path_for_access(
     path: &Path,
     access: &nono::AccessMode,
     protected_roots: &[PathBuf],
+    deny_paths: &[PathBuf],
     trust_digest: Option<&str>,
     procfs_context: Option<ProcfsAccessContext>,
 ) -> std::result::Result<std::fs::File, OpenPathError> {
@@ -4334,6 +4380,19 @@ fn open_path_for_access(
             path.display(),
             canonical.display(),
             protected_root.display(),
+        )));
+    }
+
+    // Defense in depth: the approval paths refuse denied paths before asking,
+    // but a grant must never open one either.
+    if is_under_deny_path(path, deny_paths)
+        || is_under_deny_path(&resolved_path, deny_paths)
+        || is_under_deny_path(&canonical, deny_paths)
+    {
+        return Err(OpenPathError::policy_blocked(format!(
+            "Path {} resolves to {} which is denied by policy",
+            path.display(),
+            canonical.display(),
         )));
     }
 
@@ -5171,6 +5230,51 @@ mod tests {
     }
 
     #[test]
+    fn test_deny_paths_cover_the_path_and_its_descendants_only() {
+        let deny = vec![
+            PathBuf::from("/home/u/.zprofile"),
+            PathBuf::from("/home/u/.aws"),
+        ];
+        assert!(is_under_deny_path(Path::new("/home/u/.zprofile"), &deny));
+        assert!(is_under_deny_path(
+            Path::new("/home/u/.aws/credentials"),
+            &deny
+        ));
+        // Component-wise: a sibling sharing a prefix is not covered.
+        assert!(!is_under_deny_path(
+            Path::new("/home/u/.zprofile.bak"),
+            &deny
+        ));
+        assert!(!is_under_deny_path(Path::new("/home/u/.awsx"), &deny));
+        assert!(!is_under_deny_path(Path::new("/home/u/project"), &deny));
+    }
+
+    #[test]
+    fn test_granted_open_refuses_denied_paths_including_symlink_aliases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join(".zprofile");
+        std::fs::write(&secret, "secret").expect("write secret");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&secret, &alias).expect("symlink");
+        let allowed = dir.path().join("allowed");
+        std::fs::write(&allowed, "ok").expect("write allowed");
+
+        let deny = supervisor_deny_paths(std::slice::from_ref(&secret));
+        let open = |path: &Path| {
+            open_path_for_access(path, &nono::AccessMode::Read, &[], &deny, None, None)
+        };
+
+        let direct = open(&secret).expect_err("denied path must not open");
+        assert!(direct.is_policy_blocked());
+        let via_alias = open(&alias).expect_err("alias of a denied path must not open");
+        assert!(via_alias.is_policy_blocked());
+        assert!(
+            open(&allowed).is_ok(),
+            "paths outside the deny set still open on a grant"
+        );
+    }
+
+    #[test]
     fn test_procfs_access_never_grantable_for_foreign_or_sensitive_entries() {
         let context = ProcfsAccessContext::new(4242, Some(4343));
         // Another process: process enumeration reads like these can never be granted.
@@ -5309,6 +5413,7 @@ mod tests {
         let backend = DenyAll;
         let sup_cfg = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test-session",
             attach_initial_client: false,
@@ -5440,6 +5545,7 @@ mod tests {
         // (simulating V4+ where Landlock handles networking).
         let sup_cfg = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test-proxy-v4",
             attach_initial_client: false,
@@ -5537,6 +5643,7 @@ mod tests {
         let origins = vec!["https://claude.ai".to_string()];
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5587,6 +5694,7 @@ mod tests {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5644,6 +5752,7 @@ mod tests {
         let origins = vec!["https://claude.ai".to_string()];
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5717,6 +5826,7 @@ mod tests {
         let backend = TestDenyBackend;
         let config_allow = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5751,6 +5861,7 @@ mod tests {
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5804,6 +5915,7 @@ mod tests {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -6024,6 +6136,7 @@ mod tests {
         let origins = vec!["https://idp.example.com".to_string()];
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -6075,6 +6188,7 @@ mod tests {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -6145,6 +6259,7 @@ mod tests {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,

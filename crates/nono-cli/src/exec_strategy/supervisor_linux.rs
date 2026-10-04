@@ -459,6 +459,7 @@ fn handle_received_filesystem_notification(
                     &path,
                     &access,
                     config.protected_roots,
+                    config.deny_paths,
                     None,
                     Some(procfs_context),
                 ) {
@@ -539,6 +540,28 @@ fn handle_received_filesystem_notification(
     // The procfs deny rules re-run when a granted path is opened, so asking a
     // reviewer about another process's /proc entry can only end in a denial.
     // Deny it here instead of sending hundreds of unanswerable approvals.
+    // Deny rules (deny groups and profile `filesystem.deny`) win over
+    // approvals: never ask a reviewer to open a path the policy denies.
+    if is_under_deny_path(&path, config.deny_paths)
+        || is_under_deny_path(&resolved_path, config.deny_paths)
+        || is_under_deny_path(&canonicalized, config.deny_paths)
+    {
+        debug!(
+            "Seccomp: path {} is denied by policy; denied without approval",
+            canonicalized.display()
+        );
+        record_denial(
+            denials,
+            DenialRecord {
+                path: canonicalized.clone(),
+                access,
+                reason: DenialReason::PolicyBlocked,
+            },
+        );
+        let _ = deny_notif(notify_fd, notif.id);
+        return Ok(());
+    }
+
     if procfs_access_never_grantable(&resolved_path, procfs_context) {
         debug!(
             "Seccomp: procfs path {} is never grantable; denied without approval",
@@ -692,6 +715,7 @@ fn handle_received_filesystem_notification(
             &path,
             &access,
             config.protected_roots,
+            config.deny_paths,
             verified_digest.as_deref(),
             Some(procfs_context),
         ) {
@@ -1920,6 +1944,7 @@ mod tests {
                 std::sync::LazyLock::new(nono::CapabilitySet::default);
             SupervisorConfig {
                 protected_roots: &[],
+                deny_paths: &[],
                 approval_backend: backend,
                 session_id: "test-net-decision",
                 attach_initial_client: false,

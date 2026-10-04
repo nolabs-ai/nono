@@ -119,6 +119,7 @@ fn supervise(
     let scrub = nono::ScrubPolicy::secure_default();
     let config = SupervisorConfig {
         protected_roots: &[],
+        deny_paths: &[],
         approval_backend: &Deny,
         session_id: "clone-test",
         attach_initial_client: false,
@@ -791,6 +792,7 @@ fn full_cli_supervisor_combined_path() -> Result<()> {
         let scrub = nono::ScrubPolicy::secure_default();
         let supervisor = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &Deny,
             session_id: "clone-test",
             attach_initial_client: false,

@@ -165,6 +165,14 @@ The `action.type` selects how the matched subcommand is handled:
 
 The helper runs with the matched command's real credentials, capabilities, and sandbox — it is not itself sandboxed further. Do not point `exec` at a general-purpose shell (`/bin/sh`, `/bin/bash`, etc.): it would let the caller run arbitrary commands with those credentials, defeating the sandbox. Use a purpose-specific helper that only does what the intercepted subcommand needs.
 
+### Filesystem Write Grants
+
+An `fs_write` or `fs_write_file` entry is fixed when it is absolute after supported path expansion, its original form is not a dynamic-provider token, and it does not contain `$WORKDIR`. This includes `~` and supported variables such as `$HOME`, XDG variables, or `$TMPDIR` when they expand to absolute paths. A fixed grant is not downgraded merely because the command's live cwd is an ancestor of the granted path.
+
+Relative entries, entries containing `$WORKDIR`, and dynamic-provider entries retain the existing cwd-based write-access check. Provider expansion to an absolute path does not turn the entry into a fixed-path grant. Read-only grants and socket grants are unchanged.
+
+These capabilities apply to the selected mediated command, not the agent's own filesystem permissions. Fixed-path classification does not by itself override other restrictions, such as macOS Keychain deny/bypass authorization. The agent can still supply command arguments, stdin, and permitted environment variables; profile authors should use `invocation_policy` or intercepts to restrict how the command uses its capabilities.
+
 ### Dynamic Filesystem Grants
 
 `fs_read`, `fs_write`, `fs_read_file`, and `fs_write_file` can contain dynamic provider tokens as well as literal paths. Tokens are expanded at launch before the command sandbox is built. They are opt-in: no dynamic paths are added unless a selected command sandbox policy includes one of these tokens.

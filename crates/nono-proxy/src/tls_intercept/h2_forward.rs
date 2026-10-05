@@ -375,7 +375,7 @@ async fn handle_h2_stream(
     // values, mirroring the HTTP/1.1 path. Without this, an h2/gRPC request that
     // carries a broker nonce in a header would forward the raw nonce upstream
     // instead of the resolved credential.
-    let nonce_consumer = service.map(|s| format!("proxy.{s}"));
+    let nonce_consumer = service.map(crate::oauth_capture::route_consumer);
     let redeem_phantoms: &[String] = route.map_or(&[], |r| r.redeem_phantoms.as_slice());
     let mut upstream_headers = HeaderMap::new();
     for (name, value) in request.headers() {

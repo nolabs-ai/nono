@@ -562,7 +562,7 @@ fn handle_received_filesystem_notification(
         return Ok(());
     }
 
-    if procfs_access_never_grantable(&resolved_path, procfs_context) {
+    if procfs_access_never_grantable(&resolved_path, &canonicalized, procfs_context) {
         debug!(
             "Seccomp: procfs path {} is never grantable; denied without approval",
             resolved_path.display()

@@ -4271,13 +4271,21 @@ pub(crate) fn supervisor_deny_paths(deny_paths: &[PathBuf]) -> Vec<PathBuf> {
 /// regardless of any grant: another process's `/proc/<pid>`, or one of the
 /// requester's own sensitive entries. An approval cannot change the outcome,
 /// so the supervisor denies these without asking the approval backend.
+///
+/// Both forms are checked, as [`open_path_for_access`] does: the resolved path
+/// keeps the provenance of procfs links such as `/proc/<pid>/cwd`, and the
+/// canonical path removes `..` and symlink aliases such as
+/// `/proc/<own-pid>/../<pid>/cmdline`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn procfs_access_never_grantable(
     resolved_path: &Path,
+    canonical_path: &Path,
     procfs_context: ProcfsAccessContext,
 ) -> bool {
-    validate_procfs_access(resolved_path, Some(procfs_context))
-        .is_err_and(|error| error.is_policy_blocked())
+    [resolved_path, canonical_path].into_iter().any(|path| {
+        validate_procfs_access(path, Some(procfs_context))
+            .is_err_and(|error| error.is_policy_blocked())
+    })
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -4371,6 +4379,9 @@ fn open_path_for_access(
             &e,
         )
     })?;
+    // `..` and symlink aliases can name another process's entry through the
+    // requester's own PID; validate what will actually be opened as well.
+    validate_procfs_access(&canonical, procfs_context)?;
 
     if let Some(protected_root) =
         crate::protected_paths::overlapping_protected_root(&canonical, false, protected_roots)
@@ -5280,35 +5291,95 @@ mod tests {
         // Another process: process enumeration reads like these can never be granted.
         assert!(procfs_access_never_grantable(
             Path::new("/proc/1015"),
+            Path::new("/proc/1015"),
             context
         ));
         assert!(procfs_access_never_grantable(
             Path::new("/proc/1/cmdline"),
+            Path::new("/proc/1/cmdline"),
             context
         ));
         assert!(procfs_access_never_grantable(
+            Path::new("/proc/1/task/2/stat"),
             Path::new("/proc/1/task/2/stat"),
             context
         ));
         // The requester's own sensitive entries stay blocked too.
         assert!(procfs_access_never_grantable(
             Path::new("/proc/4242/fd/3"),
+            Path::new("/proc/4242/fd/3"),
             context
         ));
         // Everything else still follows the normal grant and approval path.
         assert!(!procfs_access_never_grantable(
             Path::new("/proc/4242/status"),
+            Path::new("/proc/4242/status"),
             context
         ));
         assert!(!procfs_access_never_grantable(
             Path::new("/proc/cpuinfo"),
+            Path::new("/proc/cpuinfo"),
             context
         ));
-        assert!(!procfs_access_never_grantable(Path::new("/proc"), context));
         assert!(!procfs_access_never_grantable(
+            Path::new("/proc"),
+            Path::new("/proc"),
+            context
+        ));
+        assert!(!procfs_access_never_grantable(
+            Path::new("/home/user/file"),
             Path::new("/home/user/file"),
             context
         ));
+    }
+
+    #[test]
+    fn test_procfs_access_never_grantable_through_parent_traversal() {
+        let context = ProcfsAccessContext::new(4242, Some(4343));
+        // The raw form names the requester's own PID; canonicalization reveals
+        // another process's entry.
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/4242/../1/cmdline"),
+            Path::new("/proc/1/cmdline"),
+            context
+        ));
+        // A link that canonicalizes outside /proc keeps its raw-form block.
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/1/cwd"),
+            Path::new("/home/user"),
+            context
+        ));
+        // Traversal that lands back on the requester's own entry is still allowed.
+        assert!(!procfs_access_never_grantable(
+            Path::new("/proc/4242/../4242/status"),
+            Path::new("/proc/4242/status"),
+            context
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_open_path_for_access_blocks_parent_traversal_to_foreign_proc_entry() {
+        let own_pid = std::process::id();
+        let context = ProcfsAccessContext::new(own_pid, None);
+        let traversal = PathBuf::from(format!("/proc/{own_pid}/../1/cmdline"));
+        let error = open_path_for_access(
+            &traversal,
+            &nono::AccessMode::Read,
+            &[],
+            &[],
+            None,
+            Some(context),
+        )
+        .expect_err("a foreign procfs entry must not open through traversal");
+        assert!(error.is_policy_blocked());
+
+        // The requester's own entries still open.
+        let own = PathBuf::from(format!("/proc/{own_pid}/status"));
+        assert!(
+            open_path_for_access(&own, &nono::AccessMode::Read, &[], &[], None, Some(context))
+                .is_ok()
+        );
     }
 
     #[test]

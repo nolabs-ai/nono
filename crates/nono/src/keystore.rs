@@ -1645,7 +1645,7 @@ fn apply_keyring_decode(
                     redacted_uri, GO_KEYRING_PREFIX
                 ))
             })?;
-            let bytes = crate::trust::base64::base64_decode(encoded).map_err(|e| {
+            let bytes = crate::base64::base64_decode(encoded).map_err(|e| {
                 NonoError::ConfigParse(format!(
                     "failed to base64-decode go-keyring value for '{}': {}",
                     redacted_uri, e

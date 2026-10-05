@@ -28,7 +28,7 @@
 //! - Project-level policy cannot weaken user-level enforcement
 //! - No TOFU: files must have valid signatures from trusted publishers on first encounter
 
-pub mod base64;
+pub use crate::base64;
 pub mod bundle;
 pub mod digest;
 pub mod dsse;

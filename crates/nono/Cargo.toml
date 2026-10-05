@@ -13,10 +13,19 @@ keywords = ["sandbox", "security", "capability", "landlock", "seatbelt"]
 categories = ["os", "api-bindings"]
 
 [features]
-default = ["system-keyring"]
+default = ["system-keyring", "sigstore"]
 # Enables OS system keyring access (macOS Keychain / Linux Secret Service).
 # Headless/container consumers opt out with default-features = false.
 system-keyring = ["dep:keyring"]
+# Sigstore bundle verification and keyed audit attestation.
+# Default on. Sandbox-only consumers use default-features = false and
+# leave this off, which drops reqwest and aws-lc-sys.
+sigstore = [
+    "dep:sigstore-verify",
+    "dep:sigstore-trust-root",
+    "dep:x509-cert",
+    "dep:der",
+]
 
 [dependencies]
 thiserror.workspace = true
@@ -43,18 +52,12 @@ libc = "0.2"
 # backend to its defaults.
 keyring = { version = "3", optional = true, default-features = false }
 
-# Sigstore bundle verification.
-# `sigstore-trust-root` is pinned to 0.6.3 because 0.6.5 made
-# `TufSigningConfig::production()` async without bumping major,
-# breaking sigstore-sign 0.6.3 (which the sigstore-verify graph pulls
-# transitively even though we don't use it directly). We don't depend
-# on sigstore-sign or sigstore-trust-root in our own code; this pin
-# exists purely to keep the resolver on a coherent 0.6.3-era set
-# until the upstream API churn settles.
-sigstore-verify = { version = "0.11.0", default-features = false }
-sigstore-trust-root = "=0.11.0"
-x509-cert = { version = "0.3", default-features = false }
-der = { version = "0.8", default-features = false }
+# Sigstore bundle verification. Behind the `sigstore` feature.
+# `sigstore-trust-root` stays on the same 0.11 line as `sigstore-verify`.
+sigstore-verify = { version = "0.11.0", default-features = false, optional = true }
+sigstore-trust-root = { version = "=0.11.0", optional = true }
+x509-cert = { version = "0.3", default-features = false, optional = true }
+der = { version = "0.8", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true

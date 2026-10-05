@@ -511,7 +511,10 @@ pub async fn handle_reverse_proxy(
 
     let (upstream_scheme, upstream_host, upstream_port, upstream_path_full) =
         parse_upstream_url(&upstream_url)?;
-    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
+    let check = ctx
+        .filter
+        .check_route_upstream(&upstream_host, upstream_port)
+        .await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();
         warn!("Upstream host denied by filter: {}", reason);
@@ -803,7 +806,10 @@ async fn handle_spiffe_route(
     debug!("SPIFFE forward to upstream: {} {}", method, upstream_url);
     let (upstream_scheme, upstream_host, upstream_port, upstream_path_full) =
         parse_upstream_url(&upstream_url)?;
-    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
+    let check = ctx
+        .filter
+        .check_route_upstream(&upstream_host, upstream_port)
+        .await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();
         warn!("Upstream host denied by filter: {}", reason);
@@ -1473,7 +1479,10 @@ async fn handle_oauth2_like(
     let upstream_url = format!("{}{}", upstream.trim_end_matches('/'), upstream_path);
     let (upstream_scheme, upstream_host, upstream_port, upstream_path_full) =
         parse_upstream_url(&upstream_url)?;
-    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
+    let check = ctx
+        .filter
+        .check_route_upstream(&upstream_host, upstream_port)
+        .await?;
     if !check.result.is_allowed() {
         send_error(stream, 403, "Forbidden").await?;
         return Ok(());

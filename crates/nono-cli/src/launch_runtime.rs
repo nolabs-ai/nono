@@ -166,6 +166,13 @@ pub(crate) struct ProxyLaunchOptions {
     /// Profile-declared client-side proxy bypass entries for generated
     /// NO_PROXY/no_proxy.
     pub(crate) no_proxy: Vec<String>,
+    /// When `true`, the proxy refuses to reach the loopback interface, so the
+    /// child cannot use the proxy to sidestep a credential route and talk to
+    /// the real local service. Set from profile `network.block_loopback`.
+    pub(crate) block_loopback: bool,
+    /// Loopback ports that stay reachable under `block_loopback`. Set from
+    /// profile `network.loopback_allow`.
+    pub(crate) loopback_allow: Vec<u16>,
     /// When true, the proxy does not allocate the in-memory network audit
     /// buffer. Set from `--no-audit`. Does not change filter, credentials,
     /// or fail-closed auth.

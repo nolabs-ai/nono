@@ -269,6 +269,14 @@ The proxy resolves DNS itself and checks all resolved IP addresses against the l
 
 Link-local IPs (169.254.0.0/16, fe80::/10) are always blocked after DNS resolution. Cloud metadata hostnames are also hardcoded as denied. Private network addresses (RFC1918) are allowed to support enterprise environments.
 
+### Loopback Egress
+
+Kernel enforcement pins the child to `loopback:<proxy port>`, so the proxy is the only route off the child's loopback interface. The proxy itself will reach any loopback destination by default, which matters when a credential route mediates access to a local service: the child can address that service directly through the proxy instead of through the route, skipping credential injection and any endpoint rules on it.
+
+`network.block_loopback` makes the proxy refuse loopback destinations. A configured credential route still reaches its own upstream, because the exemption is scoped to the proxy dialling on that route's behalf rather than to the upstream address — a client asking the proxy for that address directly is refused, so it cannot step around the route's endpoint policy or credential injection. `network.loopback_allow` lists any further ports reachable on loopback. The check runs before the host allowlist, so a wildcard `allow_domain` cannot shadow it, and it covers `127.0.0.0/8`, `::1`, IPv4-mapped loopback, the unspecified addresses `0.0.0.0` and `::` (which reach localhost when connected to), `localhost` and `.localhost` names, and any hostname that resolves onto loopback.
+
+This is opt-in and off by default: loopback, like RFC1918, stays reachable unless a profile asks otherwise.
+
 ### Credential Isolation
 
 In reverse proxy mode, API credentials are loaded from the system keyring at proxy startup and stored in the supervisor's memory as `Zeroizing<String>`. They are never passed to the sandboxed child:

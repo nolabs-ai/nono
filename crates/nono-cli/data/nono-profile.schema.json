@@ -873,6 +873,19 @@
           "type": "boolean",
           "description": "Block network access. Network is allowed by default; set to true to deny all outbound traffic."
         },
+        "block_loopback": {
+          "type": "boolean",
+          "description": "Refuse to proxy to the loopback interface. Independent of `block`. Stops the sandboxed process from using the nono proxy to reach a local service directly and bypass the credential route that mediates it. Upstreams of configured credential routes stay reachable. Defaults to false."
+        },
+        "loopback_allow": {
+          "type": "array",
+          "description": "Loopback ports that remain reachable when `block_loopback` is set. Credential-route upstreams are exempt automatically and do not need listing. Has no effect unless `block_loopback` is true.",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        },
         "allow_http2": {
           "type": "boolean",
           "description": "Allow HTTP/2 to upstream servers via ALPN negotiation. Defaults to false (HTTP/1.1 with keep-alive). Equivalent to the --allow-http2 CLI flag."

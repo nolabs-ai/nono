@@ -151,13 +151,15 @@ fn rewrite_absolute_to_origin_form(line: &str) -> Result<String> {
 }
 
 /// Strip hop-by-hop proxy headers (`Proxy-Connection`, `Proxy-Authorization`)
-/// from a raw header block before forwarding upstream.
+/// and the client's `Connection` header from a raw header block before
+/// forwarding upstream.
 ///
 /// These headers are meaningful only on the client<->proxy hop and must never
-/// be forwarded: `Proxy-Authorization` carries the session token, and
-/// `Proxy-Connection` is a non-standard hop-by-hop hint. Other headers
-/// (including `Host`) are preserved verbatim so the forwarded request matches
-/// what the client sent.
+/// be forwarded: `Proxy-Authorization` carries the session token,
+/// `Proxy-Connection` is a non-standard hop-by-hop hint, and `Connection` is
+/// replaced by the `Connection: close` the caller appends (the proxy opens one
+/// upstream connection per request). Other headers (including `Host`) are
+/// preserved verbatim so the forwarded request matches what the client sent.
 fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
     let header_str = match std::str::from_utf8(header_bytes) {
         Ok(s) => s,
@@ -168,7 +170,8 @@ fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(header_bytes.len());
     for line in header_str.split_inclusive("\r\n") {
         let name = line.split(':').next().unwrap_or("").trim();
-        if name.eq_ignore_ascii_case("proxy-connection")
+        if name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("proxy-connection")
             || name.eq_ignore_ascii_case("proxy-authorization")
             || name.eq_ignore_ascii_case("content-length")
             || name.eq_ignore_ascii_case("transfer-encoding")
@@ -230,7 +233,8 @@ fn strip_and_redeem_proxy_headers(
             continue;
         };
         let trimmed_name = name.trim();
-        if trimmed_name.eq_ignore_ascii_case("proxy-connection")
+        if trimmed_name.eq_ignore_ascii_case("connection")
+            || trimmed_name.eq_ignore_ascii_case("proxy-connection")
             || trimmed_name.eq_ignore_ascii_case("proxy-authorization")
             || trimmed_name.eq_ignore_ascii_case("content-length")
             || trimmed_name.eq_ignore_ascii_case("transfer-encoding")
@@ -2093,8 +2097,8 @@ async fn handle_forward_http(
     };
 
     // Build the origin-form request bytes: rewritten request line +
-    // proxy-header-stripped header block + optional Content-Length +
-    // terminating CRLF.
+    // proxy-header-stripped header block + `Connection: close` + optional
+    // Content-Length + terminating CRLF.
     let origin_line = rewrite_absolute_to_origin_form(first_line)?;
     let inbound_path = origin_line
         .split_whitespace()
@@ -2137,6 +2141,11 @@ async fn handle_forward_http(
     let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 64);
     request_bytes.extend_from_slice(origin_line.as_bytes());
     request_bytes.extend_from_slice(&filtered_headers);
+    // One upstream connection per request, as `reverse.rs` and the TLS
+    // intercept path do: a keep-alive upstream that honours this closes the
+    // socket once the response is complete instead of leaving the relay
+    // waiting for EOF (#1977).
+    request_bytes.extend_from_slice(b"Connection: close\r\n");
     // Always re-frame when the client declared a body (CL or chunked TE),
     // including empty bodies — otherwise upstreams may answer 411 or hang.
     if reverse::should_reframe_with_content_length(header_bytes) {
@@ -5092,6 +5101,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn strip_proxy_headers_drops_client_connection_header() {
+        let headers = b"Host: example.com\r\nconnection: keep-alive, TE\r\nAccept: */*\r\n";
+        let s = String::from_utf8(strip_proxy_headers(headers)).unwrap();
+        assert!(
+            !s.to_lowercase().contains("connection"),
+            "client Connection must not be forwarded next to Connection: close, got: {s:?}"
+        );
+        assert!(s.contains("Host: example.com") && s.contains("Accept: */*"));
+    }
+
     struct TestResolver {
         nonce: String,
         real: Vec<u8>,
@@ -5253,6 +5273,21 @@ mod tests {
         assert_eq!(redeemed, headers);
     }
 
+    #[test]
+    fn strip_and_redeem_proxy_headers_drops_client_connection_header() {
+        let resolver = TestResolver {
+            nonce: make_nonce(),
+            real: b"real-secret".to_vec(),
+            admitted_consumer: "proxy.headroom".to_string(),
+            credential_name: "partner-token".to_string(),
+        };
+        let headers = b"Host: example.com\r\nConnection: keep-alive, TE\r\nAccept: */*\r\n";
+        let (out, swapped) =
+            strip_and_redeem_proxy_headers(headers, "proxy.headroom", &[], &resolver);
+        assert!(!swapped);
+        assert_eq!(out, b"Host: example.com\r\nAccept: */*\r\n");
+    }
+
     /// A route declaring `redeem_phantoms` redeems by credential name, so the
     /// absolute-form path must admit a phantom the consumer grant set would not.
     #[test]
@@ -5363,6 +5398,92 @@ mod tests {
             }
         });
         (addr, rx)
+    }
+
+    /// Keep-alive origin that honours `Connection: close`: it answers with a
+    /// close-delimited response, then closes its socket only if the request
+    /// asked for it, otherwise it holds the connection open. Yields the raw
+    /// request it received.
+    async fn spawn_keepalive_origin_honouring_close()
+    -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let received = String::from_utf8_lossy(&buf[..n]).to_string();
+                let wants_close = received.to_lowercase().contains("connection: close");
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nok")
+                    .await;
+                let _ = sock.flush().await;
+                let _ = tx.send(received);
+                if !wants_close {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+            }
+        });
+        (addr, rx)
+    }
+
+    /// #1977: the forward-http path asks the upstream to close after the
+    /// response (as `reverse.rs` and the TLS intercept path already do), so a
+    /// keep-alive upstream that honours it lets the handler return. The
+    /// client's own `Connection: keep-alive` must not reach the upstream.
+    #[tokio::test]
+    async fn forward_http_sends_connection_close_upstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, origin_rx) = spawn_keepalive_origin_honouring_close().await;
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("nono:{}", handle.token.as_str()))
+        };
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let request = format!(
+            "GET http://127.0.0.1:{p}/ HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nConnection: keep-alive\r\nProxy-Authorization: Basic {creds}\r\n\r\n",
+            p = origin_addr.port()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        // The handler returns (client sees EOF) only once the upstream has
+        // closed, which this origin does only when asked to.
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .expect("handler should return once the upstream closes after the response")
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).ends_with("\r\n\r\nok"),
+            "unexpected response: {:?}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let received = origin_rx.await.unwrap().to_lowercase();
+        assert_eq!(
+            received.matches("connection:").count(),
+            1,
+            "upstream must see exactly one Connection header: {received:?}"
+        );
+        assert!(
+            received.contains("\r\nconnection: close\r\n"),
+            "upstream must be asked to close: {received:?}"
+        );
     }
 
     /// Absolute-form http:// to an ALLOWED host is forwarded and returns the

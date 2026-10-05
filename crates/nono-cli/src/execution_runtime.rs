@@ -781,6 +781,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             let exit_result = execute_supervised_runtime(SupervisedRuntimeContext {
                 config: &config,
                 caps: &caps,
+                deny_paths: &deny_paths,
                 command: &command_display,
                 session,
                 rollback,

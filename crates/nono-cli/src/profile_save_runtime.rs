@@ -878,7 +878,12 @@ pub(crate) fn write_profile(prepared: &PreparedProfileSave) -> Result<()> {
             })?;
             format!("{profile_json}\n")
         }
-        SaveAction::Updated => updated_profile_text(&prepared.profile_path, &prepared.patch)?,
+        SaveAction::Updated => {
+            // Checked again here as well as in prepare: the file may have been
+            // swapped in between, and every writer must go through the check.
+            writable_profile_path(&prepared.profile_path)?;
+            updated_profile_text(&prepared.profile_path, &prepared.patch)?
+        }
     };
     atomic_write(&prepared.profile_path, contents.as_bytes())
 }
@@ -3404,6 +3409,37 @@ mod tests {
             .and_then(|prepared| write_profile(&prepared));
 
         match result {
+            Err(NonoError::LearnError(msg)) => {
+                assert!(msg.contains(&agent.display().to_string()), "{msg}")
+            }
+            other => panic!("expected LearnError, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&other).expect("read other"),
+            other_text
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_refuses_target_swapped_after_prepare() {
+        let project = TempDir::new().expect("tempdir");
+        let root = project.path().canonicalize().expect("canonicalize");
+        let agent = root.join("agent.json");
+        std::fs::write(&agent, r#"{ "meta": { "name": "agent" } }"#).expect("write agent");
+        let other = root.join("other.json");
+        let other_text = r#"{ "meta": { "name": "other" } }"#;
+        std::fs::write(&other, other_text).expect("write other");
+
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+        let prepared =
+            prepare_profile_save_to_file(&patch, &agent, "./agent.json").expect("prepare");
+
+        std::fs::remove_file(&agent).expect("remove agent");
+        std::os::unix::fs::symlink(&other, &agent).expect("symlink agent to other");
+
+        match write_profile(&prepared) {
             Err(NonoError::LearnError(msg)) => {
                 assert!(msg.contains(&agent.display().to_string()), "{msg}")
             }

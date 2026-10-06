@@ -47,6 +47,38 @@ Profile files use **JSONC** (JSON with Comments): standard JSON plus `//` line c
 
 This profile inherits everything from `default` and adds one extra directory. The base profile is unchanged.
 
+### Extending a harness profile from a project
+
+The most common pattern is a project profile that builds on a harness profile such as `claude-code`, optionally with a shared base file kept next to it:
+
+```json
+{
+  "extends": ["claude-code", "../shared/base.json"],
+  "filesystem": {
+    "allow": ["./build"]
+  }
+}
+```
+
+Save it as `./.nono/agent.json` and run it with `nono run --profile ./.nono/agent.json -- claude`.
+
+An `extends` entry that starts with `./` or `../` is a file path, resolved against the directory of the file that declares it. Any other entry is a profile name, as before.
+
+- The file must end in `.json` or `.jsonc`.
+- Entries starting with `/` or `~` are rejected: ``absolute and `~/` paths are not supported in `extends`; use a relative path``. Write `./shared/base.json`; `shared/base.json` without the `./` is read as a profile name and is invalid.
+- A path that points into the pack store is rejected: ``extend a pack by name (`org/pack`), not by path``. Extend packs by name.
+- Path entries are rejected in pack profiles, profile drafts, and built-in profiles. A draft is moved by `nono profile promote`, which would break its relative paths.
+- A base file reached by path finds its own bare-name entries (such as `"extends": "team-base"`) among the files next to it.
+- Cycles are detected by canonical path and fail the load.
+
+The `--extends` flag accepts the same entries. A path given on the command line is resolved against the current directory, and works with pack and built-in profiles selected by `--profile`:
+
+```bash
+nono run --profile claude-code --extends ./team-base.json -- claude
+```
+
+`nono profile init --extends ../base.json` writes the entry as you gave it and checks it relative to the output file.
+
 ### What happens when profiles are combined
 
 When nono loads a profile that extends a base, it merges the two together. Most fields fall into one of two patterns:
@@ -463,6 +495,29 @@ them as `read`, `read_file`, `allow`, or `allow_file` grants. The interactive
 selector ignores input for its first second and discards queued keypresses
 before enabling its controls, preventing input intended for the command that
 just exited from immediately confirming the default grants.
+
+### Choosing which file the save prompt updates
+
+After a run, the save prompt can write the shown rules into any writable file the profile came from: the file given to `--profile`, a user profile, a draft, or any writable file in its `extends` chain. Files that come from a pack are never offered.
+
+With one writable file, the prompt names it:
+
+```text
+Update existing profile '/work/app/.nono/agent.json' with the shown rules? [g] save / [Enter] skip:
+```
+
+With two or more, the prompt asks which one to update. The top-level profile is listed first and is the default; its bases follow in precedence order:
+
+```text
+Save the selected rules to:
+  1) /work/app/.nono/agent.json    (this profile)
+  2) /work/shared/base.json        (base — applies to every profile that extends it)
+Choice [1]:
+```
+
+Press Enter for the default, type a number to pick a file, or type `skip` to cancel. Saving to a base applies the rules to every profile that extends it. "A new user profile" is offered only when no writable file exists.
+
+Updates keep your JSONC comments and layout and only add entries. A profile file that is a symlink is updated at its target.
 
 ### Suppressing Expected macOS System-Service Diagnostics
 

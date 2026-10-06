@@ -874,13 +874,6 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         .file_name()
         .ok_or_else(|| NonoError::LearnError(format!("Invalid profile path {}", path.display())))?;
 
-    // Use a sibling temp file so the final rename is same-filesystem and
-    // therefore atomic on POSIX.
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(file_name);
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
-    let tmp_path = dir.join(&tmp_name);
-
     let write_err = |stage: &str, e: std::io::Error| {
         NonoError::LearnError(format!(
             "Failed to {} profile {}: {}",
@@ -890,26 +883,32 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         ))
     };
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)
+    // The directory may be writable by the sandboxed agent, so the temp file
+    // gets a random name and is created exclusively (O_EXCL): a name the agent
+    // planted, such as a symlink to a shell rc file, is never opened. A sibling
+    // keeps the final rename same-filesystem and therefore atomic on POSIX.
+    let mut prefix = std::ffi::OsString::from(".");
+    prefix.push(file_name);
+    prefix.push(".");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    // Match a plain create: mode 0666 filtered by the umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut file = builder
+        .tempfile_in(dir)
         .map_err(|e| write_err("open temp file for", e))?;
-    if let Err(e) = file.write_all(contents) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(write_err("write", e));
-    }
-    if let Err(e) = file.sync_all() {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(write_err("sync", e));
-    }
-    drop(file);
-
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(write_err("rename into place", e));
-    }
+    // Dropping `file` on an early return removes the temp file.
+    file.write_all(contents)
+        .map_err(|e| write_err("write", e))?;
+    file.as_file()
+        .sync_all()
+        .map_err(|e| write_err("sync", e))?;
+    file.persist(path)
+        .map_err(|e| write_err("rename into place", e.error))?;
     Ok(())
 }
 
@@ -1808,9 +1807,10 @@ pub(crate) fn prepare_profile_save_to_file(
     })
 }
 
-/// Re-resolve a save target just before writing to it. The target was
-/// classified when the profile loaded, but the sandboxed agent may since have
-/// replaced a parent directory with a symlink into the pack store.
+/// Re-check a save target just before writing to it. `path` is the canonical
+/// path recorded when the profile loaded, but the sandboxed agent may since
+/// have swapped it, or a parent directory, for a symlink to another file (a
+/// user profile, the pack store), or for a FIFO that would hang the read.
 fn writable_profile_path(path: &Path) -> Result<PathBuf> {
     let canonical = std::fs::canonicalize(path).map_err(|e| {
         NonoError::LearnError(format!(
@@ -1818,14 +1818,22 @@ fn writable_profile_path(path: &Path) -> Result<PathBuf> {
             path.display()
         ))
     })?;
-    if !profile::ProfileSourceFile::new(canonical.clone())
-        .kind
-        .is_writable()
-    {
+    if canonical != path {
         return Err(NonoError::LearnError(format!(
-            "Refusing to save to {}: it now resolves into the pack store ({})",
+            "Refusing to save to {}: it now resolves to {}",
             path.display(),
             canonical.display()
+        )));
+    }
+    let is_file = std::fs::metadata(&canonical)
+        .map_err(|e| {
+            NonoError::LearnError(format!("Cannot read profile file {}: {e}", path.display()))
+        })?
+        .is_file();
+    if !is_file {
+        return Err(NonoError::LearnError(format!(
+            "Refusing to save to {}: it is not a regular file",
+            path.display()
         )));
     }
     Ok(canonical)
@@ -2893,9 +2901,12 @@ mod tests {
         let mut patch = profile::Profile::default();
         patch.filesystem.read = vec!["/new".to_string()];
 
-        let prepared =
-            prepare_profile_save_to_file(&patch, &profile_path, "./proj/.nono/agent.json")
-                .expect("prepare");
+        let prepared = prepare_profile_save_to_file(
+            &patch,
+            &profile_path.canonicalize().expect("canonicalize"),
+            "./proj/.nono/agent.json",
+        )
+        .expect("prepare");
 
         assert!(matches!(prepared.action, SaveAction::Updated));
         assert_eq!(
@@ -2979,8 +2990,9 @@ mod tests {
     #[test]
     fn menu_choice_two_writes_base_only() {
         let dir = TempDir::new().expect("tempdir");
-        let top = dir.path().join("top.json");
-        let base = dir.path().join("base.json");
+        let root = dir.path().canonicalize().expect("canonicalize");
+        let top = root.join("top.json");
+        let base = root.join("base.json");
         let top_text = "{ \"meta\": { \"name\": \"top\" }, \"extends\": [\"./base.json\"] }\n";
         std::fs::write(&top, top_text).expect("write top");
         std::fs::write(
@@ -3095,6 +3107,59 @@ mod tests {
                 pack_before
             );
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_target_swapped_for_symlink_to_another_profile() {
+        let project = TempDir::new().expect("tempdir");
+        let root = project.path().canonicalize().expect("canonicalize");
+        let agent = root.join("agent.json");
+        std::fs::write(&agent, r#"{ "meta": { "name": "agent" } }"#).expect("write agent");
+        let other = root.join("other.json");
+        let other_text = r#"{ "meta": { "name": "other" } }"#;
+        std::fs::write(&other, other_text).expect("write other");
+
+        std::fs::remove_file(&agent).expect("remove agent");
+        std::os::unix::fs::symlink(&other, &agent).expect("symlink agent to other");
+
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+        let result = prepare_profile_save_to_file(&patch, &agent, "./agent.json")
+            .and_then(|prepared| write_profile(&prepared));
+
+        match result {
+            Err(NonoError::LearnError(msg)) => {
+                assert!(msg.contains(&agent.display().to_string()), "{msg}")
+            }
+            other => panic!("expected LearnError, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&other).expect("read other"),
+            other_text
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_non_regular_target() {
+        let project = TempDir::new().expect("tempdir");
+        let fifo = project
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("agent.json");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+
+        let patch = profile::Profile::default();
+        let result = prepare_profile_save_to_file(&patch, &fifo, "./agent.json");
+
+        match result {
+            Err(NonoError::LearnError(msg)) => {
+                assert!(msg.contains(&fifo.display().to_string()), "{msg}")
+            }
+            other => panic!("expected LearnError, got {:?}", other.map(|_| ())),
+        }
     }
 
     fn write_jsonc_user_profile(name: &str, contents: &str) -> PathBuf {
@@ -3477,9 +3542,28 @@ mod tests {
             .any(|e| {
                 e.file_name()
                     .to_string_lossy()
-                    .starts_with(".profile.json.tmp.")
+                    .starts_with(".profile.json.")
             });
         assert!(!leftover, "temp file should be renamed into place");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_does_not_follow_a_planted_temp_symlink() {
+        let dir = TempDir::new().expect("temp dir");
+        let target = dir.path().join("agent.json");
+        std::fs::write(&target, b"original\n").expect("seed");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim\n").expect("seed victim");
+        let planted = dir
+            .path()
+            .join(format!(".agent.json.tmp.{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).expect("plant symlink");
+
+        atomic_write(&target, b"updated\n").expect("atomic write");
+
+        assert_eq!(std::fs::read(&victim).expect("read victim"), b"victim\n");
+        assert_eq!(std::fs::read(&target).expect("read target"), b"updated\n");
     }
 
     // ─── URL denial patch tests ───────────────────────────────────────────

@@ -1,8 +1,8 @@
-# Relative paths in `extends` (phase 1) — design
+# Relative paths in `extends`, and save to an extended profile — design
 
 Issue: [nolabs-ai/nono#2065](https://github.com/nolabs-ai/nono/issues/2065).
-Phase 2 (choose the save target on exit) is described in the issue and gets its
-own spec.
+Both phases ship in one PR. Phase 1 commits come first; phase 2 builds on the
+phase 1 writer and path-profile save.
 
 ## Goal
 
@@ -12,6 +12,10 @@ in the save-on-exit flow that block path-based profiles:
 
 - Bug 3: `--profile ./x.json` cannot be updated on exit.
 - Bug 4: updating a profile rewrites it with `serde_json` and strips comments.
+
+Phase 2: on exit, the user can save grants to any writable profile file in the
+resolved `extends` chain, not only the top-level profile. Pack and built-in
+profiles are never offered.
 
 ## Entry syntax
 
@@ -117,13 +121,82 @@ The CST write is the only writer for updates, so the set of patched fields
 lives in two places (`merge_profile_patch` and the CST glue). A test pins them
 together (below).
 
+## Phase 2: choose the save target on exit
+
+### Recording where each layer came from
+
+Add `source_files: Vec<ProfileSourceFile>` to `Profile` (`#[serde(skip)]`, not
+part of the file format). It is filled at load and merged in `merge_profiles`
+the same way as `packs`. Each entry has the canonical path and a kind:
+
+| Kind | How it is detected | Writable |
+|---|---|---|
+| User | under `user_profile_dir()` | yes |
+| Draft | under `user_profile_draft_dir()` | yes |
+| Project | any other file (path entry, `--profile <path>`, sibling) | yes |
+| Pack | under `package_store_dir()` | no — verification fails on change and `nono pull` replaces it |
+| Built-in | no file | not listed |
+
+Detection uses `Path::starts_with` on canonical paths. The list is recorded at
+load, so the save offer uses the files the session actually ran with. It is
+not re-walked at exit.
+
+The loaded profile's `source_files` (writable entries only) is passed to
+`ProfileSaveOffer` next to `profile_save_base`.
+
+### Save flow
+
+1. The session ends with denials. nono builds the patch (no change).
+2. The user selects items in the selector or the text prompt (no change).
+   The `override` confirmation stays where it is.
+3. Build the target list:
+   - Writable source files, top-level profile first, then bases in resolution
+     order (depth-first, left to right). Remove duplicates.
+   - "a new user profile", only when the top-level profile was selected by
+     name or registry ref, or there is no profile. A new user profile cannot
+     extend a path profile (absolute paths are out of scope), so it would drop
+     the user's base.
+4. If the list has one entry, behave as today: update that file, or prompt for
+   a new user profile name.
+5. If the list has two or more entries, show a numbered menu. The same menu is
+   used after the interactive selector and in the text prompt (the selector
+   has already left raw mode).
+
+   ```
+   Save the selected rules to:
+     1) /path/proj/.nono/agent.json    (this profile)
+     2) /path/proj/shared/base.json    (base — applies to every profile that extends it)
+     3) a new user profile
+   Choice [1]:
+   ```
+
+   - Enter selects 1. `skip` cancels. Invalid input prints help and asks again.
+   - Paths are shown in full: a project file can be in a git repo.
+6. Write to the chosen file with the phase 1 CST writer, or run the existing
+   new-user-profile flow.
+
+No terminal (`terminal_prompts_available()` is false): no prompt, as today.
+
+### Phase 2 tests
+
+- Source recording: user, draft, project, pack, built-in layers get the right
+  kind; a pack layer is never in the writable list; merge keeps all layers.
+- Target list order: top-level first, then bases depth-first left to right;
+  duplicates removed.
+- "a new user profile" is listed for a named top-level profile and absent for
+  a path top-level profile.
+- One target: no menu, current behaviour.
+- Menu: Enter picks the top-level profile; `2` writes to the base and leaves the
+  top-level file unchanged; `skip` writes nothing; invalid input re-prompts.
+- Writing to a base keeps its comments (phase 1 writer).
+
 ## Out of scope
 
 - Absolute and `~/` paths (reasons in the issue).
 - `.json` vs `.jsonc` precedence in bare-name sibling lookup. Today sibling
   lookup checks only `.json`, and the user dir prefers `.jsonc`. Changing that
   alters existing resolution; it needs its own issue.
-- Phase 2 (save to a base profile).
+- Choosing a different save target per item.
 
 ## Security notes
 
@@ -136,6 +209,10 @@ together (below).
   cycle detection.
 - TOCTOU: the file is canonicalized and read once per resolution, the same as
   sibling lookup today.
+- A grant saved to a shared base applies to every profile that extends it. The
+  menu says so, and the default is the top-level profile.
+- Pack files are never write targets, so a save cannot break pack
+  verification.
 - Linux and macOS: no change to enforcement. The resolved profile goes through
   the same merge and validation.
 
@@ -171,4 +248,6 @@ Save:
 ## Docs
 
 Update `docs/cli/features/profile-authoring.mdx` ("How `extends` Works") with
-path entries, the rules, and the error cases.
+path entries, the rules, and the error cases. Update the post-run save prompt
+text near line 460 of the same page with the save-target menu and which files
+it offers.

@@ -103,7 +103,9 @@ main pattern is still a project profile with `"extends": "claude-code"`, run
 as `--profile ./.nono/agent.json`; that needs no CLI change.
 
 One function owns classification and resolution
-(`classify_extends_entry(raw, base_dir, declaring_file) -> Result<ExtendsRef>`).
+(`classify_extends_entry(raw, origin: ExtendsOrigin) -> Result<ExtendsRef>`, where
+`ExtendsOrigin` is `File(declaring_file)`, `Cli(cwd)` or `Builtin`; the origin
+selects the base directory and which rejection rules apply).
 Every caller above uses it.
 
 ## Bug 3: update a path profile on exit
@@ -273,7 +275,9 @@ Save:
 - Equivalence: for a set of patches, `parse(cst_write(original))` equals
   `merge_profile_patch(parse(original), patch)`. This pins the CST field list
   to `merge_profile_patch`.
-- Invalid CST output (forced) leaves the file unchanged and returns an error.
+- A file that is not valid JSON at save time: error, file unchanged.
+- A file that is valid JSONC but not a valid profile (unknown field): the edit
+  succeeds, the re-parse in step 4 fails, error, file unchanged.
 
 ## Docs
 

@@ -75,7 +75,9 @@
 
 - [ ] **Step 4: Run** the same command — all pass.
 
-- [ ] **Step 5: Commit** `feat(profile): classify relative-path extends entries (#2065)`.
+- [ ] **Step 5: Refactor.** Error messages are `const`s that the tests reference; classification reuses `is_registry_ref` / `is_valid_profile_name` rather than copying their logic. Re-run the Step 4 command — still passes.
+
+- [ ] **Step 6: Commit** `feat(profile): classify relative-path extends entries (#2065)`.
 
 ### Task 2: Resolve Path entries written in profile files
 
@@ -102,7 +104,9 @@
 
 - [ ] **Step 4: Run** `cargo test -p nono-cli --bin nono profile::` — all pass.
 
-- [ ] **Step 5: Commit** `feat(profile): resolve relative-path extends entries (#2065)`.
+- [ ] **Step 5: Refactor.** The "invalid base profile name" check in `load_base_profile_raw` is now done by `classify_extends_entry`; remove the duplicate. Path and sibling bases share `parse_file_backed_profile`. Re-run the Step 4 command — still passes.
+
+- [ ] **Step 6: Commit** `feat(profile): resolve relative-path extends entries (#2065)`.
 
 ### Task 3: CLI `--extends` as a separate resolved list
 
@@ -128,7 +132,9 @@ Note: CLI `Name` entries must still resolve with the selected profile's `context
 
 - [ ] **Step 4: Run** `cargo test -p nono-cli --bin nono profile::` — all pass.
 
-- [ ] **Step 5: Commit** `feat(cli): resolve --extends paths against the cwd (#2065)`.
+- [ ] **Step 5: Refactor.** One place converts `&[String]` CLI bases into `Vec<ExtendsRef>`; no leftover `cli_extends: &[String]` parameters below `load_profile_impl`. Re-run the Step 4 command — still passes.
+
+- [ ] **Step 6: Commit** `feat(cli): resolve --extends paths against the cwd (#2065)`.
 
 ### Task 4: Chain walker and `profile init --extends`
 
@@ -150,7 +156,9 @@ Note: CLI `Name` entries must still resolve with the selected profile's `context
 
 - [ ] **Step 4: Run** both commands — pass.
 
-- [ ] **Step 5: Commit** `feat(profile): follow relative extends in pack detection and profile init (#2065)`.
+- [ ] **Step 5: Refactor.** `load_profile_extends` and `load_profile_extends_resolved` share `locate_profile_file`; there is one copy of the lookup order. Re-run the Step 4 command — still passes.
+
+- [ ] **Step 6: Commit** `feat(profile): follow relative extends in pack detection and profile init (#2065)`.
 
 ### Task 5: Comment-preserving profile updates
 
@@ -179,6 +187,7 @@ Note: CLI `Name` entries must still resolve with the selected profile's `context
   In `profile_save_runtime.rs` tests:
   - `write_profile_update_keeps_jsonc_comments` — `.jsonc` user profile with comments, update via `prepare_profile_save_from_patch` + `write_profile`; comments survive.
   - `write_profile_update_invalid_file_left_unchanged` — file rewritten to `{ invalid` after prepare; `write_profile` errs; bytes unchanged (Review Focus 4).
+  - `write_profile_update_rejects_invalid_profile_left_unchanged` — file contains `"bogus_field": 1` (valid JSONC; `ProfileDeserialize` has `deny_unknown_fields`); the CST edit succeeds, the `parse_profile_bytes` re-check fails, `write_profile` errs, bytes unchanged. This pins the re-check itself.
 
 - [ ] **Step 2: Run** `cargo test -p nono-cli --bin nono profile_file_edit` and `profile_save_runtime::tests::write_profile` — fail.
 
@@ -186,7 +195,9 @@ Note: CLI `Name` entries must still resolve with the selected profile's `context
 
 - [ ] **Step 4: Run** both commands, then `cargo test -p nono-cli --bin nono profile_save_runtime` — all pass.
 
-- [ ] **Step 5: Commit** `fix(cli): keep comments when the save prompt updates a profile (#2065)`.
+- [ ] **Step 5: Refactor.** The patched fields are one table in `profile_file_edit.rs` (section, key, accessor), not repeated code per field; the comment in `merge_profile_patch` names it. Re-run the Step 4 command — still passes.
+
+- [ ] **Step 6: Commit** `fix(cli): keep comments when the save prompt updates a profile (#2065)`.
 
 ### Task 6: Record profile source files and thread them to the save offer
 
@@ -224,7 +235,9 @@ Note: CLI `Name` entries must still resolve with the selected profile's `context
 
 - [ ] **Step 4: Run** `cargo test -p nono-cli --bin nono` — all pass (no behaviour change yet).
 
-- [ ] **Step 5: Commit** `feat(profile): record the files a loaded profile came from (#2065)`.
+- [ ] **Step 5: Refactor.** Kind detection lives only in `ProfileSourceFile::new`, reusing `is_under_pack_store` (Task 1) and `is_under_user_profile_draft_dir`. Re-run the Step 4 command — still passes.
+
+- [ ] **Step 6: Commit** `feat(profile): record the files a loaded profile came from (#2065)`.
 
 ### Task 7: Save to the profile file the session ran with
 
@@ -254,7 +267,9 @@ Note: CLI `Name` entries must still resolve with the selected profile's `context
 
 - [ ] **Step 4: Run** `cargo test -p nono-cli --bin nono profile_save_runtime` — pass.
 
-- [ ] **Step 5: Commit** `fix(cli): let the save prompt update a --profile path (#2065)`.
+- [ ] **Step 5: Refactor.** The selector and text-prompt flows share one helper that writes to a `SaveTarget`; no duplicated `prepare` + `write_profile` + `print_profile_save` sequences. Re-run the Step 4 command — still passes.
+
+- [ ] **Step 6: Commit** `fix(cli): let the save prompt update a --profile path (#2065)`.
 
 ### Task 8: Save-target menu
 
@@ -267,7 +282,8 @@ Note: CLI `Name` entries must still resolve with the selected profile's `context
   ```rust
   fn render_save_target_menu(files: &[PathBuf]) -> String;
   fn parse_save_target_choice(input: &str, count: usize) -> Option<Option<usize>>; // Some(Some(i)) pick, Some(None) skip, None invalid
-  fn prompt_save_target(files: &[PathBuf]) -> Result<Option<PathBuf>>;          // loops on invalid input
+  fn chosen_save_target(files: &[PathBuf], input: &str) -> Option<Option<PathBuf>>; // parse + index into files
+  fn prompt_save_target(files: &[PathBuf]) -> Result<Option<PathBuf>>;          // loops on invalid input; uses chosen_save_target
   ```
 
 - [ ] **Step 1: Write failing tests:**
@@ -280,14 +296,17 @@ Note: CLI `Name` entries must still resolve with the selected profile's `context
     ```
     (column-align the labels; the test asserts each line's prefix, path and label).
   - `parse_choice_enter_is_first` — `""` → `Some(Some(0))`; `"2"` → `Some(Some(1))`; `" skip "` → `Some(None)`; `"3"` with count 2 → `None`; `"x"` → `None`.
+  - `menu_choice_two_writes_base_only` — temp `top.json` and `base.json` (in precedence order); `chosen_save_target(&files, "2")` → `Some(Some(base))`; `prepare_profile_save_to_file(&patch, &base, "./top.json")` + `write_profile`; `base.json` gains the patch entry and `top.json`'s bytes are unchanged.
 
-- [ ] **Step 2: Run** `cargo test -p nono-cli --bin nono profile_save_runtime::tests::render_menu profile_save_runtime::tests::parse_choice` — fail.
+- [ ] **Step 2: Run** `cargo test -p nono-cli --bin nono profile_save_runtime::tests::render_menu profile_save_runtime::tests::parse_choice profile_save_runtime::tests::menu_choice` — fail.
 
 - [ ] **Step 3: Implement.** In Task 7's 2+ files arm, call `prompt_save_target` after the selector/override confirmation and before writing, for both the selector and text-prompt flows (`prompt_print`/`read_input_line`; invalid input prints "Enter a number from 1 to N, press Enter for 1, or type skip." in red). `skip` writes nothing.
 
 - [ ] **Step 4: Run** `cargo test -p nono-cli --bin nono profile_save_runtime` — pass.
 
-- [ ] **Step 5: Commit** `feat(cli): choose which profile file the save prompt updates (#2065)`.
+- [ ] **Step 5: Refactor.** Both flows call `prompt_save_target`; `prompt_save_target` is a thin loop over `chosen_save_target`. Re-run the Step 4 command — still passes.
+
+- [ ] **Step 6: Commit** `feat(cli): choose which profile file the save prompt updates (#2065)`.
 
 ### Task 9: Docs and full verification
 

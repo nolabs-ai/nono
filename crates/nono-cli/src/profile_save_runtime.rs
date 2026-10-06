@@ -762,7 +762,16 @@ fn updated_profile_text(profile_path: &Path, patch: &profile::Profile) -> Result
             e
         ))
     })?;
-    let updated = crate::profile_file_edit::apply_patch_to_profile_text(&original, patch)?;
+    let updated = crate::profile_file_edit::apply_patch_to_profile_text(&original, patch).map_err(
+        |e| match e {
+            NonoError::LearnError(message) => NonoError::LearnError(format!(
+                "Failed to update profile {}: {}",
+                profile_path.display(),
+                message
+            )),
+            other => other,
+        },
+    )?;
     profile::parse_profile_bytes(updated.as_bytes()).map_err(|e| {
         NonoError::LearnError(format!(
             "Updated profile {} would be invalid: {}",
@@ -2788,6 +2797,49 @@ mod tests {
 
         assert!(result.is_err(), "expected error, got {:?}", result.err());
         assert_eq!(std::fs::read(&path).expect("read profile"), b"{ invalid");
+    }
+
+    #[test]
+    fn write_profile_update_edit_error_names_file() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let path = write_jsonc_user_profile(
+            "array-section",
+            "{ \"meta\": { \"name\": \"array-section\", \"version\": \"1.0.0\" } }\n",
+        );
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+        let prepared = prepare_profile_save_from_patch(&patch, "claude", "array-section", None)
+            .expect("prepare");
+
+        let array_section = "{ \"meta\": { \"name\": \"array-section\", \"version\": \"1.0.0\" }, \"filesystem\": [] }\n";
+        std::fs::write(&path, array_section).expect("rewrite profile");
+        let message = write_profile(&prepared)
+            .expect_err("non-object section")
+            .to_string();
+
+        assert!(
+            message.contains(&path.display().to_string()),
+            "message: {message}"
+        );
+        assert_eq!(
+            message.matches("Profile save error:").count(),
+            1,
+            "message: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read profile"),
+            array_section
+        );
     }
 
     #[test]

@@ -78,7 +78,7 @@ where
     deserialize_conditional_string_vec(deserializer, "origin")
 }
 
-fn deserialize_conditional_string_vec<'de, D>(
+pub(crate) fn deserialize_conditional_string_vec<'de, D>(
     deserializer: D,
     value_key: &'static str,
 ) -> std::result::Result<Vec<String>, D::Error>

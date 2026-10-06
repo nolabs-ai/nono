@@ -6,36 +6,50 @@
 
 use crate::profile;
 use jsonc_parser::ParseOptions;
-use jsonc_parser::cst::{CstInputValue, CstObject, CstRootNode};
+use jsonc_parser::cst::{CstArray, CstInputValue, CstObject, CstRootNode};
 use nono::{NonoError, Result};
+use serde::Deserialize;
 use std::collections::HashSet;
 
 type PatchValues = fn(&profile::Profile) -> &[String];
 
-/// The string lists `merge_profile_patch` dedup-appends, as
-/// (parent object key or `None` for the root, array key, patch accessor).
-/// `open_urls.allow_localhost` is a bool and is handled separately.
-const PATCHED_LISTS: &[(Option<&str>, &str, PatchValues)] = &[
-    (Some("filesystem"), "allow", |p| &p.filesystem.allow),
-    (Some("filesystem"), "read", |p| &p.filesystem.read),
-    (Some("filesystem"), "write", |p| &p.filesystem.write),
-    (Some("filesystem"), "allow_file", |p| {
+/// The string lists `merge_profile_patch` dedup-appends, as (parent object
+/// key or `None` for the root, array key, value key of a conditional
+/// `{ "<key>": ..., "when": ... }` entry or `None` if the list has none,
+/// patch accessor). `open_urls.allow_localhost` is a bool and is handled
+/// separately.
+const PATCHED_LISTS: &[(Option<&str>, &str, Option<&str>, PatchValues)] = &[
+    (Some("filesystem"), "allow", Some("path"), |p| {
+        &p.filesystem.allow
+    }),
+    (Some("filesystem"), "read", Some("path"), |p| {
+        &p.filesystem.read
+    }),
+    (Some("filesystem"), "write", Some("path"), |p| {
+        &p.filesystem.write
+    }),
+    (Some("filesystem"), "allow_file", Some("path"), |p| {
         &p.filesystem.allow_file
     }),
-    (Some("filesystem"), "read_file", |p| &p.filesystem.read_file),
-    (Some("filesystem"), "write_file", |p| {
+    (Some("filesystem"), "read_file", Some("path"), |p| {
+        &p.filesystem.read_file
+    }),
+    (Some("filesystem"), "write_file", Some("path"), |p| {
         &p.filesystem.write_file
     }),
-    (Some("filesystem"), "bypass_protection", |p| {
+    (Some("filesystem"), "bypass_protection", Some("path"), |p| {
         &p.filesystem.bypass_protection
     }),
-    (Some("filesystem"), "suppress_save_prompt", |p| {
-        &p.filesystem.suppress_save_prompt
-    }),
-    (None, "unsafe_macos_seatbelt_rules", |p| {
+    (
+        Some("filesystem"),
+        "suppress_save_prompt",
+        Some("path"),
+        |p| &p.filesystem.suppress_save_prompt,
+    ),
+    (None, "unsafe_macos_seatbelt_rules", None, |p| {
         &p.unsafe_macos_seatbelt_rules
     }),
-    (Some("open_urls"), "allow_origins", |p| {
+    (Some("open_urls"), "allow_origins", Some("origin"), |p| {
         p.open_urls.as_ref().map_or(&[], |urls| &urls.allow_origins)
     }),
 ];
@@ -50,24 +64,20 @@ pub(crate) fn apply_patch_to_profile_text(text: &str, patch: &profile::Profile) 
         .object_value_or_create()
         .ok_or_else(|| NonoError::LearnError("Profile root is not an object".to_string()))?;
 
-    for (section, key, patch_values) in PATCHED_LISTS {
+    for (section, key, conditional_key, patch_values) in PATCHED_LISTS {
         let values = patch_values(patch);
         if values.is_empty() {
             continue;
         }
+        let field = section.map_or(key.to_string(), |s| format!("{s}.{key}"));
         let parent = match section {
             Some(section) => section_object(&root_object, section)?,
             None => root_object.clone(),
         };
         let array = parent.array_value_or_create(key).ok_or_else(|| {
-            let path = section.map_or(key.to_string(), |s| format!("{s}.{key}"));
-            NonoError::LearnError(format!("Profile field `{path}` is not an array"))
+            NonoError::LearnError(format!("Profile field `{field}` is not an array"))
         })?;
-        let mut present: HashSet<String> = array
-            .elements()
-            .iter()
-            .filter_map(|node| node.as_string_lit()?.decoded_value().ok())
-            .collect();
+        let mut present = effective_entries(&array, *conditional_key, &field)?;
         for value in values {
             if present.insert(value.clone()) {
                 array.append(value.as_str().into());
@@ -92,7 +102,39 @@ pub(crate) fn apply_patch_to_profile_text(text: &str, patch: &profile::Profile) 
     Ok(root.to_string())
 }
 
+/// The entries of `array` as profile loading sees them on this platform:
+/// a conditional entry counts by its value key when its `when` matches and
+/// is skipped otherwise, so the edit agrees with `merge_profile_patch`.
+fn effective_entries(
+    array: &CstArray,
+    conditional_key: Option<&'static str>,
+    field: &str,
+) -> Result<HashSet<String>> {
+    let invalid = |e: String| NonoError::LearnError(format!("Profile field `{field}`: {e}"));
+    let value: serde_json::Value = crate::jsonc::parse(&array.to_string()).map_err(invalid)?;
+    let entries = match conditional_key {
+        Some(key) => profile::deserialize_conditional_string_vec(value, key),
+        None => Vec::<String>::deserialize(value),
+    }
+    .map_err(|e| invalid(e.to_string()))?;
+    Ok(entries.into_iter().collect())
+}
+
+/// Sections whose profile field is an `Option`, so `null` loads as absent.
+/// `"filesystem": null` does not load and stays an error.
+const NULLABLE_SECTIONS: &[&str] = &["open_urls"];
+
+/// The object at `section`, created when the key is missing, or `null` in a
+/// nullable section.
 fn section_object(root: &CstObject, section: &str) -> Result<CstObject> {
+    if NULLABLE_SECTIONS.contains(&section)
+        && let Some(prop) = root.get(section)
+        && prop
+            .value()
+            .is_some_and(|value| value.as_null_keyword().is_some())
+    {
+        prop.set_value(CstInputValue::Object(Vec::new()));
+    }
     root.object_value_or_create(section)
         .ok_or_else(|| NonoError::LearnError(format!("Profile field `{section}` is not an object")))
 }
@@ -230,17 +272,95 @@ mod tests {
             ..Default::default()
         };
 
-        for patch in [filesystem_lists, bypass, seatbelt, open_urls] {
-            let output = apply_patch_to_profile_text(input, &patch).expect("apply patch");
-            let mut expected = parse(input);
-            merge_profile_patch(&mut expected, &patch);
+        let (current, other) = platforms();
+        let conditional_input = format!(
+            r#"{{
+  "meta": {{ "name": "x" }},
+  "filesystem": {{
+    "read": [{{ "path": "/read-new", "when": "{current}" }}],
+    "write": [{{ "path": "/write-new", "when": "{other}" }}]
+  }},
+  "open_urls": {{
+    "allow_origins": [{{ "origin": "https://new.example.com", "when": "{current}" }}]
+  }}
+}}
+"#
+        );
 
-            assert_eq!(
-                serde_json::to_value(parse(&output)).expect("serialize output"),
-                serde_json::to_value(expected).expect("serialize expected"),
-                "output: {output}"
-            );
+        let patches = [filesystem_lists, bypass, seatbelt, open_urls];
+        for input in [input, conditional_input.as_str()] {
+            for patch in &patches {
+                let output = apply_patch_to_profile_text(input, patch).expect("apply patch");
+                let mut expected = parse(input);
+                merge_profile_patch(&mut expected, patch);
+
+                assert_eq!(
+                    serde_json::to_value(parse(&output)).expect("serialize output"),
+                    serde_json::to_value(expected).expect("serialize expected"),
+                    "output: {output}"
+                );
+            }
         }
+    }
+
+    fn platforms() -> (&'static str, &'static str) {
+        let current = crate::platform::current_os_name();
+        let other = if current == "linux" { "macos" } else { "linux" };
+        (current, other)
+    }
+
+    #[test]
+    fn matching_conditional_entry_counts_as_present() {
+        let (current, _) = platforms();
+        let input = format!(
+            r#"{{
+  "meta": {{ "name": "x" }},
+  "filesystem": {{ "read": [{{ "path": "/a", "when": "{current}" }}] }},
+  "open_urls": {{
+    "allow_origins": [{{ "origin": "https://a.example.com", "when": "{current}" }}]
+  }}
+}}
+"#
+        );
+        let mut patch = patch_with_read(&["/a"]);
+        patch.open_urls = Some(profile::OpenUrlConfig {
+            allow_origins: vec!["https://a.example.com".to_string()],
+            allow_localhost: false,
+        });
+
+        let output = apply_patch_to_profile_text(&input, &patch).expect("apply patch");
+
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn null_open_urls_section_is_created() {
+        let input = r#"{ "meta": { "name": "x" }, "open_urls": null }"#;
+        let patch = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: vec!["https://example.com".to_string()],
+                allow_localhost: true,
+            }),
+            ..Default::default()
+        };
+
+        let output = apply_patch_to_profile_text(input, &patch).expect("apply patch");
+        let open_urls = parse(&output).open_urls.expect("open_urls");
+
+        assert_eq!(open_urls.allow_origins, vec!["https://example.com"]);
+        assert!(open_urls.allow_localhost);
+    }
+
+    #[test]
+    fn null_filesystem_section_errors() {
+        let input = r#"{ "meta": { "name": "x" }, "filesystem": null }"#;
+        let result = apply_patch_to_profile_text(input, &patch_with_read(&["/a"]));
+
+        let message = result.expect_err("null filesystem section").to_string();
+        assert!(
+            message.contains("`filesystem` is not an object"),
+            "message: {message}"
+        );
     }
 
     #[test]
@@ -248,6 +368,10 @@ mod tests {
         let input = r#"{ "meta": { "name": "x" }, "filesystem": [] }"#;
         let result = apply_patch_to_profile_text(input, &patch_with_read(&["/a"]));
 
-        assert!(result.is_err(), "expected error, got {result:?}");
+        let message = result.expect_err("non-object section").to_string();
+        assert!(
+            message.contains("`filesystem` is not an object"),
+            "message: {message}"
+        );
     }
 }

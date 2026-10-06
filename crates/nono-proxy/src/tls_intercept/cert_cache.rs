@@ -24,7 +24,8 @@
 use crate::error::{ProxyError, Result};
 use crate::tls_intercept::ca::EphemeralCa;
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256, SanType,
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
+    PKCS_ECDSA_P256_SHA256, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -150,6 +151,10 @@ fn mint_leaf(
     // (OpenSSL 3.6+, BoringSSL) reject leaves without AKI with
     // "Missing Authority Key Identifier".
     params.use_authority_key_identifier_extension = true;
+
+    // Apple's TLS policy (macOS 10.15+, iOS 13+) rejects server certificates
+    // without an Extended Key Usage extension containing id-kp-serverAuth.
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
 
     let now = SystemTime::now();
     let ca_not_after = ca.not_after();

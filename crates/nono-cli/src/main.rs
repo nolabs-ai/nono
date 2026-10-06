@@ -40,6 +40,7 @@ mod migration;
 mod network_policy;
 mod open_url_runtime;
 mod output;
+mod owned_children;
 mod pack_update_hint;
 mod package;
 mod package_cmd;
@@ -329,6 +330,7 @@ mod tests {
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
             redaction_extra_env_vars: Vec::new(),
+            network_denial_audit: Default::default(),
             redaction_derived_env_vars: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
@@ -409,6 +411,7 @@ mod tests {
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
             redaction_extra_env_vars: Vec::new(),
+            network_denial_audit: Default::default(),
             redaction_derived_env_vars: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,

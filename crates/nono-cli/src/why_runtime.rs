@@ -467,6 +467,21 @@ fn normalize_rule_paths(paths: &[String]) -> Option<Vec<std::path::PathBuf>> {
 
 /// Determine whether a literal or home-relative deny rule can cover `path`
 /// without consulting the evaluator host's filesystem or HOME value.
+///
+/// `Some(true)` means the rule definitely covers the path, `Some(false)` that
+/// it definitely does not, and `None` that the answer depends on context this
+/// evaluation deliberately does not have. Only a rule that is already an
+/// absolute literal can produce `Some(true)`.
+///
+/// A home-relative rule cannot: without `$HOME`, finding the rule's components
+/// somewhere in the path proves nothing about *which* directory they sit under.
+/// `~/downloads` and `/var/tmp/downloads/foo` share a `downloads` component
+/// while describing unrelated locations, so treating that as a match reports a
+/// confident `Denied` for a path the rule never covers. The absence of those
+/// components is still conclusive, because every expansion of `~/downloads`
+/// ends in `downloads` — so a path without it cannot be beneath the rule for
+/// any value of `$HOME`. That asymmetry is why a match yields `None` and a
+/// non-match yields `Some(false)`.
 fn policy_rule_may_cover(rule: &str, path: &std::path::Path) -> Option<bool> {
     if let Some(normalized) = normalize_absolute_literal(std::path::Path::new(rule)) {
         return Some(path.starts_with(normalized));
@@ -485,14 +500,18 @@ fn policy_rule_may_cover(rule: &str, path: &std::path::Path) -> Option<bool> {
     }
     let suffix_components: Vec<_> = suffix_path.components().collect();
     if suffix_components.is_empty() {
-        return Some(true);
+        // A bare `~/` denies the whole home directory. Whether this path lies
+        // inside it is precisely the question `$HOME` would answer.
+        return None;
     }
     let path_components: Vec<_> = path.components().collect();
-    Some(
-        path_components
-            .windows(suffix_components.len())
-            .any(|window| window == suffix_components),
-    )
+    if path_components
+        .windows(suffix_components.len())
+        .any(|window| window == suffix_components)
+    {
+        return None;
+    }
+    Some(false)
 }
 
 fn normalize_absolute_literal(path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -1490,5 +1509,78 @@ mod tests {
                 ..
             } if reason == "invocation_policy_allowed"
         ));
+    }
+
+    #[test]
+    fn absolute_literal_rules_still_decide_both_ways() {
+        let covered = std::path::Path::new("/etc/ssh/sshd_config");
+        assert_eq!(policy_rule_may_cover("/etc/ssh", covered), Some(true));
+        assert_eq!(policy_rule_may_cover("/etc/shadow", covered), Some(false));
+        // Component comparison, not string prefix: /etc must not cover /etcetera.
+        assert_eq!(
+            policy_rule_may_cover("/etc", std::path::Path::new("/etcetera/config")),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn home_relative_rule_does_not_deny_a_coincidental_component_match() {
+        // `~/downloads` and `/var/tmp/downloads/foo` share a `downloads`
+        // component but describe unrelated locations. Without $HOME this is
+        // unknowable, so it must not report a confident denial.
+        assert_eq!(
+            policy_rule_may_cover(
+                "~/downloads",
+                std::path::Path::new("/var/tmp/downloads/foo")
+            ),
+            None
+        );
+        for rule in ["~/.ssh", "$HOME/.ssh", "${HOME}/.ssh"] {
+            assert_eq!(
+                policy_rule_may_cover(rule, std::path::Path::new("/srv/backup/.ssh/id_rsa")),
+                None,
+                "{rule} must not decide without $HOME"
+            );
+        }
+    }
+
+    #[test]
+    fn home_relative_rule_still_rules_out_paths_lacking_its_components() {
+        // Conclusive in the negative: every expansion of `~/downloads` ends in
+        // a `downloads` component, so a path without one cannot be beneath it
+        // for any value of $HOME.
+        assert_eq!(
+            policy_rule_may_cover("~/downloads", std::path::Path::new("/var/tmp/uploads/foo")),
+            Some(false)
+        );
+        assert_eq!(
+            policy_rule_may_cover("~/.ssh/id_rsa", std::path::Path::new("/etc/passwd")),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn bare_home_rule_is_undecidable_without_home() {
+        // `~/` denies the whole home directory; whether an arbitrary path lies
+        // inside it is exactly what $HOME would tell us.
+        for rule in ["~/", "$HOME/", "${HOME}/"] {
+            assert_eq!(
+                policy_rule_may_cover(rule, std::path::Path::new("/var/tmp/foo")),
+                None,
+                "{rule} must not deny an arbitrary path"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_needing_expansion_remain_undecidable() {
+        assert_eq!(
+            policy_rule_may_cover("~/*.pem", std::path::Path::new("/home/someone/key.pem")),
+            None
+        );
+        assert_eq!(
+            policy_rule_may_cover("relative/rule", std::path::Path::new("/tmp/x")),
+            None
+        );
     }
 }

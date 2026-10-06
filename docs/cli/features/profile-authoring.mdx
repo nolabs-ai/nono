@@ -433,7 +433,9 @@ nono why --scope abstract-unix-socket --profile my-agent
 ```
 
 <Note>
-  `filesystem.bypass_protection` only removes the deny rule. You must also grant access via `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant) for the path to be accessible.
+  `filesystem.bypass_protection` only removes the deny rule. A matching
+  filesystem or Unix socket field must also grant the requested access. The
+  `unix_socket*` fields add their required filesystem grant automatically.
 </Note>
 
 ### Suppressing Repeated Save Suggestions
@@ -554,6 +556,47 @@ documents how its own scrubbing differed from the default.
 For path denials that should stay visible but skip save prompts, use
 `filesystem.suppress_save_prompt` instead. To disable all diagnostic footers,
 use `--no-diagnostics`.
+
+### Tuning How Many Network Denials Are Recorded
+
+On Linux, when nono mediates network access with seccomp (proxy mode, or
+`linux.af_unix_mediation = "pathname"`), every denied connection attempt can
+produce an audit event. A process that retries a blocked destination in a tight
+loop could otherwise grow the audit trail and diagnostics without limit, so
+nono records denials individually up to a budget: 50 in a burst, then 20 per
+second.
+
+Denials past the budget are still denied. They are counted, and nono writes a
+single summary audit event, for example *"50 network syscall denials were
+enforced but not individually recorded (audit rate limit exceeded)"*, so a
+suppressed denial is never silent. Allowed connections never consume the
+budget.
+
+Raise the budget when you need every denial in the audit trail, or lower it to
+keep records small:
+
+```json
+{
+  "diagnostics": {
+    "network_denial_audit": {
+      "rate_per_sec": 100,
+      "burst": 500
+    }
+  }
+}
+```
+
+Both fields are optional and must be whole numbers from 1 up to a ceiling:
+`rate_per_sec` up to 1000 and `burst` up to 10000. A value outside that range
+makes the profile fail to load. The ceilings exist so no profile, including one
+from a package or registry, can use this setting to exhaust memory.
+
+Child profiles override these fields one at a time, so a profile that sets only
+`burst` keeps the inherited `rate_per_sec`. The `--network-denial-audit-rate`
+and `--network-denial-audit-burst` flags override the profile for a single run.
+
+This is output hygiene, not enforcement: it changes how many denials nono
+writes down, never which operations are allowed.
 
 ### Exclude Inherited Groups
 

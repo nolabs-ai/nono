@@ -1,6 +1,6 @@
 [package]
 name = "nono-cli"
-version = "0.78.0"
+version = "0.79.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -41,8 +41,8 @@ system-keyring = ["dep:keyring", "nono/system-keyring", "nono-proxy/system-keyri
 test-trust-overrides = []
 
 [dependencies]
-nono = { version = "0.78.0", path = "../nono", default-features = false }
-nono-proxy = { version = "0.78.0", path = "../nono-proxy", default-features = false }
+nono = { version = "0.79.0", path = "../nono", default-features = false }
+nono-proxy = { version = "0.79.0", path = "../nono-proxy", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 colored = "3"
@@ -95,7 +95,7 @@ urlencoding = "2"
 tempfile.workspace = true
 vt100 = "0.16.2"
 shlex = "2"
-jsonc-parser = { version = "0.33", features = ["serde"] }
+jsonc-parser = { version = "0.34", features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }

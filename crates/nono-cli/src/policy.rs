@@ -6,6 +6,8 @@
 use crate::package;
 use crate::profile;
 use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
+#[cfg(target_os = "macos")]
+use nono::{SocketScope, UnixSocketCapability};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1053,7 +1055,8 @@ pub(crate) fn add_glob_deny_rules(
 /// - `(allow file-read-metadata ...)` — programs can stat/check existence
 /// - `(deny file-read-data ...)` — deny reading content
 /// - `(deny file-write* ...)` — deny writing
-/// - `(deny network-outbound (path ...))` — blocks Unix socket connections
+/// - `(deny network-outbound ...)` — blocks Unix socket connections, recursively
+///   when the denied target is a directory
 ///
 /// On Linux, deny paths are collected for overlap validation only —
 /// Landlock has no deny semantics so platform rules would be ignored.
@@ -1115,40 +1118,15 @@ pub(crate) fn add_deny_access_rules(
         deny_paths.push(resolved.clone());
     }
 
-    // Seatbelt deny rules only apply on macOS
+    // Seatbelt deny rules only apply on macOS.
     if cfg!(target_os = "macos") {
-        // Helper: emit metadata-allow + read-deny + write-deny + network-deny for a single path
-        let emit_deny_rules = |p: &Path, caps: &mut CapabilitySet| -> Result<()> {
-            let escaped = escape_seatbelt_path(path_to_utf8(p)?)?;
-            let filter = if p.exists() && p.is_file() {
-                format!("literal \"{}\"", escaped)
-            } else {
-                format!("subpath \"{}\"", escaped)
-            };
-            caps.add_platform_rule(format!("(allow file-read-metadata ({}))", filter))?;
-            caps.add_platform_rule(format!("(deny file-read-data ({}))", filter))?;
-            caps.add_platform_rule(format!("(deny file-write* ({}))", filter))?;
-            // SECURITY: connect(2) on a Unix domain socket is enforced by Seatbelt as
-            // network-outbound, not as a file operation. File deny rules above have no
-            // effect on socket connections. Emit an exact-path network-outbound deny so
-            // that connecting to this path (e.g. a Docker daemon socket) is blocked even
-            // if the socket is created after the sandbox is applied. This rule is
-            // evaluated at syscall time, not at sandbox_init time, so it covers sockets
-            // that do not yet exist. For non-socket paths the rule is a harmless no-op.
-            // Use (path ...) not (subpath ...) — socket connections match on the exact
-            // path, not a prefix. Both symlink and canonical paths are covered because
-            // emit_deny_rules is called for each form by the caller.
-            caps.add_platform_rule(format!("(deny network-outbound (path \"{}\"))", escaped))?;
-            Ok(())
-        };
-
         // Emit deny rules for the original path
-        emit_deny_rules(&path, caps)?;
+        emit_macos_deny_rules_for_path(&path, caps)?;
 
         // Emit deny rules for the canonical path too (covers parent symlinks on existing paths)
         if let Some(ref canonical) = canonical
             && *canonical != path
-            && let Err(e) = emit_deny_rules(canonical, caps)
+            && let Err(e) = emit_macos_deny_rules_for_path(canonical, caps)
         {
             warn!(
                 "Skipping canonical deny rules for {}: {}",
@@ -1160,7 +1138,7 @@ pub(crate) fn add_deny_access_rules(
         // Emit deny rules for the parent-resolved path (covers non-existent paths
         // whose parents contain symlinks, e.g. /var/run/future.sock -> /private/var/run/future.sock)
         if let Some(ref resolved) = parent_resolved
-            && let Err(e) = emit_deny_rules(resolved, caps)
+            && let Err(e) = emit_macos_deny_rules_for_path(resolved, caps)
         {
             warn!(
                 "Skipping parent-resolved deny rules for {}: {}",
@@ -1170,6 +1148,35 @@ pub(crate) fn add_deny_access_rules(
         }
     }
 
+    Ok(())
+}
+
+/// Emit macOS Seatbelt denials for file operations and Unix-socket connects.
+///
+/// Seatbelt treats `connect(2)` to an AF_UNIX pathname as `network-outbound`,
+/// not file I/O. Directory filesystem denials are recursive, so the matching
+/// network denial must also use `subpath`; an exact `path` rule on the
+/// directory does not cover sockets below it. Non-existent targets retain the
+/// existing fail-secure directory interpretation. Existing non-directories,
+/// including socket nodes, use exact file and network paths.
+pub(crate) fn emit_macos_deny_rules_for_path(path: &Path, caps: &mut CapabilitySet) -> Result<()> {
+    let escaped = escape_seatbelt_path(path_to_utf8(path)?)?;
+    let is_existing_leaf = path.exists() && !path.is_dir();
+    let file_filter = if is_existing_leaf {
+        format!("literal \"{}\"", escaped)
+    } else {
+        format!("subpath \"{}\"", escaped)
+    };
+    let network_filter = if is_existing_leaf {
+        format!("path \"{}\"", escaped)
+    } else {
+        format!("subpath \"{}\"", escaped)
+    };
+
+    caps.add_platform_rule(format!("(allow file-read-metadata ({}))", file_filter))?;
+    caps.add_platform_rule(format!("(deny file-read-data ({}))", file_filter))?;
+    caps.add_platform_rule(format!("(deny file-write* ({}))", file_filter))?;
+    caps.add_platform_rule(format!("(deny network-outbound ({}))", network_filter))?;
     Ok(())
 }
 
@@ -1662,6 +1669,86 @@ pub fn apply_macos_keychain_db_exception(
     }
 }
 
+/// Reopen only the intersection of a bypass and explicit socket grants.
+#[cfg(target_os = "macos")]
+fn emit_macos_socket_bypass_rules(
+    caps: &mut CapabilitySet,
+    canonical: &Path,
+    expanded: &Path,
+    is_file: bool,
+) -> Result<()> {
+    #[derive(Clone, Copy)]
+    enum Filter {
+        Path,
+        Children,
+        Subtree,
+    }
+
+    let socket_caps = caps.unix_socket_capabilities().to_vec();
+    for cap in socket_caps.iter().filter(|cap| cap.source.is_user_intent()) {
+        let Some((filter, mut paths)) =
+            socket_bypass_intersection(cap, canonical, expanded, is_file)
+        else {
+            continue;
+        };
+        paths.sort_unstable();
+        paths.dedup();
+
+        for path in paths {
+            let path = path_to_utf8(&path)?;
+            let filter = match filter {
+                Filter::Path => format!("path \"{}\"", escape_seatbelt_path(path)?),
+                Filter::Children => {
+                    format!("regex #\"^{}/[^/]+$\"", escape_seatbelt_regex_path(path)?)
+                }
+                Filter::Subtree => format!("subpath \"{}\"", escape_seatbelt_path(path)?),
+            };
+            caps.add_platform_rule(format!("(allow network-outbound ({}))", filter))?;
+            if cap.mode.permits_bind() {
+                caps.add_platform_rule(format!("(allow network-bind ({}))", filter))?;
+            }
+        }
+    }
+
+    fn socket_bypass_intersection(
+        cap: &UnixSocketCapability,
+        canonical: &Path,
+        expanded: &Path,
+        is_file: bool,
+    ) -> Option<(Filter, Vec<PathBuf>)> {
+        if is_file {
+            return cap.covers(canonical).then(|| {
+                (
+                    Filter::Path,
+                    vec![canonical.to_path_buf(), expanded.to_path_buf()],
+                )
+            });
+        }
+
+        match cap.scope {
+            SocketScope::File if cap.resolved.starts_with(canonical) => Some((
+                Filter::Path,
+                vec![cap.resolved.clone(), cap.original.clone()],
+            )),
+            SocketScope::DirChildren if cap.resolved.starts_with(canonical) => Some((
+                Filter::Children,
+                vec![cap.resolved.clone(), cap.original.clone()],
+            )),
+            SocketScope::DirSubtree if cap.resolved.starts_with(canonical) => Some((
+                Filter::Subtree,
+                vec![cap.resolved.clone(), cap.original.clone()],
+            )),
+            SocketScope::DirSubtree if canonical.starts_with(&cap.resolved) => Some((
+                Filter::Subtree,
+                vec![canonical.to_path_buf(), expanded.to_path_buf()],
+            )),
+            _ => None,
+        }
+    }
+
+    Ok(())
+}
+
 /// Apply deny overrides for specific paths, punching targeted holes through deny groups.
 ///
 /// For each override path:
@@ -1670,7 +1757,7 @@ pub fn apply_macos_keychain_db_exception(
 /// 3. Removes the path from `deny_paths` so Linux `validate_deny_overlaps` passes
 /// 4. Warns to stderr for each override applied (security relaxation must be visible)
 ///
-/// The override path must also be explicitly granted via `--allow`, `--read`, or `--write`.
+/// The override path must also have an explicit filesystem or Unix socket grant.
 /// `--bypass-protection` only removes the deny; it does not implicitly grant access.
 ///
 /// Returns every applied path form (canonical and, when it differs, the
@@ -1747,8 +1834,7 @@ pub fn apply_deny_overrides(
         if !grant_has_read && !grant_has_write {
             return Err(NonoError::SandboxInit(format!(
                 "bypass_protection '{}' has no matching grant. \
-                 Add a filesystem allow (--allow, --read, --write, or profile filesystem) \
-                 for this path.",
+                 Add a filesystem or Unix socket grant for this path.",
                 override_path.display(),
             )));
         }
@@ -1759,12 +1845,13 @@ pub fn apply_deny_overrides(
             canonical.display()
         );
 
-        let is_file = canonical.is_file();
+        let is_file = !canonical.is_dir();
 
         // On macOS: emit Seatbelt allow rules to punch through deny.
         // Only emit rules matching the effective access mode from the union
         // of all covering grants to preserve least-privilege.
-        if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
             // Emit allow rules for both the canonical path and the original
             // expanded path (if it differs, e.g. symlink). This mirrors
             // add_deny_access_rules which denies both the symlink and target.
@@ -1790,6 +1877,8 @@ pub fn apply_deny_overrides(
                     caps.add_platform_rule(format!("(allow file-write* ({}))", filter))?;
                 }
             }
+
+            emit_macos_socket_bypass_rules(caps, &canonical, &expanded, is_file)?;
         }
 
         // Remove deny entries that the override covers (equal or child of the override path).
@@ -2710,11 +2799,83 @@ mod tests {
             assert!(rules[0].contains("allow file-read-metadata"));
             assert!(rules[1].contains("deny file-read-data"));
             assert!(rules[2].contains("deny file-write*"));
-            assert!(rules[3].contains("deny network-outbound"));
+            assert!(
+                rules[3].contains("deny network-outbound")
+                    && rules[3].contains("subpath \"/nonexistent/test/deny\"")
+            );
         } else {
             // On Linux, no platform rules generated (Landlock has no deny semantics)
             assert!(caps.platform_rules().is_empty());
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_deny_access_directory_recursively_denies_unix_sockets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths = Vec::new();
+
+        add_deny_access_rules(
+            dir.path().to_str().expect("UTF-8 temp path"),
+            &mut caps,
+            &mut deny_paths,
+        )
+        .expect("add directory deny rules");
+
+        let expected = format!(
+            "(deny network-outbound (subpath \"{}\"))",
+            dir.path().display()
+        );
+        assert!(
+            caps.platform_rules().iter().any(|rule| rule == &expected),
+            "directory deny must recursively cover nested socket paths: {:?}",
+            caps.platform_rules()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_deny_access_socket_uses_exact_file_and_network_paths() {
+        let dir = tempfile::Builder::new()
+            .prefix("nono-deny-sock-")
+            .tempdir_in("/tmp")
+            .expect("tempdir in /tmp");
+        let socket_path = dir.path().join("service.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind test socket");
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths = Vec::new();
+
+        add_deny_access_rules(
+            socket_path.to_str().expect("UTF-8 socket path"),
+            &mut caps,
+            &mut deny_paths,
+        )
+        .expect("add socket deny rules");
+
+        let expected_file = format!(
+            "(deny file-read-data (literal \"{}\"))",
+            socket_path.display()
+        );
+        let expected_network = format!(
+            "(deny network-outbound (path \"{}\"))",
+            socket_path.display()
+        );
+        assert!(
+            caps.platform_rules()
+                .iter()
+                .any(|rule| rule == &expected_file),
+            "socket file deny must be exact: {:?}",
+            caps.platform_rules()
+        );
+        assert!(
+            caps.platform_rules()
+                .iter()
+                .any(|rule| rule == &expected_network),
+            "socket network deny must be exact: {:?}",
+            caps.platform_rules()
+        );
     }
 
     #[test]
@@ -3812,6 +3973,46 @@ mod tests {
             rules.contains("subpath"),
             "should use subpath for directory, got: {}",
             rules
+        );
+        assert!(!rules.contains("allow network-outbound"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_deny_overrides_reopens_explicit_unix_socket() {
+        let dir = tempfile::Builder::new()
+            .prefix("nono-bypass-sock-")
+            .tempdir_in("/tmp")
+            .expect("tempdir in /tmp");
+        let socket_path = dir.path().join("agent.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind test socket");
+        let canonical = socket_path.canonicalize().expect("canonicalize socket");
+        let mut deny_paths = vec![dir.path().canonicalize().expect("canonicalize deny")];
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(
+            FsCapability::new_file(&socket_path, AccessMode::Read).expect("grant socket path"),
+        );
+        caps.add_unix_socket(
+            nono::UnixSocketCapability::new_file(&socket_path, nono::UnixSocketMode::Connect)
+                .expect("grant socket connect"),
+        );
+
+        apply_deny_overrides(
+            std::slice::from_ref(&socket_path),
+            &mut deny_paths,
+            &mut caps,
+        )
+        .expect("apply socket bypass");
+
+        let expected = format!(
+            "(allow network-outbound (path \"{}\"))",
+            canonical.display()
+        );
+        assert!(
+            caps.platform_rules().iter().any(|rule| rule == &expected),
+            "socket bypass must emit an exact network exception: {:?}",
+            caps.platform_rules()
         );
     }
 

@@ -553,7 +553,7 @@ pub(crate) async fn select_intercept_route<'a>(
                     Some(&request_reason),
                 );
                 let request = nono::supervisor::ApprovalRequest::Endpoint {
-                    request_id: format!("proxy-endpoint-approval-{}-{}", host, port),
+                    request_id: reverse::endpoint_approval_request_id(&format!("{host}-{port}")),
                     route_id: (*prefix).to_string(),
                     upstream: route.upstream.clone(),
                     method: method.to_string(),

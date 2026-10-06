@@ -789,7 +789,7 @@
         "unix_socket_bind": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Single AF_UNIX socket paths, connect and bind. Implies read+write access on the socket path when it exists, or on its parent directory when it does not yet exist. Dangling symlinks are rejected at grant time; prefer unix_socket_dir_bind for runtime-generated filenames."
+          "description": "Single AF_UNIX socket paths, connect and bind. Implies read+write access on the socket path when it exists, or on its parent directory when it does not yet exist. A covering deny therefore requires bypassing the parent directory. Dangling symlinks are rejected at grant time; prefer unix_socket_dir_bind for runtime-generated filenames."
         },
         "unix_socket_dir": {
           "type": "array",
@@ -819,7 +819,7 @@
         "bypass_protection": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Paths exempted from group-level deny rules. Each path must also appear in an allow/read/write section to actually grant access; bypass_protection only removes the deny. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
+          "description": "Paths exempted from group-level deny rules. A matching filesystem or Unix socket grant must also provide access; bypass_protection only removes the deny. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
         },
         "suppress_save_prompt": {
           "type": "array",
@@ -1673,7 +1673,7 @@
         },
         "env_var": {
           "type": "string",
-          "description": "Environment variable mapped into the child. For local-socket this receives the resolved socket path; for proxy this receives the phantom token."
+          "description": "Environment variable mapped into the child. For local-socket this receives the resolved socket path; for ordinary proxy credentials this receives the phantom token. Optional for aws_auth proxy credentials, which sign requests host-side without delivering a credential variable."
         },
         "upstream": {
           "type": "string",
@@ -1714,6 +1714,13 @@
         "format": {
           "type": "string",
           "description": "Optional literal template for the visible phantom the sandbox sees, with '{}' standing in for a freshly minted random body (e.g. 'sk-ant-oat01-{}'). Lets a client that classifies a credential by sniffing a literal token prefix recognise the phantom. Only valid for ambient credentials."
+        },
+        "aws_auth": {
+          "oneOf": [
+            { "$ref": "#/$defs/AwsAuthConfig" },
+            { "type": "null" }
+          ],
+          "description": "Optional AWS SigV4 signing configuration for proxy credentials. Mutually exclusive with source and credential_key. Does not require env_var."
         }
       }
     },
@@ -2352,6 +2359,29 @@
         "redaction": {
           "$ref": "#/$defs/RedactionConfig",
           "description": "Extra redaction applied to diagnostic and audit output. Add-only: a profile can widen redaction but cannot stop a secure default from being redacted."
+        },
+        "network_denial_audit": {
+          "$ref": "#/$defs/NetworkDenialAuditConfig",
+          "description": "Budget for recording denied network syscalls individually (Linux seccomp mediation). Does not change enforcement."
+        }
+      }
+    },
+    "NetworkDenialAuditConfig": {
+      "type": "object",
+      "description": "Budget for recording denied network syscalls individually in the audit trail and diagnostics. This is output hygiene, not enforcement: a denied syscall is always denied and an allowed one never consumes budget. Denials beyond the budget are counted and reported in one summary audit event. Overridden per run by --network-denial-audit-rate and --network-denial-audit-burst.",
+      "additionalProperties": false,
+      "properties": {
+        "rate_per_sec": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "Sustained number of denials recorded individually per second. Default 20."
+        },
+        "burst": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Number of denials that may be recorded individually in one burst. Default 50."
         }
       }
     },

@@ -173,13 +173,28 @@ pub(crate) fn apply_export_env(
 /// Replace proxy settings with supervisor-owned values immediately before a
 /// mediated command is launched. The child must not retain the session proxy
 /// credential: it has broader authority than a command-scoped proxy policy.
+///
+/// **Replace, never append.** `env` is a raw `KEY=VALUE` vector handed straight
+/// to `execve`; it does not collapse duplicate keys, and libc `getenv` (plus
+/// CPython's `os.environ`, i.e. botocore) resolves a duplicate to the *first*
+/// entry. An appended override is therefore dead whenever the same name was
+/// already forwarded from the session env, so every name in `vars` is stripped
+/// before it is set. That is wider than `PROXY_CONTROL_ENV`: `vars` comes from
+/// `ProxyHandle::env_vars()`, which also carries the TLS-intercept CA vars
+/// (`SSL_CERT_FILE`, `AWS_CA_BUNDLE`, ...). Deriving the strip set from `vars`
+/// keeps this self-maintaining as `intercept_ca_env_vars` (or a profile's
+/// `tls_intercept.ca_env_vars`) grows. `PROXY_CONTROL_ENV` is still stripped
+/// unconditionally so a session proxy credential cannot survive in a name the
+/// scoped proxy happens not to set.
 pub(crate) fn override_proxy_env(env: &mut Vec<Vec<u8>>, vars: &[(String, String)]) {
     env.retain(|entry| {
-        !PROXY_CONTROL_ENV.iter().any(|name| {
-            entry
-                .strip_prefix(name.as_bytes())
-                .is_some_and(|suffix| suffix.starts_with(b"="))
-        })
+        let Some((name, _)) = split_env_entry(entry) else {
+            return true;
+        };
+        !PROXY_CONTROL_ENV
+            .iter()
+            .any(|control| control.as_bytes() == name)
+            && !vars.iter().any(|(set, _)| set.as_bytes() == name)
     });
     for (name, value) in vars {
         env.push(format!("{name}={value}").into_bytes());
@@ -800,6 +815,55 @@ mod tests {
         assert!(!rendered.iter().any(|entry| entry.contains("outer-token")));
         assert!(!rendered.iter().any(|entry| entry.starts_with("ALL_PROXY=")));
         assert!(!rendered.iter().any(|entry| entry.starts_with("all_proxy=")));
+    }
+
+    #[test]
+    fn scoped_proxy_env_replaces_forwarded_intercept_ca_vars() {
+        // Regression: the scoped CA vars used to be APPENDED after the
+        // session-forwarded ones. `env` goes straight to `execve`, which keeps
+        // duplicates, and libc `getenv` / CPython `os.environ` resolve to the
+        // FIRST entry — so `aws` (botocore) validated TLS against the session
+        // bundle and failed with "SSL validation failed ... [Errno 1]".
+        // A `contains`-style assertion passes even with the bug: the count and
+        // the value together are what matter.
+        const SESSION_CA: &str = "/Users/dev/.local/prisma_certificates.pem";
+        const SCOPED_CA: &str = "/private/tmp/nono-scoped-intercept-1-2-scope-0/intercept-ca.pem";
+        let ca_vars = nono_proxy::config::default_intercept_ca_env_vars();
+        assert!(
+            ca_vars.iter().any(|name| name == "AWS_CA_BUNDLE"),
+            "AWS_CA_BUNDLE must be an intercept-CA var: botocore prefers it over SSL_CERT_FILE"
+        );
+
+        let mut env: Vec<Vec<u8>> = ca_vars
+            .iter()
+            .map(|name| format!("{name}={SESSION_CA}").into_bytes())
+            .collect();
+        env.push(b"PATH=/usr/bin".to_vec());
+        let scoped: Vec<(String, String)> = ca_vars
+            .iter()
+            .map(|name| (name.clone(), SCOPED_CA.to_string()))
+            .collect();
+
+        override_proxy_env(&mut env, &scoped);
+
+        let rendered = rendered(&env);
+        assert!(rendered.contains(&"PATH=/usr/bin".to_string()));
+        assert!(
+            !rendered.iter().any(|entry| entry.contains(SESSION_CA)),
+            "session CA must not survive: {rendered:?}"
+        );
+        for name in &ca_vars {
+            let prefix = format!("{name}=");
+            let matches: Vec<&String> = rendered
+                .iter()
+                .filter(|entry| entry.starts_with(&prefix))
+                .collect();
+            assert_eq!(
+                matches,
+                vec![&format!("{name}={SCOPED_CA}")],
+                "{name} must appear exactly once, set to the scoped CA"
+            );
+        }
     }
 
     #[test]

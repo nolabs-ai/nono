@@ -117,10 +117,11 @@ nono explicitly denies data access to credential storage:
 | History Files | `~/.zsh_history`, `~/.bash_history` (read-blocked; may contain secrets) |
 | Credential Files | `~/.git-credentials`, `~/.netrc`, `~/.npmrc` |
 
-To access a protected path, provide both a filesystem grant (`--allow`,
-`--read`, or `--write`) and a matching `--bypass-protection` path. A grant alone
-does not lift a deny rule. The bypass reopens only the access modes granted for
-that path; a read-only grant does not permit writes.
+To access a protected path, provide both a matching filesystem or Unix socket
+grant and a `--bypass-protection` path. A grant alone does not lift a deny rule.
+The bypass reopens only the access modes and socket scope granted for that
+path; a read-only grant does not permit writes, and an exact socket exception
+does not reopen sibling sockets.
 
 ## System Operations
 
@@ -152,7 +153,7 @@ Network access is allowed by default:
 
 When a process calls `connect(2)` on a Unix socket (e.g., `/var/run/docker.sock`), Seatbelt classifies the operation as `network-outbound`, **not** a file operation. This means a `file-read-data` or `file-write-data` deny rule for the socket path will not block the connection.
 
-To block Unix socket connections, nono emits an additional rule alongside the standard file deny rules when a socket path appears in `add_deny_access`:
+To block Unix socket connections, nono emits an additional rule alongside the standard file deny rules. Exact socket or file targets use `path`; denied directories use `subpath` so sockets anywhere below the directory are also blocked:
 
 ```scheme
 ; File deny (blocks open/read/write on the socket file itself)
@@ -162,9 +163,12 @@ To block Unix socket connections, nono emits an additional rule alongside the st
 
 ; Network deny (blocks connect(2) to the socket)
 (deny network-outbound (path "/private/var/run/docker.sock"))
+
+; Recursive directory deny
+(deny network-outbound (subpath "/private/var/run/private-agents"))
 ```
 
-The `network-outbound` rule uses `(path ...)` for an exact match rather than `(subpath ...)` because socket connections match on the precise path. Seatbelt evaluates this rule at `connect(2)` time, so it blocks connections to sockets that do not exist when the sandbox initializes.
+Seatbelt evaluates these rules at `connect(2)` time, so they also block connections to sockets created after the sandbox initializes. Non-existent deny targets use the fail-secure recursive form because they may later become directories.
 
 ### Granular Filtering Limitations
 

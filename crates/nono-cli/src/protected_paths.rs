@@ -202,12 +202,7 @@ pub(crate) fn emit_protected_root_deny_rules(
 /// Emit Seatbelt deny rules for a single path.
 #[cfg(target_os = "macos")]
 fn emit_deny_rules_for_path(path: &Path, caps: &mut CapabilitySet) -> Result<()> {
-    let escaped = crate::policy::escape_seatbelt_path(crate::policy::path_to_utf8(path)?)?;
-    let filter = format!("subpath \"{}\"", escaped);
-    caps.add_platform_rule(format!("(allow file-read-metadata ({}))", filter))?;
-    caps.add_platform_rule(format!("(deny file-read-data ({}))", filter))?;
-    caps.add_platform_rule(format!("(deny file-write* ({}))", filter))?;
-    Ok(())
+    crate::policy::emit_macos_deny_rules_for_path(path, caps)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -461,6 +456,10 @@ mod tests {
         assert!(
             joined.contains("allow file-read-metadata"),
             "should allow metadata: {joined}"
+        );
+        assert!(
+            joined.contains("deny network-outbound") && joined.contains("subpath"),
+            "should recursively deny Unix socket connections: {joined}"
         );
     }
 }

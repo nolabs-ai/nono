@@ -266,6 +266,10 @@ pub(crate) struct ExecutionFlags {
     /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     pub(crate) startup_timeout_secs: Option<u64>,
+    /// Resolved budget for recording denied network syscalls individually
+    /// (CLI flag, then profile, then default).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) network_denial_audit: crate::profile::NetworkDenialAuditLimits,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Command binaries already resolved while validating `command_policies`,
     /// reused when building the command-mediation plan instead of re-resolving.
@@ -329,6 +333,11 @@ impl ExecutionFlags {
             case_insensitive_env_vars: prepared.case_insensitive_env_vars,
             set_vars: prepared.set_vars.clone(),
             startup_timeout_secs: None,
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::resolve(
+                prepared.network_denial_audit,
+                None,
+                None,
+            )?,
             command_policies: prepared.command_policies.clone(),
             resolved_command_binaries: prepared.resolved_command_binaries.clone(),
             approval_backends: prepared.approval_backends.clone(),
@@ -474,6 +483,11 @@ pub(crate) fn prepare_run_launch_plan(
         trust,
         network,
         startup_timeout_secs,
+        network_denial_audit: crate::profile::NetworkDenialAuditLimits::resolve(
+            prepared.network_denial_audit,
+            run_args.network_denial_audit_rate,
+            run_args.network_denial_audit_burst,
+        )?,
         ..ExecutionFlags::from_prepared(&prepared, silent)?
     };
     Ok(LaunchPlan {
@@ -744,6 +758,8 @@ mod tests {
             no_diagnostics: false,
             diagnostics_json: false,
             startup_timeout_secs: None,
+            network_denial_audit_rate: None,
+            network_denial_audit_burst: None,
             no_audit: false,
             no_audit_integrity: false,
             audit_integrity: false,

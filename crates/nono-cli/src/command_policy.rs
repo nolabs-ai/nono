@@ -435,6 +435,18 @@ pub struct CommandCredentialConfig {
     /// sniffing a token prefix still recognises it. `ambient` credentials only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    /// Optional AWS SigV4 signing configuration for this per-command credential.
+    ///
+    /// When present, the scoped proxy signs outbound requests with AWS SigV4
+    /// credentials resolved host-side. The child sees only dummy keys; the real
+    /// credential never enters the sandbox. Mutually exclusive with `credential_key`
+    /// and `source` — use one credential mechanism, not multiple.
+    ///
+    /// Previously only available at session level (`network.custom_credentials.<r>.aws_auth`);
+    /// this extends it to per-command tool-sandbox routes, building on the scoped-proxy
+    /// infrastructure from #1981.
+    #[serde(default)]
+    pub aws_auth: Option<nono_proxy::config::AwsAuthConfig>,
 }
 
 impl Default for CommandCredentialConfig {
@@ -454,6 +466,7 @@ impl Default for CommandCredentialConfig {
             tls_client_key: None,
             source: None,
             format: None,
+            aws_auth: None,
         }
     }
 }
@@ -2594,6 +2607,12 @@ fn validate_credential(
                     format!("local-socket credential '{name}' cannot define HTTP proxy fields"),
                 );
             }
+            if credential.aws_auth.is_some() {
+                report.error(
+                    "invalid_credential",
+                    format!("local-socket credential '{name}' cannot define aws_auth (only proxy credentials support it)"),
+                );
+            }
         }
         CommandCredentialType::RawFile => {
             if credential.path.as_deref().unwrap_or_default().is_empty() {
@@ -2628,6 +2647,12 @@ fn validate_credential(
                     format!("raw-file credential '{name}' cannot define HTTP proxy fields"),
                 );
             }
+            if credential.aws_auth.is_some() {
+                report.error(
+                    "invalid_credential",
+                    format!("raw-file credential '{name}' cannot define aws_auth (only proxy credentials support it)"),
+                );
+            }
         }
         CommandCredentialType::Proxy => {
             if credential
@@ -2641,10 +2666,14 @@ fn validate_credential(
                     format!("proxy credential '{name}' must define upstream"),
                 );
             }
-            if credential.env_var.as_deref().unwrap_or_default().is_empty() {
+            if credential.env_var.as_deref().is_some_and(str::is_empty)
+                || (credential.env_var.is_none() && credential.aws_auth.is_none())
+            {
                 report.error(
                     "invalid_credential",
-                    format!("proxy credential '{name}' must define env_var"),
+                    format!(
+                        "proxy credential '{name}' must define a non-empty env_var unless using aws_auth"
+                    ),
                 );
             }
             if credential.path.is_some() || credential.mode.is_some() {
@@ -2661,10 +2690,27 @@ fn validate_credential(
                     ),
                 );
             }
-            if credential.source.is_none() && credential.credential_key.is_none() {
+            if credential.source.is_none()
+                && credential.credential_key.is_none()
+                && credential.aws_auth.is_none()
+            {
                 report.error(
                     "invalid_credential",
-                    format!("proxy credential '{name}' must define source or credential_key"),
+                    format!(
+                        "proxy credential '{name}' must define source, credential_key, or aws_auth"
+                    ),
+                );
+            }
+            // aws_auth is mutually exclusive with source and credential_key —
+            // same constraint as the session-level config.
+            if credential.aws_auth.is_some()
+                && (credential.source.is_some() || credential.credential_key.is_some())
+            {
+                report.error(
+                    "invalid_credential",
+                    format!(
+                        "proxy credential '{name}' cannot combine aws_auth with source or credential_key"
+                    ),
                 );
             }
             if credential.tls_client_cert.is_some() ^ credential.tls_client_key.is_some() {
@@ -2674,6 +2720,47 @@ fn validate_credential(
                         "proxy credential '{name}' must define tls_client_cert and tls_client_key together"
                     ),
                 );
+            }
+            // Replicate the session-level validate_aws_auth checks so malformed
+            // profile/region/service values don't propagate to the signing path.
+            if let Some(ref aws) = credential.aws_auth {
+                if let Some(ref profile) = aws.profile
+                    && (profile.is_empty() || profile.contains(char::is_whitespace))
+                {
+                    report.error(
+                        "invalid_credential",
+                        format!(
+                            "proxy credential '{name}' aws_auth.profile must be non-empty \
+                             with no whitespace; omit the field to use the default chain"
+                        ),
+                    );
+                }
+                if let Some(ref region) = aws.region
+                    && (region.is_empty()
+                        || region.contains(char::is_whitespace)
+                        || region.chars().any(|c| c.is_uppercase()))
+                {
+                    report.error(
+                        "invalid_credential",
+                        format!(
+                            "proxy credential '{name}' aws_auth.region must be non-empty, \
+                             lowercase, no whitespace (e.g., \"us-east-1\")"
+                        ),
+                    );
+                }
+                if let Some(ref service) = aws.service
+                    && (service.is_empty()
+                        || service.contains(char::is_whitespace)
+                        || service.chars().any(|c| c.is_uppercase()))
+                {
+                    report.error(
+                        "invalid_credential",
+                        format!(
+                            "proxy credential '{name}' aws_auth.service must be non-empty, \
+                             lowercase, no whitespace (e.g., \"sts\", \"s3\")"
+                        ),
+                    );
+                }
             }
         }
         CommandCredentialType::Ambient => {
@@ -2688,6 +2775,7 @@ fn validate_credential(
                 || credential.tls_ca.is_some()
                 || credential.tls_client_cert.is_some()
                 || credential.tls_client_key.is_some()
+                || credential.aws_auth.is_some()
             {
                 report.error(
                     "invalid_credential",
@@ -6530,6 +6618,55 @@ mod tests {
                 .iter()
                 .any(|e| e.message.contains("must not contain control characters")),
             "expected control-character error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ambient_credential_with_aws_auth_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Ambient,
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+            ..Default::default()
+        };
+        let errors = validate_one(&cred).errors;
+        assert!(
+            errors.iter().any(|e| e
+                .message
+                .contains("cannot define transport or proxy fields")),
+            "expected ambient aws_auth error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_credential_with_aws_auth_accepted() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: Some("production".to_string()),
+                region: Some("us-east-1".to_string()),
+                service: Some("bedrock".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred).errors.is_empty(),
+            "well-formed proxy aws_auth should validate"
+        );
+    }
+
+    #[test]
+    fn ordinary_proxy_credential_without_env_var_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://api.example.com".to_string()),
+            credential_key: Some("api-token".to_string()),
+            ..Default::default()
+        };
+        let errors = validate_one(&cred).errors;
+        assert!(
+            errors.iter().any(|e| e.message.contains("env_var")),
+            "expected missing env_var error, got {errors:?}"
         );
     }
 

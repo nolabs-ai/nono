@@ -1883,18 +1883,20 @@ fn collect_tool_sandbox_proxy_grants(
                 grant.name
             ))
         })?;
-        let env_var = credential.env_var.clone().ok_or_else(|| {
-            NonoError::ConfigParse(format!(
+        let env_var = credential.env_var.clone();
+        if let Some(env_var) = &env_var {
+            nono::validate_destination_env_var(env_var).map_err(|err| {
+                NonoError::ConfigParse(format!(
+                    "command sandbox proxy credential '{}' has invalid env_var: {err}",
+                    grant.name
+                ))
+            })?;
+        } else if credential.aws_auth.is_none() {
+            return Err(NonoError::ConfigParse(format!(
                 "command sandbox proxy credential '{}' missing env_var",
                 grant.name
-            ))
-        })?;
-        nono::validate_destination_env_var(&env_var).map_err(|err| {
-            NonoError::ConfigParse(format!(
-                "command sandbox proxy credential '{}' has invalid env_var: {err}",
-                grant.name
-            ))
-        })?;
+            )));
+        }
         if let Some(base_url_env_var) = &credential.base_url_env_var {
             nono::validate_destination_env_var(base_url_env_var).map_err(|err| {
                 NonoError::ConfigParse(format!(
@@ -1928,7 +1930,7 @@ fn collect_tool_sandbox_proxy_grants(
             path_replacement: None,
             query_param_name: None,
             proxy: None,
-            env_var: Some(env_var),
+            env_var,
             endpoint_rules: Vec::new(),
             endpoint_policy: Some(endpoint_policy),
             tls_ca: credential
@@ -1952,7 +1954,7 @@ fn collect_tool_sandbox_proxy_grants(
                     crate::policy::expand_path(path).map(|path| path.to_string_lossy().into_owned())
                 })
                 .transpose()?,
-            aws_auth: None,
+            aws_auth: credential.aws_auth.clone(),
             spiffe: None,
             rate_limit: None,
         };
@@ -3340,7 +3342,8 @@ fn extend_scoped_proxy_env(
 }
 
 fn is_scoped_proxy_reserved_env(name: &str) -> bool {
-    matches!(
+    // Proxy transport vars the scoped proxy always owns.
+    if matches!(
         name,
         "HTTP_PROXY"
             | "HTTPS_PROXY"
@@ -3353,12 +3356,17 @@ fn is_scoped_proxy_reserved_env(name: &str) -> bool {
             | "NONO_NO_PROXY"
             | "NONO_PROXY_TOKEN"
             | "NODE_USE_ENV_PROXY"
-            | "SSL_CERT_FILE"
-            | "CURL_CA_BUNDLE"
-            | "NODE_EXTRA_CA_CERTS"
-            | "REQUESTS_CA_BUNDLE"
-            | "GIT_SSL_CAINFO"
-    )
+    ) {
+        return true;
+    }
+    // TLS-intercept CA vars are read from the proxy's own default list rather
+    // than duplicated here: a second hardcoded copy silently drifts (it was
+    // already missing `AWS_CA_BUNDLE`), and a credential route that reuses one
+    // of these names would then collide with the intercept CA path instead of
+    // being rejected.
+    nono_proxy::config::default_intercept_ca_env_vars()
+        .iter()
+        .any(|reserved| reserved == name)
 }
 
 fn scoped_intercept_ca_dir(
@@ -3366,18 +3374,48 @@ fn scoped_intercept_ca_dir(
     scope_index: usize,
     has_routes: bool,
 ) -> Result<Option<PathBuf>> {
-    let Some(base) = base.filter(|_| has_routes) else {
+    // `base` is only read as a signal that session-level TLS interception is
+    // enabled at all; the scoped bundle deliberately does NOT live under it.
+    let Some(_base) = base.filter(|_| has_routes) else {
         return Ok(None);
     };
-    let dir = base.join(format!("scope-{scope_index}"));
-    std::fs::create_dir_all(&dir).map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "failed to create scoped TLS-intercept dir '{}': {err}",
-            dir.display()
-        ))
-    })?;
-    set_intercept_ca_dir_permissions(&dir)?;
-    Ok(Some(dir))
+    // Write the scoped proxy's CA bundle under `/tmp` rather than under the
+    // session dir (`~/.local/state/nono/sessions/intercept-*/`). The session
+    // dir is inside the protected-root deny (`deny file-read-data (subpath
+    // "~/.local/state/nono")`), and on macOS Seatbelt a deny CANNOT be
+    // overridden by a later allow — even a more specific `literal` allow
+    // (verified with sandbox-exec). So a CA written there is unreadable by
+    // any sandboxed process, regardless of what allow rules are emitted.
+    //
+    // `/tmp` is granted `system_write_macos` and is readable via explicit
+    // grants that `add_proxy_trust_bundle_caps` adds for the child. The
+    // session-level intercept CA path (when active) still lives under the
+    // session dir because the session proxy handles its own Seatbelt grants
+    // before the protected-root deny is emitted.
+    // Use tempfile::Builder for atomic secure directory creation (0o700 from
+    // the start, no TOCTOU window). The prefix is unpredictable (tempfile adds
+    // random chars), closing the symlink pre-create vector that a PID+nanos
+    // name would have in a world-writable directory.
+    //
+    // On macOS, use /private/tmp (NOT std::env::temp_dir(), which resolves to
+    // /var/folders/<hash>/T/ — only file-read-metadata, not file-read-data).
+    // On Linux, /tmp is the standard world-writable temp dir.
+    let tmp_root: &str = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("nono-scoped-intercept-scope-{scope_index}-"))
+        .tempdir_in(tmp_root)
+        .map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "failed to create scoped TLS-intercept dir in {tmp_root}: {err}"
+            ))
+        })?;
+    let dir_path = dir.keep();
+    set_intercept_ca_dir_permissions(&dir_path)?;
+    Ok(Some(dir_path))
 }
 
 fn command_proxy_scopes(
@@ -3463,22 +3501,23 @@ fn tool_sandbox_proxy_credential_env_vars(
                 "command sandbox proxy credential '{credential_name}' did not produce a proxy route"
             ))
         })?;
-    let env_var = route.env_var.as_ref().ok_or_else(|| {
-        NonoError::ConfigParse(format!(
+    let mut env_vars = Vec::new();
+    if let Some(env_var) = &route.env_var {
+        let token_value = credential_env_vars
+            .iter()
+            .find(|(key, _)| key == env_var)
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| {
+                NonoError::SandboxInit(format!(
+                    "command sandbox proxy credential '{credential_name}' is unavailable to the proxy"
+                ))
+            })?;
+        env_vars.push((env_var.clone(), token_value));
+    } else if route.aws_auth.is_none() {
+        return Err(NonoError::ConfigParse(format!(
             "command sandbox proxy credential '{credential_name}' missing env_var"
-        ))
-    })?;
-    let token_value = credential_env_vars
-        .iter()
-        .find(|(key, _)| key == env_var)
-        .map(|(_, value)| value.clone())
-        .ok_or_else(|| {
-            NonoError::SandboxInit(format!(
-                "command sandbox proxy credential '{credential_name}' is unavailable to the proxy"
-            ))
-        })?;
-
-    let mut env_vars = vec![(env_var.clone(), token_value)];
+        )));
+    }
     if let Some(base_url_env_var) = proxy.tool_sandbox_base_url_env_vars.get(credential_name) {
         env_vars.push((
             base_url_env_var.clone(),
@@ -4137,6 +4176,7 @@ mod tests {
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
             redaction_extra_env_vars: Vec::new(),
+            network_denial_audit: Default::default(),
             redaction_derived_env_vars: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
@@ -4215,6 +4255,7 @@ mod tests {
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
             redaction_extra_env_vars: Vec::new(),
+            network_denial_audit: Default::default(),
             redaction_derived_env_vars: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
@@ -4288,6 +4329,7 @@ mod tests {
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
             redaction_extra_env_vars: Vec::new(),
+            network_denial_audit: Default::default(),
             redaction_derived_env_vars: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
@@ -4404,6 +4446,68 @@ mod tests {
         assert_eq!(endpoint_policy.allow[0].method, "GET");
         assert_eq!(endpoint_policy.allow[0].path, "/repos/example/**");
 
+        Ok(())
+    }
+
+    #[test]
+    fn tool_sandbox_aws_auth_route_does_not_require_env_var() -> Result<()> {
+        let mut policies = CommandPoliciesConfig::default();
+        policies.credentials.insert(
+            "bedrock".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
+                aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                    profile: Some("production".to_string()),
+                    region: Some("us-east-1".to_string()),
+                    service: Some("bedrock".to_string()),
+                }),
+                ..CommandCredentialConfig::default()
+            },
+        );
+        policies.commands.insert(
+            "aws".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    credentials: vec![CommandCredentialGrantConfig::Policy(
+                        CommandCredentialGrantPolicyConfig {
+                            name: "bedrock".to_string(),
+                            endpoint_policy: Some(EndpointPolicyConfig::default()),
+                        },
+                    )],
+                    ..CommandSandboxConfig::default()
+                }),
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        let mut credentials = Vec::new();
+        let mut custom_credentials = HashMap::new();
+        let mut proxy_source_env_vars = HashMap::new();
+        let mut base_url_env_vars = HashMap::new();
+        let mut tool_sandbox_proxy_credentials = HashSet::new();
+        extend_proxy_settings_with_tool_sandbox_credentials(
+            Some(&policies),
+            &nono::CapabilitySet::default(),
+            &mut credentials,
+            &mut custom_credentials,
+            &mut proxy_source_env_vars,
+            &mut base_url_env_vars,
+            &mut tool_sandbox_proxy_credentials,
+        )?;
+
+        let route = custom_credentials
+            .get("bedrock")
+            .ok_or_else(|| NonoError::ConfigParse("missing bedrock route".to_string()))?;
+        assert!(route.env_var.is_none());
+        assert_eq!(
+            route
+                .aws_auth
+                .as_ref()
+                .and_then(|aws| aws.profile.as_deref()),
+            Some("production")
+        );
+        assert!(tool_sandbox_proxy_credentials.contains("bedrock"));
         Ok(())
     }
 
@@ -4696,6 +4800,24 @@ mod tests {
         );
         assert_eq!(proxy_config.routes.len(), 1);
         assert_eq!(proxy_config.routes[0].prefix, "session-api");
+        Ok(())
+    }
+
+    #[test]
+    fn tool_sandbox_aws_auth_env_vars_allow_missing_route_env_var() -> Result<()> {
+        let proxy = ProxyLaunchOptions::default();
+        let mut proxy_config = nono_proxy::config::ProxyConfig::default();
+        proxy_config.routes.push(nono_proxy::config::RouteConfig {
+            prefix: "bedrock".to_string(),
+            upstream: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+            ..nono_proxy::config::RouteConfig::default()
+        });
+
+        let vars =
+            tool_sandbox_proxy_credential_env_vars(&proxy, &proxy_config, &[], 7777, "bedrock")?;
+
+        assert!(vars.is_empty());
         Ok(())
     }
 

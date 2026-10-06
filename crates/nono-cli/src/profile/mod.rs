@@ -159,6 +159,7 @@ pub struct FilesystemConfig {
     /// Implies read+write access on the socket path when it exists, or
     /// on its parent directory when it does not yet exist (the normal
     /// `bind(2)` workflow — the syscall creates the socket file).
+    /// A covering deny therefore requires bypassing the parent directory.
     /// Dangling symlinks are rejected at grant time. For runtime-generated
     /// filenames (e.g. PID-suffixed paths) prefer `unix_socket_dir_bind`
     /// so the implied fs grant stays scoped to a dedicated directory.
@@ -186,10 +187,8 @@ pub struct FilesystemConfig {
     /// Paths exempted from group-level deny rules.
     ///
     /// **This flag does not implicitly grant access** — `bypass_protection`
-    /// only removes the deny rule. Each path must also appear in
-    /// `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the
-    /// matching `*_file` variant) to become accessible. CLI equivalent:
-    /// `--bypass-protection`.
+    /// only removes the deny rule. A matching filesystem or Unix socket grant
+    /// must also provide the requested access. CLI equivalent: `--bypass-protection`.
     ///
     /// Renamed from the legacy deny-override key in the #594 schema;
     /// the new name makes the "does not grant access" semantics explicit.
@@ -1299,6 +1298,13 @@ fn validate_profile_no_proxy(profile: &Profile) -> Result<()> {
     )
 }
 
+/// Reject out-of-range `diagnostics.network_denial_audit` values at load time,
+/// so a bad profile fails fast instead of at launch.
+fn validate_profile_network_denial_audit(profile: &Profile) -> Result<()> {
+    NetworkDenialAuditLimits::resolve(profile.diagnostics.network_denial_audit, None, None)
+        .map(|_| ())
+}
+
 /// Validate `environment.allow_vars`/`deny_vars` and
 /// `diagnostics.redaction.extra_env_vars` glob patterns.
 fn validate_profile_env_var_patterns(profile: &Profile) -> Result<()> {
@@ -2184,6 +2190,120 @@ pub struct DiagnosticsConfig {
     /// Extra redaction applied to diagnostic and audit output.
     #[serde(default)]
     pub redaction: RedactionConfig,
+
+    /// Budget for recording denied network syscalls individually.
+    #[serde(default)]
+    pub network_denial_audit: NetworkDenialAuditConfig,
+}
+
+/// Default sustained rate of individually recorded network denials.
+pub const NETWORK_DENIAL_AUDIT_DEFAULT_RATE: u32 = 20;
+/// Default burst of individually recorded network denials.
+pub const NETWORK_DENIAL_AUDIT_DEFAULT_BURST: u32 = 50;
+/// Hard ceiling on the sustained rate. Bounds worst-case memory growth from
+/// a denial flood, whatever a profile or flag asks for.
+pub const NETWORK_DENIAL_AUDIT_MAX_RATE: u32 = 1_000;
+/// Hard ceiling on the burst, for the same reason.
+pub const NETWORK_DENIAL_AUDIT_MAX_BURST: u32 = 10_000;
+
+/// Profile-supplied budget for individually recording denied network syscalls.
+///
+/// This is output hygiene, not enforcement: a denied syscall is always denied,
+/// and an allowed one never consumes budget. The budget only bounds how many
+/// denials are written individually to the audit trail and diagnostics.
+/// Denials beyond it are counted and reported in one summary audit event, so
+/// suppression is never silent. Unset fields use the defaults; set fields must
+/// be between 1 and the ceilings above.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkDenialAuditConfig {
+    /// Sustained number of denials recorded individually per second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_per_sec: Option<u32>,
+    /// Number of denials that may be recorded individually in one burst.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+}
+
+/// Validated, resolved network-denial audit budget.
+///
+/// Only consumed by the Linux seccomp supervisor; other platforms still
+/// parse and validate it so a profile behaves the same everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkDenialAuditLimits {
+    pub rate_per_sec: u32,
+    pub burst: u32,
+}
+
+impl Default for NetworkDenialAuditLimits {
+    fn default() -> Self {
+        Self {
+            rate_per_sec: NETWORK_DENIAL_AUDIT_DEFAULT_RATE,
+            burst: NETWORK_DENIAL_AUDIT_DEFAULT_BURST,
+        }
+    }
+}
+
+/// Where a candidate value came from, so errors can name it.
+enum DenialAuditSource {
+    Cli(&'static str),
+    Profile(&'static str),
+}
+
+fn check_denial_audit_value(value: u32, max: u32, source: DenialAuditSource) -> Result<u32> {
+    if (1..=max).contains(&value) {
+        return Ok(value);
+    }
+    match source {
+        DenialAuditSource::Cli(flag) => Err(NonoError::ConfigParse(format!(
+            "{flag} must be between 1 and {max}, got {value}"
+        ))),
+        DenialAuditSource::Profile(key) => Err(NonoError::ProfileParse(format!(
+            "{key} must be between 1 and {max}, got {value}"
+        ))),
+    }
+}
+
+impl NetworkDenialAuditLimits {
+    /// Resolve the budget. Precedence is CLI flag, then profile, then the
+    /// default. Every explicitly set value is validated, wherever it came from.
+    pub fn resolve(
+        profile: NetworkDenialAuditConfig,
+        cli_rate: Option<u32>,
+        cli_burst: Option<u32>,
+    ) -> Result<Self> {
+        let rate_per_sec = match (cli_rate, profile.rate_per_sec) {
+            (Some(v), _) => check_denial_audit_value(
+                v,
+                NETWORK_DENIAL_AUDIT_MAX_RATE,
+                DenialAuditSource::Cli("--network-denial-audit-rate"),
+            )?,
+            (None, Some(v)) => check_denial_audit_value(
+                v,
+                NETWORK_DENIAL_AUDIT_MAX_RATE,
+                DenialAuditSource::Profile("diagnostics.network_denial_audit.rate_per_sec"),
+            )?,
+            (None, None) => NETWORK_DENIAL_AUDIT_DEFAULT_RATE,
+        };
+        let burst = match (cli_burst, profile.burst) {
+            (Some(v), _) => check_denial_audit_value(
+                v,
+                NETWORK_DENIAL_AUDIT_MAX_BURST,
+                DenialAuditSource::Cli("--network-denial-audit-burst"),
+            )?,
+            (None, Some(v)) => check_denial_audit_value(
+                v,
+                NETWORK_DENIAL_AUDIT_MAX_BURST,
+                DenialAuditSource::Profile("diagnostics.network_denial_audit.burst"),
+            )?,
+            (None, None) => NETWORK_DENIAL_AUDIT_DEFAULT_BURST,
+        };
+        Ok(Self {
+            rate_per_sec,
+            burst,
+        })
+    }
 }
 
 /// Profile-supplied additions to the output redaction policy.
@@ -3274,6 +3394,7 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
         return Err(NonoError::ProfileParse(err));
     }
     validate_profile_env_var_patterns(&profile)?;
+    validate_profile_network_denial_audit(&profile)?;
     validate_profile_domain_patterns(&profile)?;
     merge_implicit_default_groups(&mut profile)?;
     // Re-run after extends/platform overrides: base and child profiles can
@@ -3417,6 +3538,7 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
         return Err(NonoError::ProfileParse(err));
     }
     validate_profile_env_var_patterns(&profile)?;
+    validate_profile_network_denial_audit(&profile)?;
     validate_profile_domain_patterns(&profile)?;
 
     validate_command_policies(
@@ -3905,6 +4027,18 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.diagnostics.suppress_system_services,
                 &child.diagnostics.suppress_system_services,
             ),
+            network_denial_audit: NetworkDenialAuditConfig {
+                rate_per_sec: child
+                    .diagnostics
+                    .network_denial_audit
+                    .rate_per_sec
+                    .or(base.diagnostics.network_denial_audit.rate_per_sec),
+                burst: child
+                    .diagnostics
+                    .network_denial_audit
+                    .burst
+                    .or(base.diagnostics.network_denial_audit.burst),
+            },
         },
         env_credentials: SecretsConfig {
             mappings: {
@@ -8285,6 +8419,174 @@ mod tests {
         ];
 
         assert!(validate_profile_env_var_patterns(&profile).is_ok());
+    }
+
+    fn denial_audit(rate: Option<u32>, burst: Option<u32>) -> NetworkDenialAuditConfig {
+        NetworkDenialAuditConfig {
+            rate_per_sec: rate,
+            burst,
+        }
+    }
+
+    #[test]
+    fn test_network_denial_audit_defaults_when_unset() {
+        let limits =
+            NetworkDenialAuditLimits::resolve(NetworkDenialAuditConfig::default(), None, None)
+                .expect("defaults resolve");
+        assert_eq!(limits, NetworkDenialAuditLimits::default());
+        assert_eq!(limits.rate_per_sec, NETWORK_DENIAL_AUDIT_DEFAULT_RATE);
+        assert_eq!(limits.burst, NETWORK_DENIAL_AUDIT_DEFAULT_BURST);
+    }
+
+    #[test]
+    fn test_network_denial_audit_profile_values_are_used() {
+        let limits =
+            NetworkDenialAuditLimits::resolve(denial_audit(Some(100), Some(500)), None, None)
+                .expect("profile values resolve");
+        assert_eq!((limits.rate_per_sec, limits.burst), (100, 500));
+    }
+
+    #[test]
+    fn test_network_denial_audit_cli_overrides_profile_per_field() {
+        // CLI sets only the rate; the burst still comes from the profile.
+        let limits =
+            NetworkDenialAuditLimits::resolve(denial_audit(Some(100), Some(500)), Some(7), None)
+                .expect("mixed sources resolve");
+        assert_eq!((limits.rate_per_sec, limits.burst), (7, 500));
+
+        // CLI sets only the burst; the rate falls back to the default.
+        let limits =
+            NetworkDenialAuditLimits::resolve(NetworkDenialAuditConfig::default(), None, Some(9))
+                .expect("cli burst over default rate");
+        assert_eq!(
+            (limits.rate_per_sec, limits.burst),
+            (NETWORK_DENIAL_AUDIT_DEFAULT_RATE, 9)
+        );
+    }
+
+    #[test]
+    fn test_network_denial_audit_accepts_ceilings_and_one() {
+        let limits = NetworkDenialAuditLimits::resolve(
+            denial_audit(
+                Some(NETWORK_DENIAL_AUDIT_MAX_RATE),
+                Some(NETWORK_DENIAL_AUDIT_MAX_BURST),
+            ),
+            None,
+            None,
+        )
+        .expect("ceilings are accepted");
+        assert_eq!(limits.rate_per_sec, NETWORK_DENIAL_AUDIT_MAX_RATE);
+        assert_eq!(limits.burst, NETWORK_DENIAL_AUDIT_MAX_BURST);
+        assert!(
+            NetworkDenialAuditLimits::resolve(denial_audit(Some(1), Some(1)), None, None).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_network_denial_audit_rejects_zero_and_over_ceiling_from_profile() {
+        for cfg in [
+            denial_audit(Some(0), None),
+            denial_audit(Some(NETWORK_DENIAL_AUDIT_MAX_RATE + 1), None),
+            denial_audit(None, Some(0)),
+            denial_audit(None, Some(NETWORK_DENIAL_AUDIT_MAX_BURST + 1)),
+            denial_audit(Some(u32::MAX), Some(u32::MAX)),
+        ] {
+            let err = NetworkDenialAuditLimits::resolve(cfg, None, None)
+                .expect_err("out-of-range profile value must be rejected");
+            assert!(matches!(err, NonoError::ProfileParse(_)), "{err:?}");
+            assert!(
+                err.to_string()
+                    .contains("diagnostics.network_denial_audit."),
+                "error must name the profile key: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_network_denial_audit_rejects_out_of_range_cli_and_names_flag() {
+        let err =
+            NetworkDenialAuditLimits::resolve(NetworkDenialAuditConfig::default(), Some(0), None)
+                .expect_err("zero rate rejected");
+        assert!(matches!(err, NonoError::ConfigParse(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("--network-denial-audit-rate"),
+            "{err}"
+        );
+
+        let err = NetworkDenialAuditLimits::resolve(
+            NetworkDenialAuditConfig::default(),
+            None,
+            Some(NETWORK_DENIAL_AUDIT_MAX_BURST + 1),
+        )
+        .expect_err("over-ceiling burst rejected");
+        assert!(
+            err.to_string().contains("--network-denial-audit-burst"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_network_denial_audit_invalid_profile_value_is_rejected_even_when_cli_overrides() {
+        // A CLI override must not launder a bad profile at load time: the
+        // profile is validated on its own when it loads.
+        let mut profile = Profile::default();
+        profile.diagnostics.network_denial_audit = denial_audit(Some(0), None);
+        assert!(validate_profile_network_denial_audit(&profile).is_err());
+        profile.diagnostics.network_denial_audit = denial_audit(Some(10), Some(10));
+        assert!(validate_profile_network_denial_audit(&profile).is_ok());
+    }
+
+    #[test]
+    fn test_network_denial_audit_merge_child_overrides_per_field() {
+        let mut base = Profile::default();
+        base.diagnostics.network_denial_audit = denial_audit(Some(100), Some(500));
+        let mut child = Profile::default();
+        child.diagnostics.network_denial_audit = denial_audit(None, Some(40));
+
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged.diagnostics.network_denial_audit,
+            denial_audit(Some(100), Some(40)),
+            "child burst overrides; unset child rate inherits the base"
+        );
+    }
+
+    #[test]
+    fn test_network_denial_audit_parses_from_json_and_rejects_unknown_key() {
+        let profile: Profile = serde_json::from_str(
+            r#"{ "diagnostics": { "network_denial_audit": { "rate_per_sec": 60, "burst": 200 } } }"#,
+        )
+        .expect("network_denial_audit should parse");
+        assert_eq!(
+            profile.diagnostics.network_denial_audit,
+            denial_audit(Some(60), Some(200))
+        );
+
+        let parsed: std::result::Result<Profile, _> = serde_json::from_str(
+            r#"{ "diagnostics": { "network_denial_audit": { "enforce": false } } }"#,
+        );
+        assert!(parsed.is_err(), "unknown keys must be rejected");
+
+        let parsed: std::result::Result<Profile, _> = serde_json::from_str(
+            r#"{ "diagnostics": { "network_denial_audit": { "burst": -1 } } }"#,
+        );
+        assert!(parsed.is_err(), "negative values must not parse");
+    }
+
+    /// The published schema must agree with the ceilings enforced at runtime.
+    #[test]
+    fn test_network_denial_audit_schema_bounds_match_constants() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../data/nono-profile.schema.json"))
+                .expect("schema is valid JSON");
+        let props = &schema["$defs"]["NetworkDenialAuditConfig"]["properties"];
+        assert_eq!(props["rate_per_sec"]["minimum"], 1);
+        assert_eq!(
+            props["rate_per_sec"]["maximum"],
+            NETWORK_DENIAL_AUDIT_MAX_RATE
+        );
+        assert_eq!(props["burst"]["minimum"], 1);
+        assert_eq!(props["burst"]["maximum"], NETWORK_DENIAL_AUDIT_MAX_BURST);
     }
 
     #[test]

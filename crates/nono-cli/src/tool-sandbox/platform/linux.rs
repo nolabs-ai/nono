@@ -4619,7 +4619,8 @@ fn launch_child_with_direct_fds(
         .stdout(Stdio::from(File::from(stdio.stdout)))
         .stderr(Stdio::from(File::from(stdio.stderr)));
     install_lineage_attach(state, command_name, &mut command)?;
-    let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
+    let mut child =
+        crate::owned_children::spawn(&mut command).map_err(NonoError::CommandExecution)?;
     drop(command);
     let exit_code = wait_for_tracked_child(state, command_name, launch_caller, &mut child)?;
     Ok(ChildLaunchResult {
@@ -4655,7 +4656,8 @@ fn launch_child_with_brokered_stdio(
         .stderr(Stdio::from(File::from(stderr_write)));
     install_lineage_attach(state, command_name, &mut command)?;
 
-    let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
+    let mut child =
+        crate::owned_children::spawn(&mut command).map_err(NonoError::CommandExecution)?;
     drop(command);
     track_spawned_child(state, command_name, launch_caller, &mut child)?;
 
@@ -4918,7 +4920,8 @@ fn launch_child_with_capture(
     drop(stdio.stdout);
     install_lineage_attach(state, command_name, &mut command)?;
 
-    let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
+    let mut child =
+        crate::owned_children::spawn(&mut command).map_err(NonoError::CommandExecution)?;
     drop(command);
     // The write end was moved into the child's Stdio and is now closed in
     // the parent, so reading from pipe_read will yield EOF when the child
@@ -4975,7 +4978,8 @@ fn launch_child_with_pty(
         .stdout(Stdio::from(File::from(stdout_slave)))
         .stderr(Stdio::from(File::from(stderr_slave)));
     install_lineage_attach(state, command_name, &mut command)?;
-    let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
+    let mut child =
+        crate::owned_children::spawn(&mut command).map_err(NonoError::CommandExecution)?;
     drop(command);
     drop(pty.slave);
     track_spawned_child(state, command_name, launch_caller, &mut child)?;

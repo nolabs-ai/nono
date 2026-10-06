@@ -1,6 +1,6 @@
 [package]
 name = "nono-proxy"
-version = "0.78.0"
+version = "0.79.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -18,7 +18,7 @@ default = ["system-keyring"]
 system-keyring = ["nono/system-keyring"]
 
 [dependencies]
-nono = { version = "0.78.0", path = "../nono", default-features = false }
+nono = { version = "0.79.0", path = "../nono", default-features = false }
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -39,7 +39,16 @@ urlencoding = "2"
 globset.workspace = true
 
 # AWS SigV4 signing support (smithy-rs, no service SDK required)
-aws-config = { version = "1", features = ["behavior-version-latest"] }
+# `credentials-login` is required to resolve an active `aws login` session
+# (a `~/.aws/config` profile whose chain base is a `LoginSession`). Without it
+# the default provider chain fails with "This behavior requires following cargo
+# feature(s) enabled: credentials-login", so an `aws_auth` route cannot sign for
+# an SSO-logged-in operator — the primary intended use of host-side credential
+# resolution.
+aws-config = { version = "1", features = [
+    "behavior-version-latest",
+    "credentials-login",
+] }
 aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 

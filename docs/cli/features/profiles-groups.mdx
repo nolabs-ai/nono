@@ -253,7 +253,7 @@ This is the primary mechanism for surgically customizing inherited profiles with
 | `allow` | `filesystem` | Additional read+write directories to allow |
 | `deny` | `filesystem` | Additional deny rules to apply (block read and write content). On macOS, Unix socket paths also emit a `network-outbound` deny so that `connect(2)` to the socket is blocked. |
 | `deny` | `commands` | Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer `filesystem.deny` and narrower grants. |
-| `bypass_protection` | `filesystem` | Paths exempted from deny groups. **Does not grant access** — each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write`. |
+| `bypass_protection` | `filesystem` | Paths exempted from deny groups. **Does not grant access** — a matching filesystem or Unix socket field must also grant access. |
 | `suppress_save_prompt` | `filesystem` | Paths whose runtime denials should not be offered in save-profile prompts. **Does not grant access** and does not hide diagnostics. |
 | `suppress_system_services` | `diagnostics` | macOS Seatbelt operation names to hide from diagnostic footers and save-profile prompts. **Does not grant access** and does not change enforcement. |
 
@@ -295,7 +295,7 @@ Use `filesystem.deny` as the enforcement mechanism. `commands.deny` remains depr
 }
 ```
 
-On macOS, `filesystem.deny` on a socket path also emits a `network-outbound` deny — Seatbelt classifies `connect(2)` as a network operation, so a file deny alone won't block it. Prefer path- and network-based controls; `commands.deny` is not enforced for child processes.
+On macOS, `filesystem.deny` also emits a `network-outbound` deny — exact socket paths are blocked directly, while denied directories recursively block sockets beneath them. Seatbelt classifies `connect(2)` as a network operation, so a file deny alone won't block it. Prefer path- and network-based controls; `commands.deny` is not enforced for child processes.
 
 #### Adding Write-Only Access
 
@@ -590,7 +590,7 @@ Every profile's effective capability set is built through composition:
 2. **profile.groups.include** adds additional groups on top
 3. **profile.groups.exclude** removes groups from the composed set (exclusion wins)
 4. **profile.filesystem.allow/read/write**, **profile.filesystem.deny**, and **profile.commands.allow/deny** apply additive overrides
-5. **profile.filesystem.bypass_protection** punches targeted holes through deny groups (requires a matching grant in `filesystem.allow`/`read`/`write`)
+5. **profile.filesystem.bypass_protection** punches targeted holes through deny groups (requires a matching filesystem or Unix socket grant)
 6. **CLI overrides** (`--allow`, `--read`, `--bypass-protection`, etc.) are applied last
 
 `profile.filesystem.suppress_save_prompt` and `--suppress-save-prompt` are

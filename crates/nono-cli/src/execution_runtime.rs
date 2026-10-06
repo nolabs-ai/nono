@@ -791,6 +791,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 audit_signer: audit_signer.as_ref(),
                 redaction_policy: &flags.redaction_policy,
                 approval_backend,
+                #[cfg(target_os = "linux")]
+                network_denial_audit: flags.network_denial_audit,
                 silent: flags.silent,
             });
 

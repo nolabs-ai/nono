@@ -6,6 +6,12 @@
 
 pub(crate) mod builtin;
 mod credential_provider;
+#[allow(dead_code)] // wired into callers in a later change
+mod extends_ref;
+#[allow(unused_imports)] // wired into callers in a later change
+pub(crate) use extends_ref::{
+    ExtendsOrigin, ExtendsRef, classify_extends_entry, is_under_pack_store,
+};
 
 pub use credential_provider::{
     CredentialProviderDef, CredentialProviderRequestBodyFormat,

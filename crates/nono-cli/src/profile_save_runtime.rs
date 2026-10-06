@@ -379,11 +379,7 @@ fn offer_save_text_prompt(
     print_patch_preview(patch);
 
     let targets = save_targets(offer.profile_save_files);
-    let existing_path = match targets.first() {
-        Some(SaveTarget::File(path)) => Some(path.as_path()),
-        Some(SaveTarget::NewUserProfile) | None => None,
-    };
-    let choice = prompt_profile_save_choice(existing_path, suppress_patch.is_some())?;
+    let choice = prompt_profile_save_choice(&targets, suppress_patch.is_some())?;
     let Some(selected_patch) =
         selected_profile_save_patch(choice, patch, suppress_patch.as_ref(), has_overrides)?
     else {
@@ -448,7 +444,12 @@ fn parse_save_target_choice(input: &str, count: usize) -> Option<Option<usize>> 
     }
 }
 
+/// `input` is the raw line read, so an empty string means the input closed
+/// (EOF) and cancels, while Enter arrives as a newline and picks file 1.
 fn chosen_save_target(files: &[PathBuf], input: &str) -> Option<Option<PathBuf>> {
+    if input.is_empty() {
+        return Some(None);
+    }
     parse_save_target_choice(input, files.len())
         .map(|choice| choice.and_then(|index| files.get(index).cloned()))
 }
@@ -606,29 +607,45 @@ fn prompt_profile_name(suggested: Option<&str>) -> Result<Option<String>> {
     }
 }
 
+/// The save question names the file only when it is the sole target; with
+/// several, the menu that follows picks the file.
+fn profile_save_question(targets: &[SaveTarget], can_suppress: bool) -> String {
+    if targets.len() > 1 {
+        return if can_suppress {
+            "Save suggestions to a profile? [g] grant / [s] suppress / [Enter] skip: ".to_string()
+        } else {
+            "Save the shown rules to a profile? [g] save / [Enter] skip: ".to_string()
+        };
+    }
+    let existing_profile = match targets.first() {
+        Some(SaveTarget::File(path)) => Some(path.as_path()),
+        Some(SaveTarget::NewUserProfile) | None => None,
+    };
+    match (existing_profile, can_suppress) {
+        (Some(path), true) => format!(
+            "Update profile '{}' with suggestions? [g] grant / [s] suppress / [Enter] skip: ",
+            path.display()
+        ),
+        (Some(path), false) => format!(
+            "Update existing profile '{}' with the shown rules? [g] save / [Enter] skip: ",
+            path.display()
+        ),
+        (None, true) => {
+            "Save suggestions to a user profile? [g] grant / [s] suppress / [Enter] skip: "
+                .to_string()
+        }
+        (None, false) => {
+            "Save the shown rules in a user profile? [g] save / [Enter] skip: ".to_string()
+        }
+    }
+}
+
 fn prompt_profile_save_choice(
-    existing_profile: Option<&Path>,
+    targets: &[SaveTarget],
     can_suppress: bool,
 ) -> Result<ProfileSaveChoice> {
+    let prompt = profile_save_question(targets, can_suppress);
     loop {
-        let prompt = match (existing_profile, can_suppress) {
-            (Some(path), true) => format!(
-                "Update profile '{}' with suggestions? [g] grant / [s] suppress / [Enter] skip: ",
-                path.display()
-            ),
-            (Some(path), false) => format!(
-                "Update existing profile '{}' with the shown rules? [g] save / [Enter] skip: ",
-                path.display()
-            ),
-            (None, true) => {
-                "Save suggestions to a user profile? [g] grant / [s] suppress / [Enter] skip: "
-                    .to_string()
-            }
-            (None, false) => {
-                "Save the shown rules in a user profile? [g] save / [Enter] skip: ".to_string()
-            }
-        };
-
         prompt_print(&prompt, &[]);
 
         let input = read_input_line()?;
@@ -2991,11 +3008,44 @@ mod tests {
         let files = vec![PathBuf::from("/a.json"), PathBuf::from("/b.json")];
 
         assert_eq!(
-            chosen_save_target(&files, ""),
+            chosen_save_target(&files, "\n"),
             Some(Some(PathBuf::from("/a.json")))
         );
-        assert_eq!(chosen_save_target(&files, "skip"), Some(None));
+        assert_eq!(chosen_save_target(&files, "skip\n"), Some(None));
         assert_eq!(chosen_save_target(&files, "9"), None);
+    }
+
+    #[test]
+    fn menu_choice_closed_input_cancels() {
+        let files = vec![PathBuf::from("/a.json"), PathBuf::from("/b.json")];
+
+        assert_eq!(chosen_save_target(&files, ""), Some(None));
+    }
+
+    #[test]
+    fn save_question_names_file_only_for_single_target() {
+        let one = [SaveTarget::File(PathBuf::from("/work/agent.json"))];
+        let two = [
+            SaveTarget::File(PathBuf::from("/work/agent.json")),
+            SaveTarget::File(PathBuf::from("/work/base.json")),
+        ];
+
+        assert_eq!(
+            profile_save_question(&one, true),
+            "Update profile '/work/agent.json' with suggestions? [g] grant / [s] suppress / [Enter] skip: "
+        );
+        assert_eq!(
+            profile_save_question(&two, true),
+            "Save suggestions to a profile? [g] grant / [s] suppress / [Enter] skip: "
+        );
+        assert_eq!(
+            profile_save_question(&two, false),
+            "Save the shown rules to a profile? [g] save / [Enter] skip: "
+        );
+        assert_eq!(
+            profile_save_question(&[SaveTarget::NewUserProfile], true),
+            "Save suggestions to a user profile? [g] grant / [s] suppress / [Enter] skip: "
+        );
     }
 
     #[cfg(unix)]

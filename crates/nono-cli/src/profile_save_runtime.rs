@@ -509,24 +509,39 @@ fn save_patch_to_target(
     cmd_name: &str,
     offer: &ProfileSaveOffer<'_>,
 ) -> Result<()> {
-    let prepared = match target {
-        SaveTarget::File(path) => {
-            let path_text = path.display().to_string();
-            let run_with = offer.compared_profile.unwrap_or(&path_text);
-            prepare_profile_save_to_file(patch, path, run_with)?
-        }
-        SaveTarget::NewUserProfile => {
-            let suggested = suggested_run_profile_name(offer.compared_profile, cmd_name);
-            let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
-                return Ok(());
-            };
-            prepare_profile_save_from_patch(patch, cmd_name, &profile_name, offer.compared_profile)?
-        }
+    let Some(prepared) = prepare_save_to_target(target, patch, cmd_name, offer.compared_profile)?
+    else {
+        return Ok(());
     };
     write_profile(&prepared)?;
     print_profile_save(&prepared, offer.command);
     print_suppression_save_note(patch);
     Ok(())
+}
+
+/// Prepare the save of `patch` to `target`. `None` when the user cancels the
+/// new-profile name prompt.
+fn prepare_save_to_target(
+    target: &SaveTarget,
+    patch: &profile::Profile,
+    cmd_name: &str,
+    compared_profile: Option<&str>,
+) -> Result<Option<PreparedProfileSave>> {
+    match target {
+        SaveTarget::File(path) => {
+            let path_text = path.display().to_string();
+            let run_with = compared_profile.unwrap_or(&path_text);
+            prepare_profile_save_to_file(patch, path, run_with).map(Some)
+        }
+        SaveTarget::NewUserProfile => {
+            let suggested = suggested_run_profile_name(compared_profile, cmd_name);
+            let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
+                return Ok(None);
+            };
+            prepare_profile_save_from_patch(patch, cmd_name, &profile_name, compared_profile)
+                .map(Some)
+        }
+    }
 }
 
 fn selected_profile_save_patch<'a>(
@@ -3039,6 +3054,31 @@ mod tests {
             Some(top.as_path())
         ));
         assert!(!save_target_menu_needed(&[], None));
+    }
+
+    #[test]
+    fn prepare_save_to_file_target_runs_with_full_path_and_writes_patch() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("agent.json");
+        std::fs::write(&path, r#"{ "meta": { "name": "agent" } }"#).expect("write agent");
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+
+        let prepared =
+            prepare_save_to_target(&SaveTarget::File(path.clone()), &patch, "claude", None)
+                .expect("prepare")
+                .expect("file target never cancels");
+        write_profile(&prepared).expect("write");
+
+        assert_eq!(prepared.profile_path, path);
+        assert_eq!(prepared.profile_name, path.display().to_string());
+        let written = std::fs::read_to_string(&path).expect("read agent");
+        let reparsed = profile::parse_profile_bytes(written.as_bytes()).expect("reparse");
+        assert_eq!(reparsed.filesystem.read, vec!["/new"]);
     }
 
     #[test]

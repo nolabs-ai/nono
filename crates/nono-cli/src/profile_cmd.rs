@@ -126,11 +126,11 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
     // Validate --extends target exists in any of the three sources the
     // resolver knows about (user dir, pack store, built-in).
     if let Some(ref base) = args.extends {
-        if base.starts_with("./") || base.starts_with("../") {
-            // The entry is written as given and later resolved against the
-            // file that holds it, so validate it the same way.
+        // The entry is written as given and later resolved against the file
+        // that holds it, so validate it the same way.
+        let entry =
             profile::classify_extends_entry(base, profile::ExtendsOrigin::File(&output_path))?;
-        } else if !profile_exists(base) {
+        if !matches!(entry, profile::ExtendsRef::Path(_)) && !profile_exists(base) {
             return Err(NonoError::ProfileParse(extends_target_not_found_message(
                 base,
             )));
@@ -3499,12 +3499,12 @@ mod tests {
         assert!(err.to_string().contains("not found"));
     }
 
-    fn init_with_relative_extends(xdg: &std::path::Path, out: &std::path::Path) -> Result<()> {
+    fn init_with_extends(xdg: &std::path::Path, out: &std::path::Path, base: &str) -> Result<()> {
         let xdg_str = xdg.to_str().expect("utf8 xdg");
         let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
         cmd_init(ProfileInitArgs {
             name: "new".to_string(),
-            extends: Some("../base.json".to_string()),
+            extends: Some(base.to_string()),
             groups: vec![],
             description: None,
             full: false,
@@ -3526,16 +3526,36 @@ mod tests {
         std::fs::create_dir_all(proj.join(".nono")).expect("create .nono");
         let out = proj.join(".nono/new.json");
 
-        let err = init_with_relative_extends(&xdg, &out).expect_err("base is absent");
+        let err = init_with_extends(&xdg, &out, "../base.json").expect_err("base is absent");
         assert!(err.to_string().contains("cannot be read"), "got: {err}");
         assert!(!out.exists());
 
         std::fs::write(proj.join("base.json"), r#"{ "meta": { "name": "base" } }"#)
             .expect("write base");
-        init_with_relative_extends(&xdg, &out).expect("base present");
+        init_with_extends(&xdg, &out, "../base.json").expect("base present");
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).expect("read")).expect("json");
         assert_eq!(written["extends"], "../base.json");
+    }
+
+    #[test]
+    fn test_init_extends_absolute_path_reports_unsupported() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let out = dir.path().join("new.json");
+
+        let err = init_with_extends(&xdg, &out, "/abs.json").expect_err("absolute path");
+        assert!(
+            err.to_string()
+                .contains("absolute and `~/` paths are not supported in `extends`"),
+            "got: {err}"
+        );
+        assert!(!out.exists());
     }
 
     #[test]

@@ -6,12 +6,8 @@
 
 pub(crate) mod builtin;
 mod credential_provider;
-#[allow(dead_code)] // wired into callers in a later change
 mod extends_ref;
-#[allow(unused_imports)] // wired into callers in a later change
-pub(crate) use extends_ref::{
-    ExtendsOrigin, ExtendsRef, classify_extends_entry, is_under_pack_store,
-};
+pub(crate) use extends_ref::{ExtendsOrigin, ExtendsRef, classify_extends_entry};
 
 pub use credential_provider::{
     CredentialProviderDef, CredentialProviderRequestBodyFormat,
@@ -3416,7 +3412,14 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
 
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
 pub(crate) fn resolve_and_finalize_profile(profile: Profile) -> Result<Profile> {
-    finalize_profile(resolve_extends(profile, &mut Vec::new(), 0, None, None)?)
+    finalize_profile(resolve_extends(
+        profile,
+        &mut Vec::new(),
+        0,
+        None,
+        None,
+        &[],
+    )?)
 }
 
 /// Get the implicit default groups for a finalized profile.
@@ -3553,7 +3556,14 @@ fn load_from_file(path: &Path, cli_extends: &[String]) -> Result<Profile> {
     } else {
         source_path.parent()
     };
-    resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(&source_path))
+    resolve_extends(
+        profile,
+        &mut Vec::new(),
+        0,
+        context_dir,
+        Some(&source_path),
+        &[],
+    )
 }
 
 fn prepend_cli_extends(profile: &mut Profile, cli_extends: &[String]) {
@@ -3588,8 +3598,11 @@ const MAX_INHERITANCE_DEPTH: usize = 10;
 /// profiles can reference each other by name. `source_file` is the path of
 /// the file whose extends are being resolved so sibling lookup can skip
 /// self-references (e.g. `.nono/codex.json` extending `"codex"` should not
-/// resolve to itself). The `visited` vec tracks profile names already in the
-/// chain to detect circular dependencies.
+/// resolve to itself). Entries written in `source_file` are classified against
+/// it; with no `source_file` they are treated as built-in. `leading` holds
+/// already-classified bases merged ahead of the profile's own entries. The
+/// `visited` vec tracks the `ExtendsRef::visited_key` of each base already in
+/// the chain to detect circular dependencies.
 ///
 /// Shared transitive bases are handled naturally: `visited` tracks only the
 /// current ancestor chain (push before recurse, pop after). When two siblings
@@ -3602,11 +3615,11 @@ fn resolve_extends(
     depth: usize,
     context_dir: Option<&Path>,
     source_file: Option<&Path>,
+    leading: &[ExtendsRef],
 ) -> Result<Profile> {
-    let base_names = match child.extends {
-        Some(ref names) => names.clone(),
-        None => return Ok(child),
-    };
+    if child.extends.is_none() && leading.is_empty() {
+        return Ok(child);
+    }
 
     if depth >= MAX_INHERITANCE_DEPTH {
         return Err(NonoError::ProfileInheritance(format!(
@@ -3616,20 +3629,38 @@ fn resolve_extends(
         )));
     }
 
+    let origin = match source_file {
+        Some(file) => ExtendsOrigin::File(file),
+        None => ExtendsOrigin::Builtin,
+    };
+    let mut bases = leading.to_vec();
+    for raw in child.extends.iter().flatten() {
+        bases.push(classify_extends_entry(raw, origin)?);
+    }
+
     // Resolve each base and fold-merge them left-to-right
     let mut accumulated_base: Option<Profile> = None;
-    for base_name in &base_names {
-        if visited.contains(base_name) {
+    for base in &bases {
+        let key = base.visited_key();
+        if visited.contains(&key) {
             return Err(NonoError::ProfileInheritance(format!(
                 "circular dependency detected: {} -> {}",
                 visited.join(" -> "),
-                base_name
+                key
             )));
         }
 
-        visited.push(base_name.clone());
+        visited.push(key);
 
-        let resolved = load_base_profile_raw(base_name, context_dir, source_file)?;
+        let resolved = match base {
+            ExtendsRef::Path(path) => {
+                let (profile, source_path) = parse_file_backed_profile(path)?;
+                ResolvedBase::Sibling(profile, source_path)
+            }
+            ExtendsRef::Name(name) | ExtendsRef::Registry(name) => {
+                load_base_profile_raw(name, context_dir, source_file)?
+            }
+        };
         let resolved_base = match resolved {
             ResolvedBase::Sibling(base, source_path) => resolve_extends(
                 base,
@@ -3637,8 +3668,13 @@ fn resolve_extends(
                 depth + 1,
                 source_path.parent(),
                 Some(&source_path),
+                &[],
             )?,
-            ResolvedBase::Global(base) => resolve_extends(base, visited, depth + 1, None, None)?,
+            // Pack-store bases keep their file so path entries in them hit the
+            // pack-profile rule; name lookup still gets no sibling context.
+            ResolvedBase::Global(base, pack_path) => {
+                resolve_extends(base, visited, depth + 1, None, pack_path.as_deref(), &[])?
+            }
         };
         // Pop to restore the stack to the pre-base state. On the error path
         // above (? propagation), visited is abandoned so the missing pop is harmless.
@@ -3659,10 +3695,11 @@ fn resolve_extends(
 /// Distinguishes where a base profile was resolved from so `resolve_extends`
 /// can propagate the canonical source directory only for sibling-resolved
 /// profiles. Global sources clear the context to prevent project-local files
-/// from hijacking built-in inheritance chains.
+/// from hijacking built-in inheritance chains. A pack-store base carries its
+/// profile path; a built-in carries `None`.
 enum ResolvedBase {
     Sibling(Profile, PathBuf),
-    Global(Profile),
+    Global(Profile, Option<PathBuf>),
 }
 
 /// Load a base profile by name WITHOUT applying implicit default-group merging.
@@ -3689,13 +3726,6 @@ fn load_base_profile_raw(
     context_dir: Option<&Path>,
     source_file: Option<&Path>,
 ) -> Result<ResolvedBase> {
-    if !is_valid_profile_name(name) && !is_registry_ref(name) {
-        return Err(NonoError::ProfileInheritance(format!(
-            "invalid base profile name '{}'",
-            name
-        )));
-    }
-
     // 0. Sibling in the same directory as the child profile.
     //    Skip if the sibling path is the source file itself to avoid
     //    self-references (e.g. `.nono/codex.json` extending "codex").
@@ -3732,13 +3762,13 @@ fn load_base_profile_raw(
         if !base.packs.contains(&pack_key) {
             base.packs.push(pack_key.clone());
         }
-        return Ok(ResolvedBase::Global(base));
+        return Ok(ResolvedBase::Global(base, Some(profile_path)));
     }
 
     // 3. Built-in profile from embedded policy.
     let policy = crate::policy::load_embedded_policy()?;
     if let Some(def) = policy.profiles.get(name) {
-        return Ok(ResolvedBase::Global(def.to_raw_profile()));
+        return Ok(ResolvedBase::Global(def.to_raw_profile(), None));
     }
 
     // 4. Pack-provided rescue: when we were entered through
@@ -3761,7 +3791,7 @@ fn load_base_profile_raw(
                         base.packs.push(pack_key.clone());
                     }
                     resolve_store_pack_session_hooks(&mut base, &pack_key)?;
-                    return Ok(ResolvedBase::Global(base));
+                    return Ok(ResolvedBase::Global(base, Some(profile_path)));
                 }
             }
             crate::migration::MigrationOutcome::Skipped => {
@@ -7786,6 +7816,143 @@ mod tests {
     }
 
     #[test]
+    fn test_extends_relative_path_sibling_dir()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let nono_dir = dir.path().join("proj/.nono");
+        let shared_dir = dir.path().join("proj/shared");
+        std::fs::create_dir_all(&nono_dir)?;
+        std::fs::create_dir_all(&shared_dir)?;
+        std::fs::write(
+            shared_dir.join("base.json"),
+            r#"{ "meta": { "name": "base" }, "filesystem": { "read": ["/base"] } }"#,
+        )?;
+        std::fs::write(
+            nono_dir.join("agent.json"),
+            r#"{ "extends": "../shared/base.json", "meta": { "name": "agent" },
+                 "filesystem": { "read": ["/child"] } }"#,
+        )?;
+
+        let profile = load_from_file(&nono_dir.join("agent.json"), &[])?;
+
+        assert_eq!(profile.filesystem.read, vec!["/base", "/child"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_extends_relative_path_base_finds_own_sibling()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let child_dir = dir.path().join("child");
+        let shared_dir = dir.path().join("shared");
+        std::fs::create_dir_all(&child_dir)?;
+        std::fs::create_dir_all(&shared_dir)?;
+        std::fs::write(
+            shared_dir.join("base.json"),
+            r#"{ "extends": "common", "meta": { "name": "base" } }"#,
+        )?;
+        std::fs::write(
+            shared_dir.join("common.json"),
+            r#"{ "meta": { "name": "common" }, "filesystem": { "read": ["/shared-common"] } }"#,
+        )?;
+        std::fs::write(
+            child_dir.join("common.json"),
+            r#"{ "meta": { "name": "decoy" }, "filesystem": { "read": ["/decoy"] } }"#,
+        )?;
+        std::fs::write(
+            child_dir.join("agent.json"),
+            r#"{ "extends": "../shared/base.json", "meta": { "name": "agent" } }"#,
+        )?;
+
+        let profile = load_from_file(&child_dir.join("agent.json"), &[])?;
+
+        assert_eq!(profile.filesystem.read, vec!["/shared-common"]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extends_relative_path_symlink_uses_target_dir()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let link_dir = dir.path().join("d");
+        let target_dir = dir.path().join("e");
+        std::fs::create_dir_all(&link_dir)?;
+        std::fs::create_dir_all(&target_dir)?;
+        std::fs::write(
+            target_dir.join("real.json"),
+            r#"{ "extends": "sib", "meta": { "name": "real" } }"#,
+        )?;
+        std::fs::write(
+            target_dir.join("sib.json"),
+            r#"{ "meta": { "name": "sib" }, "filesystem": { "read": ["/target-sib"] } }"#,
+        )?;
+        std::fs::write(
+            link_dir.join("sib.json"),
+            r#"{ "meta": { "name": "decoy" }, "filesystem": { "read": ["/link-sib"] } }"#,
+        )?;
+        std::fs::write(
+            link_dir.join("child.json"),
+            r#"{ "extends": "./link.json", "meta": { "name": "child" } }"#,
+        )?;
+        std::os::unix::fs::symlink(target_dir.join("real.json"), link_dir.join("link.json"))?;
+
+        let profile = load_from_file(&link_dir.join("child.json"), &[])?;
+
+        assert_eq!(profile.filesystem.read, vec!["/target-sib"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_extends_relative_path_cycle_detected() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("a.json"),
+            r#"{ "extends": "./b.json", "meta": { "name": "a" } }"#,
+        )
+        .expect("write a");
+        std::fs::write(
+            dir.path().join("b.json"),
+            r#"{ "extends": "./a.json", "meta": { "name": "b" } }"#,
+        )
+        .expect("write b");
+
+        let err = load_from_file(&dir.path().join("a.json"), &[]).expect_err("cycle must error");
+
+        assert!(
+            err.to_string().contains("circular dependency"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_extends_same_file_two_spellings_is_not_cycle()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        std::fs::create_dir_all(dir.path().join("x"))?;
+        std::fs::create_dir_all(dir.path().join("y"))?;
+        std::fs::write(
+            dir.path().join("x/a.json"),
+            r#"{ "meta": { "name": "a" }, "filesystem": { "read": ["/a"] } }"#,
+        )?;
+        std::fs::write(
+            dir.path().join("y/b.json"),
+            r#"{ "extends": "../x/a.json", "meta": { "name": "b" },
+                 "filesystem": { "read": ["/b"] } }"#,
+        )?;
+        std::fs::write(
+            dir.path().join("child.json"),
+            r#"{ "extends": ["./x/a.json", "./y/b.json"], "meta": { "name": "child" } }"#,
+        )?;
+
+        let profile = load_from_file(&dir.path().join("child.json"), &[])?;
+
+        assert!(profile.filesystem.read.contains(&"/a".to_string()));
+        assert!(profile.filesystem.read.contains(&"/b".to_string()));
+        Ok(())
+    }
+
+    #[test]
     fn test_extends_user_profile() {
         // Test user-to-user file-based inheritance by parsing two temp files
         // and running resolve_extends + merge_profiles — the same pipeline
@@ -7864,7 +8031,7 @@ mod tests {
 
         // Resolve B first
         let resolved_b =
-            resolve_extends(b_profile, &mut Vec::new(), 0, None, None).expect("resolve b");
+            resolve_extends(b_profile, &mut Vec::new(), 0, None, None, &[]).expect("resolve b");
         // Then merge A on top
         let merged = merge_profiles(resolved_b, a_profile);
 
@@ -7880,7 +8047,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None);
+        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None, &[]);
         assert!(result.is_err());
         let err = result.expect_err("missing base should error");
         assert!(
@@ -7899,7 +8066,7 @@ mod tests {
         };
 
         let mut visited = vec!["a".to_string(), "b".to_string()];
-        let result = resolve_extends(profile, &mut visited, 2, None, None);
+        let result = resolve_extends(profile, &mut visited, 2, None, None, &[]);
         assert!(result.is_err());
         let err = result.expect_err("circular dep should error");
         assert!(
@@ -7917,7 +8084,7 @@ mod tests {
         };
 
         let mut visited = vec!["self-ref".to_string()];
-        let result = resolve_extends(profile, &mut visited, 1, None, None);
+        let result = resolve_extends(profile, &mut visited, 1, None, None, &[]);
         assert!(result.is_err());
         let err = result.expect_err("self-reference should error");
         assert!(
@@ -7943,6 +8110,7 @@ mod tests {
             MAX_INHERITANCE_DEPTH,
             None,
             None,
+            &[],
         );
         assert!(result.is_err());
         let err = result.expect_err("depth limit should error");
@@ -8596,7 +8764,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None);
+        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None, &[]);
         assert!(result.is_err());
         let err = result.expect_err("empty string base should error");
         assert!(
@@ -8725,7 +8893,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None);
+        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None, &[]);
         assert!(
             result.is_ok(),
             "duplicate base should be deduplicated, not error: {:?}",
@@ -10799,6 +10967,55 @@ mod tests {
             &[],
             hook_file,
         )
+    }
+
+    #[test]
+    fn test_extends_path_entry_in_pack_profile_rejected() {
+        let err = with_config_env(|config_dir| {
+            build_fake_pack_store(
+                config_dir,
+                "acme",
+                "pathy",
+                "pathy",
+                r#"{ "extends": "./other.json", "meta": { "name": "pathy" } }"#,
+                None,
+            );
+            load_profile("acme/pathy").expect_err("path entry in pack profile must error")
+        });
+
+        assert!(
+            err.to_string()
+                .contains("path entries in `extends` are not allowed in pack profiles"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_extends_path_entry_in_pack_base_rejected() {
+        let err = with_config_env(|config_dir| {
+            build_fake_pack_store(
+                config_dir,
+                "acme",
+                "pathy",
+                "pathy",
+                r#"{ "extends": "./other.json", "meta": { "name": "pathy" } }"#,
+                None,
+            );
+            let dir = tempdir().expect("tmpdir");
+            let child = dir.path().join("child.json");
+            std::fs::write(
+                &child,
+                r#"{ "extends": "pathy", "meta": { "name": "child" } }"#,
+            )
+            .expect("write child");
+            load_from_file(&child, &[]).expect_err("path entry in pack base must error")
+        });
+
+        assert!(
+            err.to_string()
+                .contains("path entries in `extends` are not allowed in pack profiles"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Test 1: A hook script starting with `$PACK_DIR` in a registry-pack profile

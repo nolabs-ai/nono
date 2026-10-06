@@ -30,6 +30,7 @@ pub(crate) enum ExtendsOrigin<'a> {
     /// may not exist yet for `profile init`).
     File(&'a Path),
     /// Entry from `--extends`; paths resolve against this directory.
+    #[allow(dead_code)] // constructed by CLI `--extends` handling in a later change
     Cli(&'a Path),
     Builtin,
 }
@@ -74,6 +75,9 @@ fn resolve_path_entry(raw: &str, origin: ExtendsOrigin<'_>) -> Result<PathBuf> {
             return Err(inheritance_error(format!("'{raw}': {ERR_PATH_IN_BUILTIN}")));
         }
         ExtendsOrigin::File(file) => {
+            // The rejection checks compare canonical prefixes; a non-canonical
+            // spelling of a store or draft path would otherwise slip past them.
+            let file = &nono::try_canonicalize(file);
             if is_under_pack_store(file) {
                 return Err(inheritance_error(format!(
                     "'{raw}': {ERR_PATH_IN_PACK_PROFILE}"
@@ -88,7 +92,7 @@ fn resolve_path_entry(raw: &str, origin: ExtendsOrigin<'_>) -> Result<PathBuf> {
                     file.display()
                 ))
             })?;
-            nono::try_canonicalize(parent)
+            parent.to_path_buf()
         }
     };
 
@@ -265,6 +269,34 @@ mod tests {
             let file = drafts.join("x.json");
             let msg = err_text(classify_extends_entry("./y.json", origin_file(&file)));
             assert!(msg.contains(ERR_PATH_IN_DRAFT), "{msg}");
+        });
+    }
+
+    #[test]
+    fn path_entry_in_draft_rejected_via_non_canonical_spelling() {
+        with_isolated_config_home(|cfg| {
+            let drafts = cfg.join("nono/profile-drafts");
+            fs::create_dir_all(&drafts).expect("mkdir");
+            fs::write(drafts.join("y.json"), "{}").expect("write");
+            let file = cfg.join("nono/../nono/profile-drafts/x.json");
+            let msg = err_text(classify_extends_entry("./y.json", origin_file(&file)));
+            assert!(msg.contains(ERR_PATH_IN_DRAFT), "{msg}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_outside_store_into_pack_store_rejected() {
+        with_isolated_config_home(|cfg| {
+            let pack = cfg.join("nono/packages/ns/p/profiles");
+            fs::create_dir_all(&pack).expect("mkdir");
+            fs::write(pack.join("x.json"), "{}").expect("write");
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let d = tmp.path().canonicalize().expect("canon");
+            std::os::unix::fs::symlink(pack.join("x.json"), d.join("link.json")).expect("link");
+            let child = d.join("child.json");
+            let msg = err_text(classify_extends_entry("./link.json", origin_file(&child)));
+            assert!(msg.contains(ERR_PACK_STORE_TARGET), "{msg}");
         });
     }
 

@@ -50,6 +50,7 @@ mod platform_client;
 mod policy;
 mod profile;
 mod profile_cmd;
+mod profile_file_edit;
 mod profile_runtime;
 mod profile_save_runtime;
 mod protected_paths;

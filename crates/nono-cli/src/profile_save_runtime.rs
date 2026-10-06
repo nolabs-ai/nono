@@ -22,6 +22,7 @@ pub(crate) struct PreparedProfileSave {
     pub(crate) profile_name: String,
     pub(crate) profile_path: PathBuf,
     pub(crate) profile: profile::Profile,
+    pub(crate) patch: profile::Profile,
 }
 
 #[derive(Clone, Copy)]
@@ -739,12 +740,37 @@ pub(crate) fn write_profile(prepared: &PreparedProfileSave) -> Result<()> {
         ))
     })?;
 
-    let profile_json = serde_json::to_string_pretty(&prepared.profile)
-        .map_err(|e| NonoError::LearnError(format!("Failed to serialize profile: {}", e)))?;
-    atomic_write(
-        &prepared.profile_path,
-        format!("{profile_json}\n").as_bytes(),
-    )
+    let contents = match prepared.action {
+        SaveAction::Created => {
+            let profile_json = serde_json::to_string_pretty(&prepared.profile).map_err(|e| {
+                NonoError::LearnError(format!("Failed to serialize profile: {}", e))
+            })?;
+            format!("{profile_json}\n")
+        }
+        SaveAction::Updated => updated_profile_text(&prepared.profile_path, &prepared.patch)?,
+    };
+    atomic_write(&prepared.profile_path, contents.as_bytes())
+}
+
+/// Apply `patch` to the profile file's current text, keeping its comments.
+/// The result must still parse as a profile; otherwise the file is left as is.
+fn updated_profile_text(profile_path: &Path, patch: &profile::Profile) -> Result<String> {
+    let original = std::fs::read_to_string(profile_path).map_err(|e| {
+        NonoError::LearnError(format!(
+            "Failed to read profile {}: {}",
+            profile_path.display(),
+            e
+        ))
+    })?;
+    let updated = crate::profile_file_edit::apply_patch_to_profile_text(&original, patch)?;
+    profile::parse_profile_bytes(updated.as_bytes()).map_err(|e| {
+        NonoError::LearnError(format!(
+            "Updated profile {} would be invalid: {}",
+            profile_path.display(),
+            e
+        ))
+    })?;
+    Ok(updated)
 }
 
 /// Write `contents` to `path` atomically: write to a sibling temp file, fsync,
@@ -1693,6 +1719,7 @@ pub(crate) fn prepare_profile_save_from_patch(
             profile_name: profile_name.to_string(),
             profile_path,
             profile: existing,
+            patch: patch.clone(),
         });
     }
 
@@ -1728,6 +1755,7 @@ pub(crate) fn prepare_profile_save_from_patch(
         profile_name: profile_name.to_string(),
         profile_path,
         profile: new_profile,
+        patch: patch.clone(),
     })
 }
 
@@ -1964,6 +1992,8 @@ fn merge_access(existing: AccessMode, requested: AccessMode) -> AccessMode {
     }
 }
 
+/// Keep the merged fields in step with `PATCHED_LISTS` in `profile_file_edit`,
+/// which applies the same patch to profile text when updating a file.
 pub(crate) fn merge_profile_patch(profile: &mut profile::Profile, patch: &profile::Profile) {
     profile.filesystem.allow =
         profile::dedup_append(&profile.filesystem.allow, &patch.filesystem.allow);
@@ -2688,6 +2718,108 @@ mod tests {
         assert_eq!(
             prepared.profile.unsafe_macos_seatbelt_rules,
             vec![USER_PREFERENCES_SEATBELT_RULE.to_string()]
+        );
+    }
+
+    fn write_jsonc_user_profile(name: &str, contents: &str) -> PathBuf {
+        let dir = profile::user_profile_dir().expect("profile dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(format!("{name}.jsonc"));
+        std::fs::write(&path, contents).expect("write profile");
+        path
+    }
+
+    #[test]
+    fn write_profile_update_keeps_jsonc_comments() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let path = write_jsonc_user_profile(
+            "commented",
+            "{\n  // why this profile exists\n  \"meta\": { \"name\": \"commented\", \"version\": \"1.0.0\" },\n  \"filesystem\": {\n    // project data\n    \"read\": [\"/old\"]\n  }\n}\n",
+        );
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+
+        let prepared =
+            prepare_profile_save_from_patch(&patch, "claude", "commented", None).expect("prepare");
+        assert!(matches!(prepared.action, SaveAction::Updated));
+        write_profile(&prepared).expect("write profile");
+
+        let written = std::fs::read_to_string(&path).expect("read profile");
+        assert!(written.contains("// why this profile exists"), "{written}");
+        assert!(written.contains("// project data"), "{written}");
+        let reparsed = profile::parse_profile_bytes(written.as_bytes()).expect("reparse");
+        assert_eq!(reparsed.filesystem.read, vec!["/old", "/new"]);
+    }
+
+    #[test]
+    fn write_profile_update_invalid_file_left_unchanged() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let path = write_jsonc_user_profile(
+            "broken",
+            "{ \"meta\": { \"name\": \"broken\", \"version\": \"1.0.0\" } }\n",
+        );
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+        let prepared =
+            prepare_profile_save_from_patch(&patch, "claude", "broken", None).expect("prepare");
+
+        std::fs::write(&path, "{ invalid").expect("corrupt profile");
+        let result = write_profile(&prepared);
+
+        assert!(result.is_err(), "expected error, got {:?}", result.err());
+        assert_eq!(std::fs::read(&path).expect("read profile"), b"{ invalid");
+    }
+
+    #[test]
+    fn write_profile_update_rejects_invalid_profile_left_unchanged() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let path = write_jsonc_user_profile(
+            "unknown-field",
+            "{ \"meta\": { \"name\": \"unknown-field\", \"version\": \"1.0.0\" } }\n",
+        );
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+        let prepared = prepare_profile_save_from_patch(&patch, "claude", "unknown-field", None)
+            .expect("prepare");
+
+        let unknown_field = "{ \"meta\": { \"name\": \"unknown-field\", \"version\": \"1.0.0\" }, \"bogus_field\": 1 }\n";
+        std::fs::write(&path, unknown_field).expect("rewrite profile");
+        let result = write_profile(&prepared);
+
+        assert!(result.is_err(), "expected error, got {:?}", result.err());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read profile"),
+            unknown_field
         );
     }
 

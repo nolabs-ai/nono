@@ -308,6 +308,8 @@ mod tests {
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -387,6 +389,8 @@ mod tests {
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]

@@ -116,6 +116,60 @@ impl ProxyFilter {
         })
     }
 
+    /// Resolve a host the operator has explicitly approved at runtime, bypassing
+    /// the allowlist but STILL enforcing the cloud-metadata / link-local SSRF
+    /// guard against the resolved IPs.
+    ///
+    /// A plain allowlist miss ([`FilterResult::DenyNotAllowed`]) never resolves
+    /// DNS in [`Self::check_host`] — the lookup itself would leak the hostname to
+    /// its nameserver. Once an operator approves such a host, this performs the
+    /// deferred lookup and re-applies only the SSRF guard: approval overrides the
+    /// "not in allowlist" decision, but it can NEVER override a metadata or
+    /// link-local denial. If any resolved IP is in a denied range the connection
+    /// is refused and no addresses are returned.
+    ///
+    /// On success `resolved_addrs` holds the vetted addresses. Callers MUST
+    /// connect to these without re-resolving the hostname, closing the DNS
+    /// rebinding TOCTOU window exactly as [`Self::check_host`] requires.
+    pub async fn resolve_approved_host(&self, host: &str, port: u16) -> Result<CheckResult> {
+        // Guard the hostname literal itself before any lookup (defense in depth;
+        // the CONNECT pre-check already did this, but keep the method total).
+        if let Some(deny) = proxy_metadata_filter_result(host, &[]) {
+            return Ok(CheckResult {
+                result: deny,
+                resolved_addrs: Vec::new(),
+            });
+        }
+
+        let addr_str = format!("{}:{}", host, port);
+        let resolved: Vec<SocketAddr> = match tokio::net::lookup_host(&addr_str).await {
+            Ok(addrs) => addrs.collect(),
+            Err(e) => {
+                debug!("DNS resolution failed for {}: {}", host, e);
+                Vec::new()
+            }
+        };
+
+        let resolved_ips: Vec<IpAddr> = resolved.iter().map(|a| a.ip()).collect();
+        // `check_host_with_ips` applies the metadata guard AND the library's
+        // link-local check, but also the allowlist. We deliberately treat only
+        // the hard security denials (metadata / link-local) as fatal here — a
+        // renewed `DenyNotAllowed` is expected (the host is not on the list) and
+        // is exactly what the operator just overrode.
+        match self.check_host_with_ips(host, &resolved_ips) {
+            FilterResult::Allow | FilterResult::DenyNotAllowed { .. } => Ok(CheckResult {
+                result: FilterResult::Allow,
+                resolved_addrs: resolved,
+            }),
+            deny @ (FilterResult::DenyHost { .. } | FilterResult::DenyLinkLocal { .. }) => {
+                Ok(CheckResult {
+                    result: deny,
+                    resolved_addrs: Vec::new(),
+                })
+            }
+        }
+    }
+
     /// Check a host with pre-resolved IPs (no DNS lookup).
     #[must_use]
     pub fn check_host_with_ips(&self, host: &str, resolved_ips: &[IpAddr]) -> FilterResult {
@@ -293,6 +347,59 @@ mod tests {
         let public_ip = vec![IpAddr::V4(Ipv4Addr::new(104, 18, 7, 96))];
         let result = filter.check_host_with_ips("anything.com", &public_ip);
         assert!(result.is_allowed());
+    }
+
+    // --- resolve_approved_host (runtime approval re-vets against SSRF guard) ---
+
+    #[tokio::test]
+    async fn resolve_approved_host_allows_not_allowlisted_public_ip() {
+        // Operator approved a host that is not on the allowlist. Using an IP
+        // literal keeps the test hermetic (no real DNS). The renewed
+        // `DenyNotAllowed` is the very decision the operator overrode, so the
+        // result must become Allow with the vetted address returned.
+        let filter = ProxyFilter::new_strict(&[]);
+        let check = filter
+            .resolve_approved_host("104.18.7.96", 443)
+            .await
+            .unwrap();
+        assert!(
+            check.result.is_allowed(),
+            "approval overrides allowlist miss"
+        );
+        assert!(
+            !check.resolved_addrs.is_empty(),
+            "vetted address must be returned for the caller to connect to"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_approved_host_never_overrides_metadata_literal() {
+        // Approval must NEVER override the cloud-metadata SSRF guard, even when
+        // the host is an IP literal in the denied range.
+        let filter = ProxyFilter::allow_all();
+        let check = filter
+            .resolve_approved_host("169.254.169.254", 443)
+            .await
+            .unwrap();
+        assert!(!check.result.is_allowed(), "metadata IP must stay denied");
+        assert!(matches!(check.result, FilterResult::DenyHost { .. }));
+        assert!(
+            check.resolved_addrs.is_empty(),
+            "no addresses returned for a denied metadata host"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_approved_host_never_overrides_resolved_link_local() {
+        // A resolved link-local IP is denied regardless of approval. The
+        // link-local literal resolves to itself locally (no network).
+        let filter = ProxyFilter::allow_all();
+        let check = filter
+            .resolve_approved_host("169.254.10.20", 443)
+            .await
+            .unwrap();
+        assert!(!check.result.is_allowed(), "link-local must stay denied");
+        assert!(check.resolved_addrs.is_empty());
     }
 
     #[test]

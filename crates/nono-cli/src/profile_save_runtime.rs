@@ -363,6 +363,7 @@ fn offer_save_with_patch(
     let Some(target) = choose_save_target(
         save_targets(offer.profile_save_files),
         top_level_profile(offer.profile_save_files),
+        &mut TtyPrompt,
     )?
     else {
         return Ok(());
@@ -383,14 +384,18 @@ fn offer_save_text_prompt(
     print_patch_preview(patch);
 
     let targets = save_targets(offer.profile_save_files);
-    let choice = prompt_profile_save_choice(&targets, suppress_patch.is_some())?;
+    let choice = prompt_profile_save_choice(&targets, suppress_patch.is_some(), &mut TtyPrompt)?;
     let Some(selected_patch) =
         selected_profile_save_patch(choice, patch, suppress_patch.as_ref(), has_overrides)?
     else {
         return Ok(());
     };
 
-    let Some(target) = choose_save_target(targets, top_level_profile(offer.profile_save_files))?
+    let Some(target) = choose_save_target(
+        targets,
+        top_level_profile(offer.profile_save_files),
+        &mut TtyPrompt,
+    )?
     else {
         return Ok(());
     };
@@ -421,6 +426,7 @@ fn save_target_menu_needed(files: &[PathBuf], top_level: Option<&Path>) -> bool 
 fn choose_save_target(
     targets: Vec<SaveTarget>,
     top_level: Option<&Path>,
+    io: &mut impl PromptLines,
 ) -> Result<Option<SaveTarget>> {
     let files: Vec<PathBuf> = targets
         .iter()
@@ -432,7 +438,7 @@ fn choose_save_target(
     if !save_target_menu_needed(&files, top_level) {
         return Ok(targets.into_iter().next());
     }
-    Ok(prompt_save_target(&files, top_level)?.map(SaveTarget::File))
+    Ok(prompt_save_target(&files, top_level, io)?.map(SaveTarget::File))
 }
 
 fn render_save_target_menu(files: &[PathBuf], top_level: Option<&Path>) -> String {
@@ -481,15 +487,19 @@ fn chosen_save_target(files: &[PathBuf], input: &str) -> Option<Option<PathBuf>>
         .map(|choice| choice.and_then(|index| files.get(index).cloned()))
 }
 
-fn prompt_save_target(files: &[PathBuf], top_level: Option<&Path>) -> Result<Option<PathBuf>> {
+fn prompt_save_target(
+    files: &[PathBuf],
+    top_level: Option<&Path>,
+    io: &mut impl PromptLines,
+) -> Result<Option<PathBuf>> {
     let menu = render_save_target_menu(files, top_level);
     let (options, choice_prompt) = menu.rsplit_once('\n').unwrap_or(("", menu.as_str()));
     for line in options.lines() {
-        prompt_println(line);
+        io.println(line);
     }
     loop {
-        prompt_print(choice_prompt, &[]);
-        let input = read_input_line()?;
+        io.print(choice_prompt);
+        let input = io.read_line()?;
         if let Some(choice) = chosen_save_target(files, &input) {
             return Ok(choice);
         }
@@ -497,7 +507,7 @@ fn prompt_save_target(files: &[PathBuf], top_level: Option<&Path>) -> Result<Opt
             "Enter a number from 1 to {}, press Enter for 1, or type skip.",
             files.len()
         );
-        prompt_println(&format!("{}", help.red()));
+        io.println(&format!("{}", help.red()));
     }
 }
 
@@ -685,12 +695,13 @@ fn profile_save_question(targets: &[SaveTarget], can_suppress: bool) -> String {
 fn prompt_profile_save_choice(
     targets: &[SaveTarget],
     can_suppress: bool,
+    io: &mut impl PromptLines,
 ) -> Result<ProfileSaveChoice> {
     let prompt = profile_save_question(targets, can_suppress);
     loop {
-        prompt_print(&prompt, &[]);
+        io.print(&prompt);
 
-        let input = read_input_line()?;
+        let input = io.read_line()?;
         if let Some(choice) = parse_profile_save_choice(&input, can_suppress) {
             return Ok(choice);
         }
@@ -700,7 +711,7 @@ fn prompt_profile_save_choice(
         } else {
             "Enter g to save, or press Enter to skip."
         };
-        prompt_println(&format!("{}", help.red()));
+        io.println(&format!("{}", help.red()));
     }
 }
 
@@ -1942,6 +1953,31 @@ fn read_input_line() -> Result<String> {
     prompt_read_line()
 }
 
+/// Line I/O for the save-menu loops, so tests can script the answers.
+/// `read_line` returns the raw line: an empty string is EOF, Enter is "\n".
+trait PromptLines {
+    fn print(&mut self, text: &str);
+    fn println(&mut self, line: &str);
+    fn read_line(&mut self) -> Result<String>;
+}
+
+/// The controlling terminal, as every other save prompt uses it.
+struct TtyPrompt;
+
+impl PromptLines for TtyPrompt {
+    fn print(&mut self, text: &str) {
+        prompt_write(text);
+    }
+
+    fn println(&mut self, line: &str) {
+        prompt_println(line);
+    }
+
+    fn read_line(&mut self) -> Result<String> {
+        read_input_line()
+    }
+}
+
 fn build_run_profile_patch(
     policy_explanations: &[PolicyExplanation],
     error_observation: &ErrorObservation,
@@ -3090,6 +3126,140 @@ mod tests {
         assert_eq!(parse_save_target_choice("3", 2), None);
         assert_eq!(parse_save_target_choice("0", 2), None);
         assert_eq!(parse_save_target_choice("x", 2), None);
+    }
+
+    /// Scripted answers for the save-menu loops; `output` collects every
+    /// prompt and help line they print.
+    struct ScriptedPrompt {
+        input: std::io::Cursor<&'static str>,
+        output: String,
+    }
+
+    impl ScriptedPrompt {
+        fn new(input: &'static str) -> Self {
+            Self {
+                input: std::io::Cursor::new(input),
+                output: String::new(),
+            }
+        }
+    }
+
+    impl PromptLines for ScriptedPrompt {
+        fn print(&mut self, text: &str) {
+            self.output.push_str(text);
+        }
+
+        fn println(&mut self, line: &str) {
+            self.output.push_str(line);
+            self.output.push('\n');
+        }
+
+        fn read_line(&mut self) -> Result<String> {
+            let mut line = String::new();
+            self.input.read_line(&mut line).map_err(NonoError::Io)?;
+            Ok(line)
+        }
+    }
+
+    const MENU_HELP: &str = "Enter a number from 1 to 2, press Enter for 1, or type skip.";
+
+    fn menu_files() -> [PathBuf; 2] {
+        [
+            PathBuf::from("/work/agent.json"),
+            PathBuf::from("/work/base.json"),
+        ]
+    }
+
+    fn run_menu(input: &'static str) -> (Option<PathBuf>, String) {
+        let files = menu_files();
+        let mut io = ScriptedPrompt::new(input);
+        let choice = prompt_save_target(&files, Some(files[0].as_path()), &mut io).expect("menu");
+        (choice, io.output)
+    }
+
+    #[test]
+    fn menu_invalid_answer_prints_help_once_then_takes_the_valid_one() {
+        let (choice, output) = run_menu("x\n2\n");
+        assert_eq!(choice, Some(PathBuf::from("/work/base.json")));
+        assert_eq!(output.matches(MENU_HELP).count(), 1, "{output}");
+        assert_eq!(output.matches("Choice [1]: ").count(), 2, "{output}");
+        assert!(output.contains("Save the selected rules to:"), "{output}");
+    }
+
+    #[test]
+    fn menu_enter_picks_the_first_file() {
+        let (choice, output) = run_menu("\n");
+        assert_eq!(choice, Some(PathBuf::from("/work/agent.json")));
+        assert!(!output.contains(MENU_HELP), "{output}");
+    }
+
+    #[test]
+    fn menu_eof_cancels() {
+        assert_eq!(run_menu("").0, None);
+    }
+
+    #[test]
+    fn menu_skip_cancels() {
+        assert_eq!(run_menu("skip\n").0, None);
+    }
+
+    #[test]
+    fn lone_base_target_still_shows_the_menu() {
+        let base = PathBuf::from("/work/base.json");
+        let mut io = ScriptedPrompt::new("1\n");
+        let target = choose_save_target(
+            vec![SaveTarget::File(base.clone())],
+            Some(Path::new("/work/agent.json")),
+            &mut io,
+        )
+        .expect("choose");
+        assert!(
+            matches!(target, Some(SaveTarget::File(ref path)) if *path == base),
+            "lone base must be picked through the menu"
+        );
+        assert!(
+            io.output.contains("Save the selected rules to:"),
+            "{}",
+            io.output
+        );
+        assert!(io.output.contains("Choice [1]: "), "{}", io.output);
+    }
+
+    fn run_save_question(input: &'static str, can_suppress: bool) -> (ProfileSaveChoice, String) {
+        let mut io = ScriptedPrompt::new(input);
+        let choice =
+            prompt_profile_save_choice(&[SaveTarget::NewUserProfile], can_suppress, &mut io)
+                .expect("question");
+        (choice, io.output)
+    }
+
+    #[test]
+    fn save_question_maps_g_s_and_enter() {
+        assert_eq!(run_save_question("g\n", true).0, ProfileSaveChoice::Grant);
+        assert_eq!(
+            run_save_question("s\n", true).0,
+            ProfileSaveChoice::Suppress
+        );
+        assert_eq!(run_save_question("\n", true).0, ProfileSaveChoice::Skip);
+        assert_eq!(run_save_question("", true).0, ProfileSaveChoice::Skip);
+    }
+
+    #[test]
+    fn save_question_reprompts_after_invalid_answer() {
+        let (choice, output) = run_save_question("x\ng\n", true);
+        assert_eq!(choice, ProfileSaveChoice::Grant);
+        let help = "Enter g to grant, s to suppress, or press Enter to skip.";
+        assert_eq!(output.matches(help).count(), 1, "{output}");
+        let question = profile_save_question(&[SaveTarget::NewUserProfile], true);
+        assert_eq!(output.matches(question.as_str()).count(), 2, "{output}");
+    }
+
+    #[test]
+    fn save_question_rejects_s_when_suppress_is_not_offered() {
+        let (choice, output) = run_save_question("s\n\n", false);
+        assert_eq!(choice, ProfileSaveChoice::Skip);
+        let help = "Enter g to save, or press Enter to skip.";
+        assert_eq!(output.matches(help).count(), 1, "{output}");
     }
 
     #[test]

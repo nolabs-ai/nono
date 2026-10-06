@@ -274,6 +274,28 @@ mod tests {
     }
 
     #[test]
+    fn minted_leaf_carries_server_auth_eku() {
+        // Apple's TLS policy rejects server certificates without an Extended
+        // Key Usage extension containing id-kp-serverAuth. Verify the EKU
+        // extension OID 2.5.29.37 (DER bytes 06 03 55 1d 25) and the
+        // serverAuth purpose OID 1.3.6.1.5.5.7.3.1 are present in the leaf DER.
+        let cache = fresh_cache();
+        let ck = cache.get_or_mint("api.example.com").unwrap();
+        let der = ck.cert[0].as_ref();
+        let eku_oid = [0x06, 0x03, 0x55, 0x1d, 0x25];
+        let server_auth_oid = [0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        assert!(
+            der.windows(eku_oid.len()).any(|w| w == eku_oid),
+            "minted leaf must include Extended Key Usage (OID 2.5.29.37)"
+        );
+        assert!(
+            der.windows(server_auth_oid.len())
+                .any(|w| w == server_auth_oid),
+            "minted leaf EKU must include serverAuth (OID 1.3.6.1.5.5.7.3.1)"
+        );
+    }
+
+    #[test]
     fn minted_leaf_uses_configured_shorter_validity() {
         use x509_parser::prelude::FromDer;
 

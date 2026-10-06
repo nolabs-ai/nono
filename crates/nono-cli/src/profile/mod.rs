@@ -11391,6 +11391,86 @@ mod tests {
     }
 
     #[test]
+    fn test_top_level_pack_profile_is_recorded_and_not_writable() {
+        let (profile, pack_file) = with_config_env(|config_dir| {
+            let install_dir = build_fake_pack_store(
+                config_dir,
+                "acme",
+                "packy",
+                "packy",
+                r#"{ "meta": { "name": "packy" } }"#,
+                None,
+            );
+            let profile = load_profile("packy").expect("load pack profile");
+            let pack_file = install_dir
+                .join("profiles/packy.json")
+                .canonicalize()
+                .expect("canonicalize pack file");
+            (profile, pack_file)
+        });
+
+        let pack_entries: Vec<&ProfileSourceFile> = profile
+            .source_files
+            .iter()
+            .filter(|file| file.kind == ProfileSourceKind::Pack)
+            .collect();
+        assert_eq!(pack_entries.len(), 1, "{:?}", profile.source_files);
+        assert_eq!(pack_entries[0].path, pack_file);
+        assert!(
+            profile.writable_source_files().is_empty(),
+            "{:?}",
+            profile.source_files
+        );
+    }
+
+    #[test]
+    fn test_jsonc_user_profile_is_top_level_user_source() {
+        let (profile, expected) = with_config_env(|config_dir| {
+            let profiles = config_dir.join("nono/profiles");
+            std::fs::create_dir_all(&profiles).expect("mkdir profiles");
+            let path = profiles.join("mine.jsonc");
+            std::fs::write(
+                &path,
+                "{\n  // comment\n  \"meta\": { \"name\": \"mine\" },\n}\n",
+            )
+            .expect("write jsonc profile");
+            let profile = load_profile_no_migrate("mine").expect("load jsonc user profile");
+            (
+                profile,
+                ProfileSourceFile {
+                    top_level: true,
+                    ..source_file(&path, ProfileSourceKind::User)
+                },
+            )
+        });
+
+        assert_eq!(profile.source_files, vec![expected]);
+    }
+
+    #[test]
+    fn test_load_profile_extends_resolved_drops_unclassifiable_entries() {
+        let (resolved, base) = with_config_env(|_| {
+            let dir = tempdir().expect("tmpdir");
+            let base = dir.path().join("base.json");
+            std::fs::write(&base, r#"{ "meta": { "name": "base" } }"#).expect("write base");
+            let child = dir.path().join("child.json");
+            std::fs::write(
+                &child,
+                r#"{ "extends": ["/abs.json", "./base.json", "default", "~/x.json"],
+                     "meta": { "name": "child" } }"#,
+            )
+            .expect("write child");
+            let resolved = load_profile_extends_resolved(child.to_str().expect("utf-8 path"));
+            (resolved, base.canonicalize().expect("canonicalize base"))
+        });
+
+        assert_eq!(
+            resolved,
+            Some(vec![base.display().to_string(), "default".to_string()])
+        );
+    }
+
+    #[test]
     fn test_source_files_not_serialized() {
         let profile = Profile {
             source_files: vec![ProfileSourceFile {

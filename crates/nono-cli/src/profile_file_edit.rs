@@ -229,6 +229,23 @@ mod tests {
     }
 
     #[test]
+    fn allow_localhost_creates_missing_open_urls_section() {
+        let input = r#"{ "meta": { "name": "x" } }"#;
+        let patch = localhost_patch(true);
+
+        let output = apply_patch_to_profile_text(input, &patch).expect("apply patch");
+        assert!(parse(&output).open_urls.expect("open_urls").allow_localhost);
+
+        let mut expected = parse(input);
+        merge_profile_patch(&mut expected, &patch);
+        assert_eq!(
+            serde_json::to_value(parse(&output)).expect("serialize output"),
+            serde_json::to_value(expected).expect("serialize expected"),
+            "output: {output}"
+        );
+    }
+
+    #[test]
     fn matches_merge_profile_patch() {
         let input = r#"{
   // comment

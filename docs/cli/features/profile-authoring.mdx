@@ -55,7 +55,7 @@ The most common pattern is a project profile that builds on a harness profile su
 {
   "extends": ["claude-code", "../shared/base.json"],
   "filesystem": {
-    "allow": ["./build"]
+    "allow": ["$WORKDIR/build"]
   }
 }
 ```
@@ -500,7 +500,7 @@ just exited from immediately confirming the default grants.
 
 After a run, the save prompt can write the shown rules into any writable file the profile came from: the file given to `--profile`, a user profile, a draft, or any writable file in its `extends` chain. Files that come from a pack are never offered.
 
-With one writable file, the prompt names it:
+When the only writable file is the top-level profile, the prompt names it:
 
 ```text
 Update existing profile '/work/app/.nono/agent.json' with the shown rules? [g] save / [Enter] skip:
@@ -514,6 +514,8 @@ Save the selected rules to:
   2) /work/shared/base.json        (base — applies to every profile that extends it)
 Choice [1]:
 ```
+
+The prompt also asks when the only writable file is a base, for example with `--profile claude-code --extends ./team-base.json`. That file is labelled as a base, so you confirm before the rules land in a shared file. Only the top-level profile is labelled "this profile".
 
 Press Enter for the default, type a number to pick a file, or type `skip` to cancel. Saving to a base applies the rules to every profile that extends it. "A new user profile" is offered only when no writable file exists.
 

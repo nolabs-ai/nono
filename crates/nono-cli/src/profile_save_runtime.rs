@@ -3039,19 +3039,20 @@ mod tests {
     fn save_target_menu_shown_unless_the_only_target_is_the_top_level_profile() {
         let top = PathBuf::from("/work/agent.json");
         let extra = PathBuf::from("/work/extra.json");
+        let top_level = Some(top.as_path());
 
         assert!(!save_target_menu_needed(
-            &[top.clone()],
-            Some(top.as_path())
+            std::slice::from_ref(&top),
+            top_level
         ));
         assert!(save_target_menu_needed(
-            &[extra.clone()],
-            Some(top.as_path())
+            std::slice::from_ref(&extra),
+            top_level
         ));
-        assert!(save_target_menu_needed(&[extra.clone()], None));
+        assert!(save_target_menu_needed(std::slice::from_ref(&extra), None));
         assert!(save_target_menu_needed(
-            &[top.clone(), extra],
-            Some(top.as_path())
+            &[top.clone(), extra.clone()],
+            top_level
         ));
         assert!(!save_target_menu_needed(&[], None));
     }

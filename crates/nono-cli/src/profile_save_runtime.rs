@@ -25,6 +25,27 @@ pub(crate) struct PreparedProfileSave {
     pub(crate) patch: profile::Profile,
 }
 
+/// Where a save prompt writes its rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SaveTarget {
+    /// An existing profile file the session ran with.
+    File(PathBuf),
+    /// A user profile the user names at the prompt.
+    NewUserProfile,
+}
+
+/// Save targets in precedence order. A new user profile is offered only when
+/// the session ran with no writable profile file.
+fn save_targets(save_files: &[profile::ProfileSourceFile]) -> Vec<SaveTarget> {
+    if save_files.is_empty() {
+        return vec![SaveTarget::NewUserProfile];
+    }
+    save_files
+        .iter()
+        .map(|file| SaveTarget::File(file.path.clone()))
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 struct PatchGrant {
     access: AccessMode,
@@ -272,7 +293,7 @@ pub(crate) fn offer_save_run_profile(offer: &ProfileSaveOffer<'_>) -> Result<()>
     )?
     else {
         // No filesystem patch — but we may still have URL denials
-        return offer_url_only_save(offer.url_denials, offer.command, offer.compared_profile);
+        return offer_url_only_save(offer);
     };
 
     // Merge URL grants into the filesystem patch profile so extract_denial_items
@@ -293,32 +314,23 @@ pub(crate) fn offer_save_run_profile(offer: &ProfileSaveOffer<'_>) -> Result<()>
             let Some(combined_patch) = build_combined_patch_from_items(&items) else {
                 return Ok(());
             };
-            offer_save_with_patch(
-                &combined_patch,
-                &cmd_name,
-                offer.command,
-                offer.compared_profile,
-            )
+            offer_save_with_patch(&combined_patch, &cmd_name, offer)
         }
-        None => offer_save_text_prompt(&patch, &cmd_name, offer.command, offer.compared_profile),
+        None => offer_save_text_prompt(&patch, &cmd_name, offer),
     }
 }
 
 /// Offer profile save when only URL denials exist (no filesystem patch).
-fn offer_url_only_save(
-    url_denials: &[UrlDenialRecord],
-    command: &[std::ffi::OsString],
-    compared_profile: Option<&str>,
-) -> Result<()> {
-    if url_denials.is_empty() {
+fn offer_url_only_save(offer: &ProfileSaveOffer<'_>) -> Result<()> {
+    if offer.url_denials.is_empty() {
         return Ok(());
     }
 
-    let Some(url_patch) = build_url_patch(url_denials) else {
+    let Some(url_patch) = build_url_patch(offer.url_denials) else {
         return Ok(());
     };
 
-    let Some(cmd_name) = offer_command_name(command) else {
+    let Some(cmd_name) = offer_command_name(offer.command) else {
         return Ok(());
     };
 
@@ -327,17 +339,16 @@ fn offer_url_only_save(
             let Some(combined_patch) = build_combined_patch_from_items(&items) else {
                 return Ok(());
             };
-            offer_save_with_patch(&combined_patch, &cmd_name, command, compared_profile)
+            offer_save_with_patch(&combined_patch, &cmd_name, offer)
         }
-        None => offer_save_text_prompt(&url_patch, &cmd_name, command, compared_profile),
+        None => offer_save_text_prompt(&url_patch, &cmd_name, offer),
     }
 }
 
 fn offer_save_with_patch(
     patch: &profile::Profile,
     cmd_name: &str,
-    command: &[std::ffi::OsString],
-    compared_profile: Option<&str>,
+    offer: &ProfileSaveOffer<'_>,
 ) -> Result<()> {
     let has_overrides = patch_has_policy_overrides(patch);
     if has_overrides
@@ -349,42 +360,14 @@ fn offer_save_with_patch(
         return Ok(());
     }
 
-    let has_suppressions = !patch.filesystem.suppress_save_prompt.is_empty();
-
-    if let Some(existing_profile) = compared_profile
-        .filter(|name| profile::is_valid_profile_name(name) && profile::is_user_override(name))
-    {
-        let prepared =
-            prepare_profile_save_from_patch(patch, cmd_name, existing_profile, compared_profile)?;
-        write_profile(&prepared)?;
-        print_profile_save(&prepared, command);
-        if has_suppressions {
-            print_suppression_save_note(patch);
-        }
-        return Ok(());
-    }
-
-    let suggested = suggested_run_profile_name(compared_profile, cmd_name);
-    let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
-        return Ok(());
-    };
-
-    let prepared =
-        prepare_profile_save_from_patch(patch, cmd_name, &profile_name, compared_profile)?;
-    write_profile(&prepared)?;
-    print_profile_save(&prepared, command);
-    if has_suppressions {
-        print_suppression_save_note(patch);
-    }
-
-    Ok(())
+    let target = first_save_target(offer.profile_save_files);
+    save_patch_to_target(&target, patch, cmd_name, offer)
 }
 
 fn offer_save_text_prompt(
     patch: &profile::Profile,
     cmd_name: &str,
-    command: &[std::ffi::OsString],
-    compared_profile: Option<&str>,
+    offer: &ProfileSaveOffer<'_>,
 ) -> Result<()> {
     let has_overrides = patch_has_policy_overrides(patch);
     let suppress_patch = build_suppress_save_prompt_patch(patch);
@@ -393,50 +376,54 @@ fn offer_save_text_prompt(
     prompt_println("");
     print_patch_preview(patch);
 
-    if let Some(existing_profile) = compared_profile
-        .filter(|name| profile::is_valid_profile_name(name) && profile::is_user_override(name))
-    {
-        let choice = prompt_profile_save_choice(Some(existing_profile), suppress_patch.is_some())?;
-        let Some(selected_patch) =
-            selected_profile_save_patch(choice, patch, suppress_patch.as_ref(), has_overrides)?
-        else {
-            return Ok(());
-        };
-
-        let prepared = prepare_profile_save_from_patch(
-            selected_patch,
-            cmd_name,
-            existing_profile,
-            compared_profile,
-        )?;
-        write_profile(&prepared)?;
-        print_profile_save(&prepared, command);
-        if choice == ProfileSaveChoice::Suppress {
-            print_suppression_save_note(selected_patch);
-        }
-        return Ok(());
-    }
-
-    let choice = prompt_profile_save_choice(None, suppress_patch.is_some())?;
+    let target = first_save_target(offer.profile_save_files);
+    let existing_path = match &target {
+        SaveTarget::File(path) => Some(path.as_path()),
+        SaveTarget::NewUserProfile => None,
+    };
+    let choice = prompt_profile_save_choice(existing_path, suppress_patch.is_some())?;
     let Some(selected_patch) =
         selected_profile_save_patch(choice, patch, suppress_patch.as_ref(), has_overrides)?
     else {
         return Ok(());
     };
 
-    let suggested = suggested_run_profile_name(compared_profile, cmd_name);
-    let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
-        return Ok(());
+    save_patch_to_target(&target, selected_patch, cmd_name, offer)
+}
+
+/// The highest-precedence save target.
+fn first_save_target(save_files: &[profile::ProfileSourceFile]) -> SaveTarget {
+    save_targets(save_files)
+        .into_iter()
+        .next()
+        .unwrap_or(SaveTarget::NewUserProfile)
+}
+
+/// Write `patch` to `target`, prompting for a name when it is a new user
+/// profile, and report the save.
+fn save_patch_to_target(
+    target: &SaveTarget,
+    patch: &profile::Profile,
+    cmd_name: &str,
+    offer: &ProfileSaveOffer<'_>,
+) -> Result<()> {
+    let prepared = match target {
+        SaveTarget::File(path) => {
+            let path_text = path.display().to_string();
+            let run_with = offer.compared_profile.unwrap_or(&path_text);
+            prepare_profile_save_to_file(patch, path, run_with)?
+        }
+        SaveTarget::NewUserProfile => {
+            let suggested = suggested_run_profile_name(offer.compared_profile, cmd_name);
+            let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
+                return Ok(());
+            };
+            prepare_profile_save_from_patch(patch, cmd_name, &profile_name, offer.compared_profile)?
+        }
     };
-
-    let prepared =
-        prepare_profile_save_from_patch(selected_patch, cmd_name, &profile_name, compared_profile)?;
     write_profile(&prepared)?;
-    print_profile_save(&prepared, command);
-    if choice == ProfileSaveChoice::Suppress {
-        print_suppression_save_note(selected_patch);
-    }
-
+    print_profile_save(&prepared, offer.command);
+    print_suppression_save_note(patch);
     Ok(())
 }
 
@@ -546,18 +533,18 @@ fn prompt_profile_name(suggested: Option<&str>) -> Result<Option<String>> {
 }
 
 fn prompt_profile_save_choice(
-    existing_profile: Option<&str>,
+    existing_profile: Option<&Path>,
     can_suppress: bool,
 ) -> Result<ProfileSaveChoice> {
     loop {
         let prompt = match (existing_profile, can_suppress) {
-            (Some(name), true) => format!(
-                "Update user profile '{}' with suggestions? [g] grant / [s] suppress / [Enter] skip: ",
-                name
+            (Some(path), true) => format!(
+                "Update profile '{}' with suggestions? [g] grant / [s] suppress / [Enter] skip: ",
+                path.display()
             ),
-            (Some(name), false) => format!(
-                "Update existing user profile '{}' with the shown rules? [g] save / [Enter] skip: ",
-                name
+            (Some(path), false) => format!(
+                "Update existing profile '{}' with the shown rules? [g] save / [Enter] skip: ",
+                path.display()
             ),
             (None, true) => {
                 "Save suggestions to a user profile? [g] grant / [s] suppress / [Enter] skip: "
@@ -1711,6 +1698,24 @@ fn prompt_line_for_tty(message: &str) -> String {
     format!("\r{message}\x1b[K\r\n")
 }
 
+/// Prepare an update of the existing profile file at `path`. `run_with` is the
+/// `--profile` value shown in the "Run with:" hint.
+pub(crate) fn prepare_profile_save_to_file(
+    patch: &profile::Profile,
+    path: &Path,
+    run_with: &str,
+) -> Result<PreparedProfileSave> {
+    let mut existing = profile::load_raw_profile_from_path(path)?;
+    merge_profile_patch(&mut existing, patch);
+    Ok(PreparedProfileSave {
+        action: SaveAction::Updated,
+        profile_name: run_with.to_string(),
+        profile_path: path.to_path_buf(),
+        profile: existing,
+        patch: patch.clone(),
+    })
+}
+
 pub(crate) fn prepare_profile_save_from_patch(
     patch: &profile::Profile,
     cmd_name: &str,
@@ -2728,6 +2733,91 @@ mod tests {
             prepared.profile.unsafe_macos_seatbelt_rules,
             vec![USER_PREFERENCES_SEATBELT_RULE.to_string()]
         );
+    }
+
+    fn project_source_file(path: &str) -> profile::ProfileSourceFile {
+        profile::ProfileSourceFile {
+            path: PathBuf::from(path),
+            kind: profile::ProfileSourceKind::Project,
+        }
+    }
+
+    #[test]
+    fn save_targets_empty_is_new_user_profile() {
+        assert_eq!(save_targets(&[]), vec![SaveTarget::NewUserProfile]);
+    }
+
+    #[test]
+    fn save_targets_files_never_include_new_user_profile() {
+        let files = [
+            project_source_file("/work/proj/agent.json"),
+            project_source_file("/work/shared/base.json"),
+        ];
+
+        assert_eq!(
+            save_targets(&files),
+            vec![
+                SaveTarget::File(PathBuf::from("/work/proj/agent.json")),
+                SaveTarget::File(PathBuf::from("/work/shared/base.json")),
+            ]
+        );
+    }
+
+    #[test]
+    fn prepare_profile_save_to_file_updates_path_profile() {
+        let dir = TempDir::new().expect("tempdir");
+        let profile_dir = dir.path().join("proj/.nono");
+        std::fs::create_dir_all(&profile_dir).expect("mkdir");
+        let profile_path = profile_dir.join("agent.json");
+        std::fs::write(
+            &profile_path,
+            r#"{ "meta": { "name": "agent" }, "filesystem": { "read": ["/old"] } }"#,
+        )
+        .expect("write profile");
+
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+
+        let prepared =
+            prepare_profile_save_to_file(&patch, &profile_path, "./proj/.nono/agent.json")
+                .expect("prepare");
+
+        assert!(matches!(prepared.action, SaveAction::Updated));
+        assert_eq!(prepared.profile_path, profile_path);
+        assert_eq!(prepared.profile_name, "./proj/.nono/agent.json");
+        assert_eq!(
+            prepared.profile.filesystem.read,
+            vec!["/old".to_string(), "/new".to_string()]
+        );
+        assert_eq!(prepared.patch.filesystem.read, vec!["/new".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_profile_symlinked_into_pack_store_not_offered() {
+        let (source_files, writable) = crate::test_env::with_isolated_config_home(|config| {
+            let install_dir = crate::test_env::write_fake_pack(
+                config,
+                "acme",
+                "packy",
+                "packy",
+                r#"{ "meta": { "name": "packy" } }"#,
+                &[],
+                None,
+            );
+            let dir = TempDir::new().expect("tempdir");
+            let link = dir.path().join("agent.json");
+            std::os::unix::fs::symlink(install_dir.join("profiles/packy.json"), &link)
+                .expect("symlink");
+
+            let loaded = profile::load_profile_from_path(&link).expect("load via symlink");
+            (loaded.source_files.clone(), loaded.writable_source_files())
+        });
+
+        assert_eq!(source_files.len(), 1);
+        assert_eq!(source_files[0].kind, profile::ProfileSourceKind::Pack);
+        assert!(writable.is_empty(), "got {writable:?}");
+        assert_eq!(save_targets(&writable), vec![SaveTarget::NewUserProfile]);
     }
 
     fn write_jsonc_user_profile(name: &str, contents: &str) -> PathBuf {

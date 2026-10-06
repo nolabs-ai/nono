@@ -3779,8 +3779,14 @@ fn resolve_extends(
             // pack-profile rule; name lookup still gets no sibling context.
             ResolvedBase::Global(mut base, pack_path) => {
                 if let Some(path) = &pack_path {
-                    base.source_files
-                        .push(ProfileSourceFile::new(nono::try_canonicalize(path)));
+                    // A non-canonical path could miss the pack-store check and
+                    // be classed as writable, so a canonicalize failure errors.
+                    let canonical =
+                        std::fs::canonicalize(path).map_err(|e| NonoError::ProfileRead {
+                            path: path.clone(),
+                            source: e,
+                        })?;
+                    base.source_files.push(ProfileSourceFile::new(canonical));
                 }
                 resolve_extends(base, visited, depth + 1, None, pack_path.as_deref(), &[])?
             }

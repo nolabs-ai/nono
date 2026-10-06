@@ -113,8 +113,6 @@ pub(crate) struct ProfileSaveOffer<'a> {
     pub(crate) compared_profile: Option<&'a str>,
     pub(crate) sandbox_violations: &'a [nono::SandboxViolation],
     pub(crate) ignored_denial_paths: &'a [std::path::PathBuf],
-    // Read by the save prompt's file choice (#2065).
-    #[allow(dead_code)]
     pub(crate) profile_save_files: &'a [crate::profile::ProfileSourceFile],
     pub(crate) url_denials: &'a [UrlDenialRecord],
 }

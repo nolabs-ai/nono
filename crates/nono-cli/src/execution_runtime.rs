@@ -728,6 +728,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             .as_deref()
             .or(recommended_profile),
         ignored_denial_paths: &flags.ignored_denial_paths,
+        profile_save_files: &flags.profile_save_files,
         suppressed_system_service_operations: &flags.suppressed_system_service_operations,
         startup_timeout: flags
             .startup_timeout_secs

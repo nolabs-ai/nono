@@ -160,7 +160,7 @@ fn collect_profile_packs(profile_name: &str) -> Vec<(String, String)> {
         }
         // Walk extends for all profiles, pack-provided or not, so a user
         // profile that extends a pack profile is handled correctly.
-        if let Some(bases) = crate::profile::load_profile_extends(&name) {
+        if let Some(bases) = crate::profile::load_profile_extends_resolved(&name) {
             queue.extend(bases);
         }
     }
@@ -344,5 +344,50 @@ mod tests {
         let _env = crate::test_env::EnvVarGuard::set_all(&[(NO_PACK_UPDATE_HINTS_ENV, "1")]);
 
         assert!(is_opted_out());
+    }
+
+    #[test]
+    fn collect_profile_packs_follows_relative_path_extends() {
+        crate::test_env::with_isolated_config_home(|config_home| {
+            crate::test_env::write_fake_pack(
+                config_home,
+                "acme",
+                "widget",
+                "widget",
+                r#"{ "meta": { "name": "widget" } }"#,
+                &[],
+                None,
+            );
+            let lockfile = crate::package::lockfile_path().expect("lockfile path");
+            std::fs::create_dir_all(lockfile.parent().expect("parent")).expect("mkdir");
+            std::fs::write(
+                &lockfile,
+                r#"{ "lockfile_version": 1, "packages": {
+                    "acme/widget": { "version": "1.2.3", "installed_at": "2026-01-01T00:00:00Z" }
+                } }"#,
+            )
+            .expect("write lockfile");
+
+            let nono_dir = config_home.join("proj/.nono");
+            let shared = config_home.join("proj/shared");
+            std::fs::create_dir_all(&nono_dir).expect("mkdir .nono");
+            std::fs::create_dir_all(&shared).expect("mkdir shared");
+            std::fs::write(
+                shared.join("base.json"),
+                r#"{ "meta": { "name": "base" }, "extends": "widget" }"#,
+            )
+            .expect("write base");
+            let agent = nono_dir.join("agent.json");
+            std::fs::write(
+                &agent,
+                r#"{ "meta": { "name": "agent" }, "extends": "../shared/base.json" }"#,
+            )
+            .expect("write agent");
+
+            assert_eq!(
+                collect_profile_packs(agent.to_str().expect("utf-8 path")),
+                vec![("acme/widget".to_string(), "1.2.3".to_string())]
+            );
+        });
     }
 }

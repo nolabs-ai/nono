@@ -113,6 +113,7 @@ pub(crate) struct ProfileSaveOffer<'a> {
     pub(crate) compared_profile: Option<&'a str>,
     pub(crate) sandbox_violations: &'a [nono::SandboxViolation],
     pub(crate) ignored_denial_paths: &'a [std::path::PathBuf],
+    pub(crate) profile_save_files: &'a [crate::profile::ProfileSourceFile],
     pub(crate) url_denials: &'a [UrlDenialRecord],
 }
 
@@ -292,6 +293,8 @@ pub struct ExecConfig<'a> {
     pub profile_save_base: Option<&'a str>,
     /// Denied paths that should not be offered in the save-profile prompt.
     pub ignored_denial_paths: &'a [std::path::PathBuf],
+    /// Writable profile files a save may target, highest precedence first.
+    pub profile_save_files: &'a [crate::profile::ProfileSourceFile],
     /// Non-filesystem sandbox operations suppressed from diagnostic footers.
     pub suppressed_system_service_operations: &'a [String],
     /// Optional startup timeout for known interactive CLIs that were launched
@@ -1762,6 +1765,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     compared_profile: config.profile_save_base,
                     sandbox_violations: &visible_sandbox_violations,
                     ignored_denial_paths: config.ignored_denial_paths,
+                    profile_save_files: config.profile_save_files,
                     url_denials: &url_denials,
                 };
                 // An optional profile-save failure never changes the child status.

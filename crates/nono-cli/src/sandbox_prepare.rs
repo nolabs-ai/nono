@@ -557,6 +557,8 @@ pub(crate) struct PreparedSandbox {
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) bypass_protection_paths: Vec<crate::policy::AppliedBypass>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
+    /// Writable files the loaded profile came from, highest precedence first.
+    pub(crate) profile_save_files: Vec<profile::ProfileSourceFile>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
     /// `diagnostics.redaction.extra_env_vars` from the profile: extra
     /// environment-variable name globs to redact in diagnostics and audit
@@ -1550,6 +1552,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 open_url_allow_localhost: false,
                 bypass_protection_paths: Vec::new(),
                 ignored_denial_paths: Vec::new(),
+                profile_save_files: Vec::new(),
                 suppressed_system_service_operations: Vec::new(),
                 redaction_extra_env_vars: Vec::new(),
                 network_denial_audit: Default::default(),
@@ -1907,6 +1910,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .as_ref()
         .map(|profile| profile.credential_capture.clone())
         .unwrap_or_default();
+    let profile_save_files = loaded_profile
+        .as_ref()
+        .map(profile::Profile::writable_source_files)
+        .unwrap_or_default();
     let loaded_secrets = load_env_credentials(args, &profile_secrets, silent, &caps)?;
 
     finalize_prepared_sandbox(
@@ -1952,6 +1959,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             open_url_allow_localhost,
             bypass_protection_paths,
             ignored_denial_paths,
+            profile_save_files,
             suppressed_system_service_operations,
             redaction_extra_env_vars,
             network_denial_audit,
@@ -2936,6 +2944,7 @@ mod tests {
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
+            profile_save_files: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
             redaction_extra_env_vars: Vec::new(),
             network_denial_audit: Default::default(),

@@ -125,12 +125,16 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
 
     // Validate --extends target exists in any of the three sources the
     // resolver knows about (user dir, pack store, built-in).
-    if let Some(ref base) = args.extends
-        && !profile_exists(base)
-    {
-        return Err(NonoError::ProfileParse(extends_target_not_found_message(
-            base,
-        )));
+    if let Some(ref base) = args.extends {
+        // The entry is written as given and later resolved against the file
+        // that holds it, so validate it the same way.
+        let entry =
+            profile::classify_extends_entry(base, profile::ExtendsOrigin::File(&output_path))?;
+        if !matches!(entry, profile::ExtendsRef::Path(_)) && !profile_exists(base) {
+            return Err(NonoError::ProfileParse(extends_target_not_found_message(
+                base,
+            )));
+        }
     }
 
     // Validate --groups against embedded policy
@@ -2608,7 +2612,7 @@ pub(crate) fn cmd_promote(args: ProfilePromoteArgs) -> Result<()> {
             raw_profile.meta.name, args.name
         )));
     }
-    let resolved_profile = profile::resolve_and_finalize_profile(raw_profile)?;
+    let resolved_profile = profile::resolve_and_finalize_draft_profile(raw_profile, &draft_path)?;
     validate_promote_profile(&resolved_profile)?;
 
     let target_exists = regular_file_exists(&target_path, "target profile")?;
@@ -3495,6 +3499,65 @@ mod tests {
         assert!(err.to_string().contains("not found"));
     }
 
+    fn init_with_extends(xdg: &std::path::Path, out: &std::path::Path, base: &str) -> Result<()> {
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+        cmd_init(ProfileInitArgs {
+            name: "new".to_string(),
+            extends: Some(base.to_string()),
+            groups: vec![],
+            description: None,
+            full: false,
+            output: Some(out.to_path_buf()),
+            force: false,
+        })
+    }
+
+    #[test]
+    fn test_init_extends_relative_path_validates_against_output_dir() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(proj.join(".nono")).expect("create .nono");
+        let out = proj.join(".nono/new.json");
+
+        let err = init_with_extends(&xdg, &out, "../base.json").expect_err("base is absent");
+        assert!(err.to_string().contains("cannot be read"), "got: {err}");
+        assert!(!out.exists());
+
+        std::fs::write(proj.join("base.json"), r#"{ "meta": { "name": "base" } }"#)
+            .expect("write base");
+        init_with_extends(&xdg, &out, "../base.json").expect("base present");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).expect("read")).expect("json");
+        assert_eq!(written["extends"], "../base.json");
+    }
+
+    #[test]
+    fn test_init_extends_absolute_path_reports_unsupported() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let out = dir.path().join("new.json");
+
+        let err = init_with_extends(&xdg, &out, "/abs.json").expect_err("absolute path");
+        assert!(
+            err.to_string()
+                .contains("absolute and `~/` paths are not supported in `extends`"),
+            "got: {err}"
+        );
+        assert!(!out.exists());
+    }
+
     #[test]
     fn test_init_blocked_when_shadowing_builtin() {
         let _guard = match crate::test_env::ENV_LOCK.lock() {
@@ -4184,6 +4247,40 @@ mod tests {
             !draft_path.exists(),
             "draft should be removed after promote"
         );
+    }
+
+    #[test]
+    fn promote_rejects_path_extends_in_draft() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let draft_dir = profile::user_profile_draft_dir().expect("draft dir");
+        std::fs::create_dir_all(&draft_dir).expect("create drafts");
+        std::fs::write(draft_dir.join("x.json"), r#"{ "meta": { "name": "x" } }"#)
+            .expect("write base");
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        std::fs::write(
+            &draft_path,
+            r#"{ "meta": { "name": "agent-local" }, "extends": "./x.json" }"#,
+        )
+        .expect("write draft");
+
+        let err = cmd_promote(ProfilePromoteArgs {
+            name: "agent-local".to_string(),
+            diff: false,
+            yes: true,
+            help: None,
+        })
+        .expect_err("draft path extends must be rejected");
+        assert!(err.to_string().contains("profile drafts"), "got: {err}");
+        assert!(draft_path.exists());
     }
 
     #[test]

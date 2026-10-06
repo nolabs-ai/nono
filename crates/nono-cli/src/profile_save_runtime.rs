@@ -360,7 +360,11 @@ fn offer_save_with_patch(
         return Ok(());
     }
 
-    let Some(target) = choose_save_target(save_targets(offer.profile_save_files))? else {
+    let Some(target) = choose_save_target(
+        save_targets(offer.profile_save_files),
+        top_level_profile(offer.profile_save_files),
+    )?
+    else {
         return Ok(());
     };
     save_patch_to_target(&target, patch, cmd_name, offer)
@@ -386,15 +390,38 @@ fn offer_save_text_prompt(
         return Ok(());
     };
 
-    let Some(target) = choose_save_target(targets)? else {
+    let Some(target) = choose_save_target(targets, top_level_profile(offer.profile_save_files))?
+    else {
         return Ok(());
     };
     save_patch_to_target(&target, selected_patch, cmd_name, offer)
 }
 
-/// The target to save to: the only one, or the user's menu choice when the
-/// session ran with several writable files. `None` when the user skips.
-fn choose_save_target(targets: Vec<SaveTarget>) -> Result<Option<SaveTarget>> {
+/// The top-level profile's file, when it is one of the writable save files.
+fn top_level_profile(save_files: &[profile::ProfileSourceFile]) -> Option<&Path> {
+    save_files
+        .iter()
+        .find(|file| file.top_level)
+        .map(|file| file.path.as_path())
+}
+
+/// A lone target is written without asking only when it is the top-level
+/// profile; a base reached through `--extends` under a pack or built-in is
+/// shared, so the user picks it explicitly.
+fn save_target_menu_needed(files: &[PathBuf], top_level: Option<&Path>) -> bool {
+    match files {
+        [] => false,
+        [only] => Some(only.as_path()) != top_level,
+        _ => true,
+    }
+}
+
+/// The target to save to: the top-level profile when it is the only writable
+/// file, otherwise the user's menu choice. `None` when the user skips.
+fn choose_save_target(
+    targets: Vec<SaveTarget>,
+    top_level: Option<&Path>,
+) -> Result<Option<SaveTarget>> {
     let files: Vec<PathBuf> = targets
         .iter()
         .filter_map(|target| match target {
@@ -402,13 +429,13 @@ fn choose_save_target(targets: Vec<SaveTarget>) -> Result<Option<SaveTarget>> {
             SaveTarget::NewUserProfile => None,
         })
         .collect();
-    if files.len() < 2 {
+    if !save_target_menu_needed(&files, top_level) {
         return Ok(targets.into_iter().next());
     }
-    Ok(prompt_save_target(&files)?.map(SaveTarget::File))
+    Ok(prompt_save_target(&files, top_level)?.map(SaveTarget::File))
 }
 
-fn render_save_target_menu(files: &[PathBuf]) -> String {
+fn render_save_target_menu(files: &[PathBuf], top_level: Option<&Path>) -> String {
     let paths: Vec<String> = files
         .iter()
         .map(|path| path.display().to_string())
@@ -419,8 +446,8 @@ fn render_save_target_menu(files: &[PathBuf]) -> String {
         .max()
         .unwrap_or(0);
     let mut menu = String::from("Save the selected rules to:\n");
-    for (index, path) in paths.iter().enumerate() {
-        let label = if index == 0 {
+    for (index, (file, path)) in files.iter().zip(&paths).enumerate() {
+        let label = if Some(file.as_path()) == top_level {
             "this profile"
         } else {
             "base — applies to every profile that extends it"
@@ -454,8 +481,8 @@ fn chosen_save_target(files: &[PathBuf], input: &str) -> Option<Option<PathBuf>>
         .map(|choice| choice.and_then(|index| files.get(index).cloned()))
 }
 
-fn prompt_save_target(files: &[PathBuf]) -> Result<Option<PathBuf>> {
-    let menu = render_save_target_menu(files);
+fn prompt_save_target(files: &[PathBuf], top_level: Option<&Path>) -> Result<Option<PathBuf>> {
+    let menu = render_save_target_menu(files, top_level);
     let (options, choice_prompt) = menu.rsplit_once('\n').unwrap_or(("", menu.as_str()));
     for line in options.lines() {
         prompt_println(line);
@@ -2862,6 +2889,7 @@ mod tests {
         profile::ProfileSourceFile {
             path: PathBuf::from(path),
             kind: profile::ProfileSourceKind::Project,
+            top_level: false,
         }
     }
 
@@ -2956,7 +2984,7 @@ mod tests {
             PathBuf::from("/work/shared/base.json"),
         ];
 
-        let menu = render_save_target_menu(&files);
+        let menu = render_save_target_menu(&files, Some(files[0].as_path()));
         let lines: Vec<&str> = menu.split('\n').collect();
 
         assert_eq!(lines.len(), 4, "{menu}");
@@ -2975,6 +3003,42 @@ mod tests {
         );
         assert_eq!(lines[1].find('('), lines[2].find('('), "{menu}");
         assert_eq!(lines[3], "Choice [1]: ");
+    }
+
+    #[test]
+    fn render_menu_labels_only_the_top_level_profile_as_this_profile() {
+        let files = [PathBuf::from("/work/extra.json")];
+
+        let menu = render_save_target_menu(&files, Some(Path::new("/work/agent.json")));
+        assert!(
+            menu.contains("(base — applies to every profile that extends it)"),
+            "{menu}"
+        );
+        assert!(!menu.contains("this profile"), "{menu}");
+
+        let menu = render_save_target_menu(&files, None);
+        assert!(!menu.contains("this profile"), "{menu}");
+    }
+
+    #[test]
+    fn save_target_menu_shown_unless_the_only_target_is_the_top_level_profile() {
+        let top = PathBuf::from("/work/agent.json");
+        let extra = PathBuf::from("/work/extra.json");
+
+        assert!(!save_target_menu_needed(
+            &[top.clone()],
+            Some(top.as_path())
+        ));
+        assert!(save_target_menu_needed(
+            &[extra.clone()],
+            Some(top.as_path())
+        ));
+        assert!(save_target_menu_needed(&[extra.clone()], None));
+        assert!(save_target_menu_needed(
+            &[top.clone(), extra],
+            Some(top.as_path())
+        ));
+        assert!(!save_target_menu_needed(&[], None));
     }
 
     #[test]

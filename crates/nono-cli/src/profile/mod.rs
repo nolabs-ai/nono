@@ -2708,6 +2708,8 @@ pub(crate) struct ProfileSourceFile {
     /// Canonical path to the profile file.
     pub(crate) path: PathBuf,
     pub(crate) kind: ProfileSourceKind,
+    /// The profile the session was started with, as opposed to a base.
+    pub(crate) top_level: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2737,6 +2739,7 @@ impl ProfileSourceFile {
         Self {
             path: canonical,
             kind,
+            top_level: false,
         }
     }
 }
@@ -3665,9 +3668,10 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 /// (user profiles → packs → builtins).
 fn load_from_file(path: &Path, cli: &[ExtendsRef]) -> Result<Profile> {
     let (mut profile, source_path) = parse_file_backed_profile(path)?;
-    profile
-        .source_files
-        .push(ProfileSourceFile::new(source_path.clone()));
+    profile.source_files.push(ProfileSourceFile {
+        top_level: true,
+        ..ProfileSourceFile::new(source_path.clone())
+    });
     let context_dir = if is_under_user_profile_draft_dir(&source_path) {
         None
     } else {
@@ -11251,6 +11255,7 @@ mod tests {
         ProfileSourceFile {
             path: path.canonicalize().expect("canonicalize source file"),
             kind,
+            top_level: false,
         }
     }
 
@@ -11285,7 +11290,10 @@ mod tests {
                     &install_dir.join("profiles/packy.json"),
                     ProfileSourceKind::Pack,
                 ),
-                source_file(&agent, ProfileSourceKind::Project),
+                ProfileSourceFile {
+                    top_level: true,
+                    ..source_file(&agent, ProfileSourceKind::Project)
+                },
             ];
             (profile, expected)
         });
@@ -11323,7 +11331,31 @@ mod tests {
             .map(|file| file.path)
             .collect();
 
-        assert_eq!(paths, vec![top, b, a, c]);
+        assert_eq!(paths, vec![top.clone(), b, a, c]);
+        let top_level: Vec<PathBuf> = profile
+            .source_files
+            .iter()
+            .filter(|file| file.top_level)
+            .map(|file| file.path.clone())
+            .collect();
+        assert_eq!(top_level, vec![top]);
+    }
+
+    #[test]
+    fn test_cli_extends_file_under_builtin_is_not_top_level() {
+        let profile = with_config_env(|config_dir| {
+            let profiles = config_dir.join("nono/profiles");
+            std::fs::create_dir_all(&profiles).expect("mkdir profiles");
+            std::fs::write(
+                profiles.join("extra.json"),
+                r#"{ "meta": { "name": "extra" } }"#,
+            )
+            .expect("write extra");
+            load_profile_with_extends("default", &["extra".to_string()]).expect("load")
+        });
+
+        assert_eq!(profile.source_files.len(), 1, "{:?}", profile.source_files);
+        assert!(!profile.source_files[0].top_level);
     }
 
     #[test]
@@ -11343,8 +11375,14 @@ mod tests {
             (
                 user,
                 draft,
-                source_file(&user_path, ProfileSourceKind::User),
-                source_file(&draft_path, ProfileSourceKind::Draft),
+                ProfileSourceFile {
+                    top_level: true,
+                    ..source_file(&user_path, ProfileSourceKind::User)
+                },
+                ProfileSourceFile {
+                    top_level: true,
+                    ..source_file(&draft_path, ProfileSourceKind::Draft)
+                },
             )
         });
 
@@ -11358,6 +11396,7 @@ mod tests {
             source_files: vec![ProfileSourceFile {
                 path: PathBuf::from("/tmp/agent.json"),
                 kind: ProfileSourceKind::Project,
+                top_level: true,
             }],
             ..Default::default()
         };

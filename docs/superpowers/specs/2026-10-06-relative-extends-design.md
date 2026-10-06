@@ -19,8 +19,9 @@ profiles are never offered.
 
 ## Entry syntax
 
-Each `extends` entry (in a file, or from `--extends` on the CLI) is classified
-once, in this order:
+Each `extends` entry written in a profile file is classified once, in this
+order. CLI `--extends` entries follow the same table, except that a Path entry
+resolves against the cwd (see "CLI `--extends`" below).
 
 | Entry | Kind | Rule |
 |---|---|---|
@@ -53,6 +54,9 @@ This keeps the rule to one check and stops it colliding with registry refs.
 
 ### Where path entries are rejected
 
+These rules apply to entries written in a profile file. They never apply to CLI
+`--extends` entries.
+
 - In a profile loaded from the pack store: any Path entry is an error. A pack
   must not load files outside itself.
 - In a profile under `profile-drafts/`: any Path entry is an error, because
@@ -69,9 +73,7 @@ the same file are one node. `MAX_INHERITANCE_DEPTH` is unchanged.
 ## Callers that must understand Path entries
 
 - `resolve_extends` / `load_base_profile_raw` — the main change.
-- `prepend_cli_extends` — CLI Path entries resolve against the cwd, not the
-  profile's directory. Resolve them to canonical paths before they join the
-  chain, so the profile's `context_dir` cannot change their meaning.
+- `prepend_cli_extends` — see "CLI `--extends`" below.
 - `package_status::walk_extends_chain` (Claude Code / official pack detection)
   — it walks raw strings without a directory. It must resolve Path entries
   relative to the declaring file, using the same classify-and-resolve function.
@@ -81,6 +83,24 @@ the same file are one node. `MAX_INHERITANCE_DEPTH` is unchanged.
   loaded.
 - `profile show` / `diff` / `validate` / `why` — show the raw entry as written.
   They resolve through the shared loader, so no extra logic.
+
+### CLI `--extends`
+
+Today `prepend_cli_extends` inserts CLI bases into the selected profile's own
+`extends` list (`load_from_file`, the pack-store branch, and the built-in
+branch of `load_profile_inner`). That would put a CLI path inside a pack or
+built-in profile's list, where path entries are rejected, and the resolved
+absolute path would hit the "no absolute paths" rule.
+
+Change: CLI bases do not go into `profile.extends`. Classify and resolve them
+first (Path entries against the cwd, to a canonical path), then pass the
+resolved entries to the resolver as a separate list that is merged ahead of the
+profile's own bases, in the same position they take today. The pack-store,
+built-in and "no absolute paths" rules check only entries written in a file.
+
+So `nono run --profile claude-code --extends ./project-extra.json` works. The
+main pattern is still a project profile with `"extends": "claude-code"`, run
+as `--profile ./.nono/agent.json`; that needs no CLI change.
 
 One function owns classification and resolution
 (`classify_extends_entry(raw, base_dir, declaring_file) -> Result<ExtendsRef>`).
@@ -92,9 +112,12 @@ When `profile_save_base` is a file path (`is_file_path_ref`):
 
 - Canonicalize it. If it is inside the pack store, do not offer an update; keep
   the current new-user-profile flow.
-- Otherwise offer "Update profile `<full path>`?" and write to that file, the
-  same as the existing named-user-profile branch. Show the full path, because
-  the file can be in a git repo.
+- Otherwise update that file, exactly like the existing named-user-profile
+  branch: the interactive selector writes without a further question (the item
+  selection is the confirmation), and the text prompt asks its existing
+  "Update …? [g/s/Enter]" question. In both, the prompt and the
+  `print_profile_save` output show the full path, because the file can be in a
+  git repo.
 
 `prepare_profile_save_from_patch` takes a name today. Add a path-based entry
 point; keep the name-based one for user profiles.
@@ -150,8 +173,11 @@ The loaded profile's `source_files` (writable entries only) is passed to
 2. The user selects items in the selector or the text prompt (no change).
    The `override` confirmation stays where it is.
 3. Build the target list:
-   - Writable source files, top-level profile first, then bases in resolution
-     order (depth-first, left to right). Remove duplicates.
+   - Writable source files in precedence order: the reverse of the recorded
+     merge order. The top-level profile is first; then the base whose values
+     win, down to the base that wins least. For `extends: ["a", "b"]` where
+     `a` extends `c`, the merge records `[c, a, b, top]` and the menu shows
+     `top, b, a, c`. Duplicates are already removed by the merge.
    - "a new user profile", only when the top-level profile was selected by
      name or registry ref, or there is no profile. A new user profile cannot
      extend a path profile (absolute paths are out of scope), so it would drop
@@ -181,8 +207,8 @@ No terminal (`terminal_prompts_available()` is false): no prompt, as today.
 
 - Source recording: user, draft, project, pack, built-in layers get the right
   kind; a pack layer is never in the writable list; merge keeps all layers.
-- Target list order: top-level first, then bases depth-first left to right;
-  duplicates removed.
+- Target list order: precedence order (`top, b, a, c` for the example in the
+  save flow); duplicates removed.
 - "a new user profile" is listed for a named top-level profile and absent for
   a path top-level profile.
 - One target: no menu, current behaviour.
@@ -231,12 +257,16 @@ Resolution (`profile/mod.rs` tests, using temp dirs and `with_config_env`):
   path target inside the pack store errors.
 - CLI `--extends ./x.json` resolves against the cwd, not the profile's
   directory.
+- CLI `--extends ./x.json` works with a pack-store top-level profile and with a
+  built-in top-level profile.
 - `walk_extends_chain` follows a Path entry to the Claude pack.
 - `profile init --extends ../base.json` validates relative to the output file.
 
 Save:
 
-- `--profile ./x.json` run offers and writes an update to that file.
+- `--profile ./x.json` run updates that file: no extra question after the
+  interactive selector; the existing question in the text prompt; the full path
+  is printed.
 - A path profile inside the pack store is not offered for update.
 - Updating a `.jsonc` profile keeps comments and layout; only new entries are
   added.
@@ -248,6 +278,7 @@ Save:
 ## Docs
 
 Update `docs/cli/features/profile-authoring.mdx` ("How `extends` Works") with
-path entries, the rules, and the error cases. Update the post-run save prompt
+path entries, the rules, and the error cases. Lead with the main pattern: a
+project profile that extends the harness profile (`"extends": "claude-code"`). Update the post-run save prompt
 text near line 460 of the same page with the save-target menu and which files
 it offers.

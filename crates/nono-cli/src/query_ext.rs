@@ -246,6 +246,7 @@ pub fn query_network(
     domain_endpoints: &[crate::sandbox_state::DomainEndpointState],
 ) -> QueryResult {
     let (domain, url_path) = parse_host_input(host);
+    let invalid_http_url = url_path.is_some() && host.parse::<http::Uri>().is_err();
 
     match caps.network_mode() {
         nono::NetworkMode::Blocked => QueryResult::Denied {
@@ -276,6 +277,9 @@ pub fn query_network(
                         .find(|de| de.domain.eq_ignore_ascii_case(&domain));
 
                     match (matching_endpoints, &url_path) {
+                        (Some(de), Some(_)) if !de.endpoints.is_empty() && invalid_http_url => {
+                            invalid_endpoint_url(&de.endpoints)
+                        }
                         (Some(de), Some(path)) => {
                             if path_matches_endpoint_rules(path, &de.endpoints) {
                                 QueryResult::Allowed {
@@ -386,6 +390,9 @@ pub fn query_network(
                             .find(|de| de.domain.eq_ignore_ascii_case(&domain));
 
                         match (matching_endpoints, &url_path) {
+                            (Some(de), Some(_)) if !de.endpoints.is_empty() && invalid_http_url => {
+                                invalid_endpoint_url(&de.endpoints)
+                            }
                             (Some(de), Some(path)) => {
                                 if path_matches_endpoint_rules(path, &de.endpoints) {
                                     QueryResult::Allowed {
@@ -486,11 +493,14 @@ pub fn query_network(
 fn parse_host_input(input: &str) -> (String, Option<String>) {
     if let Ok(parsed) = url::Url::parse(input) {
         let domain = parsed.host_str().unwrap_or(input).to_lowercase();
-        let path = parsed.path();
-        let url_path = if path.is_empty() || path == "/" {
-            None
-        } else {
-            Some(path.to_string())
+        // Preserve the HTTP request path: Url normalizes encoded dot segments
+        // and backslashes before the proxy's ambiguity checks can see them.
+        let url_path = match input.parse::<http::Uri>() {
+            Ok(uri) if uri.path().is_empty() || uri.path() == "/" => None,
+            Ok(uri) => Some(uri.path().to_string()),
+            // Keep a path marker even if Url normalized the input to "/".
+            // Endpoint queries explicitly reject invalid HTTP URLs above.
+            Err(_) => Some(parsed.path().to_string()),
         };
         (domain, url_path)
     } else {
@@ -498,38 +508,36 @@ fn parse_host_input(input: &str) -> (String, Option<String>) {
     }
 }
 
-/// Normalize a URL path for endpoint rule matching (mirrors proxy behavior).
-fn normalize_path(path: &str) -> String {
-    let path = path.split('?').next().unwrap_or(path);
-    let binary = urlencoding::decode_binary(path.as_bytes());
-    let decoded = String::from_utf8_lossy(&binary);
-    let segments: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", segments.join("/"))
+fn invalid_endpoint_url(rules: &[crate::sandbox_state::EndpointRuleState]) -> QueryResult {
+    QueryResult::Denied {
+        reason: "endpoint_restricted".to_string(),
+        details: Some(
+            "Cannot check endpoint rules for an invalid HTTP URL; percent-encode spaces, \
+             remove control characters, and use an ASCII hostname."
+                .to_string(),
+        ),
+        policy_source: Some("endpoint rules".to_string()),
+        matching_capability: None,
+        suggested_flag: None,
+        endpoint_rules: Some(rules.to_vec()),
     }
 }
 
-/// Check if a path matches any endpoint rule using glob matching.
+/// Check paths with the proxy's normalization and ambiguity rules.
+/// `why --host` does not select an HTTP method, so retain path-only matching.
 fn path_matches_endpoint_rules(
     path: &str,
     rules: &[crate::sandbox_state::EndpointRuleState],
 ) -> bool {
-    if rules.is_empty() {
-        return true;
-    }
-    let normalized = normalize_path(path);
-    rules.iter().any(|r| {
-        let Ok(glob) = globset::GlobBuilder::new(&r.path)
-            .literal_separator(true)
-            .build()
-        else {
-            return false;
-        };
-        let matcher = glob.compile_matcher();
-        matcher.is_match(&normalized)
-    })
+    let rules: Vec<_> = rules
+        .iter()
+        .map(|rule| nono_proxy::config::EndpointRule {
+            method: "*".to_string(),
+            path: rule.path.clone(),
+        })
+        .collect();
+    nono_proxy::config::CompiledEndpointRules::compile(&rules)
+        .is_ok_and(|compiled| compiled.is_allowed("*", path))
 }
 
 /// Query whether a Landlock scope is requested and enforced.
@@ -1348,6 +1356,162 @@ mod tests {
     }
 
     #[test]
+    fn test_query_network_endpoint_paths_follow_proxy_validation() {
+        let allowed = vec!["registry.npmjs.org".to_string()];
+        let endpoints = vec![crate::sandbox_state::DomainEndpointState {
+            domain: "registry.npmjs.org".to_string(),
+            endpoints: vec![crate::sandbox_state::EndpointRuleState {
+                method: "POST".to_string(),
+                path: "/**".to_string(),
+            }],
+        }];
+        for mode in [
+            nono::NetworkMode::ProxyOnly {
+                port: 0,
+                bind_ports: vec![],
+            },
+            nono::NetworkMode::AllowAll,
+        ] {
+            let caps = CapabilitySet::new().set_network_mode(mode);
+            for (path, allowed_path) in [
+                ("/@mozilla%2ffirefox-devtools-mcp", false),
+                ("/@mozilla%2Ffirefox-devtools-mcp", false),
+                ("/package%2ename", false),
+                ("/package%5cname", false),
+                ("/package%25name", false),
+                ("/package;version=1", false),
+                ("/package%00name", false),
+                ("/package%0aname", false),
+                ("/%40mozilla/firefox-devtools-mcp", true),
+                ("/package%20name", true),
+                ("/package/name", true),
+                ("/package//name/", true),
+                ("/package?query=%2f;%25", true),
+                ("/package#%2f;%25", true),
+            ] {
+                let result = query_network(
+                    &format!("https://registry.npmjs.org{path}"),
+                    443,
+                    &caps,
+                    &allowed,
+                    &[],
+                    &endpoints,
+                );
+                assert_eq!(
+                    matches!(result, QueryResult::Allowed { .. }),
+                    allowed_path,
+                    "unexpected query result for {path}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_query_network_endpoint_paths_preserve_encoded_dot_segments() {
+        let caps = CapabilitySet::new();
+        let allowed = vec!["registry.npmjs.org".to_string()];
+        let endpoints = vec![crate::sandbox_state::DomainEndpointState {
+            domain: "registry.npmjs.org".to_string(),
+            endpoints: vec![crate::sandbox_state::EndpointRuleState {
+                method: "GET".to_string(),
+                path: "/**".to_string(),
+            }],
+        }];
+        for path in ["/%2e", "/package/%2e%2e/other", "/package\\other"] {
+            let result = query_network(
+                &format!("https://registry.npmjs.org{path}"),
+                443,
+                &caps,
+                &allowed,
+                &[],
+                &endpoints,
+            );
+            assert!(
+                matches!(result, QueryResult::Denied { .. }),
+                "raw ambiguous path must not be normalized into an allow: {path}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_query_network_endpoint_paths_reject_invalid_http_urls_explicitly() {
+        let caps = CapabilitySet::new();
+        let allowed = vec!["registry.npmjs.org".to_string()];
+        let endpoints = vec![crate::sandbox_state::DomainEndpointState {
+            domain: "registry.npmjs.org".to_string(),
+            endpoints: vec![crate::sandbox_state::EndpointRuleState {
+                method: "GET".to_string(),
+                path: "/**".to_string(),
+            }],
+        }];
+        for url in [
+            "https://registry.npmjs.org/package name",
+            "https://registry.npmjs.org/package\nname",
+            "https://registry.npmjs.org/\t",
+        ] {
+            let result = query_network(url, 443, &caps, &allowed, &[], &endpoints);
+            assert!(
+                matches!(
+                    &result,
+                    QueryResult::Denied { details: Some(details), suggested_flag: None, .. }
+                        if details.contains("percent-encode")
+                ),
+                "invalid HTTP URL must explain how to query it: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_query_network_endpoint_paths_preserve_supported_url_forms() {
+        let caps = CapabilitySet::new();
+        let allowed = vec!["registry.npmjs.org".to_string()];
+        let endpoints = vec![crate::sandbox_state::DomainEndpointState {
+            domain: "registry.npmjs.org".to_string(),
+            endpoints: vec![crate::sandbox_state::EndpointRuleState {
+                method: "DELETE".to_string(),
+                path: "/**".to_string(),
+            }],
+        }];
+        for url in [
+            "registry.npmjs.org",
+            "https://registry.npmjs.org/",
+            "https://registry.npmjs.org:8443/package",
+            "https://user:password@registry.npmjs.org/package",
+            "https://registry.npmjs.org/包",
+            "https://registry.npmjs.org/package?filter=%2f;%25#%2e",
+        ] {
+            let result = query_network(url, 443, &caps, &allowed, &[], &endpoints);
+            assert!(
+                matches!(result, QueryResult::Allowed { .. }),
+                "{url}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_query_network_endpoint_paths_without_rules_remain_unrestricted() {
+        let caps = CapabilitySet::new().set_network_mode(nono::NetworkMode::ProxyOnly {
+            port: 0,
+            bind_ports: vec![],
+        });
+        let allowed = vec!["registry.npmjs.org".to_string()];
+        let empty_endpoints = vec![crate::sandbox_state::DomainEndpointState {
+            domain: "registry.npmjs.org".to_string(),
+            endpoints: vec![],
+        }];
+        for endpoints in [&[][..], empty_endpoints.as_slice()] {
+            for url in [
+                "https://registry.npmjs.org/@mozilla%2ffirefox-devtools-mcp",
+                "https://registry.npmjs.org/package name",
+                "https://registry.npmjs.org/package\nname",
+            ] {
+                let result = query_network(url, 443, &caps, &allowed, &[], endpoints);
+                assert!(matches!(result, QueryResult::Allowed { .. }), "{result:?}");
+            }
+        }
+    }
+
+    #[test]
     fn test_query_network_bare_domain_with_endpoint_rules_shows_allowed() {
         let caps = CapabilitySet::new().set_network_mode(nono::NetworkMode::ProxyOnly {
             port: 0,
@@ -1390,8 +1554,11 @@ mod tests {
 
     #[test]
     fn test_parse_host_input_bare_hostname() {
-        let (domain, path) = parse_host_input("github.com");
-        assert_eq!(domain, "github.com");
+        for host in ["github.com", "github.com:8443", "::1", "[::1]:8443"] {
+            let (domain, _) = parse_host_input(host);
+            assert_eq!(domain, host);
+        }
+        let (_, path) = parse_host_input("github.com");
         assert_eq!(path, None);
     }
 

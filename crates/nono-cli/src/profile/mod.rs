@@ -2862,6 +2862,44 @@ pub fn is_user_override(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Find the profile file that `name_or_path` loads from, in resolver order:
+/// direct path, registry ref (pack store), user profile, pack store. Returns
+/// `None` for built-ins and for names that resolve to nothing.
+fn locate_profile_file(name_or_path: &str) -> Option<PathBuf> {
+    if is_file_path_ref(name_or_path) {
+        return Some(nono::try_canonicalize(Path::new(name_or_path)));
+    }
+    // Registry refs are not valid bare profile names, so resolve them from the
+    // pack store before the name check below rejects them.
+    if is_registry_ref(name_or_path) {
+        return find_pack_store_profile(name_or_path).map(|(path, _)| path);
+    }
+    if !is_valid_profile_name(name_or_path) {
+        return None;
+    }
+    if let Ok(profile_path) = resolve_user_profile_path(name_or_path)
+        && profile_path.exists()
+    {
+        return Some(profile_path);
+    }
+    // Any installed pack that declares a profile artifact with matching
+    // `install_as`.
+    find_pack_store_profile(name_or_path).map(|(path, _)| path)
+}
+
+fn builtin_profile_extends(name: &str) -> Option<Vec<String>> {
+    if !is_valid_profile_name(name) {
+        return None;
+    }
+    let policy = crate::policy::load_embedded_policy().ok()?;
+    policy
+        .profiles
+        .get(name)?
+        .extends
+        .as_ref()
+        .map(|s| vec![s.clone()])
+}
+
 /// Load a profile's raw (unresolved) extends target names.
 ///
 /// Returns `Some(base_names)` if the profile declares `extends`, `None` otherwise.
@@ -2877,50 +2915,35 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
     // only stderr emission and counter increments are suppressed.
     let _suppress = crate::deprecation_warnings::WarningSuppressionGuard::begin();
 
-    // Direct file path
-    if is_file_path_ref(name_or_path) {
-        return parse_profile_file(Path::new(name_or_path))
-            .ok()
-            .and_then(|p| p.extends);
+    match locate_profile_file(name_or_path) {
+        Some(file) => parse_profile_file(&file).ok().and_then(|p| p.extends),
+        None => builtin_profile_extends(name_or_path),
     }
+}
 
-    // Registry refs are not valid bare profile names, so resolve them from the
-    // pack store before the name check below rejects them.
-    if is_registry_ref(name_or_path) {
-        return find_pack_store_profile(name_or_path)
-            .and_then(|(profile_path, _)| parse_profile_file(&profile_path).ok())
-            .and_then(|p| p.extends);
-    }
+/// Like [`load_profile_extends`], but path entries become canonical absolute
+/// path strings, so a caller can walk the chain without knowing which file an
+/// entry was written in. Entries that fail to classify are dropped: callers
+/// use this for best-effort detection, and the real load reports the error.
+pub(crate) fn load_profile_extends_resolved(name_or_path: &str) -> Option<Vec<String>> {
+    let _suppress = crate::deprecation_warnings::WarningSuppressionGuard::begin();
 
-    if !is_valid_profile_name(name_or_path) {
-        return None;
-    }
-
-    // User profile
-    if let Ok(profile_path) = resolve_user_profile_path(name_or_path)
-        && profile_path.exists()
-    {
-        return parse_profile_file(&profile_path)
-            .ok()
-            .and_then(|p| p.extends);
-    }
-
-    // Pack-store: any installed pack that declares a profile artifact with
-    // matching `install_as`.
-    if let Some((profile_path, _)) = find_pack_store_profile(name_or_path) {
-        return parse_profile_file(&profile_path)
-            .ok()
-            .and_then(|p| p.extends);
-    }
-
-    // Built-in profile
-    if let Ok(policy) = crate::policy::load_embedded_policy()
-        && let Some(def) = policy.profiles.get(name_or_path)
-    {
-        return def.extends.as_ref().map(|s| vec![s.clone()]);
-    }
-
-    None
+    let Some(file) = locate_profile_file(name_or_path) else {
+        return builtin_profile_extends(name_or_path);
+    };
+    let extends = parse_profile_file(&file).ok()?.extends?;
+    Some(
+        extends
+            .into_iter()
+            .filter_map(
+                |raw| match classify_extends_entry(&raw, ExtendsOrigin::File(&file)) {
+                    Ok(ExtendsRef::Path(path)) => Some(path.display().to_string()),
+                    Ok(_) => Some(raw),
+                    Err(_) => None,
+                },
+            )
+            .collect(),
+    )
 }
 
 /// Load a profile by name or file path
@@ -2949,11 +2972,17 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
 /// lookup, pack provenance, migration prompts, and validation remain shared
 /// with JSON-authored inheritance.
 pub fn load_profile_with_extends(name_or_path: &str, cli_extends: &[String]) -> Result<Profile> {
-    let cwd = std::env::current_dir().map_err(NonoError::Io)?;
-    let cli = cli_extends
-        .iter()
-        .map(|raw| classify_extends_entry(raw, ExtendsOrigin::Cli(&cwd)))
-        .collect::<Result<Vec<_>>>()?;
+    // Only `--extends` entries need the cwd; a profile load without them must
+    // not fail because the cwd is gone.
+    let cli = if cli_extends.is_empty() {
+        Vec::new()
+    } else {
+        let cwd = std::env::current_dir().map_err(NonoError::Io)?;
+        cli_extends
+            .iter()
+            .map(|raw| classify_extends_entry(raw, ExtendsOrigin::Cli(&cwd)))
+            .collect::<Result<Vec<_>>>()?
+    };
     load_profile_with_cli_bases(name_or_path, &cli)
 }
 
@@ -3423,6 +3452,22 @@ pub(crate) fn resolve_and_finalize_profile(profile: Profile) -> Result<Profile> 
         0,
         None,
         None,
+        &[],
+    )?)
+}
+
+/// Like [`resolve_and_finalize_profile`] for a profile read from `draft_path`,
+/// so path entries in `extends` are rejected as draft entries.
+pub(crate) fn resolve_and_finalize_draft_profile(
+    profile: Profile,
+    draft_path: &Path,
+) -> Result<Profile> {
+    finalize_profile(resolve_extends(
+        profile,
+        &mut Vec::new(),
+        0,
+        None,
+        Some(draft_path),
         &[],
     )?)
 }

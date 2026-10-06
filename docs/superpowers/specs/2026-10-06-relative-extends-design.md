@@ -178,10 +178,11 @@ The loaded profile's `source_files` (writable entries only) is passed to
      win, down to the base that wins least. For `extends: ["a", "b"]` where
      `a` extends `c`, the merge records `[c, a, b, top]` and the menu shows
      `top, b, a, c`. Duplicates are already removed by the merge.
-   - "a new user profile", only when the top-level profile was selected by
-     name or registry ref, or there is no profile. A new user profile cannot
-     extend a path profile (absolute paths are out of scope), so it would drop
-     the user's base.
+   - "a new user profile", only when the list of writable files is empty
+     (today's rule: a pack, built-in or no profile). So a named user profile
+     with no writable bases saves exactly as today, with no menu. A new user
+     profile is never offered for a path profile: it cannot extend one
+     (absolute paths are out of scope), so it would drop the user's base.
 4. If the list has one entry, behave as today: update that file, or prompt for
    a new user profile name.
 5. If the list has two or more entries, show a numbered menu. The same menu is
@@ -192,7 +193,6 @@ The loaded profile's `source_files` (writable entries only) is passed to
    Save the selected rules to:
      1) /path/proj/.nono/agent.json    (this profile)
      2) /path/proj/shared/base.json    (base — applies to every profile that extends it)
-     3) a new user profile
    Choice [1]:
    ```
 
@@ -209,8 +209,8 @@ No terminal (`terminal_prompts_available()` is false): no prompt, as today.
   kind; a pack layer is never in the writable list; merge keeps all layers.
 - Target list order: precedence order (`top, b, a, c` for the example in the
   save flow); duplicates removed.
-- "a new user profile" is listed for a named top-level profile and absent for
-  a path top-level profile.
+- "a new user profile" is the only target when no writable file exists, and is
+  never listed next to writable files.
 - One target: no menu, current behaviour.
 - Menu: Enter picks the top-level profile; `2` writes to the base and leaves the
   top-level file unchanged; `skip` writes nothing; invalid input re-prompts.

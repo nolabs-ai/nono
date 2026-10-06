@@ -61,6 +61,7 @@ fn config(caps: &CapabilitySet, filesystem: bool, proxy: bool) -> ExecConfig<'_>
         protected_paths: &[],
         profile_save_base: None,
         ignored_denial_paths: &[],
+        profile_save_files: &[],
         suppressed_system_service_operations: &[],
         startup_timeout: None,
         seccomp_policy: SeccompPolicy {

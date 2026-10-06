@@ -7,7 +7,9 @@
 pub(crate) mod builtin;
 mod credential_provider;
 mod extends_ref;
-pub(crate) use extends_ref::{ExtendsOrigin, ExtendsRef, classify_extends_entry};
+pub(crate) use extends_ref::{
+    ExtendsOrigin, ExtendsRef, classify_extends_entry, is_under_pack_store,
+};
 
 pub use credential_provider::{
     CredentialProviderDef, CredentialProviderRequestBodyFormat,
@@ -2682,6 +2684,68 @@ pub struct Profile {
     /// are child-wins, lists are dedup-appended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_overrides: Option<PlatformOverrides>,
+    /// Files this profile was loaded from, bases first and the top-level file
+    /// last. Built-in bases have no file and are not listed.
+    #[serde(skip)]
+    pub(crate) source_files: Vec<ProfileSourceFile>,
+}
+
+impl Profile {
+    /// Source files a save may write to, highest precedence first.
+    pub(crate) fn writable_source_files(&self) -> Vec<ProfileSourceFile> {
+        self.source_files
+            .iter()
+            .rev()
+            .filter(|file| file.kind.is_writable())
+            .cloned()
+            .collect()
+    }
+}
+
+/// A file a loaded profile came from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ProfileSourceFile {
+    /// Canonical path to the profile file.
+    pub(crate) path: PathBuf,
+    pub(crate) kind: ProfileSourceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ProfileSourceKind {
+    /// Under the user profile directory.
+    User,
+    /// Under the user profile-drafts directory.
+    Draft,
+    /// Any other file, such as a project-local `.nono/` profile.
+    Project,
+    /// Inside the installed pack store.
+    Pack,
+}
+
+impl ProfileSourceFile {
+    /// Classify `canonical` by the directory it lives in.
+    pub(crate) fn new(canonical: PathBuf) -> Self {
+        let kind = if is_under_pack_store(&canonical) {
+            ProfileSourceKind::Pack
+        } else if is_under_user_profile_draft_dir(&canonical) {
+            ProfileSourceKind::Draft
+        } else if is_under_user_profile_dir(&canonical) {
+            ProfileSourceKind::User
+        } else {
+            ProfileSourceKind::Project
+        };
+        Self {
+            path: canonical,
+            kind,
+        }
+    }
+}
+
+impl ProfileSourceKind {
+    /// Pack-store files are owned by the pack and never edited in place.
+    pub(crate) fn is_writable(self) -> bool {
+        self != Self::Pack
+    }
 }
 
 /// Per-OS patches for [`Profile::platform_overrides`].
@@ -2835,6 +2899,7 @@ impl From<ProfileDeserialize> for Profile {
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
             platform_overrides: raw.platform_overrides,
+            source_files: Vec::new(),
         }
     }
 }
@@ -3599,7 +3664,10 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 /// (#1565). Drafts resolve `extends` the same way as `resolve_and_finalize_profile`
 /// (user profiles → packs → builtins).
 fn load_from_file(path: &Path, cli: &[ExtendsRef]) -> Result<Profile> {
-    let (profile, source_path) = parse_file_backed_profile(path)?;
+    let (mut profile, source_path) = parse_file_backed_profile(path)?;
+    profile
+        .source_files
+        .push(ProfileSourceFile::new(source_path.clone()));
     let context_dir = if is_under_user_profile_draft_dir(&source_path) {
         None
     } else {
@@ -3695,17 +3763,25 @@ fn resolve_extends(
             }
         };
         let resolved_base = match resolved {
-            ResolvedBase::Sibling(base, source_path) => resolve_extends(
-                base,
-                visited,
-                depth + 1,
-                source_path.parent(),
-                Some(&source_path),
-                &[],
-            )?,
+            ResolvedBase::Sibling(mut base, source_path) => {
+                base.source_files
+                    .push(ProfileSourceFile::new(source_path.clone()));
+                resolve_extends(
+                    base,
+                    visited,
+                    depth + 1,
+                    source_path.parent(),
+                    Some(&source_path),
+                    &[],
+                )?
+            }
             // Pack-store bases keep their file so path entries in them hit the
             // pack-profile rule; name lookup still gets no sibling context.
-            ResolvedBase::Global(base, pack_path) => {
+            ResolvedBase::Global(mut base, pack_path) => {
+                if let Some(path) = &pack_path {
+                    base.source_files
+                        .push(ProfileSourceFile::new(nono::try_canonicalize(path)));
+                }
                 resolve_extends(base, visited, depth + 1, None, pack_path.as_deref(), &[])?
             }
         };
@@ -4176,6 +4252,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             &base.unsafe_macos_seatbelt_rules,
             &child.unsafe_macos_seatbelt_rules,
         ),
+        source_files: dedup_append(&base.source_files, &child.source_files),
     }
 }
 
@@ -4292,19 +4369,28 @@ pub(crate) fn user_profile_draft_dir() -> Result<PathBuf> {
 
 /// True when `path` is inside the user profile-drafts directory.
 ///
-/// `path` must already be canonical. The only caller, `load_from_file`,
-/// passes the path returned by `parse_file_backed_profile`.
+/// `path` must already be canonical.
 /// Uses [`Path::starts_with`] (not string prefix matching) so lookalike
 /// paths such as `profile-drafts-evil/` cannot match.
 pub(crate) fn is_under_user_profile_draft_dir(path: &Path) -> bool {
-    let Ok(drafts) = user_profile_draft_dir() else {
+    is_under_dir(path, user_profile_draft_dir())
+}
+
+/// True when canonical `path` is inside the user profile directory.
+fn is_under_user_profile_dir(path: &Path) -> bool {
+    is_under_dir(path, user_profile_dir())
+}
+
+/// True when canonical `path` is inside `dir`, compared canonically.
+fn is_under_dir(path: &Path, dir: Result<PathBuf>) -> bool {
+    let Ok(dir) = dir else {
         return false;
     };
-    let Ok(drafts_canon) = drafts.canonicalize() else {
-        // Drafts dir missing or unreadable → nothing can be under it.
+    let Ok(dir_canon) = dir.canonicalize() else {
+        // Directory missing or unreadable → nothing can be under it.
         return false;
     };
-    path.starts_with(&drafts_canon)
+    path.starts_with(&dir_canon)
 }
 
 pub(crate) fn get_user_profile_draft_path(name: &str) -> Result<PathBuf> {
@@ -7251,6 +7337,7 @@ mod tests {
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
             platform_overrides: None,
+            source_files: Vec::new(),
         }
     }
 
@@ -7342,6 +7429,7 @@ mod tests {
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
             platform_overrides: None,
+            source_files: Vec::new(),
         }
     }
 
@@ -11151,6 +11239,126 @@ mod tests {
                 .contains("path entries in `extends` are not allowed in pack profiles"),
             "unexpected error: {err}"
         );
+    }
+
+    fn source_file(path: &Path, kind: ProfileSourceKind) -> ProfileSourceFile {
+        ProfileSourceFile {
+            path: path.canonicalize().expect("canonicalize source file"),
+            kind,
+        }
+    }
+
+    #[test]
+    fn test_source_files_record_kinds() {
+        let (profile, expected) = with_config_env(|config_dir| {
+            let install_dir = build_fake_pack_store(
+                config_dir,
+                "acme",
+                "packy",
+                "packy",
+                r#"{ "meta": { "name": "packy" } }"#,
+                None,
+            );
+            let dir = tempdir().expect("tmpdir");
+            std::fs::create_dir_all(dir.path().join("proj")).expect("mkdir proj");
+            std::fs::create_dir_all(dir.path().join("shared")).expect("mkdir shared");
+            let base = dir.path().join("shared/base.json");
+            std::fs::write(&base, r#"{ "meta": { "name": "base" } }"#).expect("write base");
+            let agent = dir.path().join("proj/agent.json");
+            std::fs::write(
+                &agent,
+                r#"{ "extends": ["../shared/base.json", "packy", "default"],
+                     "meta": { "name": "agent" } }"#,
+            )
+            .expect("write agent");
+
+            let profile = load_profile_from_path(&agent).expect("load agent");
+            let expected = vec![
+                source_file(&base, ProfileSourceKind::Project),
+                source_file(
+                    &install_dir.join("profiles/packy.json"),
+                    ProfileSourceKind::Pack,
+                ),
+                source_file(&agent, ProfileSourceKind::Project),
+            ];
+            (profile, expected)
+        });
+
+        assert_eq!(profile.source_files, expected);
+        assert_eq!(
+            profile.writable_source_files(),
+            vec![expected[2].clone(), expected[0].clone()]
+        );
+    }
+
+    #[test]
+    fn test_writable_source_files_precedence_order() {
+        let dir = tempdir().expect("tmpdir");
+        let write = |name: &str, json: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, json).expect("write profile");
+            path.canonicalize().expect("canonicalize profile")
+        };
+        let c = write("c.json", r#"{ "meta": { "name": "c" } }"#);
+        let b = write("b.json", r#"{ "meta": { "name": "b" } }"#);
+        let a = write(
+            "a.json",
+            r#"{ "extends": "./c.json", "meta": { "name": "a" } }"#,
+        );
+        let top = write(
+            "top.json",
+            r#"{ "extends": ["./a.json", "./b.json"], "meta": { "name": "top" } }"#,
+        );
+
+        let profile = load_from_file(&top, &[]).expect("load top");
+        let paths: Vec<PathBuf> = profile
+            .writable_source_files()
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+
+        assert_eq!(paths, vec![top, b, a, c]);
+    }
+
+    #[test]
+    fn test_source_files_draft_and_user_kinds() {
+        let (user, draft, expected_user, expected_draft) = with_config_env(|config_dir| {
+            let profiles = config_dir.join("nono/profiles");
+            let drafts = config_dir.join("nono/profile-drafts");
+            std::fs::create_dir_all(&profiles).expect("mkdir profiles");
+            std::fs::create_dir_all(&drafts).expect("mkdir drafts");
+            let user_path = profiles.join("mine.json");
+            std::fs::write(&user_path, r#"{ "meta": { "name": "mine" } }"#).expect("write user");
+            let draft_path = drafts.join("draft.json");
+            std::fs::write(&draft_path, r#"{ "meta": { "name": "draft" } }"#).expect("write draft");
+
+            let user = load_profile_no_migrate("mine").expect("load user profile");
+            let draft = load_profile_from_path(&draft_path).expect("load draft");
+            (
+                user,
+                draft,
+                source_file(&user_path, ProfileSourceKind::User),
+                source_file(&draft_path, ProfileSourceKind::Draft),
+            )
+        });
+
+        assert_eq!(user.source_files, vec![expected_user]);
+        assert_eq!(draft.source_files, vec![expected_draft]);
+    }
+
+    #[test]
+    fn test_source_files_not_serialized() {
+        let profile = Profile {
+            source_files: vec![ProfileSourceFile {
+                path: PathBuf::from("/tmp/agent.json"),
+                kind: ProfileSourceKind::Project,
+            }],
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&profile).expect("serialize profile");
+
+        assert!(value.get("source_files").is_none(), "got {value}");
     }
 
     /// Test 1: A hook script starting with `$PACK_DIR` in a registry-pack profile

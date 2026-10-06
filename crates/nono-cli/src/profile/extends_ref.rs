@@ -3,7 +3,9 @@
 //! An entry is a built-in/user profile name, a registry pack reference, or a
 //! relative `./`/`../` path to a profile file.
 
-use super::{is_registry_ref, is_under_user_profile_draft_dir, is_valid_profile_name};
+use super::{
+    is_registry_ref, is_under_dir, is_under_user_profile_draft_dir, is_valid_profile_name,
+};
 use nono::{NonoError, Result};
 use std::path::{Path, PathBuf};
 
@@ -117,13 +119,7 @@ fn resolve_path_entry(raw: &str, origin: ExtendsOrigin<'_>) -> Result<PathBuf> {
 /// True when `path` is inside the installed pack store. A missing store
 /// contains nothing.
 pub(crate) fn is_under_pack_store(path: &Path) -> bool {
-    let Ok(store) = crate::package::package_store_dir() else {
-        return false;
-    };
-    let Ok(store_canon) = store.canonicalize() else {
-        return false;
-    };
-    path.starts_with(&store_canon)
+    is_under_dir(path, crate::package::package_store_dir())
 }
 
 #[cfg(test)]

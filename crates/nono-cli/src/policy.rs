@@ -187,6 +187,7 @@ impl ProfileDef {
             command_args: self.command_args.clone(),
             unsafe_macos_seatbelt_rules: self.unsafe_macos_seatbelt_rules.clone(),
             platform_overrides: self.platform_overrides.clone(),
+            source_files: Vec::new(),
         }
     }
 }

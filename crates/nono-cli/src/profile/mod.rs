@@ -2938,21 +2938,26 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
 /// 4. Auto-pull prompt for the registry pack `nolabs-ai/claude` when
 ///    the requested profile is `claude-code` (or inherits from it).
 pub fn load_profile(name_or_path: &str) -> Result<Profile> {
-    load_profile_impl(name_or_path, &[])
+    load_profile_with_cli_bases(name_or_path, &[])
 }
 
 /// Load a profile by name or file path, injecting additional CLI-selected bases.
 ///
-/// Non-empty `cli_extends` behaves as if those base names were prepended to the
-/// selected profile's raw `extends` list before inheritance resolution. Bases
-/// still resolve through the normal profile resolver, so cycle checks, sibling
+/// `cli_extends` bases are merged ahead of the selected profile's own `extends`
+/// bases. Path entries resolve against the current directory; names resolve
+/// exactly as if written in the selected profile, so cycle checks, sibling
 /// lookup, pack provenance, migration prompts, and validation remain shared
 /// with JSON-authored inheritance.
 pub fn load_profile_with_extends(name_or_path: &str, cli_extends: &[String]) -> Result<Profile> {
-    load_profile_impl(name_or_path, cli_extends)
+    let cwd = std::env::current_dir().map_err(NonoError::Io)?;
+    let cli = cli_extends
+        .iter()
+        .map(|raw| classify_extends_entry(raw, ExtendsOrigin::Cli(&cwd)))
+        .collect::<Result<Vec<_>>>()?;
+    load_profile_with_cli_bases(name_or_path, &cli)
 }
 
-fn load_profile_impl(name_or_path: &str, cli_extends: &[String]) -> Result<Profile> {
+fn load_profile_with_cli_bases(name_or_path: &str, cli: &[ExtendsRef]) -> Result<Profile> {
     // Enable the chain-aware migration prompt for the duration of this
     // call: if `extends` resolution hits a pack-provided base that isn't
     // installed (e.g. user profile that `extends: ["claude-code"]`),
@@ -2960,7 +2965,7 @@ fn load_profile_impl(name_or_path: &str, cli_extends: &[String]) -> Result<Profi
     // than failing with "base profile not found". The flag is restored
     // on exit so nested `load_profile_no_migrate` calls stay quiet.
     with_missing_base_prompt(true, || {
-        if let Some(profile) = load_profile_inner(name_or_path, cli_extends)? {
+        if let Some(profile) = load_profile_inner(name_or_path, cli)? {
             return Ok(profile);
         }
 
@@ -2978,7 +2983,7 @@ fn load_profile_impl(name_or_path: &str, cli_extends: &[String]) -> Result<Profi
                         profile_path.display()
                     );
                     let mut profile =
-                        load_from_file(&profile_path, cli_extends).and_then(finalize_profile)?;
+                        load_from_file(&profile_path, cli).and_then(finalize_profile)?;
                     if !profile.packs.contains(&pack_key) {
                         profile.packs.push(pack_key);
                     }
@@ -3047,12 +3052,12 @@ fn missing_base_prompt_enabled() -> bool {
 /// and `Err(_)` on validation/IO failures. Shared between `load_profile`
 /// (which then runs the migration prompt) and `load_profile_no_migrate`
 /// (which surfaces a not-found error directly).
-fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Option<Profile>> {
+fn load_profile_inner(name_or_path: &str, cli: &[ExtendsRef]) -> Result<Option<Profile>> {
     if is_registry_ref(name_or_path) {
-        return load_registry_profile(name_or_path, cli_extends).map(Some);
+        return load_registry_profile(name_or_path, cli).map(Some);
     }
     if is_file_path_ref(name_or_path) {
-        return load_profile_from_path_impl(Path::new(name_or_path), cli_extends).map(Some);
+        return load_profile_from_path_impl(Path::new(name_or_path), cli).map(Some);
     }
     if !is_valid_profile_name(name_or_path) {
         return Err(NonoError::ProfileParse(format!(
@@ -3063,14 +3068,14 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
     let profile_path = resolve_user_profile_path(name_or_path)?;
     if profile_path.exists() {
         tracing::info!("Loading user profile from: {}", profile_path.display());
-        return load_profile_from_path_impl(&profile_path, cli_extends).map(Some);
+        return load_profile_from_path_impl(&profile_path, cli).map(Some);
     }
     if let Some((profile_path, pack_key)) = find_pack_store_profile(name_or_path) {
         tracing::info!(
             "Loading pack-store profile from: {}",
             profile_path.display()
         );
-        let mut profile = load_from_file(&profile_path, cli_extends)?;
+        let mut profile = load_from_file(&profile_path, cli)?;
         resolve_store_pack_session_hooks(&mut profile, &pack_key)?;
         let mut profile = finalize_profile(profile)?;
         // Inject the source pack ref so it's always present in the
@@ -3080,7 +3085,7 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         }
         return Ok(Some(profile));
     }
-    if cli_extends.is_empty() {
+    if cli.is_empty() {
         if let Some(profile) = builtin::get_builtin(name_or_path) {
             tracing::info!("Using built-in profile: {}", name_or_path);
             return Ok(Some(profile));
@@ -3089,9 +3094,9 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         let policy = crate::policy::load_embedded_policy()?;
         if let Some(def) = policy.profiles.get(name_or_path) {
             tracing::info!("Using built-in profile: {}", name_or_path);
-            let mut profile = def.to_raw_profile();
-            prepend_cli_extends(&mut profile, cli_extends);
-            return resolve_and_finalize_profile(profile).map(Some);
+            let profile =
+                resolve_extends(def.to_raw_profile(), &mut Vec::new(), 0, None, None, cli)?;
+            return finalize_profile(profile).map(Some);
         }
     }
     Ok(None)
@@ -3248,7 +3253,7 @@ fn resolve_store_pack_session_hooks(profile: &mut Profile, pack_key: &str) -> Re
 
 /// Load a profile from a registry pack. If the pack isn't installed locally,
 /// pull it first (Docker-style auto-pull with Sigstore verification).
-fn load_registry_profile(name_or_path: &str, cli_extends: &[String]) -> Result<Profile> {
+fn load_registry_profile(name_or_path: &str, cli: &[ExtendsRef]) -> Result<Profile> {
     let package_ref = crate::package::parse_package_ref(name_or_path)?;
     let install_dir =
         crate::package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
@@ -3315,7 +3320,7 @@ fn load_registry_profile(name_or_path: &str, cli_extends: &[String]) -> Result<P
                 .join(format!("{install_name}.json"));
             if profile_path.exists() {
                 tracing::info!("Loading registry profile from: {}", profile_path.display());
-                let mut profile = load_from_file(&profile_path, cli_extends)?;
+                let mut profile = load_from_file(&profile_path, cli)?;
                 resolve_store_pack_session_hooks(&mut profile, &package_ref.key())?;
                 return finalize_profile(profile);
             }
@@ -3336,7 +3341,7 @@ pub fn load_profile_from_path(path: &Path) -> Result<Profile> {
     load_profile_from_path_impl(path, &[])
 }
 
-fn load_profile_from_path_impl(path: &Path, cli_extends: &[String]) -> Result<Profile> {
+fn load_profile_from_path_impl(path: &Path, cli: &[ExtendsRef]) -> Result<Profile> {
     if !path.exists() {
         return Err(NonoError::ProfileRead {
             path: path.to_path_buf(),
@@ -3345,7 +3350,7 @@ fn load_profile_from_path_impl(path: &Path, cli_extends: &[String]) -> Result<Pr
     }
 
     tracing::info!("Loading profile from path: {}", path.display());
-    finalize_profile(load_from_file(path, cli_extends)?)
+    finalize_profile(load_from_file(path, cli)?)
 }
 
 /// Load a raw profile from a direct file path without resolving inheritance.
@@ -3548,9 +3553,8 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 /// base and make `show`/`validate` disagree with post-`promote` resolution
 /// (#1565). Drafts resolve `extends` the same way as `resolve_and_finalize_profile`
 /// (user profiles → packs → builtins).
-fn load_from_file(path: &Path, cli_extends: &[String]) -> Result<Profile> {
-    let (mut profile, source_path) = parse_file_backed_profile(path)?;
-    prepend_cli_extends(&mut profile, cli_extends);
+fn load_from_file(path: &Path, cli: &[ExtendsRef]) -> Result<Profile> {
+    let (profile, source_path) = parse_file_backed_profile(path)?;
     let context_dir = if is_under_user_profile_draft_dir(&source_path) {
         None
     } else {
@@ -3562,24 +3566,8 @@ fn load_from_file(path: &Path, cli_extends: &[String]) -> Result<Profile> {
         0,
         context_dir,
         Some(&source_path),
-        &[],
+        cli,
     )
-}
-
-fn prepend_cli_extends(profile: &mut Profile, cli_extends: &[String]) {
-    if cli_extends.is_empty() {
-        return;
-    }
-    let mut extends = Vec::with_capacity(
-        cli_extends
-            .len()
-            .saturating_add(profile.extends.as_ref().map_or(0, Vec::len)),
-    );
-    extends.extend(cli_extends.iter().cloned());
-    if let Some(existing) = profile.extends.take() {
-        extends.extend(existing);
-    }
-    profile.extends = Some(extends);
 }
 
 // ============================================================================
@@ -5224,6 +5212,108 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    /// Writes `{ "filesystem": { "read": [read] } }` to `path`, returning its
+    /// canonical form.
+    fn write_read_only_profile(path: &Path, read: &str) -> PathBuf {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{ "meta": {{ "name": "extra" }}, "filesystem": {{ "read": ["{read}"] }} }}"#
+            ),
+        )
+        .expect("write profile");
+        path.canonicalize().expect("canonicalize profile")
+    }
+
+    #[test]
+    fn test_cli_path_extends_with_pack_profile() {
+        let read = crate::test_env::with_isolated_config_home(|config_home| {
+            crate::test_env::write_fake_pack(
+                config_home,
+                "acme",
+                "packy",
+                "packy",
+                r#"{ "meta": { "name": "packy" }, "filesystem": { "read": ["/tmp/packy"] } }"#,
+                &[],
+                None,
+            );
+            let extra = write_read_only_profile(&config_home.join("extra.json"), "/tmp/extra");
+            load_profile_with_cli_bases("acme/packy", &[ExtendsRef::Path(extra)])
+                .expect("pack profile with CLI path base")
+                .filesystem
+                .read
+        });
+        assert!(read.contains(&"/tmp/extra".to_string()), "got {read:?}");
+        assert!(read.contains(&"/tmp/packy".to_string()), "got {read:?}");
+    }
+
+    #[test]
+    fn test_cli_path_extends_with_builtin_profile() {
+        let read = crate::test_env::with_isolated_config_home(|config_home| {
+            let extra = write_read_only_profile(&config_home.join("extra.json"), "/tmp/extra");
+            load_profile_with_cli_bases("default", &[ExtendsRef::Path(extra)])
+                .expect("built-in profile with CLI path base")
+                .filesystem
+                .read
+        });
+        assert!(read.contains(&"/tmp/extra".to_string()), "got {read:?}");
+    }
+
+    #[test]
+    fn test_cli_path_resolves_against_cwd_not_profile_dir() {
+        let read = crate::test_env::with_isolated_config_home(|config_home| {
+            let a = config_home.join("a");
+            let b = config_home.join("b");
+            std::fs::create_dir_all(&a).expect("mkdir a");
+            std::fs::create_dir_all(&b).expect("mkdir b");
+            write_read_only_profile(&a.join("extra.json"), "/tmp/from-a");
+            write_read_only_profile(&b.join("extra.json"), "/tmp/from-b");
+            let agent = a.join("agent.json");
+            std::fs::write(&agent, r#"{ "meta": { "name": "agent" } }"#).expect("write agent");
+
+            let cli = classify_extends_entry("./extra.json", ExtendsOrigin::Cli(&b))
+                .expect("classify CLI path");
+            load_profile_with_cli_bases(agent.to_str().expect("utf-8 path"), &[cli])
+                .expect("load with CLI path base")
+                .filesystem
+                .read
+        });
+        assert!(read.contains(&"/tmp/from-b".to_string()), "got {read:?}");
+        assert!(!read.contains(&"/tmp/from-a".to_string()), "got {read:?}");
+    }
+
+    #[test]
+    fn test_load_profile_with_extends_resolves_cli_path_against_cwd() {
+        let read = crate::test_env::with_isolated_config_home(|config_home| {
+            let project = config_home.join("proj");
+            let cwd = config_home.join("cwd");
+            std::fs::create_dir_all(&project).expect("mkdir proj");
+            std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+            write_read_only_profile(&project.join("x.json"), "/tmp/decoy");
+            write_read_only_profile(&cwd.join("x.json"), "/tmp/from-cwd");
+            let agent = project.join("agent.json");
+            std::fs::write(&agent, r#"{ "meta": { "name": "agent" } }"#).expect("write agent");
+
+            // The cwd is process-global; the config-home helper holds ENV_LOCK,
+            // and catch_unwind guarantees the restore even if loading panics.
+            let original = std::env::current_dir().expect("cwd");
+            std::env::set_current_dir(&cwd).expect("chdir");
+            let result = std::panic::catch_unwind(|| {
+                load_profile_with_extends(
+                    agent.to_str().expect("utf-8 path"),
+                    &["./x.json".to_string()],
+                )
+            });
+            std::env::set_current_dir(original).expect("restore cwd");
+            match result {
+                Ok(loaded) => loaded.expect("load with CLI path base").filesystem.read,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        });
+        assert!(read.contains(&"/tmp/from-cwd".to_string()), "got {read:?}");
+        assert!(!read.contains(&"/tmp/decoy".to_string()), "got {read:?}");
     }
 
     #[test]
@@ -8758,7 +8848,7 @@ mod tests {
 
     #[test]
     fn test_extends_empty_string_in_array_rejected() {
-        // An empty string passes deserialization but is caught by load_base_profile_raw
+        // An empty string passes deserialization but is caught by classify_extends_entry
         let profile = Profile {
             extends: Some(vec!["".to_string()]),
             ..Default::default()

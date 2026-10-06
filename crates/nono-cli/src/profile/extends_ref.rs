@@ -30,7 +30,6 @@ pub(crate) enum ExtendsOrigin<'a> {
     /// may not exist yet for `profile init`).
     File(&'a Path),
     /// Entry from `--extends`; paths resolve against this directory.
-    #[allow(dead_code)] // constructed by CLI `--extends` handling in a later change
     Cli(&'a Path),
     Builtin,
 }

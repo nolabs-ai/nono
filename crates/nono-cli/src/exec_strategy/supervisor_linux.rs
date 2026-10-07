@@ -2703,6 +2703,96 @@ mod tests {
             );
         }
 
+        /// Regression (#1652): open_port localhost IPC must allow connect back to
+        /// declared ports in proxy mode, not only to the proxy listener port.
+        #[test]
+        fn af_inet_connect_to_open_port_localhost_allowed() {
+            let backend = DenyAllBackend;
+            let caps = nono::CapabilitySet::new()
+                .allow_localhost_port_range(8250, 8255)
+                .expect("valid localhost range");
+            let mut config = make_config(&backend, 8080, vec![], &[]);
+            config.caps = &caps;
+            for port in [8250u16, 8253, 8255] {
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        SYS_CONNECT,
+                        &inet_loopback(port),
+                        &config,
+                    ),
+                    NetworkDecision::Allow,
+                    "connect to open_port range port {port} must be allowed"
+                );
+            }
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(8249), &config),
+                NetworkDecision::Deny,
+                "connect outside declared range must be denied"
+            );
+        }
+
+        #[test]
+        fn af_inet_connect_to_bind_only_grants_denied() {
+            let backend = DenyAllBackend;
+            let config =
+                make_config_with_ranges(&backend, 8080, vec![9000], vec![(9100, 9102)], &[]);
+            for port in [9000, 9001, 9100, 9101, 9102] {
+                for syscall in [SYS_CONNECT, SYS_SENDTO, SYS_SENDMSG, SYS_SENDMMSG] {
+                    assert_eq!(
+                        decide_network_notification(
+                            test_pid(),
+                            syscall,
+                            &inet_loopback(port),
+                            &config
+                        ),
+                        NetworkDecision::Deny,
+                        "listen-only grant must not allow outbound syscall {syscall} to port {port}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn af_inet_connect_to_non_loopback_declared_port_denied() {
+            let backend = DenyAllBackend;
+            let caps = nono::CapabilitySet::new()
+                .allow_localhost_port_range(8250, 8255)
+                .expect("valid localhost range");
+            let mut config = make_config(&backend, 8080, vec![], &[]);
+            config.caps = &caps;
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(8250), &config,),
+                NetworkDecision::Deny,
+                "declared ports must not bypass loopback restriction"
+            );
+        }
+
+        /// Regression: `listen_port` servers typically bind `0.0.0.0` (not
+        /// loopback). Declared bind grants must still allow that; connect stays
+        /// loopback-only (issue #1652).
+        #[test]
+        fn af_inet_bind_on_declared_port_allows_non_loopback() {
+            let backend = DenyAllBackend;
+            let config =
+                make_config_with_ranges(&backend, 8080, vec![9000], vec![(8250, 8255)], &[]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_external(9000), &config),
+                NetworkDecision::Allow,
+                "bind 0.0.0.0:listen_port must be allowed"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_external(8253), &config),
+                NetworkDecision::Allow,
+                "bind 0.0.0.0:listen_port_range must be allowed"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_external(8249), &config),
+                NetworkDecision::Deny,
+                "undeclared bind port must stay denied even on 0.0.0.0"
+            );
+        }
+
         #[test]
         fn bind_allowed_by_individual_port_or_range() {
             let backend = DenyAllBackend;

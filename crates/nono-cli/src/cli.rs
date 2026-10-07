@@ -1205,9 +1205,33 @@ pub struct SandboxArgs {
     #[arg(long = "listen-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_bind: Vec<u16>,
 
+    /// Inclusive TCP listen port range (bind only; repeatable; START:END).
+    /// Equivalent to profile `listen_port_range`.
+    /// ALIAS(canonical="--listen-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
+    #[arg(
+        long = "listen-port-range",
+        alias = "allow-bind-range",
+        value_name = "START:END",
+        value_parser = crate::proxy_runtime::parse_port_range_arg,
+        help_heading = "NETWORK"
+    )]
+    pub allow_bind_range: Vec<(u16, u16)>,
+
     /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
     #[arg(long = "open-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_port: Vec<u16>,
+
+    /// Inclusive localhost TCP port range for bidirectional IPC (repeatable; START:END).
+    /// Equivalent to profile `open_port_range`. macOS: combined ranges limited to 16,384 ports.
+    /// ALIAS(canonical="--open-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
+    #[arg(
+        long = "open-port-range",
+        alias = "allow-port-range",
+        value_name = "START:END",
+        value_parser = crate::proxy_runtime::parse_port_range_arg,
+        help_heading = "NETWORK"
+    )]
+    pub allow_port_range: Vec<(u16, u16)>,
 
     /// Allow outbound TCP connect to a specific port (repeatable; Linux Landlock V4+ only)
     #[arg(
@@ -1390,7 +1414,8 @@ pub struct SandboxArgs {
             "allow_unix_socket_subtree", "allow_unix_socket_subtree_bind",
             "profile", "extends", "bypass_protection", "suppress_save_prompt", "allow_cwd",
             "block_net", "allow_net", "network_profile", "allow_proxy",
-            "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
+            "allow_bind", "allow_bind_range", "allow_port", "allow_port_range",
+            "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu", "allow_http2",
             "memory", "max_processes",
@@ -1741,9 +1766,33 @@ pub struct WrapSandboxArgs {
     #[arg(long = "listen-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_bind: Vec<u16>,
 
+    /// Inclusive TCP listen port range (bind only; repeatable; START:END).
+    /// Equivalent to profile `listen_port_range`.
+    /// ALIAS(canonical="--listen-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
+    #[arg(
+        long = "listen-port-range",
+        alias = "allow-bind-range",
+        value_name = "START:END",
+        value_parser = crate::proxy_runtime::parse_port_range_arg,
+        help_heading = "NETWORK"
+    )]
+    pub allow_bind_range: Vec<(u16, u16)>,
+
     /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
     #[arg(long = "open-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_port: Vec<u16>,
+
+    /// Inclusive localhost TCP port range for bidirectional IPC (repeatable; START:END).
+    /// Equivalent to profile `open_port_range`. macOS: combined ranges limited to 16,384 ports.
+    /// ALIAS(canonical="--open-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
+    #[arg(
+        long = "open-port-range",
+        alias = "allow-port-range",
+        value_name = "START:END",
+        value_parser = crate::proxy_runtime::parse_port_range_arg,
+        help_heading = "NETWORK"
+    )]
+    pub allow_port_range: Vec<(u16, u16)>,
 
     /// Allow outbound TCP connect to a specific port (repeatable; Linux Landlock V4+ only)
     #[arg(
@@ -1822,7 +1871,8 @@ pub struct WrapSandboxArgs {
             "allow_unix_socket_dir", "allow_unix_socket_dir_bind",
             "allow_unix_socket_subtree", "allow_unix_socket_subtree_bind",
             "profile", "extends", "bypass_protection", "suppress_save_prompt", "allow_cwd",
-            "block_net", "allow_bind", "allow_port", "allow_connect_port",
+            "block_net", "allow_bind", "allow_bind_range", "allow_port", "allow_port_range",
+            "allow_connect_port",
             "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu",
         ],
@@ -1868,7 +1918,9 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_proxy: Vec::new(),
             deny_proxy: Vec::new(),
             allow_bind: args.allow_bind,
+            allow_bind_range: args.allow_bind_range,
             allow_port: args.allow_port,
+            allow_port_range: args.allow_port_range,
             allow_connect_port: args.allow_connect_port,
             external_proxy: None,
             external_proxy_bypass: Vec::new(),
@@ -3310,6 +3362,61 @@ mod tests {
                 assert_eq!(args.sandbox.allow_port, vec![5432]);
             }
             _ => panic!("Expected Wrap command"),
+        }
+    }
+
+    #[test]
+    fn port_range_flags_reach_run_and_wrap_args() {
+        for command in ["run", "wrap"] {
+            for (open, listen) in [
+                ("--open-port-range", "--listen-port-range"),
+                ("--allow-port-range", "--allow-bind-range"),
+            ] {
+                let cli = Cli::try_parse_from([
+                    "nono",
+                    command,
+                    open,
+                    "3000:3002",
+                    listen,
+                    "8000:8100",
+                    "--",
+                    "echo",
+                ])
+                .expect("valid range flags");
+                let args = match cli.command {
+                    Commands::Run(args) => args.sandbox,
+                    Commands::Wrap(args) => args.sandbox.into(),
+                    _ => panic!("expected run or wrap"),
+                };
+                assert_eq!(args.allow_port_range, vec![(3000, 3002)]);
+                assert_eq!(args.allow_bind_range, vec![(8000, 8100)]);
+            }
+        }
+    }
+
+    #[test]
+    fn port_range_flags_reject_invalid_bounds_and_manifest_combination() {
+        for command in ["run", "wrap"] {
+            for flag in ["--open-port-range", "--listen-port-range"] {
+                for range in ["0:3000", "3000:0", "3002:3000", "1:65536"] {
+                    assert!(
+                        Cli::try_parse_from(["nono", command, flag, range, "--", "echo"]).is_err()
+                    );
+                }
+                assert!(
+                    Cli::try_parse_from([
+                        "nono",
+                        command,
+                        "--config",
+                        "manifest.json",
+                        flag,
+                        "3000:3002",
+                        "--",
+                        "echo",
+                    ])
+                    .is_err()
+                );
+            }
         }
     }
 

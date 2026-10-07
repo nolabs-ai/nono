@@ -408,6 +408,8 @@ nono run --network-profile claude-code --open-port 3000 --allow-cwd -- claude
 
 This generates Seatbelt rules (macOS) or Landlock rules (Linux) that allow both `connect()` and `bind()` on the specified port, in addition to the proxy port.
 
+Use `--open-port-range START:END` for an inclusive range, for example `--open-port-range 49152:49200`. It corresponds to the profile field `network.open_port_range`; repeat the flag for multiple ranges.
+
 See [CLI Reference](/cli/usage/flags#--open-port) for full details and platform limitations.
 
 ### Listen-Only Ports
@@ -417,6 +419,8 @@ Use `--listen-port` when a sandboxed process needs to accept inbound connections
 ```bash
 nono run --allow-cwd --network-profile developer --listen-port 3000 -- npm run dev
 ```
+
+Use `--listen-port-range START:END` for an inclusive bind-only range, for example `--listen-port-range 8000:8100`. It corresponds to the profile field `network.listen_port_range` and does not grant outbound connections. Both range flags reject port 0 and reversed endpoints.
 
 See [CLI Reference](/cli/usage/flags#--listen-port) for platform limitations.
 

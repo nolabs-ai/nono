@@ -4543,9 +4543,10 @@ fn caps_to_spec(caps: &CapabilitySet) -> ChildCapsSpec {
             NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
         },
-        proxy_bind_port_ranges: caps.localhost_port_ranges().to_vec(),
+        proxy_bind_port_ranges: caps.merged_localhost_port_ranges(),
         tcp_connect_ports: caps.tcp_connect_ports().to_vec(),
         tcp_bind_ports: caps.tcp_bind_ports().to_vec(),
+        tcp_bind_port_ranges: caps.tcp_bind_port_ranges().to_vec(),
     }
 }
 
@@ -4576,6 +4577,9 @@ fn caps_from_spec(spec: &ChildCapsSpec) -> Result<CapabilitySet> {
     }
     for port in &spec.tcp_bind_ports {
         caps.add_tcp_bind_port(*port);
+    }
+    for &(start, end) in &spec.tcp_bind_port_ranges {
+        caps.add_tcp_bind_port_range(start, end)?;
     }
     Ok(caps)
 }
@@ -7059,6 +7063,29 @@ mod tests {
     }
 
     #[test]
+    fn child_cap_spec_keeps_bind_ranges_separate_from_open_ranges() -> Result<()> {
+        let caps = CapabilitySet::new()
+            .proxy_only(8080)
+            .allow_localhost_port(3000)
+            .allow_localhost_port_range(3001, 3002)?
+            .allow_tcp_bind_port_range(8000, 8002)?;
+        let spec = caps_to_spec(&caps);
+        // Exercise the actual serialized child protocol, not only the in-memory struct.
+        let json = serde_json::to_vec(&spec).map_err(|e| NonoError::ConfigParse(e.to_string()))?;
+        let spec: ChildCapsSpec =
+            serde_json::from_slice(&json).map_err(|e| NonoError::ConfigParse(e.to_string()))?;
+        let restored = caps_from_spec(&spec)?;
+        assert_eq!(restored.localhost_port_ranges(), &[(3000, 3002)]);
+        assert_eq!(restored.tcp_bind_port_ranges(), &[(8000, 8002)]);
+        assert!(restored.tcp_connect_ports().is_empty());
+        assert!(matches!(
+            restored.network_mode(),
+            NetworkMode::ProxyOnly { port: 8080, .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn child_cap_spec_serializes_resolved_filesystem_paths() -> Result<()> {
         let temp = test_tempdir()?;
         let real = temp.path().join("real");
@@ -7178,6 +7205,7 @@ mod tests {
             proxy_bind_port_ranges: Vec::new(),
             tcp_connect_ports: Vec::new(),
             tcp_bind_ports: Vec::new(),
+            tcp_bind_port_ranges: Vec::new(),
         };
 
         let err = caps_from_spec(&spec).err().ok_or_else(|| {

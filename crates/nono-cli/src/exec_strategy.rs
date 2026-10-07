@@ -2852,6 +2852,11 @@ fn reap_reparented_orphans(child: Pid) -> Option<WaitStatus> {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn reap_credential_orphans_for_test() {
+    let _ = reap_reparented_orphans(Pid::from_raw(i32::MAX));
+}
+
 /// Supervisor IPC event loop for capability expansion (Linux).
 ///
 /// Multiplexes between:

@@ -458,7 +458,7 @@ impl ProxyCredentialCaptureBackend {
             command.env_remove(name);
         }
 
-        let mut child = command.spawn().map_err(|err| {
+        let mut child = crate::owned_children::spawn(&mut command).map_err(|err| {
             self.capture_error(
                 entry,
                 CaptureErrorDetails::new("spawn_failed", start.elapsed())
@@ -2040,18 +2040,18 @@ fn load_command_credential_source(
              no remaining PATH entry is safe for this sandbox"
         ))
     })?;
-    let mut child = Command::new(command)
+    let mut credential_command = Command::new(command);
+    credential_command
         .args(args)
         .env("PATH", &safe_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            NonoError::SandboxInit(format!(
-                "failed to start supervisor credential source '{command}': {err}"
-            ))
-        })?;
+        .stderr(Stdio::piped());
+    let mut child = crate::owned_children::spawn(&mut credential_command).map_err(|err| {
+        NonoError::SandboxInit(format!(
+            "failed to start supervisor credential source '{command}': {err}"
+        ))
+    })?;
 
     let start = Instant::now();
     loop {
@@ -4836,6 +4836,228 @@ mod tests {
             .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
         assert_capture_secret(&second, "ghp_test");
         assert_eq!(second.metadata.cache_action, "cache_hit");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    mod orphan_reap_tests {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+
+        const ISOLATED_ENV: &str = "NONO_CREDENTIAL_ORPHAN_REAP_TEST";
+
+        // The wildcard reaper must run alone so it cannot take children from
+        // unrelated tests. Follow exec_strategy's orphan-reaper test isolation.
+        fn isolated(name: &str, test: impl FnOnce()) {
+            if std::env::var(ISOLATED_ENV).ok().as_deref() == Some(name) {
+                test();
+                return;
+            }
+            let _env_lock = crate::test_env::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let executable = std::env::current_exe().expect("test executable");
+            let status = Command::new(executable)
+                .args([
+                    "--exact",
+                    &format!("proxy_runtime::tests::orphan_reap_tests::{name}"),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED_ENV, name)
+                .status()
+                .expect("run isolated credential test");
+            assert!(status.success(), "isolated {name}: {status}");
+        }
+
+        struct Reaper {
+            stop: Arc<AtomicBool>,
+            polls: Arc<AtomicUsize>,
+            thread: Option<JoinHandle<()>>,
+        }
+
+        impl Reaper {
+            fn start() -> Self {
+                let stop = Arc::new(AtomicBool::new(false));
+                let thread_stop = Arc::clone(&stop);
+                let polls = Arc::new(AtomicUsize::new(0));
+                let thread_polls = Arc::clone(&polls);
+                let thread = std::thread::spawn(move || {
+                    while !thread_stop.load(Ordering::SeqCst) {
+                        crate::exec_strategy::reap_credential_orphans_for_test();
+                        thread_polls.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+                Self {
+                    stop,
+                    polls,
+                    thread: Some(thread),
+                }
+            }
+
+            fn assert_polled(&self) {
+                assert!(self.polls.load(Ordering::SeqCst) > 0, "reaper must run");
+            }
+        }
+
+        impl Drop for Reaper {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                if let Some(thread) = self.thread.take() {
+                    thread.join().expect("join credential orphan reaper");
+                }
+            }
+        }
+
+        #[test]
+        fn capture_command_keeps_its_status_during_orphan_reaping() {
+            isolated(
+                "capture_command_keeps_its_status_during_orphan_reaping",
+                || {
+                    let entries = HashMap::from([(
+                        "test".to_string(),
+                        test_capture_entry_no_cache(vec![
+                            "/bin/sh".to_string(),
+                            "-c".to_string(),
+                            "/bin/sleep 0.01; printf capture-token".to_string(),
+                        ]),
+                    )]);
+                    let backend = ProxyCredentialCaptureBackend::new(
+                        &entries,
+                        "sess-reaper".to_string(),
+                        CapabilitySet::default(),
+                    )
+                    .expect("capture backend");
+                    let reaper = Reaper::start();
+                    // The helper exits between the owner's 25ms polls while the
+                    // real supervisor reaper concurrently drains terminated children.
+                    for _ in 0..10 {
+                        let response = nono_proxy::capture::CredentialCaptureBackend::capture(
+                            &backend,
+                            test_capture_request(),
+                        )
+                        .expect("capture owner retains the helper's successful status");
+                        assert_capture_secret(&response, "capture-token");
+                        assert_eq!(response.metadata.exit_status, Some(0));
+                        assert_eq!(response.metadata.stdout_bytes, Some(13));
+                        assert_eq!(response.metadata.cache_action, "captured");
+                    }
+                    reaper.assert_polled();
+                },
+            );
+        }
+
+        #[test]
+        fn supervisor_credential_command_keeps_its_status_during_orphan_reaping() {
+            isolated(
+                "supervisor_credential_command_keeps_its_status_during_orphan_reaping",
+                || {
+                    let reaper = Reaper::start();
+                    for _ in 0..10 {
+                        let credential = load_command_credential_source(
+                            "/bin/sh",
+                            &[
+                                "-c".to_string(),
+                                "/bin/sleep 0.01; printf capture-token".to_string(),
+                            ],
+                            Some(5),
+                            &CapabilitySet::default(),
+                        )
+                        .expect("credential source owner retains the helper's status");
+                        assert_eq!(credential, "capture-token");
+                    }
+                    reaper.assert_polled();
+                },
+            );
+        }
+    }
+
+    fn test_capture_request() -> nono_proxy::capture::CredentialCaptureRequest {
+        nono_proxy::capture::CredentialCaptureRequest {
+            credential_name: "test".to_string(),
+            route_id: "test".to_string(),
+            request_host: "api.example.com".to_string(),
+            request_path: "/".to_string(),
+            request_method: "GET".to_string(),
+            session_id: String::new(),
+            cache_scope: String::new(),
+        }
+    }
+
+    fn timeout_helper_command(pid_file: &Path) -> Vec<String> {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf %s \"$$\" > \"$1\"; exec /bin/sleep 10".to_string(),
+            "sh".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        ]
+    }
+
+    fn assert_credential_helper_collected(pid_file: &Path) {
+        let pid: u32 = std::fs::read_to_string(pid_file)
+            .expect("helper writes its PID before the timeout")
+            .parse()
+            .expect("helper PID");
+        assert!(
+            !crate::owned_children::lock().contains(&pid),
+            "timed-out helper is no longer registered"
+        );
+        assert_eq!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(i32::try_from(pid).expect("PID fits i32")),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+            ),
+            Err(nix::errno::Errno::ECHILD),
+            "timeout cleanup collected the helper"
+        );
+    }
+
+    #[test]
+    fn proxy_credential_capture_timeout_collects_and_unregisters_helper() -> Result<()> {
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().map_err(NonoError::Io)?;
+        let pid_file = temp.path().join("capture-pid");
+        let entries = HashMap::from([(
+            "test".to_string(),
+            test_capture_entry_no_cache(timeout_helper_command(&pid_file)),
+        )]);
+        let mut backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-timeout".to_string(),
+            CapabilitySet::default(),
+        )?;
+        backend.entries.get_mut("test").expect("test entry").timeout = Duration::from_millis(200);
+        let err = nono_proxy::capture::CredentialCaptureBackend::capture(
+            &backend,
+            test_capture_request(),
+        )
+        .expect_err("timed-out capture must not produce a credential");
+        assert_eq!(err.metadata.cache_action, "timeout");
+        assert_credential_helper_collected(&pid_file);
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_credential_source_timeout_collects_and_unregisters_helper() -> Result<()> {
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().map_err(NonoError::Io)?;
+        let pid_file = temp.path().join("source-pid");
+        let command = timeout_helper_command(&pid_file);
+        let err = load_command_credential_source(
+            &command[0],
+            &command[1..],
+            Some(1),
+            &CapabilitySet::default(),
+        )
+        .expect_err("timed-out source must not produce a credential");
+        assert!(err.to_string().contains("timed out"));
+        assert_credential_helper_collected(&pid_file);
         Ok(())
     }
 

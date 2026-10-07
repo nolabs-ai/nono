@@ -22,7 +22,7 @@
 //! tunnel for a route that asked for L7 visibility.
 
 use crate::error::{ProxyError, Result};
-use crate::tls_intercept::ca::EphemeralCa;
+use crate::tls_intercept::ca::{EphemeralCa, certificate_not_before, system_time_to_offset};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256, SanType,
 };
@@ -32,7 +32,6 @@ use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use time::OffsetDateTime;
 use tracing::{debug, warn};
 
 /// Per-hostname leaf certificate cache backed by the session's [`EphemeralCa`].
@@ -137,6 +136,15 @@ fn mint_leaf(
     hostname: &str,
     leaf_validity: Option<Duration>,
 ) -> Result<Arc<CertifiedKey>> {
+    mint_leaf_at(ca, hostname, leaf_validity, SystemTime::now())
+}
+
+fn mint_leaf_at(
+    ca: &EphemeralCa,
+    hostname: &str,
+    leaf_validity: Option<Duration>,
+    now: SystemTime,
+) -> Result<Arc<CertifiedKey>> {
     // Generate a new key pair for this leaf. Distinct from the CA key:
     // we never expose the CA's signing key in any TLS handshake.
     let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
@@ -151,18 +159,22 @@ fn mint_leaf(
     // "Missing Authority Key Identifier".
     params.use_authority_key_identifier_extension = true;
 
-    let now = SystemTime::now();
     let ca_not_after = ca.not_after();
     if ca_not_after <= now {
         return Err(ProxyError::Config(format!(
             "CA certificate has expired; cannot mint leaf for '{hostname}'"
         )));
     }
-    let leaf_not_after = leaf_validity
-        .and_then(|validity| now.checked_add(validity))
-        .map(|requested| requested.min(ca_not_after))
-        .unwrap_or(ca_not_after);
-    params.not_before = system_time_to_offset(now)?;
+    let leaf_not_after = match leaf_validity {
+        Some(validity) => now
+            .checked_add(validity)
+            .ok_or_else(|| {
+                ProxyError::Config("leaf certificate expiry exceeds system time range".to_string())
+            })?
+            .min(ca_not_after),
+        None => ca_not_after,
+    };
+    params.not_before = system_time_to_offset(certificate_not_before(now)?)?;
     params.not_after = system_time_to_offset(leaf_not_after)?;
 
     let mut dn = DistinguishedName::new();
@@ -212,21 +224,71 @@ fn is_plausible_dns_name(s: &str) -> bool {
         && s.contains(|c: char| c.is_ascii_alphabetic())
 }
 
-fn system_time_to_offset(t: SystemTime) -> Result<OffsetDateTime> {
-    OffsetDateTime::from_unix_timestamp(
-        t.duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| ProxyError::Config(format!("system time before unix epoch: {}", e)))?
-            .as_secs()
-            .try_into()
-            .map_err(|_| ProxyError::Config("system time exceeds i64::MAX".to_string()))?,
-    )
-    .map_err(|e| ProxyError::Config(format!("invalid system time for cert validity: {}", e)))
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minted_leaf_tolerates_bounded_clock_skew()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use rustls::client::WebPkiServerVerifier;
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{ServerName, UnixTime};
+        use x509_parser::prelude::FromDer;
+
+        let issued_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ca = EphemeralCa::generate_with_cn_at(
+            "nono-test-ca",
+            Duration::from_secs(86400),
+            issued_at,
+        )?;
+        let ck = mint_leaf_at(&ca, "api.example.com", None, issued_at)?;
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(ck.cert[0].as_ref())
+            .map_err(|e| ProxyError::Config(format!("test certificate parse failed: {e}")))?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ck.cert[1].clone())?;
+        let verifier = WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()?;
+        let name = ServerName::try_from("api.example.com")?;
+        verifier.verify_server_cert(
+            &ck.cert[0],
+            &[],
+            &name,
+            &[],
+            UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000 - 3600)),
+        )?;
+        assert_eq!(cert.validity().not_before.timestamp(), 1_800_000_000 - 3600);
+        assert_eq!(cert.validity().not_after.timestamp(), 1_800_000_000 + 86400);
+        assert!(matches!(
+            verifier.verify_server_cert(
+                &ck.cert[0],
+                &[],
+                &name,
+                &[],
+                UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000 - 3601)),
+            ),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidYetContext { .. }
+            ))
+        ));
+        assert!(matches!(
+            verifier.verify_server_cert(
+                &ck.cert[0],
+                &[],
+                &name,
+                &[],
+                UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000 + 86401)),
+            ),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ExpiredContext { .. }
+            ))
+        ));
+        Ok(())
+    }
 
     fn fresh_cache() -> CertCache {
         CertCache::new(Arc::new(EphemeralCa::generate().unwrap()))
@@ -269,27 +331,116 @@ mod tests {
     }
 
     #[test]
-    fn minted_leaf_uses_configured_shorter_validity() {
-        use x509_parser::prelude::FromDer;
+    fn minted_leaf_lifetime_is_measured_from_issuance() -> Result<()> {
+        let issued_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ca = EphemeralCa::generate_with_cn_at(
+            "nono-test-ca",
+            Duration::from_secs(86400),
+            issued_at,
+        )?;
+        let ck = mint_leaf_at(
+            &ca,
+            "api.example.com",
+            Some(Duration::from_secs(60)),
+            issued_at,
+        )?;
+        assert_eq!(cert_validity(ck.cert[0].as_ref())?.1, 1_800_000_060);
+        Ok(())
+    }
 
-        let ca = Arc::new(
-            EphemeralCa::generate_with_cn("nono-test-ca", Duration::from_secs(24 * 60 * 60))
-                .unwrap(),
-        );
-        let cache =
-            CertCache::new_with_leaf_validity(Arc::clone(&ca), Some(Duration::from_secs(60)));
-        let ck = cache.get_or_mint("api.example.com").unwrap();
-        let (_, cert) =
-            x509_parser::certificate::X509Certificate::from_der(ck.cert[0].as_ref()).unwrap();
-        let leaf_not_after = cert.validity().not_after.timestamp();
+    #[test]
+    fn minted_leaf_uses_configured_shorter_validity()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let ca = Arc::new(EphemeralCa::generate()?);
+        let cache = CertCache::new_with_leaf_validity(ca, Some(Duration::from_secs(60)));
+        let ck = cache.get_or_mint("api.example.com")?;
+        let leaf_not_after = cert_validity(ck.cert[0].as_ref())?.1;
         let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)?
             .as_secs() as i64;
-        assert!(
-            leaf_not_after >= now + 30 && leaf_not_after <= now + 90,
-            "leaf_not_after={leaf_not_after}, now={now}"
+        assert!(leaf_not_after >= now + 30 && leaf_not_after <= now + 90);
+        Ok(())
+    }
+
+    #[test]
+    fn minted_leaf_clamps_clock_skew_at_unix_epoch() -> Result<()> {
+        let issued_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let ca = EphemeralCa::generate_with_cn_at(
+            "nono-test-ca",
+            Duration::from_secs(86400),
+            issued_at,
+        )?;
+        let ck = mint_leaf_at(&ca, "api.example.com", None, issued_at)?;
+        assert_eq!(cert_validity(ck.cert[0].as_ref())?, (0, 86410));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_leaf_issuance_time_and_lifetime_return_errors() -> Result<()> {
+        let issued_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ca = EphemeralCa::generate_with_cn_at(
+            "nono-test-ca",
+            Duration::from_secs(86400),
+            issued_at,
+        )?;
+        let before_epoch = SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .ok_or_else(|| ProxyError::Config("test pre-epoch time unavailable".to_string()))?;
+        assert!(mint_leaf_at(&ca, "api.example.com", None, before_epoch).is_err());
+        assert!(mint_leaf_at(&ca, "api.example.com", Some(Duration::MAX), issued_at).is_err());
+        Ok(())
+    }
+
+    fn cert_validity(der: &[u8]) -> Result<(i64, i64)> {
+        use x509_parser::prelude::FromDer;
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der)
+            .map_err(|e| ProxyError::Config(format!("test certificate parse failed: {e}")))?;
+        Ok((
+            cert.validity().not_before.timestamp(),
+            cert.validity().not_after.timestamp(),
+        ))
+    }
+
+    #[test]
+    fn persisted_ca_dates_are_preserved_and_bound_leaf_expiry() -> Result<()> {
+        let issued_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let original =
+            EphemeralCa::generate_with_cn_at("nono-test-ca", Duration::from_secs(600), issued_at)?;
+        let reloaded = EphemeralCa::from_existing(original.key_der(), original.cert_pem())?;
+        assert_eq!(reloaded.cert_der(), original.cert_der());
+        assert_eq!(reloaded.cert_pem(), original.cert_pem());
+        assert_eq!(
+            cert_validity(reloaded.cert_der())?,
+            cert_validity(original.cert_der())?
         );
+
+        let mint_at = issued_at + Duration::from_secs(300);
+        for (requested, expected_expiry) in [
+            (None, 1_800_000_600),
+            (Some(Duration::from_secs(30)), 1_800_000_330),
+            (Some(Duration::from_secs(1200)), 1_800_000_600),
+        ] {
+            let ck = mint_leaf_at(&reloaded, "api.example.com", requested, mint_at)?;
+            let (not_before, not_after) = cert_validity(ck.cert[0].as_ref())?;
+            assert_eq!(not_before, 1_800_000_300 - 3600);
+            assert_eq!(not_after, expected_expiry);
+            assert!(not_after <= cert_validity(reloaded.cert_der())?.1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn expired_ca_cannot_mint_even_with_clock_tolerance() -> Result<()> {
+        let issued_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ca =
+            EphemeralCa::generate_with_cn_at("nono-test-ca", Duration::from_secs(600), issued_at)?;
+        for mint_at in [ca.not_after(), ca.not_after() + Duration::from_secs(1)] {
+            let result = mint_leaf_at(&ca, "api.example.com", None, mint_at);
+            assert!(
+                matches!(result, Err(ProxyError::Config(message)) if message.contains("has expired"))
+            );
+        }
+        Ok(())
     }
 
     #[test]

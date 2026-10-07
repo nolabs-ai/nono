@@ -551,6 +551,8 @@ Environment variable: `NONO_TRUST_PROXY_CA=1`
 
 Set the ephemeral proxy CA certificate validity in days (1–365, default: 1). Leaf certificates minted for intercepted hosts share the same expiry as the CA.
 
+New CA and leaf certificates start their validity one hour before generation to tolerate client clock differences. This does not extend their expiry. An existing Keychain CA retains its original validity dates until it regenerates.
+
 ```bash
 # CA valid for 7 days (useful for long-running sessions)
 nono run --credential github --proxy-ca-validity 7 -- gh api /user

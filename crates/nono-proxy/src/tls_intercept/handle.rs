@@ -152,6 +152,25 @@ pub struct InterceptCtx<'a> {
     pub enable_h2: bool,
 }
 
+/// A validity alert covers both expired and not-yet-valid certificates.
+/// Generic failures (including EOF) do not identify why the client rejected TLS.
+fn intercept_handshake_hint(error: &std::io::Error) -> &'static str {
+    let tls_error = error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<rustls::Error>());
+    if matches!(
+        tls_error,
+        Some(rustls::Error::AlertReceived(
+            rustls::AlertDescription::CertificateExpired
+        ))
+    ) {
+        "Client rejected certificate validity (expired or not yet valid); \
+         check certificate dates and the client clock."
+    } else {
+        "Check the client's TLS error, trust bundle, and TLS settings for the cause."
+    }
+}
+
 /// Handle a CONNECT request that matched a route requiring L7 visibility.
 ///
 /// Caller responsibilities (already enforced in `server.rs`):
@@ -178,11 +197,11 @@ pub async fn handle_intercept_connect(stream: &mut TcpStream, ctx: InterceptCtx<
             // we record the failure with a sanitized rustls Display string.
             let reason = format!("tls handshake failed: {}", e);
             warn!(
-                "tls_intercept: handshake failed for {}:{} — {}. \
-                 Agent likely pins certs or carries a hard-coded trust list. \
-                 Remove endpoint_rules / credential_key from the route to fall \
-                 back to a transparent CONNECT tunnel.",
-                ctx.host, ctx.port, e
+                "tls_intercept: handshake failed for {}:{} — {}. {}",
+                ctx.host,
+                ctx.port,
+                e,
+                intercept_handshake_hint(&e)
             );
             audit::log_denied(
                 ctx.audit_log,
@@ -2210,6 +2229,38 @@ fn parse_request_line(line: &str) -> Result<(String, String, String)> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_validity_alert_reports_clock_and_dates() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::CertificateExpired),
+        );
+        let hint = intercept_handshake_hint(&error);
+        assert!(hint.contains("expired or not yet valid"));
+        assert!(hint.contains("client clock"));
+        assert!(!hint.contains("pins"));
+    }
+
+    #[test]
+    fn generic_handshake_failure_does_not_infer_validity_or_pinning() {
+        for error in [
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "tls handshake eof"),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                rustls::Error::AlertReceived(rustls::AlertDescription::UnknownCA),
+            ),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "certificate expired or not yet valid",
+            ),
+        ] {
+            let hint = intercept_handshake_hint(&error);
+            assert!(hint.contains("client's TLS error"));
+            assert!(!hint.contains("client clock"));
+            assert!(!hint.contains("pins"));
+        }
+    }
 
     #[test]
     fn parse_request_line_extracts_components() {

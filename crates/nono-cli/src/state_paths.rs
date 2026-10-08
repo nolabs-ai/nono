@@ -360,7 +360,8 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
         let home_str = home.to_string_lossy().to_string();
-        let _env = EnvVarGuard::set_all(&[("HOME", &home_str)]);
+        let env = EnvVarGuard::set_all(&[("HOME", &home_str), ("XDG_STATE_HOME", "")]);
+        env.remove("XDG_STATE_HOME");
         assert_eq!(
             user_state_dir().unwrap(),
             home.join(".local").join("state").join("nono")

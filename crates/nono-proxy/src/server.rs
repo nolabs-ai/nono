@@ -14,7 +14,7 @@ use crate::connect;
 use crate::credential::CredentialStore;
 use crate::error::{ProxyError, Result};
 use crate::external;
-use crate::filter::ProxyFilter;
+use crate::filter::{ProxyFilter, RuntimeProxyFilter};
 use crate::forward::{self, AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
 use crate::line_reader;
 use crate::oauth_capture::OAuthCaptureStore;
@@ -27,6 +27,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -908,6 +909,9 @@ struct ProxyState {
     /// Explicit upstream authority carried by configured reverse routes.
     /// Keeping this separate prevents a credential route from widening CONNECT.
     route_filter: ProxyFilter,
+    runtime_filter: Option<RuntimeProxyFilter>,
+    approval_tx: Option<tokio::sync::mpsc::Sender<connect::ApprovalChannelRequest>>,
+    approval_timeout: Duration,
     session_token: Zeroizing<String>,
     /// Route-level configuration (upstream, L7 filtering, custom TLS CA) for all routes.
     route_store: Arc<RouteStore>,
@@ -957,6 +961,10 @@ struct ProxyState {
     /// itself (absolute-form `http://127.0.0.1:{bound_port}/…`) and re-route
     /// them to the reverse-proxy credential-injection path.
     bound_port: u16,
+    /// PID of the sandboxed child process (for approval requests).
+    child_pid: u32,
+    /// Session ID for correlating approval requests.
+    session_id: String,
 }
 
 struct CompositeNonceResolver {
@@ -1047,7 +1055,27 @@ pub async fn start_with_approval_and_capture_registry(
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
 ) -> Result<ProxyHandle> {
-    start_with_nonce_resolver(config, approval_backends, credential_capture_backend, None).await
+    start_with_nonce_resolver(
+        config,
+        approval_backends,
+        credential_capture_backend,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Runtime network host-approval wiring for the session proxy.
+///
+/// When [`start_with_nonce_resolver`] receives `None`, the approval path is
+/// disabled and CONNECT requests that are not covered by the static host
+/// filter are denied instead of escalated to a supervisor.
+pub struct NetworkApprovalWiring {
+    pub runtime_filter: Option<RuntimeProxyFilter>,
+    pub approval_tx: Option<tokio::sync::mpsc::Sender<connect::ApprovalChannelRequest>>,
+    pub child_pid: u32,
+    pub session_id: String,
+    pub approval_timeout: Duration,
 }
 
 /// Start the proxy server with all optional backends including a nonce resolver.
@@ -1056,6 +1084,7 @@ pub async fn start_with_nonce_resolver(
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
+    network_approval: Option<NetworkApprovalWiring>,
 ) -> Result<ProxyHandle> {
     validate_no_proxy_config(&config)?;
 
@@ -1177,6 +1206,7 @@ pub async fn start_with_nonce_resolver(
     }
 
     // Build filter. Strict mode treats an empty allowlist as deny-all.
+    // With rejected hosts, use new_with_reject for deny-list support.
     let filter = if config.strict_filter {
         ProxyFilter::new_strict(&config.allowed_hosts)
     } else if config.allowed_hosts.is_empty() {
@@ -1340,9 +1370,23 @@ pub async fn start_with_nonce_resolver(
 
     let enable_h2 = config.enable_h2;
     let intercept_ca_env_vars = config.intercept_ca_env_vars.clone();
+    let (runtime_filter, approval_tx, child_pid, session_id, approval_timeout) =
+        match network_approval {
+            Some(wiring) => (
+                wiring.runtime_filter,
+                wiring.approval_tx,
+                wiring.child_pid,
+                wiring.session_id,
+                wiring.approval_timeout,
+            ),
+            None => (None, None, 0, String::new(), Duration::from_secs(0)),
+        };
     let state = Arc::new(ProxyState {
         filter,
         route_filter,
+        runtime_filter,
+        approval_tx,
+        approval_timeout,
         session_token: session_token.clone(),
         route_store: Arc::new(route_store),
         credential_store: Arc::new(credential_store),
@@ -1362,6 +1406,8 @@ pub async fn start_with_nonce_resolver(
         enable_h2,
         h2_cache: UpstreamH2Cache::new(),
         bound_port: port,
+        child_pid,
+        session_id,
     });
 
     // Spawn accept loop as a task within the current runtime.
@@ -1851,17 +1897,39 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         };
 
         if let Some(ext_config) = use_external {
-            external::handle_external_proxy(
-                first_line,
-                &mut stream,
-                &header_bytes,
-                &state.filter,
-                &state.session_token,
-                state.config.require_auth,
-                ext_config,
-                state.audit_log.as_ref(),
-            )
-            .await
+            if let (Some(rf), Some(tx)) =
+                (state.runtime_filter.as_ref(), state.approval_tx.as_ref())
+            {
+                let approval_ctx = connect::ApprovalContext {
+                    primary_filter: &state.filter,
+                    runtime_filter: rf,
+                    session_token: &state.session_token,
+                    audit_log: state.audit_log.as_ref(),
+                    approval_tx: tx,
+                    child_pid: state.child_pid,
+                    session_id: &state.session_id,
+                    approval_timeout: state.approval_timeout,
+                };
+                connect::handle_connect_with_approval(
+                    first_line,
+                    &mut stream,
+                    &header_bytes,
+                    &approval_ctx,
+                )
+                .await
+            } else {
+                external::handle_external_proxy(
+                    first_line,
+                    &mut stream,
+                    &header_bytes,
+                    &state.filter,
+                    &state.session_token,
+                    state.config.require_auth,
+                    ext_config,
+                    state.audit_log.as_ref(),
+                )
+                .await
+            }
         } else if state.config.external_proxy.is_some() {
             // Bypass route: enforce strict session token validation before
             // routing direct. Without this, bypassed hosts would inherit
@@ -1872,14 +1940,57 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &header_bytes,
                 &state.session_token,
             )?;
-            connect::handle_connect(
+
+            if let (Some(rf), Some(tx)) =
+                (state.runtime_filter.as_ref(), state.approval_tx.as_ref())
+            {
+                let approval_ctx = connect::ApprovalContext {
+                    primary_filter: &state.filter,
+                    runtime_filter: rf,
+                    session_token: &state.session_token,
+                    audit_log: state.audit_log.as_ref(),
+                    approval_tx: tx,
+                    child_pid: state.child_pid,
+                    session_id: &state.session_id,
+                    approval_timeout: state.approval_timeout,
+                };
+                connect::handle_connect_with_approval(
+                    first_line,
+                    &mut stream,
+                    &header_bytes,
+                    &approval_ctx,
+                )
+                .await
+            } else {
+                connect::handle_connect(
+                    first_line,
+                    &mut stream,
+                    &state.filter,
+                    &state.session_token,
+                    &header_bytes,
+                    connect_auth_mode,
+                    state.audit_log.as_ref(),
+                )
+                .await
+            }
+        } else if let (Some(rf), Some(tx)) =
+            (state.runtime_filter.as_ref(), state.approval_tx.as_ref())
+        {
+            let approval_ctx = connect::ApprovalContext {
+                primary_filter: &state.filter,
+                runtime_filter: rf,
+                session_token: &state.session_token,
+                audit_log: state.audit_log.as_ref(),
+                approval_tx: tx,
+                child_pid: state.child_pid,
+                session_id: &state.session_id,
+                approval_timeout: state.approval_timeout,
+            };
+            connect::handle_connect_with_approval(
                 first_line,
                 &mut stream,
-                &state.filter,
-                &state.session_token,
                 &header_bytes,
-                connect_auth_mode,
-                state.audit_log.as_ref(),
+                &approval_ctx,
             )
             .await
         } else {
@@ -5584,7 +5695,7 @@ mod tests {
             admitted_consumer: "proxy.local".to_string(),
             credential_name: "partner-token".to_string(),
         };
-        let handle = start_with_nonce_resolver(config, None, None, Some(Arc::new(resolver)))
+        let handle = start_with_nonce_resolver(config, None, None, Some(Arc::new(resolver)), None)
             .await
             .unwrap();
         let token = handle.token.to_string();
@@ -5683,7 +5794,7 @@ mod tests {
             admitted_consumer: "proxy.local".to_string(),
             credential_name: "partner-token".to_string(),
         };
-        let handle = start_with_nonce_resolver(config, None, None, Some(Arc::new(resolver)))
+        let handle = start_with_nonce_resolver(config, None, None, Some(Arc::new(resolver)), None)
             .await
             .unwrap();
         let token = handle.token.to_string();

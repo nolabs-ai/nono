@@ -38,7 +38,7 @@ impl ApprovalBackend for TerminalApproval {
                     sanitize_for_terminal(&path.display().to_string())
                 );
                 eprintln!("[nono]   Access: {}", format_access_mode(access));
-                if let Some(r) = reason {
+                if let Some(r) = reason.as_ref() {
                     eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
@@ -53,7 +53,7 @@ impl ApprovalBackend for TerminalApproval {
                 eprintln!("[nono]   Host:     {}", sanitize_for_terminal(host));
                 eprintln!("[nono]   Port:     {port}");
                 eprintln!("[nono]   Protocol: {protocol}");
-                if let Some(r) = reason {
+                if let Some(r) = reason.as_ref() {
                     eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
@@ -80,7 +80,7 @@ impl ApprovalBackend for TerminalApproval {
                     "[nono]   Rule:    {}",
                     sanitize_for_terminal(intercept_rule)
                 );
-                if let Some(r) = reason {
+                if let Some(r) = reason.as_ref() {
                     eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
@@ -99,7 +99,7 @@ impl ApprovalBackend for TerminalApproval {
                 eprintln!("[nono]   Path:    {}", sanitize_for_terminal(path));
                 eprintln!("[nono]   Upstream: {}", sanitize_for_terminal(upstream));
                 eprintln!("[nono]   Rule:    {}", sanitize_for_terminal(rule_label));
-                if let Some(r) = reason {
+                if let Some(r) = reason.as_ref() {
                     eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }

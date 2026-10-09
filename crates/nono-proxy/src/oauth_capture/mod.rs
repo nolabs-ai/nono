@@ -5,13 +5,22 @@
 //! consumers. The proxy then rewrites real OAuth tokens to `nono_<64hex>`
 //! phantoms before responses reach the sandbox, and resolves those phantoms
 //! only for admitted consumers on egress.
+//!
+//! The persisted store is shared by every concurrent nono session, while each
+//! session's proxy keeps its own in-memory copy. A phantom-to-real mapping is
+//! never modified after minting, so a cached hit can't go stale. Only a miss
+//! can mean another session minted the phantom, and only then is the store
+//! re-read. Writes take an exclusive file lock and merge with the on-disk
+//! store so one session never discards phantoms minted by another.
 
 mod endpoint;
 mod persist;
 mod rewrite;
 
 use self::endpoint::{LoadedOAuthEndpoint, load_endpoint, provider_consumer};
-use self::persist::{load_persisted_tokens, persist_tokens};
+use self::persist::{
+    StoreFingerprint, load_persisted_tokens, lock_store, persist_tokens, store_fingerprint,
+};
 use crate::config::OAuthCaptureConfig;
 use crate::error::{ProxyError, Result};
 use crate::token::{NonceResolver, PHANTOM_BODY_HEX_LEN, PhantomTemplate, rewrite_first_phantom};
@@ -19,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::debug;
+use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 #[derive(Debug)]
@@ -27,6 +36,14 @@ pub(super) struct StoredOAuthToken {
     pub(super) real: Zeroizing<Vec<u8>>,
     pub(super) admitted_consumers: HashSet<String>,
     pub(super) created_at_secs: u64,
+}
+
+/// In-memory phantom map plus the version of the persisted store it last
+/// incorporated.
+#[derive(Debug, Default)]
+struct PhantomState {
+    tokens: HashMap<String, StoredOAuthToken>,
+    fingerprint: Option<StoreFingerprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +57,7 @@ pub struct OAuthCaptureHostPolicy {
 pub struct OAuthCaptureStore {
     endpoints: Vec<LoadedOAuthEndpoint>,
     by_host: HashMap<String, Vec<usize>>,
-    phantoms: Mutex<HashMap<String, StoredOAuthToken>>,
+    phantoms: Mutex<PhantomState>,
     persist_path: Option<PathBuf>,
     /// Distinct visible-phantom templates declared across all endpoints, used
     /// to recognise and replace templated phantoms on egress.
@@ -87,11 +104,14 @@ impl OAuthCaptureStore {
         }
 
         let phantoms = if let Some(path) = persist_path.as_deref() {
-            let mut phantoms = load_persisted_tokens(path)?;
-            prune_phantoms(&mut phantoms);
-            phantoms
+            let (mut tokens, fingerprint) = load_persisted_tokens(path)?;
+            prune_phantoms(&mut tokens);
+            PhantomState {
+                tokens,
+                fingerprint,
+            }
         } else {
-            HashMap::new()
+            PhantomState::default()
         };
 
         let mut templates: Vec<PhantomTemplate> = Vec::new();
@@ -177,32 +197,84 @@ impl OAuthCaptureStore {
 
     /// Store `real` under the phantom key `phantom` (the string the sandbox
     /// sees and later resents), admitting it for `admitted_consumers`.
+    #[cfg(test)]
     pub(super) fn store_phantom(
         &self,
         phantom: &str,
         real: &[u8],
         admitted_consumers: &HashSet<String>,
     ) -> Result<()> {
-        let token = StoredOAuthToken {
-            real: Zeroizing::new(real.to_vec()),
-            admitted_consumers: admitted_consumers.clone(),
-            created_at_secs: now_secs(),
-        };
+        self.store_phantoms(
+            vec![(phantom.to_string(), Zeroizing::new(real.to_vec()))],
+            admitted_consumers,
+        )
+    }
+
+    /// Store each `(phantom, real)` pair (the phantom being the string the
+    /// sandbox sees and later resends), admitting it for `admitted_consumers`.
+    ///
+    /// With persistence, the new entries are merged into the on-disk store
+    /// under its exclusive lock and written back in a single file replacement.
+    pub(super) fn store_phantoms(
+        &self,
+        entries: Vec<(String, Zeroizing<Vec<u8>>)>,
+        admitted_consumers: &HashSet<String>,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let created_at_secs = now_secs();
         let mut guard = self
             .phantoms
             .lock()
             .map_err(|_| ProxyError::Config("OAuth capture store lock poisoned".to_string()))?;
-        guard.insert(phantom.to_string(), token);
-        prune_phantoms(&mut guard);
-        self.persist_locked(&guard)?;
+        for (phantom, real) in entries {
+            guard.tokens.insert(
+                phantom,
+                StoredOAuthToken {
+                    real,
+                    admitted_consumers: admitted_consumers.clone(),
+                    created_at_secs,
+                },
+            );
+        }
+        let Some(path) = self.persist_path.as_deref() else {
+            prune_phantoms(&mut guard.tokens);
+            return Ok(());
+        };
+        let lock = lock_store(path)?;
+        let (on_disk, _) = load_persisted_tokens(path)?;
+        merge_missing(&mut guard.tokens, on_disk);
+        prune_phantoms(&mut guard.tokens);
+        guard.fingerprint = persist_tokens(&lock, path, &guard.tokens)?;
         Ok(())
     }
 
-    fn persist_locked(&self, tokens: &HashMap<String, StoredOAuthToken>) -> Result<()> {
+    /// Pull in phantoms other sessions persisted since this store last looked.
+    /// A no-op unless the store file has been replaced.
+    fn refresh_from_disk(&self, state: &mut PhantomState) -> Result<()> {
         let Some(path) = self.persist_path.as_deref() else {
             return Ok(());
         };
-        persist_tokens(path, tokens)
+        if store_fingerprint(path)? == state.fingerprint {
+            return Ok(());
+        }
+        let (on_disk, fingerprint) = load_persisted_tokens(path)?;
+        merge_missing(&mut state.tokens, on_disk);
+        prune_phantoms(&mut state.tokens);
+        state.fingerprint = fingerprint;
+        Ok(())
+    }
+}
+
+/// Add entries from `other` whose phantom isn't already present. Mappings are
+/// never modified after minting, so an existing entry always wins.
+fn merge_missing(
+    tokens: &mut HashMap<String, StoredOAuthToken>,
+    other: HashMap<String, StoredOAuthToken>,
+) {
+    for (phantom, token) in other {
+        tokens.entry(phantom).or_insert(token);
     }
 }
 
@@ -237,8 +309,14 @@ fn host_from_host_port(host_port: &str) -> Option<&str> {
 
 impl NonceResolver for OAuthCaptureStore {
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
-        let guard = self.phantoms.lock().ok()?;
-        let token = guard.get(nonce)?;
+        let mut guard = self.phantoms.lock().ok()?;
+        if !guard.tokens.contains_key(nonce)
+            && let Err(err) = self.refresh_from_disk(&mut guard)
+        {
+            warn!("failed to refresh OAuth capture store on phantom miss: {err}");
+            return None;
+        }
+        let token = guard.tokens.get(nonce)?;
         if !token.admitted_consumers.contains(consumer) {
             return None;
         }
@@ -649,6 +727,165 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn mint_access(store: &OAuthCaptureStore) -> String {
+        let endpoint = store.lookup("auth.openai.com:443", "/oauth/token").unwrap();
+        let rewritten = store
+            .rewrite_response_body(
+                endpoint,
+                br#"{"access_token":"real-access","refresh_token":"real-refresh"}"#,
+            )
+            .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        json["access_token"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn concurrent_sessions_resolve_each_others_phantoms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+        // Both sessions start before either has minted anything.
+        let session_a = store_with_persistence(path.clone());
+        let session_b = store_with_persistence(path);
+
+        let from_a = mint_access(&session_a);
+        assert!(
+            session_b.resolve(&from_a, "proxy.openai_oauth").is_some(),
+            "a session must resolve phantoms minted by another session after it started"
+        );
+
+        let from_b = mint_access(&session_b);
+        assert!(session_a.resolve(&from_b, "proxy.openai_oauth").is_some());
+    }
+
+    #[test]
+    fn concurrent_sessions_do_not_clobber_persisted_phantoms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+        let session_a = store_with_persistence(path.clone());
+        let session_b = store_with_persistence(path.clone());
+
+        // B never looked up A's phantom, so its in-memory map lacks it when B
+        // writes. The write must merge, not overwrite.
+        let from_a = mint_access(&session_a);
+        let from_b = mint_access(&session_b);
+
+        let restarted = store_with_persistence(path);
+        assert!(restarted.resolve(&from_a, "proxy.openai_oauth").is_some());
+        assert!(restarted.resolve(&from_b, "proxy.openai_oauth").is_some());
+    }
+
+    #[test]
+    fn refreshed_phantoms_still_enforce_admitted_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+        let session_a = store_with_persistence(path.clone());
+        let session_b = store_with_persistence(path);
+
+        let from_a = mint_access(&session_a);
+        assert!(
+            session_b.resolve(&from_a, "proxy.other").is_none(),
+            "phantoms loaded on a miss must keep their admitted consumers"
+        );
+        assert!(session_b.resolve(&from_a, "proxy.openai_oauth").is_some());
+    }
+
+    #[test]
+    fn unknown_phantom_misses_without_store_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+        let store = store_with_persistence(path.clone());
+        let known = mint_access(&store);
+
+        assert!(
+            store
+                .resolve(&generate_phantom().unwrap(), "proxy.openai_oauth")
+                .is_none()
+        );
+        assert!(store.resolve(&known, "proxy.openai_oauth").is_some());
+        // An empty in-memory store with no file on disk also just misses.
+        let empty = store_with_persistence(dir.path().join("absent.json"));
+        assert!(empty.resolve(&known, "proxy.openai_oauth").is_none());
+    }
+
+    #[test]
+    fn corrupt_store_fails_closed_on_miss_but_keeps_cached_phantoms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+        let store = store_with_persistence(path.clone());
+        let known = mint_access(&store);
+
+        fs::write(&path, b"{ not json").unwrap();
+
+        assert!(
+            store
+                .resolve(&generate_phantom().unwrap(), "proxy.openai_oauth")
+                .is_none(),
+            "an unreadable store must deny, not panic or admit"
+        );
+        assert!(
+            store.resolve(&known, "proxy.openai_oauth").is_some(),
+            "cached phantoms never depend on re-reading the store"
+        );
+        let endpoint = store.lookup("auth.openai.com:443", "/oauth/token").unwrap();
+        assert!(
+            store
+                .rewrite_response_body(
+                    endpoint,
+                    br#"{"access_token":"real-access","refresh_token":"real-refresh"}"#,
+                )
+                .is_err(),
+            "minting must fail closed rather than overwrite a store it cannot merge"
+        );
+    }
+
+    #[test]
+    fn parallel_writers_keep_every_phantom() {
+        const WRITERS: usize = 4;
+        const MINTS_PER_WRITER: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+
+        let handles = (0..WRITERS)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let store = store_with_persistence(path);
+                    (0..MINTS_PER_WRITER)
+                        .map(|_| mint_access(&store))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let minted = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        let restarted = store_with_persistence(path);
+        for phantom in &minted {
+            assert!(
+                restarted.resolve(phantom, "proxy.openai_oauth").is_some(),
+                "a concurrent write discarded a persisted phantom"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_and_lock_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("oauth-capture");
+        let path = store_dir.join("providers.json");
+        let store = store_with_persistence(path.clone());
+        mint_access(&store);
+
+        let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&store_dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&store_dir.join("providers.json.lock")), 0o600);
     }
 
     fn opaque_fields<const N: usize>(paths: [&str; N]) -> Vec<OAuthTokenResponseFieldConfig> {

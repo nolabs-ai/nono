@@ -383,6 +383,13 @@ owner-only permissions. Entries are retained for up to 90 days and capped at
 4096 phantoms. Treat this as plaintext-at-rest under your user account: protect
 the state directory the same way you protect other local credential stores.
 
+The store is shared by concurrent nono sessions. When one session logs in or
+refreshes, other running sessions pick up the new phantoms the first time they
+see them, so tools that share one credential file (such as Claude Code's
+`~/.claude/.credentials.json`) keep working across sessions. Writers serialize
+on an owner-only `providers.json.lock` next to the store and merge with what is
+on disk rather than overwriting it.
+
 ## Add helper commands
 
 Helpers document how a user should check login state or start login/logout.

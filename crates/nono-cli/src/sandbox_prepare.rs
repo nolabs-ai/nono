@@ -278,7 +278,11 @@ fn claude_keychain_service_name(
     config_dir_explicit: bool,
     service_suffix: &str,
 ) -> String {
-    let dir_hash = if config_dir_explicit {
+    // An empty CLAUDE_SECURESTORAGE_CONFIG_DIR makes Claude Code use the
+    // default service name even when CLAUDE_CONFIG_DIR is set (#1950).
+    let default_service_forced =
+        std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR").is_some_and(|value| value.is_empty());
+    let dir_hash = if config_dir_explicit && !default_service_forced {
         let digest = Sha256::digest(config_dir.to_string_lossy().as_bytes());
         let prefix = digest[..4]
             .iter()
@@ -2462,6 +2466,7 @@ mod tests {
             ("CLAUDE_CODE_USE_FOUNDRY", "0"),
             ("ANTHROPIC_UNIX_SOCKET", "placeholder"),
             ("CLAUDE_CODE_SIMPLE", "0"),
+            ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "placeholder"),
         ]);
         for key in [
             "ANTHROPIC_API_KEY",
@@ -2474,10 +2479,42 @@ mod tests {
             "USER_TYPE",
             "ANTHROPIC_UNIX_SOCKET",
             "CLAUDE_CODE_SIMPLE",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
         ] {
             env.remove(key);
         }
         env
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_keychain_service_name_hashes_explicit_config_dir() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+        let config_dir = dir.path().join("claude-config");
+        let _env = claude_preflight_env(dir.path(), &config_dir);
+
+        let service = claude_keychain_service_name(&config_dir, true, "-credentials");
+        assert!(
+            service.starts_with("Claude Code-credentials-") && service.len() == 32,
+            "expected hashed service name, got {service}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_keychain_service_name_empty_securestorage_dir_selects_default() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+        let config_dir = dir.path().join("claude-config");
+        let _env = claude_preflight_env(dir.path(), &config_dir);
+        let _securestorage =
+            crate::test_env::EnvVarGuard::set_all(&[("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")]);
+
+        assert_eq!(
+            claude_keychain_service_name(&config_dir, true, "-credentials"),
+            "Claude Code-credentials"
+        );
     }
 
     #[cfg(target_os = "macos")]

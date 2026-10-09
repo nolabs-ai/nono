@@ -4543,6 +4543,19 @@ mod tests {
     }
 
     #[test]
+    fn push_set_vars_keeps_empty_value() {
+        // Set-but-empty differs from unset: Claude Code's Keychain lookup
+        // depends on CLAUDE_SECURESTORAGE_CONFIG_DIR="" reaching the child.
+        let mut env_c = Vec::new();
+        let set_vars = vec![("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), String::new())];
+        push_set_vars(&mut env_c, &set_vars, &[]);
+        assert_eq!(
+            env_strings(&env_c),
+            vec!["CLAUDE_SECURESTORAGE_CONFIG_DIR="]
+        );
+    }
+
+    #[test]
     fn push_set_vars_overrides_inherited_host_var_without_duplicating() {
         // An inherited host var with the same key must be replaced, not duplicated.
         let mut env_c = vec![

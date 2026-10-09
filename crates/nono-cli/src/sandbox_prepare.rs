@@ -227,6 +227,25 @@ fn migrate_claude_json(legacy: &Path, canonical: &Path, claude_dir: &Path) {
     // Neither existed: nothing to migrate, Claude Code creates canonical fresh.
 }
 
+/// Env vars that point Claude Code at `claude_dir`.
+///
+/// Claude Code appends a hash of the config dir to its Keychain service name
+/// whenever CLAUDE_CONFIG_DIR is set, even to the default path, so a sandboxed
+/// session would miss the credentials `/login` stored outside nono (#1950).
+/// An empty CLAUDE_SECURESTORAGE_CONFIG_DIR selects the default service name
+/// again. A host value is left alone: the user chose that service on purpose.
+#[cfg(unix)]
+fn claude_config_dir_env(claude_dir: &Path) -> Vec<(String, String)> {
+    let mut vars = vec![(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        claude_dir.to_string_lossy().into_owned(),
+    )];
+    if std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR").is_none() {
+        vars.push(("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), String::new()));
+    }
+    vars
+}
+
 #[cfg(target_os = "macos")]
 fn claude_config_dir() -> std::result::Result<(PathBuf, bool), String> {
     if let Some(config_dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
@@ -1703,10 +1722,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 claude_dir.join(".claude.json"),
             );
             migrate_claude_json(&legacy_json, &redirected_json, &claude_dir);
-            profile_set_vars.get_or_insert_with(Vec::new).push((
-                "CLAUDE_CONFIG_DIR".to_string(),
-                claude_dir.to_string_lossy().into_owned(),
-            ));
+            profile_set_vars
+                .get_or_insert_with(Vec::new)
+                .extend(claude_config_dir_env(&claude_dir));
         }
     }
 
@@ -2364,6 +2382,45 @@ mod tests {
         assert!(
             collect_missing_cli_requested_paths(&args).is_empty(),
             "macOS exact-file grants should not be reported as skipped when the file is absent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_config_dir_env_keeps_default_keychain_service() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let env = crate::test_env::EnvVarGuard::set_all(&[("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")]);
+        env.remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
+
+        assert_eq!(
+            claude_config_dir_env(Path::new("/home/u/.claude")),
+            vec![
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/home/u/.claude".to_string()
+                ),
+                // Empty keeps Claude Code on the default Keychain service
+                // name instead of hashing CLAUDE_CONFIG_DIR into it (#1950).
+                ("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_config_dir_env_preserves_host_securestorage_dir() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            "/elsewhere",
+        )]);
+
+        assert_eq!(
+            claude_config_dir_env(Path::new("/home/u/.claude")),
+            vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/u/.claude".to_string()
+            )]
         );
     }
 

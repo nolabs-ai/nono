@@ -268,10 +268,11 @@ These fields are matched against claims in the Fulcio certificate that Sigstore 
 | Field | Description | Wildcards |
 |-------|-------------|-----------|
 | `name` | Human-readable label for this publisher (not matched against anything) | No |
-| `issuer` | The OIDC provider URL. For GitHub Actions this is always `https://token.actions.githubusercontent.com` | No |
-| `repository` | The `owner/repo` that ran the signing workflow (maps to the GitHub OIDC `repository` claim). Use `org/*` to trust all repos in an org | Yes (`org/*`) |
-| `workflow` | Path to the workflow file that performed the signing, relative to the repo root | Yes (`*`) |
-| `ref_pattern` | The git ref that triggered the workflow (e.g., `refs/heads/main`, `refs/tags/v1.0`). Use wildcards to trust a range of refs | Yes (`refs/tags/v*`) |
+| `issuer` | The OIDC provider URL. GitHub Actions: `https://token.actions.githubusercontent.com`. GitLab: `https://gitlab.com` | No |
+| `repository` | GitHub: the `owner/repo` string (maps to the `repository` OIDC claim). GitLab: the full project URL (e.g. `https://gitlab.com/org/repo`). Use wildcards to trust a range of repos | Yes (`org/*`, `https://gitlab.com/org/*`) |
+| `workflow` | Path to the CI config file that performed the signing, relative to the repo root (e.g. `.github/workflows/sign.yml`) | Yes (`*`) |
+| `build_signer_uri` | GitLab CI only. Full URI of the CI configuration file and ref that performed the signing (e.g. `https://gitlab.com/org/repo//.gitlab-ci.yml@refs/heads/main`) | Yes (`*`) |
+| `ref_pattern` | The git ref that triggered the job (e.g., `refs/heads/main`, `refs/tags/v1.0`). Use wildcards to trust a range of refs | Yes (`refs/tags/v*`) |
 
 ### blocklist
 
@@ -366,6 +367,79 @@ jobs:
 ```
 
 This policy declares: only trust files signed by a GitHub Actions workflow in `my-org/my-repo`, from the `main` branch.
+
+## GitLab CI Integration
+
+Keyless signing also integrates with GitLab CI's OIDC tokens. The signing job must request an ID token with the `sigstore` audience so Fulcio can issue a certificate.
+
+### Signing Job
+
+```yaml
+nono-cli-sign:
+  image:
+    name: ghcr.io/always-further/nono:0.36.0
+    entrypoint: [""]
+  script:
+    - nono trust sign --all --keyless
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  artifacts:
+    paths:
+      - "**/*.bundle"
+```
+
+The `id_tokens` block instructs GitLab to inject a short-lived OIDC token into `$SIGSTORE_ID_TOKEN`. Nono reads this variable automatically when `--keyless` is specified — no additional configuration is needed.
+
+### Trust Policy for CI-Signed Files
+
+GitLab uses `build_signer_uri` instead of `workflow` to identify the signing pipeline. The `repository` field takes the full project URL, and `issuer` is `https://gitlab.com`.
+
+**Branch ref:**
+
+```json
+{
+  "version": 1,
+  "includes": ["SKILLS*", "CLAUDE*"],
+  "publishers": [
+    {
+      "name": "erran-skills@main",
+      "issuer": "https://gitlab.com",
+      "build_signer_uri": "https://gitlab.com/erran/skills//.gitlab-ci.yml@refs/heads/main",
+      "repository": "https://gitlab.com/erran/skills",
+      "ref_pattern": "refs/heads/main"
+    }
+  ],
+  "blocklist": { "digests": [] },
+  "enforcement": "deny"
+}
+```
+
+**Tag ref:**
+
+```json
+{
+  "version": 1,
+  "includes": ["SKILLS*", "CLAUDE*"],
+  "publishers": [
+    {
+      "name": "erran-skills@0.0.9",
+      "issuer": "https://gitlab.com",
+      "build_signer_uri": "https://gitlab.com/erran/skills//.gitlab-ci.yml@refs/tags/0.0.9",
+      "repository": "https://gitlab.com/erran/skills",
+      "ref_pattern": "refs/tags/0.0.9"
+    }
+  ],
+  "blocklist": { "digests": [] },
+  "enforcement": "deny"
+}
+```
+
+Note the double slash in the `build_signer_uri` path separator (`org/repo//.gitlab-ci.yml`). This is the format Fulcio embeds in the certificate — copy it exactly from `nono trust verify` output if you are unsure.
+
+<Warning>
+  Wildcards in `build_signer_uri` and `repository` make it easy to over-trust. An entry with `issuer: https://gitlab.com` and `repository: https://gitlab.com/*` trusts any project on GitLab.com — including forks and unrelated projects. Scope `repository` to the specific project URL, and use `ref_pattern` to restrict to protected branches or release tags.
+</Warning>
 
 ## Signing Modes
 

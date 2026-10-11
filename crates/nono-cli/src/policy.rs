@@ -1353,6 +1353,24 @@ impl EffectiveDenyPolicy {
         Self::from_applied_bypasses(deny_paths, &bypasses)
     }
 
+    /// This policy with `extra` bypasses applied on top, for a mediated
+    /// command whose own policy lifts a deny the agent keeps. The deny paths
+    /// are unchanged, so `extra` reopens only the modes it records.
+    #[must_use]
+    pub fn with_additional_bypasses(&self, extra: &[AppliedBypass]) -> Self {
+        let mut bypasses = self.bypasses.clone();
+        bypasses.extend_from_slice(extra);
+        let mut bypass_paths = self.bypass_paths.clone();
+        bypass_paths.extend(extra.iter().map(|bypass| bypass.path.clone()));
+        bypass_paths.sort_unstable();
+        bypass_paths.dedup();
+        Self {
+            deny_paths: self.deny_paths.clone(),
+            bypass_paths,
+            bypasses,
+        }
+    }
+
     /// The bypass paths, in both their given and their resolved forms.
     #[must_use]
     pub fn bypass_paths(&self) -> &[PathBuf] {
@@ -1421,6 +1439,30 @@ const KEYCHAIN_MACH_SERVICES: [&str; 5] = [
     "com.apple.security.agent",
 ];
 
+/// The user's keychain DB files, derived from `$HOME`; empty when it is unset.
+pub(crate) fn macos_user_keychain_dbs() -> Vec<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|home| {
+            vec![
+                Path::new(&home).join("Library/Keychains/login.keychain-db"),
+                Path::new(&home).join("Library/Keychains/metadata.keychain-db"),
+            ]
+        })
+        .unwrap_or_default()
+}
+
+/// The keychain DB files a keychain exception can authorize: the user's and
+/// the system's.
+fn macos_keychain_db_candidates() -> Vec<PathBuf> {
+    let mut dbs = macos_user_keychain_dbs();
+    dbs.extend([
+        PathBuf::from("/Library/Keychains/login.keychain-db"),
+        PathBuf::from("/Library/Keychains/metadata.keychain-db"),
+    ]);
+    dbs
+}
+
 /// Add a narrow macOS exception for authorized keychain DB grants.
 ///
 /// This keeps broad keychain deny groups active while allowing only the exact
@@ -1442,39 +1484,8 @@ pub fn apply_macos_keychain_db_exception(
         return;
     }
 
-    let user_keychain_dbs = std::env::var("HOME").ok().map(|home| {
-        [
-            Path::new(&home).join("Library/Keychains/login.keychain-db"),
-            Path::new(&home).join("Library/Keychains/metadata.keychain-db"),
-        ]
-    });
-    let system_keychain_dbs = [
-        Path::new("/Library/Keychains/login.keychain-db").to_path_buf(),
-        Path::new("/Library/Keychains/metadata.keychain-db").to_path_buf(),
-    ];
-
-    let is_keychain_db = |path: &Path| -> bool {
-        if system_keychain_dbs
-            .iter()
-            .any(|candidate| path == candidate)
-        {
-            return true;
-        }
-        if let Some(ref user_keychain_dbs) = user_keychain_dbs
-            && user_keychain_dbs.iter().any(|candidate| path == candidate)
-        {
-            return true;
-        }
-        false
-    };
-
-    let all_keychain_dbs: Vec<PathBuf> = user_keychain_dbs
-        .as_ref()
-        .map(|dbs| dbs.to_vec())
-        .unwrap_or_default()
-        .into_iter()
-        .chain(system_keychain_dbs.iter().cloned())
-        .collect();
+    let all_keychain_dbs = macos_keychain_db_candidates();
+    let is_keychain_db = |path: &Path| -> bool { all_keychain_dbs.iter().any(|db| path == db) };
 
     let merge_access = |existing: &mut AccessMode, next: AccessMode| {
         *existing = match (*existing, next) {

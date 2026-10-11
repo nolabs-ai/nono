@@ -165,6 +165,8 @@ The effective command sandbox is selected as follows:
 
 Each direct, caller-specific, and intercept command sandbox policy with `network.allow_domain` receives a distinct scoped proxy. For example, direct `curl` may allow `github.com`, while `curl` launched by `git` is independently limited by `curl.from.git.sandbox` to `api.github.com`. `git.sandbox` controls Git itself. Domain allowlists are replaced, not merged: neither the caller's command sandbox nor the non-intercepted command sandbox contributes domains to the selected command sandbox's proxy policy.
 
+`keychain_access` (command sandbox, macOS only, `"read"` or `"readwrite"`) grants that command's child the user's login keychain (`login.keychain-db` and `metadata.keychain-db` under `~/Library/Keychains`) plus the keychain Mach services, through the agent's keychain deny; the agent keeps the deny. No separate filesystem grant is needed. The keychain is the only agent deny a command sandbox inherits, so no other path needs this. Prefer it over an agent-level `filesystem.bypass_protection` when only a mediated command (e.g. a credential helper) needs the keychain.
+
 `unix_socket_bind` (command sandbox only) grants `connect(2)`/`bind(2)` on named pathname AF_UNIX sockets, with the same implied filesystem coupling as the agent-level field of the same name. It also accepts the `@git:fsmonitor-socket` dynamic token, which expands to `fsmonitor--daemon.ipc` under the current worktree's private git-dir — resolved by a pure filesystem walk (no `git` process spawn), so an attacker-controlled working directory cannot influence resolution through `.git/config`.
 
 ```json

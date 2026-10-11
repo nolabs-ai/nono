@@ -851,6 +851,30 @@ pub struct CommandSandboxConfig {
     /// single command. Supports dynamic-provider tokens.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unix_socket_bind: Vec<String>,
+    /// macOS-only: grant this command's child the user's login keychain
+    /// (`login.keychain-db` and `metadata.keychain-db` under
+    /// `~/Library/Keychains`) in the given mode, plus the keychain Mach
+    /// services, despite the agent's keychain deny. Scoped to this command;
+    /// the agent's own deny is unchanged. Ignored on Linux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keychain_access: Option<CommandKeychainAccess>,
+}
+
+/// Keychain access mode for a command sandbox's `keychain_access`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandKeychainAccess {
+    Read,
+    ReadWrite,
+}
+
+impl CommandKeychainAccess {
+    fn merge(base: Option<Self>, child: Option<Self>) -> Option<Self> {
+        match (base, child) {
+            (Some(Self::ReadWrite), _) | (_, Some(Self::ReadWrite)) => Some(Self::ReadWrite),
+            (base, child) => base.or(child),
+        }
+    }
 }
 
 impl CommandSandboxConfig {
@@ -880,6 +904,10 @@ impl CommandSandboxConfig {
             ),
             exec_paths: dedup_append(&self.exec_paths, &child.exec_paths),
             unix_socket_bind: dedup_append(&self.unix_socket_bind, &child.unix_socket_bind),
+            keychain_access: CommandKeychainAccess::merge(
+                self.keychain_access,
+                child.keychain_access,
+            ),
         }
     }
 }
@@ -1997,6 +2025,26 @@ fn validate_sandbox(
         &sandbox.unsafe_macos_seatbelt_rules,
         report,
     );
+
+    if sandbox.keychain_access.is_some() {
+        if cfg!(target_os = "macos") {
+            report.warning(
+                "keychain_access",
+                format!(
+                    "command '{command_name}' from.{caller} is granted the login keychain via \
+                     keychain_access — review carefully"
+                ),
+            );
+        } else {
+            report.info(
+                "keychain_access_macos_only",
+                format!(
+                    "command '{command_name}' from.{caller} sets keychain_access, which only \
+                     has an effect on macOS and is ignored on this platform"
+                ),
+            );
+        }
+    }
 
     if let Some(network) = &sandbox.network {
         validate_network(command_name, caller, network, report);

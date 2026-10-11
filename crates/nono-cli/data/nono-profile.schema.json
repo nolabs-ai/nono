@@ -2008,6 +2008,11 @@
           "items": { "type": "string" },
           "description": "AF_UNIX socket bind grants in the selected command sandbox policy."
         },
+        "keychain_access": {
+          "type": "string",
+          "enum": ["read", "readwrite"],
+          "description": "macOS-only. Grant this command's sandbox the user's login keychain (login.keychain-db and metadata.keychain-db under ~/Library/Keychains) in the given mode, plus the keychain Mach services, despite the agent's keychain deny. Scoped to this command; the agent's own deny is unchanged. Ignored on Linux."
+        },
         "use_credentials": {
           "type": "array",
           "items": { "$ref": "#/$defs/CommandPolicyIdentifier" },

@@ -1356,6 +1356,7 @@ impl EffectiveDenyPolicy {
     /// This policy with `extra` bypasses applied on top, for a mediated
     /// command whose own policy lifts a deny the agent keeps. The deny paths
     /// are unchanged, so `extra` reopens only the modes it records.
+    #[cfg(target_os = "macos")]
     #[must_use]
     pub fn with_additional_bypasses(&self, extra: &[AppliedBypass]) -> Self {
         let mut bypasses = self.bypasses.clone();

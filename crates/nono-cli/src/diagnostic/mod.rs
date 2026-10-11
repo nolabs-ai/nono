@@ -6,6 +6,6 @@
 mod formatter;
 
 pub use formatter::{
-    CommandContext, DiagnosticFormatter, DiagnosticMode, ErrorObservation, PolicyExplanation,
-    analyze_error_output,
+    CommandContext, DiagnosticFormatter, DiagnosticMode, ErrorObservation, MediatedViolation,
+    PolicyExplanation, analyze_error_output,
 };

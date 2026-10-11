@@ -1616,7 +1616,42 @@ pub fn apply_macos_keychain_db_exception(
                 allow_rules.push(format!("(allow file-write* ({}))", filter));
             }
         }
+
+        // The Security framework saves a keychain by writing
+        // `<db>.sb-XXXXXXXX-XXXXXX` and renaming it over the DB. Allow that
+        // temp file for a write grant, as a regular file only, so it cannot be
+        // a symlink or hard link renamed over the DB.
+        if access.contains(AccessMode::Write) {
+            let escaped_regex = match escape_seatbelt_regex_path(path_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "Skipping keychain save exception for {}: {}",
+                        path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+            let temp = format!(
+                r#"require-all (regex #"^{}\.sb-[0-9A-Za-z]+-[0-9A-Za-z]+$") (vnode-type REGULAR-FILE)"#,
+                escaped_regex
+            );
+            if access.contains(AccessMode::Read) {
+                allow_rules.push(format!("(allow file-read-data ({temp}))"));
+                allow_rules.push(format!("(allow file-read* ({temp}))"));
+            }
+            allow_rules.push(format!("(allow file-write-data ({temp}))"));
+            allow_rules.push(format!("(allow file-write* ({temp}))"));
+        }
     }
+
+    // SECURITY: a write grant on a keychain DB also permits unlinking it, so
+    // without these the process could put a symlink or hard link where the
+    // DB was (or alias the DB elsewhere) and redirect every later unsandboxed
+    // keychain save into a file it can read. Emitted after every allow so
+    // they win under last-matching-rule.
+    let mut hardening_rules = Vec::new();
 
     for (root, access) in keychain_roots {
         let root_str = match path_to_utf8(&root) {
@@ -1649,6 +1684,29 @@ pub fn apply_macos_keychain_db_exception(
             ),
         ];
 
+        if access.contains(AccessMode::Write) {
+            match escape_seatbelt_path(root_str) {
+                Ok(escaped) => {
+                    hardening_rules.push(format!("(deny file-link (subpath \"{escaped}\"))"));
+                    hardening_rules.push(format!(
+                        "(deny file-write-create (require-all (subpath \"{escaped}\") \
+                         (require-not (vnode-type REGULAR-FILE))))"
+                    ));
+                }
+                Err(e) => {
+                    // The root is a prefix of a DB path that escaped above, so
+                    // this is unreachable in practice; still never emit a
+                    // root's write exception without its hardening.
+                    warn!(
+                        "Skipping keychain runtime exception for {}: {}",
+                        root.display(),
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+
         // See comment above: emit specific ops alongside wildcards so they override
         // the specific-op denies from deny_keychains_macos.
         for filter in filters {
@@ -1672,8 +1730,10 @@ pub fn apply_macos_keychain_db_exception(
     }
 
     allow_rules.sort_unstable();
+    hardening_rules.sort_unstable();
+    hardening_rules.dedup();
 
-    for rule in allow_rules {
+    for rule in allow_rules.into_iter().chain(hardening_rules) {
         if let Err(e) = caps.add_platform_rule(rule) {
             warn!("Failed to add keychain DB exception rule: {}", e);
         }
@@ -4095,6 +4155,83 @@ mod tests {
             "(allow {op} (literal \"{}\"))",
             escape_seatbelt_path(resolved.to_str().expect("utf8 path")).expect("escaped path")
         )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_write_grant_allows_regular_save_temp_and_denies_links() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.login_db),
+        );
+        let db = fixture.login_db.canonicalize().expect("canonical db");
+        let root = db.parent().expect("keychain root");
+        let db_regex =
+            escape_seatbelt_regex_path(db.to_str().expect("utf8 path")).expect("escaped regex");
+        let root_escaped =
+            escape_seatbelt_path(root.to_str().expect("utf8 path")).expect("escaped root");
+
+        let temp = format!(
+            "(allow file-write* (require-all (regex #\"^{db_regex}\\.sb-[0-9A-Za-z]+-[0-9A-Za-z]+$\") (vnode-type REGULAR-FILE)))"
+        );
+        let deny_link = format!("(deny file-link (subpath \"{root_escaped}\"))");
+        let deny_create = format!(
+            "(deny file-write-create (require-all (subpath \"{root_escaped}\") (require-not (vnode-type REGULAR-FILE))))"
+        );
+        let lines: Vec<&str> = rules.lines().collect();
+        for expected in [&temp, &deny_link, &deny_create] {
+            assert!(
+                lines.contains(&expected.as_str()),
+                "missing {expected}, got: {rules}"
+            );
+        }
+        // The denies must follow every allow to win under last-matching-rule.
+        let last_allow = lines
+            .iter()
+            .rposition(|rule| rule.starts_with("(allow"))
+            .expect("allow rules");
+        let first_deny = lines
+            .iter()
+            .position(|rule| rule.starts_with("(deny"))
+            .expect("deny rules");
+        assert!(
+            first_deny > last_allow,
+            "hardening denies must come after the allows, got: {rules}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_keychain_read_grant_emits_no_save_temp_or_link_rules() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let rules = keychain_exception_rules(
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                CapabilitySource::Profile,
+            ),
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.login_db),
+        );
+
+        assert!(
+            rules.contains("file-read-data"),
+            "expected read rules, got: {rules}"
+        );
+        assert!(
+            !rules.contains(".sb-"),
+            "read must not open the save temp file: {rules}"
+        );
+        assert!(
+            !rules.contains("(deny"),
+            "read needs no write hardening: {rules}"
+        );
     }
 
     #[cfg(target_os = "macos")]

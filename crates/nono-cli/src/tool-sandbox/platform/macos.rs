@@ -182,6 +182,9 @@ struct ToolSandboxState {
     scoped_proxy_env_vars: BTreeMap<String, Vec<(String, String)>>,
     reserved_proxy_ports: BTreeSet<u16>,
     active_children: Mutex<HashMap<u32, ActiveChild>>,
+    /// Every child this runtime launched, kept after exit so the sandbox log
+    /// collector can attribute a command sandbox's denials to its command.
+    mediated_pids: crate::sandbox_log::MediatedPids,
     /// Attributes severed-ancestry callers to their spawning command. See the
     /// daemon-lineage section below.
     lineage: LineageMarker,
@@ -381,6 +384,7 @@ impl PreparedToolSandboxRuntime {
                 scoped_proxy_env_vars: scoped_proxy_env_vars.clone(),
                 reserved_proxy_ports: reserved_proxy_ports.clone(),
                 active_children: Mutex::new(HashMap::new()),
+                mediated_pids: crate::sandbox_log::MediatedPids::default(),
                 lineage,
                 session_lineage: SessionLineage::default(),
                 active_count: AtomicUsize::new(0),
@@ -400,6 +404,11 @@ impl PreparedToolSandboxRuntime {
 
     pub(crate) fn emitted_error_response(&self) -> bool {
         self.inner.emitted_error_response.load(Ordering::SeqCst)
+    }
+
+    /// Registry of launched mediated-command PIDs, for diagnostics attribution.
+    pub(crate) fn mediated_pids(&self) -> crate::sandbox_log::MediatedPids {
+        self.inner.mediated_pids.clone()
     }
 
     pub(crate) fn cleanup_runtime_dir(&self) {
@@ -2723,6 +2732,7 @@ fn track_child(
         },
     );
     drop(map);
+    state.mediated_pids.record(child_pid, command_name);
     state
         .session_lineage
         .record(child_pid, command_name, launch_caller, identity);
@@ -5808,6 +5818,7 @@ mod tests {
             scoped_proxy_env_vars: BTreeMap::new(),
             reserved_proxy_ports: BTreeSet::new(),
             active_children: Mutex::new(HashMap::new()),
+            mediated_pids: crate::sandbox_log::MediatedPids::default(),
             lineage: LineageMarker::Disabled,
             session_lineage: SessionLineage::default(),
             active_count: AtomicUsize::new(0),

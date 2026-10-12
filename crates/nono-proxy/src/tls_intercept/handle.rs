@@ -428,7 +428,7 @@ pub(crate) async fn select_intercept_route<'a>(
             continue;
         }
         if route.endpoint_policy.allows_all_without_l7() {
-            if route.requires_managed_credential {
+            if route.carries_managed_credential {
                 catchall_cred.push((prefix, route));
             } else {
                 catchall_passthrough.push((prefix, route));
@@ -456,11 +456,13 @@ pub(crate) async fn select_intercept_route<'a>(
                     &rule_label,
                     None,
                 );
-                if route.requires_managed_credential {
+                if !route.requires_managed_credential {
+                    endpoint_authorized = true;
+                }
+                if route.carries_managed_credential {
                     matched_cred.push((prefix, route));
                 } else {
                     matched_passthrough.push((prefix, route));
-                    endpoint_authorized = true;
                 }
             }
             EndpointPolicyOutcome::Approve {
@@ -584,11 +586,13 @@ pub(crate) async fn select_intercept_route<'a>(
                             &rule_label,
                             None,
                         );
-                        if route.requires_managed_credential {
+                        if !route.requires_managed_credential {
+                            endpoint_authorized = true;
+                        }
+                        if route.carries_managed_credential {
                             matched_cred.push((prefix, route));
                         } else {
                             matched_passthrough.push((prefix, route));
-                            endpoint_authorized = true;
                         }
                     }
                     Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Denied { reason }))) => {
@@ -774,15 +778,19 @@ pub(crate) async fn select_intercept_route<'a>(
     } else {
         &matched_cred
     };
-    if credential_layer.len() > 1 {
-        let names: Vec<&str> = credential_layer.iter().map(|(p, _)| *p).collect();
+    let contested: Vec<&str> = credential_layer
+        .iter()
+        .filter(|(_, route)| route.requires_managed_credential)
+        .map(|(prefix, _)| *prefix)
+        .collect();
+    if contested.len() > 1 {
         let reason = format!(
             "ambiguous route: {} {} matched {} credential routes: {:?}. \
              Narrow endpoint rules so each request matches exactly one route.",
             method,
             path,
-            names.len(),
-            names
+            contested.len(),
+            contested
         );
         warn!("tls_intercept: {}", reason);
         audit::log_denied(
@@ -800,7 +808,9 @@ pub(crate) async fn select_intercept_route<'a>(
     }
 
     let selected = credential_layer
-        .first()
+        .iter()
+        .find(|(_, route)| route.requires_managed_credential)
+        .or_else(|| credential_layer.first())
         .copied()
         .or_else(|| matched_passthrough.first().copied())
         .or_else(|| catchall_passthrough.first().copied());
@@ -1258,7 +1268,7 @@ where
         request.push_str(&format!("Authorization: Bearer {}\r\n", token.as_str()));
     }
     let injected_header_names = reverse::injected_credential_header_names(cred);
-    let nonce_consumer = service.map(|s| format!("proxy.{s}"));
+    let nonce_consumer = service.map(crate::oauth_capture::route_consumer);
     let redeem_phantoms: &[String] = route.map_or(&[], |r| r.redeem_phantoms.as_slice());
     for (name, value) in &filtered_headers {
         if injected_header_names
@@ -2159,7 +2169,7 @@ fn build_websocket_upstream_request(
     if let Some(cred) = cred {
         reverse::inject_credential_for_mode(cred, &mut request);
     }
-    let nonce_consumer = service.map(|name| format!("proxy.{name}"));
+    let nonce_consumer = service.map(crate::oauth_capture::route_consumer);
     for field in filtered_headers {
         // Ask the resolver, not a bare `nono_` scan: a templated phantom carries
         // no marker and would otherwise be forwarded upstream unrewritten.
@@ -2583,6 +2593,115 @@ mod tests {
             spiffe: None,
             upgrades: vec![],
             rate_limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn select_intercept_route_oauth_capture_not_shadowed_by_endpoint_route() {
+        fn req<'a>(method: &'a str, path: &'a str) -> InterceptRouteRequest<'a> {
+            InterceptRouteRequest {
+                method,
+                path,
+                websocket_path: None,
+            }
+        }
+
+        let ep_route = crate::config::RouteConfig {
+            prefix: "_ep_*".to_string(),
+            upstream: "https://*".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/**".to_string(),
+            }],
+            ..Default::default()
+        };
+        let oauth_route = crate::config::RouteConfig {
+            prefix: "anthropic_oauth".to_string(),
+            upstream: "https://api.anthropic.com".to_string(),
+            endpoint_policy: Some(crate::config::EndpointPolicyConfig {
+                default: crate::config::EndpointPolicyDefault::default(),
+                deny: vec![],
+                approve: vec![],
+                allow: vec![
+                    crate::config::EndpointPolicyRule {
+                        method: "GET".to_string(),
+                        path: "/v1/mcp_servers".to_string(),
+                        backend: None,
+                        reason: None,
+                        timeout_secs: None,
+                    },
+                    crate::config::EndpointPolicyRule {
+                        method: "POST".to_string(),
+                        path: "/v1/messages".to_string(),
+                        backend: None,
+                        reason: None,
+                        timeout_secs: None,
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let capture = vec![crate::config::OAuthCaptureConfig {
+            provider: "claude_code".to_string(),
+            token_endpoints: vec![],
+            admitted_consumers: vec![crate::oauth_capture::route_consumer("anthropic_oauth")],
+        }];
+        let store = RouteStore::load_with_oauth_capture(&[ep_route, oauth_route], &capture)
+            .await
+            .unwrap();
+
+        match select_intercept_route(
+            &store,
+            "api.anthropic.com",
+            443,
+            req("GET", "/v1/mcp_servers?limit=1000"),
+            None,
+            None,
+        )
+        .await
+        {
+            RouteSelection::Selected(Some(selected)) => assert_eq!(
+                selected.id, "anthropic_oauth",
+                "_ep_* must not shadow the oauth_capture route"
+            ),
+            RouteSelection::Selected(None) => panic!("must not forward without the credential"),
+            RouteSelection::Rejected(status) => panic!("unexpected rejection with status {status}"),
+        }
+
+        match select_intercept_route(
+            &store,
+            "api.anthropic.com",
+            443,
+            req("POST", "/v1/messages"),
+            None,
+            None,
+        )
+        .await
+        {
+            RouteSelection::Selected(Some(selected)) => {
+                assert_eq!(selected.id, "anthropic_oauth")
+            }
+            RouteSelection::Selected(None) => panic!("must not forward without the credential"),
+            RouteSelection::Rejected(status) => {
+                panic!("POST /v1/messages must stay allowed, got status {status}")
+            }
+        }
+
+        match select_intercept_route(
+            &store,
+            "api.anthropic.com",
+            443,
+            req("DELETE", "/v1/messages"),
+            None,
+            None,
+        )
+        .await
+        {
+            RouteSelection::Rejected(status) => assert_eq!(status, 403),
+            RouteSelection::Selected(Some(selected)) => {
+                panic!("unauthorized method selected route '{}'", selected.id)
+            }
+            RouteSelection::Selected(None) => panic!("unauthorized method must not pass through"),
         }
     }
 
@@ -3633,5 +3752,136 @@ mod tests {
         .unwrap();
 
         assert!(tunnel_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn select_intercept_route_matched_redeemer_outranks_credential_catchall() {
+        fn req<'a>(method: &'a str, path: &'a str) -> InterceptRouteRequest<'a> {
+            InterceptRouteRequest {
+                method,
+                path,
+                websocket_path: None,
+            }
+        }
+
+        let redeem_route = crate::config::RouteConfig {
+            prefix: "redeemer".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            redeem_phantoms: vec!["example".to_string()],
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "POST".to_string(),
+                path: "/v1/messages".to_string(),
+            }],
+            ..Default::default()
+        };
+        let cred_catchall = crate::config::RouteConfig {
+            prefix: "creds".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://TOK".to_string()),
+            credential_format: Some("Bearer {}".to_string()),
+            env_var: Some("TOK".to_string()),
+            ..Default::default()
+        };
+        let store = RouteStore::load(&[redeem_route, cred_catchall])
+            .await
+            .unwrap();
+
+        match select_intercept_route(
+            &store,
+            "api.example.com",
+            443,
+            req("POST", "/v1/messages"),
+            None,
+            None,
+        )
+        .await
+        {
+            RouteSelection::Selected(Some(selected)) => assert_eq!(
+                selected.id, "redeemer",
+                "an endpoint-matched phantom redeemer wins over a credential catch-all"
+            ),
+            RouteSelection::Selected(None) => {
+                panic!("expected the redeemer route, got passthrough")
+            }
+            RouteSelection::Rejected(status) => {
+                panic!("expected the redeemer route, got a {status} rejection")
+            }
+        }
+
+        match select_intercept_route(
+            &store,
+            "api.example.com",
+            443,
+            req("GET", "/v1/other"),
+            None,
+            None,
+        )
+        .await
+        {
+            RouteSelection::Rejected(status) => assert_eq!(
+                status, 403,
+                "the redeemer's endpoint rules still gate the upstream: a credential \
+                 catch-all must not widen them"
+            ),
+            RouteSelection::Selected(Some(selected)) => {
+                panic!("expected a hard deny, got route '{}'", selected.id)
+            }
+            RouteSelection::Selected(None) => panic!("expected a hard deny, got passthrough"),
+        }
+    }
+
+    #[tokio::test]
+    async fn select_intercept_route_credential_route_cannot_lift_endpoint_only_gate() {
+        fn req<'a>(method: &'a str, path: &'a str) -> InterceptRouteRequest<'a> {
+            InterceptRouteRequest {
+                method,
+                path,
+                websocket_path: None,
+            }
+        }
+
+        let ep_route = crate::config::RouteConfig {
+            prefix: "_ep_*".to_string(),
+            upstream: "https://*".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/**".to_string(),
+            }],
+            ..Default::default()
+        };
+        let cred_route = crate::config::RouteConfig {
+            prefix: "gh".to_string(),
+            upstream: "https://api.github.com".to_string(),
+            credential_key: Some("env://GH_TOKEN".to_string()),
+            credential_format: Some("Bearer {}".to_string()),
+            env_var: Some("GH_TOKEN".to_string()),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "POST".to_string(),
+                path: "/repos/**".to_string(),
+            }],
+            ..Default::default()
+        };
+        let store = RouteStore::load(&[ep_route, cred_route]).await.unwrap();
+
+        match select_intercept_route(
+            &store,
+            "api.github.com",
+            443,
+            req("POST", "/repos/x"),
+            None,
+            None,
+        )
+        .await
+        {
+            RouteSelection::Rejected(status) => assert_eq!(
+                status, 403,
+                "a read-only _ep_ wildcard must still deny POST"
+            ),
+            RouteSelection::Selected(Some(selected)) => panic!(
+                "credential route '{}' must not widen the _ep_ allow-list",
+                selected.id
+            ),
+            RouteSelection::Selected(None) => panic!("expected a hard deny, got passthrough"),
+        }
     }
 }

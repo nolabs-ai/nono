@@ -27,7 +27,8 @@ pub use sigstore_verify::types::{DerPublicKey, PayloadBytes, SignatureBytes};
 // Internal imports from sigstore
 use sigstore_verify::crypto::hash::sha256;
 use sigstore_verify::types::bundle::{
-    Bundle, MediaType, SignatureContent, VerificationMaterial, VerificationMaterialContent,
+    Bundle, MediaType, PublicKeyIdentifier, SignatureContent, VerificationMaterial,
+    VerificationMaterialContent,
 };
 use sigstore_verify::types::dsse::{DsseEnvelope as SigstoreDsseEnvelope, DsseSignature};
 use sigstore_verify::types::encoding::KeyId;
@@ -329,10 +330,7 @@ pub fn sign_statement_bundle(
     let envelope = SigstoreDsseEnvelope::new(
         dsse::IN_TOTO_PAYLOAD_TYPE.to_string(),
         payload,
-        vec![DsseSignature {
-            sig: signature,
-            keyid: KeyId::default(),
-        }],
+        DsseSignature::new(signature, KeyId::default()),
     );
 
     // Build the key hint from the public key hash
@@ -344,15 +342,13 @@ pub fn sign_statement_bundle(
     // is short-lived and the Rekor entry provides a signed timestamp proving the
     // signature was created during the certificate's validity window. For keyed
     // bundles, the long-lived key provides its own trust anchor.
-    let bundle = Bundle {
-        media_type: MediaType::Bundle0_3.as_str().to_string(),
-        verification_material: VerificationMaterial {
-            content: VerificationMaterialContent::PublicKey { hint },
-            tlog_entries: Vec::new(),
-            timestamp_verification_data: Default::default(),
-        },
-        content: SignatureContent::DsseEnvelope(envelope),
-    };
+    let bundle = Bundle::new(
+        MediaType::Bundle0_3,
+        VerificationMaterial::new(VerificationMaterialContent::PublicKey(
+            PublicKeyIdentifier::new(hint),
+        )),
+        SignatureContent::DsseEnvelope(envelope),
+    );
 
     // Serialize to pretty JSON
     bundle
@@ -520,7 +516,7 @@ mod tests {
 
         // Verify the signature with the public key
         let pub_key = kp.public_key_der().unwrap();
-        let vk = VerificationKey::from_spki(&pub_key, kp.default_scheme()).unwrap();
+        let vk = VerificationKey::from_spki(&pub_key).unwrap();
         vk.verify(&pae_bytes, &sig_bytes).unwrap();
     }
 
@@ -532,13 +528,10 @@ mod tests {
 
         // Should parse as a sigstore Bundle
         let bundle = Bundle::from_json(&json).unwrap();
-        assert_eq!(
-            bundle.media_type,
-            "application/vnd.dev.sigstore.bundle.v0.3+json"
-        );
+        assert_eq!(bundle.media_type(), MediaType::Bundle0_3);
         assert!(matches!(
             bundle.verification_material.content,
-            VerificationMaterialContent::PublicKey { .. }
+            VerificationMaterialContent::PublicKey(_)
         ));
         assert!(matches!(bundle.content, SignatureContent::DsseEnvelope(_)));
     }
@@ -685,7 +678,7 @@ mod tests {
         let pae_bytes = sigstore_verify::types::dsse::pae(IN_TOTO_PAYLOAD_TYPE, &payload_bytes);
 
         let pub_key = kp.public_key_der().unwrap();
-        let vk = VerificationKey::from_spki(&pub_key, kp.default_scheme()).unwrap();
+        let vk = VerificationKey::from_spki(&pub_key).unwrap();
         vk.verify(&pae_bytes, &sig_bytes).unwrap();
     }
 
@@ -792,7 +785,7 @@ mod tests {
         let pae_bytes = sigstore_verify::types::dsse::pae(IN_TOTO_PAYLOAD_TYPE, &payload_bytes);
 
         let pub_key = kp.public_key_der().unwrap();
-        let vk = VerificationKey::from_spki(&pub_key, kp.default_scheme()).unwrap();
+        let vk = VerificationKey::from_spki(&pub_key).unwrap();
         vk.verify(&pae_bytes, &sig_bytes).unwrap();
     }
 
@@ -806,10 +799,7 @@ mod tests {
         let json = sign_files(&files, &kp, "test-key").unwrap();
 
         let bundle = Bundle::from_json(&json).unwrap();
-        assert_eq!(
-            bundle.media_type,
-            "application/vnd.dev.sigstore.bundle.v0.3+json"
-        );
+        assert_eq!(bundle.media_type(), MediaType::Bundle0_3);
         assert!(matches!(bundle.content, SignatureContent::DsseEnvelope(_)));
     }
 

@@ -1465,7 +1465,13 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .and_then(|c| std::path::Path::new(c).file_name())
                     .and_then(|n| n.to_str())
                     .map(str::to_string);
-                crate::sandbox_log::SandboxLogCollector::start(child.as_raw(), command_name)
+                crate::sandbox_log::SandboxLogCollector::start(
+                    child.as_raw(),
+                    command_name,
+                    config
+                        .tool_sandbox_runtime
+                        .map(crate::tool_sandbox::PreparedToolSandboxRuntime::mediated_pids),
+                )
             } else {
                 None
             };
@@ -1613,19 +1619,25 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             };
 
             #[cfg(target_os = "macos")]
-            let sandbox_violations = if supervisor.is_some() {
+            let collected_violations = if supervisor.is_some() {
                 let include_historical_sandbox_log =
                     exit_code != 0 || !denials.is_empty() || error_observation.has_findings();
                 match sandbox_log_collector {
                     Some(collector) if include_historical_sandbox_log => collector.finish(),
                     Some(collector) => collector.finish_realtime_only(),
-                    None => Vec::new(),
+                    None => crate::sandbox_log::CollectedViolations::default(),
                 }
             } else {
-                Vec::new()
+                crate::sandbox_log::CollectedViolations::default()
             };
+            #[cfg(target_os = "macos")]
+            let (sandbox_violations, mediated_violations) =
+                (collected_violations.agent, collected_violations.mediated);
             #[cfg(not(target_os = "macos"))]
-            let sandbox_violations = Vec::new();
+            let (sandbox_violations, mediated_violations): (
+                Vec<nono::SandboxViolation>,
+                Vec<crate::diagnostic::MediatedViolation>,
+            ) = (Vec::new(), Vec::new());
             let visible_sandbox_violations = filter_suppressed_system_service_violations(
                 &sandbox_violations,
                 config.suppressed_system_service_operations,
@@ -1700,6 +1712,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .with_denials(&denials)
                     .with_ipc_denials(&ipc_denials)
                     .with_sandbox_violations(&sandbox_violations)
+                    .with_mediated_violations(&mediated_violations)
                     .with_protected_paths(config.protected_paths)
                     .with_error_observation(error_observation)
                     .with_current_dir(config.current_dir)
@@ -4540,6 +4553,19 @@ mod tests {
         let set_vars = vec![("RUST_LOG".to_string(), "debug".to_string())];
         push_set_vars(&mut env_c, &set_vars, &[]);
         assert_eq!(env_strings(&env_c), vec!["HOME=/home/x", "RUST_LOG=debug"]);
+    }
+
+    #[test]
+    fn push_set_vars_keeps_empty_value() {
+        // Set-but-empty differs from unset: Claude Code's Keychain lookup
+        // depends on CLAUDE_SECURESTORAGE_CONFIG_DIR="" reaching the child.
+        let mut env_c = Vec::new();
+        let set_vars = vec![("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), String::new())];
+        push_set_vars(&mut env_c, &set_vars, &[]);
+        assert_eq!(
+            env_strings(&env_c),
+            vec!["CLAUDE_SECURESTORAGE_CONFIG_DIR="]
+        );
     }
 
     #[test]

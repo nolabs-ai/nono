@@ -43,16 +43,9 @@ libc = "0.2"
 # backend to its defaults.
 keyring = { version = "3", optional = true, default-features = false }
 
-# Sigstore bundle verification.
-# `sigstore-trust-root` is pinned to 0.6.3 because 0.6.5 made
-# `TufSigningConfig::production()` async without bumping major,
-# breaking sigstore-sign 0.6.3 (which the sigstore-verify graph pulls
-# transitively even though we don't use it directly). We don't depend
-# on sigstore-sign or sigstore-trust-root in our own code; this pin
-# exists purely to keep the resolver on a coherent 0.6.3-era set
-# until the upstream API churn settles.
-sigstore-verify = { version = "0.11.0", default-features = false }
-sigstore-trust-root = "=0.11.0"
+# Sigstore bundle verification. The release line is coordinated with
+# sigstore-sign at the workspace level.
+sigstore-verify.workspace = true
 x509-cert = { version = "0.3", default-features = false }
 der = { version = "0.8", default-features = false }
 

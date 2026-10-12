@@ -1364,12 +1364,17 @@ pub fn prompt_cwd_sharing(cwd: &Path, access: &AccessMode) -> Result<bool> {
     Ok(answer == "y" || answer == "yes")
 }
 
-pub fn print_profile_hint(program: &str, pack_ref: &str, silent: bool) {
+pub fn print_profile_hint(program: &str, pack_ref: &str, command_args: &[&str], silent: bool) {
     if silent {
         return;
     }
 
     let t = theme::current();
+    let command_suffix = if command_args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", command_args.join(" "))
+    };
     eprintln!(
         "  {}",
         fg(
@@ -1383,7 +1388,7 @@ pub fn print_profile_hint(program: &str, pack_ref: &str, silent: bool) {
         "  {}",
         fg(
             &format!(
-                "Try: nono run --profile {pack_ref} -- {program}  (install first: nono pull {pack_ref})"
+                "Try: nono run --profile {pack_ref} -- {program}{command_suffix}  (install first: nono pull {pack_ref})"
             ),
             t.subtext,
         )
@@ -1442,7 +1447,7 @@ mod tests {
 
     #[test]
     fn print_profile_hint_is_noop_when_silent() {
-        print_profile_hint("claude", "nolabs-ai/claude", true);
+        print_profile_hint("claude", "nolabs-ai/claude", &[], true);
     }
 
     #[test]

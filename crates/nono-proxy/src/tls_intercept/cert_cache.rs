@@ -24,7 +24,8 @@
 use crate::error::{ProxyError, Result};
 use crate::tls_intercept::ca::EphemeralCa;
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256, SanType,
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
+    PKCS_ECDSA_P256_SHA256, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -151,6 +152,10 @@ fn mint_leaf(
     // "Missing Authority Key Identifier".
     params.use_authority_key_identifier_extension = true;
 
+    // Apple's TLS policy (macOS 10.15+, iOS 13+) rejects server certificates
+    // without an Extended Key Usage extension containing id-kp-serverAuth.
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+
     let now = SystemTime::now();
     let ca_not_after = ca.not_after();
     if ca_not_after <= now {
@@ -265,6 +270,28 @@ mod tests {
         assert!(
             der.windows(aki_oid.len()).any(|w| w == aki_oid),
             "minted leaf must include Authority Key Identifier (OID 2.5.29.35)"
+        );
+    }
+
+    #[test]
+    fn minted_leaf_carries_server_auth_eku() {
+        // Apple's TLS policy rejects server certificates without an Extended
+        // Key Usage extension containing id-kp-serverAuth. Verify the EKU
+        // extension OID 2.5.29.37 (DER bytes 06 03 55 1d 25) and the
+        // serverAuth purpose OID 1.3.6.1.5.5.7.3.1 are present in the leaf DER.
+        let cache = fresh_cache();
+        let ck = cache.get_or_mint("api.example.com").unwrap();
+        let der = ck.cert[0].as_ref();
+        let eku_oid = [0x06, 0x03, 0x55, 0x1d, 0x25];
+        let server_auth_oid = [0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        assert!(
+            der.windows(eku_oid.len()).any(|w| w == eku_oid),
+            "minted leaf must include Extended Key Usage (OID 2.5.29.37)"
+        );
+        assert!(
+            der.windows(server_auth_oid.len())
+                .any(|w| w == server_auth_oid),
+            "minted leaf EKU must include serverAuth (OID 1.3.6.1.5.5.7.3.1)"
         );
     }
 

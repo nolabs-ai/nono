@@ -653,6 +653,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "fs_read_file",
             "fs_write",
             "fs_write_file",
+            "keychain_access",
             "network",
             "open_urls",
             "resources",

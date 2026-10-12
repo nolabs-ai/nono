@@ -24,16 +24,21 @@ To get you going quickly, we provide pre-built profiles for popular AI agents an
 Just search for your favorite coding agent from the registry
 
 ```bash
-nono search opencode
-nolabs-ai/opencode	-	Official nolabs-ai OpenCode Plugin
+nono search pi
+nono pull nolabs-ai/pi
 ```
 
 And then run..
 
 ```bash
-nono run --profile nolabs-ai/claude -- claude
-nono run --profile nolabs-ai/codex -- codex
+# Pi
 nono run --profile nolabs-ai/pi -- pi
+
+# Claude Code
+nono run --profile nolabs-ai/claude -- claude
+
+# Codex
+nono run --profile nolabs-ai/codex -- codex
 ```
 
 ## Network Access
@@ -153,14 +158,14 @@ For setting up nono with a specific AI agent:
 It's likely that you are going to want to customize the pre-built profiles or create your own for different tools and needs. You can do this easily with `nono profile init` which will create a new profile based on an existing one, with the option to customize it interactively.
 
 ```bash
-nono profile init claude --extends nolabs-ai/claude --full
+nono profile init pi-local --extends nolabs-ai/pi --full
 
-nono profile Created profile at /Users/jdoe/.config/nono/profiles/claude.json
-nono profile Validate with: nono profile validate claude
+nono profile Created profile at /Users/jdoe/.config/nono/profiles/pi-local.json
+nono profile Validate with: nono profile validate pi-local
 nono profile For editor autocomplete: nono profile schema -o nono-profile.schema.json
 ```
 
-You can now call your own profile with `--profile claude` just like the pre-built ones.
+You can now call your own profile with `--profile pi-local` just like the pre-built ones.
 
 From here, move to [Profiles & Groups](/cli/features/profiles-groups) for more indepth details on how to create and manage profiles, groups, and the policy engine.
 

@@ -363,6 +363,16 @@ nono-packs/
 
 Each per-pack workflow is **fully self-contained** — checkout, build the file list from `package.json::artifacts[]`, call `agent-sign`. There's some duplication between files, but it buys strict per-pack OIDC identity (see [Why Inlined, Not Reusable](#why-inlined-not-reusable) below). The file list is still single-sourced in each pack's `package.json` so adding/removing an artifact is a one-place edit in the manifest, not the workflow.
 
+If one pack name prefixes another, make the shorter workflow exclude the longer tag. For example, `opencode-v*` also matches `opencode-v1-v0.1.0`:
+
+```yaml
+on:
+  push:
+    tags:
+      - "opencode-v*"
+      - "!opencode-v1-v*"
+```
+
 ```yaml
 # .github/workflows/publish-claude.yml
 name: Publish claude pack

@@ -104,7 +104,32 @@ The selected `sandbox` object is the command sandbox policy and describes what t
 | `allow_launch_services` | boolean | macOS-only direct LaunchServices URL opening. |
 | `allow_raw_file_credentials_in_chained_policy` | boolean | Required before non-session callers can receive raw-file credentials. |
 | `unsafe_macos_seatbelt_rules` | string array | macOS-only escape hatch: raw Seatbelt rules appended to this command sandbox's Seatbelt profile after the deny gate (last-match-wins). Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to one command/intercept. Use sparingly — e.g. to let a command exec + read a binary it forks by absolute path. Honoured only for **user-authored profiles** (same trust boundary as `binary` — see below); pack and built-in profiles have these rules stripped with a warning. |
+| `keychain_access` | `"read"` or `"readwrite"` | macOS-only. Grants this command's child the user's login keychain (`login.keychain-db` and `metadata.keychain-db` under `~/Library/Keychains`) in the given mode, plus the keychain Mach services, through the agent's keychain deny. The agent's own sandbox keeps the deny. No separate filesystem grant is needed. See [Keychain access for a mediated command](#keychain-access-for-a-mediated-command). Ignored on Linux. |
 | `unix_socket_bind` | path array | Grant `connect(2)` and `bind(2)` on the named pathname AF_UNIX socket files (supports the dynamic tokens below). Implied filesystem grant is ReadWrite on the file if it already exists, otherwise ReadWrite on its parent directory (so `bind(2)` can create it) — mirrors the agent-level `unix_socket_bind` field, see [AF_UNIX Socket Grants](/cli/features/profiles-groups#af-unix-socket-grants). A path that resolves to an existing dangling symlink is rejected. |
+
+### Keychain access for a mediated command
+
+Command sandboxes don't inherit the agent's deny groups, so a filesystem grant normally works as written. The exception is the macOS keychain: a command sandbox keeps the agent's keychain deny, so a keychain file grant alone is ineffective. To let one command reach the keychain without exposing it to the agent, set `keychain_access`:
+
+```json
+{
+  "command_policies": {
+    "commands": {
+      "docker-credential-osxkeychain": {
+        "sandbox": {
+          "keychain_access": "read"
+        }
+      }
+    }
+  }
+}
+```
+
+This grants the command's child `login.keychain-db` and `metadata.keychain-db` under `~/Library/Keychains` and the keychain Mach services. The agent stays denied all of them. Use `"readwrite"` if the command must store credentials. If no user keychain exists, the command is refused rather than run without it.
+
+`"read"` blocks writes to the keychain files, which stops saving items through the file-based keychain API. The keychain Mach services can't be split by access mode, though, so don't rely on `"read"` alone to stop every keychain write path.
+
+`"readwrite"` lets the command save items: macOS writes a temporary `login.keychain-db.sb-…` file next to the DB and renames it into place. nono allows that temporary file only as a regular file and denies creating hard links or symlinks anywhere in `~/Library/Keychains`, so the command can't swap the keychain for a link to a file the agent can read. It can still overwrite or delete the keychain, so grant `"readwrite"` only to a command that needs it. For a general-purpose tool such as `security`, restrict its arguments with an `invocation_policy` as well.
 
 ### Per-Intercept Sandbox Override
 

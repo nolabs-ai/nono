@@ -32,15 +32,6 @@
 > [!NOTE]
 > In the lead-up to a 1.0 release, APIs are stabilizing. API changes may still occur where necessary, but will be kept to a minimum.
 
-> [!IMPORTANT]
-> **Organization migration:** The official nono registry namespace has moved from `always-further` to `nolabs-ai`. Update any references in your scripts, profiles, and CI.
-> If you already have a pack installed under the old namespace, remove it first before pulling from the new one:
-> ```bash
-> nono remove always-further/claude
-> nono pull nolabs-ai/claude
-> ```
-> The old namespace will be retired — migrate now.
-
 **Run AI agents in a zero latency sandbox in seconds and with zero setup** — *Claude Code, Codex, Pi, CoPilot, Hermes, OpenCode, OpenClaw* and more — nono gets you up and running within seconds, with no daemon, no container, no VM, and no disk space usage. Out of the box, nono enforces a least-privilege sandbox and supports macOS, Linux, and Windows (WSL2).
 
 From here **fork the config**, tweak it, theme it, make it your own, and share it with your team or the community via the [nono registry](https://registry.nono.sh).
@@ -98,13 +89,12 @@ nix run "github:nolabs-ai/nono?ref=$(curl -fsSL https://api.github.com/repos/nol
 Search for an agent in the registry, then run it:
 
 ```bash
-$ nono search opencode
-nolabs-ai/opencode	-	Official Opencode Plugin
-
-$ nono run --profile nolabs-ai/opencode -- opencode
+nono search pi
+nono pull nolabs-ai/pi
+nono run --profile nolabs-ai/pi -- pi
 ```
 
-That's it. `opencode` now runs with read/write access to the current directory and **nothing else** — your SSH keys, your cloud credentials, the rest of your disk are invisible to it.
+That's it. Pi now runs with the reviewed capabilities supplied by the pack. nono shows the exact filesystem, network, and credential access before applying the sandbox.
 
 Profiles for all the popular agents live at [registry.nono.sh](https://registry.nono.sh), secured and ready to pull. Each one bundles the right filesystem scope, network allowlist, hooks, skills and more.
 
@@ -113,8 +103,8 @@ Profiles for all the popular agents live at [registry.nono.sh](https://registry.
 Outgrow the defaults? Scaffold a profile and tweak it — same command you already know:
 
 ```bash
-nono profile init opencode --extends nolabs-ai/opencode
-nono run --profile opencode -- opencode
+nono profile init pi-local --extends nolabs-ai/pi
+nono run --profile pi-local -- pi
 ```
 
 `nono profile init` exports an extended and editable profile file for your agent, that inherits from the specified base profile. That profile is composable JSON, so you can review the exact filesystem, network, credentials, and tool rules before sharing it with a team or publishing it for the community.

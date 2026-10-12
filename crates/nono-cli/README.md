@@ -39,11 +39,11 @@ nono run --allow ./project-a --allow ./project-b -- command
 # Block network access
 nono run --allow-cwd --block-net -- command
 
-# Use a pack profile (requires: nono pull nolabs-ai/claude)
-nono run --profile nolabs-ai/claude -- claude
+# Use a pack profile (requires: nono pull nolabs-ai/pi)
+nono run --profile nolabs-ai/pi -- pi
 
-# Use a built-in profile
-nono run --profile nolabs-ai/opencode -- opencode
+# Run OpenCode 2 with its server in the sandbox
+nono run --profile nolabs-ai/opencode -- opencode --standalone
 
 # Keep a profile but temporarily allow unrestricted network
 nono run --profile nolabs-ai/claude --allow-net -- claude
@@ -85,14 +85,16 @@ Precedence is: CLI flag, then `NONO_THEME`, then config file, then the default `
 
 | Profile | Install | Command |
 |---------|---------|---------|
+| Pi | `nono pull nolabs-ai/pi` | `nono run --profile nolabs-ai/pi -- pi` |
 | Claude Code | `nono pull nolabs-ai/claude` | `nono run --profile nolabs-ai/claude -- claude` |
 | Codex | `nono pull nolabs-ai/codex` | `nono run --profile nolabs-ai/codex -- codex` |
+| OpenCode 2 | `nono pull nolabs-ai/opencode` | `nono run --profile nolabs-ai/opencode -- opencode --standalone` |
+| OpenCode 1 | `nono pull nolabs-ai/opencode-v1` | `nono run --profile nolabs-ai/opencode-v1 -- opencode` |
 
 ### Pack profiles (continued)
 
 | Profile | Command |
 |---------|---------|
-| OpenCode | `nono run --profile nolabs-ai/opencode -- opencode` |
 | OpenClaw | `nono run --profile nolabs-ai/openclaw -- openclaw gateway` |
 | Swival | `nono run --profile jedisct1/swival -- swival` (officially maintained by Swival's creator) |
 

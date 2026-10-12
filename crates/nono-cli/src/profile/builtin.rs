@@ -32,7 +32,8 @@ mod tests {
     #[test]
     fn test_opencode_no_longer_inbuilt() {
         // Removed: opencode is now shipped via the registry pack
-        // `nolabs-ai/opencode` (formerly `always-further/opencode`), not embedded in policy.json.
+        // `nolabs-ai/opencode` for v2 and `nolabs-ai/opencode-v1` for v1,
+        // not embedded in policy.json.
         assert!(get_builtin("opencode").is_none());
     }
 
@@ -87,7 +88,8 @@ mod tests {
         // Profiles that ship via registry packs instead of as built-ins:
         //   claude-code → nolabs-ai/claude   (formerly always-further/claude, removed v0.43.0)
         //   codex       → nolabs-ai/codex    (formerly always-further/codex, removed v0.43.0)
-        //   opencode    → nolabs-ai/opencode (formerly always-further/opencode, removed)
+        //   opencode    → nolabs-ai/opencode (v2; removed)
+        //   opencode-v1 → nolabs-ai/opencode-v1
         //   openclaw    → nolabs-ai/openclaw (removed v0.71.0)
         //   swival      → jedisct1/swival   (removed v0.71.0; official namespace of Swival's creator)
         // Command-policy examples should also live outside embedded built-ins.

@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.80.0] - 2026-10-12
+
+### Bug Fixes
+
+- *(proxy)* Add serverAuth EKU to minted TLS intercept leaf certificates (#2068) ([#2068](https://github.com/nolabs-ai/nono/pull/2068))
+
+- *(cli)* Keep Claude Code on its default Keychain service (#1950) (#2085) ([#2085](https://github.com/nolabs-ai/nono/pull/2085))
+
+- *(supervisor)* Separate network denial throttling from policy enforcement (#2047) ([#2047](https://github.com/nolabs-ai/nono/pull/2047))
+
+- *(macos)* Allow bypassed sockets under denied directories (#2041) ([#2041](https://github.com/nolabs-ai/nono/pull/2041))
+
+- *(linux)* Honour open ports in proxy fallback (#2042) ([#2042](https://github.com/nolabs-ai/nono/pull/2042))
+
+- *(cli)* Harden approval ids, orphan reaping and lexical why evaluation (#2033) ([#2033](https://github.com/nolabs-ai/nono/pull/2033))
+
+
+### Dependencies
+
+- *(deps)* Bump tokio-rustls from 0.26.5 to 0.26.6 (#2100) ([#2100](https://github.com/nolabs-ai/nono/pull/2100))
+
+- *(deps)* Bump ignore from 0.4.30 to 0.4.33 (#2097) ([#2097](https://github.com/nolabs-ai/nono/pull/2097))
+
+- *(deps)* Bump sha1 from 0.10.7 to 0.11.0 (#2098) ([#2098](https://github.com/nolabs-ai/nono/pull/2098))
+
+- *(deps)* Bump h2 from 0.4.19 to 0.4.20 (#2099) ([#2099](https://github.com/nolabs-ai/nono/pull/2099))
+
+- *(deps)* Bump zeroize from 1.9.0 to 1.9.1 (#2096) ([#2096](https://github.com/nolabs-ai/nono/pull/2096))
+
+- *(deps)* Bump actions/download-artifact from 8.0.1 to 8.0.2 (#2101) ([#2101](https://github.com/nolabs-ai/nono/pull/2101))
+
+- *(deps)* Bump actions/upload-artifact from 7.0.1 to 7.0.2 (#2102) ([#2102](https://github.com/nolabs-ai/nono/pull/2102))
+
+- *(deps)* Bump sigstore-sign from 0.11.0 to 0.14.0 (#2060) ([#2060](https://github.com/nolabs-ai/nono/pull/2060))
+
+- *(deps)* Bump jsonc-parser from 0.33.1 to 0.34.0 (#2059) ([#2059](https://github.com/nolabs-ai/nono/pull/2059))
+
+- *(deps)* Bump thiserror from 2.0.20 to 2.0.21 (#2058) ([#2058](https://github.com/nolabs-ai/nono/pull/2058))
+
+- *(deps)* Bump der from 0.8.1 to 0.8.2 (#2056) ([#2056](https://github.com/nolabs-ai/nono/pull/2056))
+
+- *(deps)* Bump clap_complete from 4.6.9 to 4.6.11 (#2057) ([#2057](https://github.com/nolabs-ai/nono/pull/2057))
+
+
+### Documentation
+
+- Clarify OpenCode versions and refresh Pi quickstart (#2103) ([#2103](https://github.com/nolabs-ai/nono/pull/2103))
+
+- *(neps)* Add NEP-0002 for invocation-scoped commands (#1971) ([#1971](https://github.com/nolabs-ai/nono/pull/1971))
+
+- *(neps)* Add nep-0005 for windows enforcement backend (#2032) ([#2032](https://github.com/nolabs-ai/nono/pull/2032))
+
+
+### Features
+
+- *(cli)* Add command-level keychain_access grant for macOS (#2093) ([#2093](https://github.com/nolabs-ai/nono/pull/2093))
+
+- *(tool-sandbox)* Per-command aws_auth + fix scoped-proxy CA env ordering (#2024) ([#2024](https://github.com/nolabs-ai/nono/pull/2024))
+
+
+### Miscellaneous
+
+- *(nix)* Update prebuilt hashes for v0.79.0 (#2028) ([#2028](https://github.com/nolabs-ai/nono/pull/2028))
+
 ## [0.79.0] - 2026-09-30
 
 ### Security Advisories

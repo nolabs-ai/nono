@@ -39,7 +39,7 @@ sigstore-verify = { version = "0.14.0", default-features = false }
 
 # Hashing
 sha2 = "0.11"
-sha1 = "0.10"
+sha1 = "0.11"
 uuid = { version = "1", features = ["serde", "v7"] }
 
 # Filesystem walking

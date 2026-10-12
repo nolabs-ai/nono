@@ -159,10 +159,17 @@ impl From<CapabilityRequest> for ApprovalRequest {
 /// The supervisor's response to a [`CapabilityRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ApprovalDecision {
-    /// Access was granted. The supervisor will pass an fd via `SCM_RIGHTS`.
+    /// Access was granted for this request. The supervisor will pass an fd via
+    /// `SCM_RIGHTS` for capability requests.
+    ///
+    /// For network connections this is single-use: never cache it locally or
+    /// share it with concurrent waiting connections. Each new connection must
+    /// consult the backend again, allowing remote policy changes or revocations.
     Granted,
     /// Access was granted, and the grant should persist for the remainder of
-    /// the session so equivalent later requests are not re-prompted.
+    /// the session so equivalent later requests are not re-prompted. For network
+    /// approvals this explicitly permits local reuse without consulting the
+    /// backend again; each connection still undergoes its own address checks.
     ///
     /// Callers that do not implement session caching (e.g. the L7 endpoint
     /// approval path) MUST treat this exactly as [`ApprovalDecision::Granted`];

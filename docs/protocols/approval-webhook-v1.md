@@ -60,6 +60,13 @@ Both variants `POST` the same JSON body:
 Every variant also carries `request_id`, `session_id`, `reason` (nullable), and
 `child_pid`.
 
+For CONNECT network approvals, `request_id` is a UUID v4 generated once per
+new approval attempt. It is independent of `host`, `port`, and `session_id`:
+subsequent connections, concurrent single-use attempts, and separate sessions
+or devices must not reuse an earlier attempt's identity. Retries of the same
+attempt retain the original body and ID; signed polls use that ID in the URL.
+The webhook client does not automatically retry failed HTTP requests.
+
 Headers on every request, in both variants:
 
 ```text
@@ -87,10 +94,37 @@ The endpoint answers the `POST` with `2xx` and a JSON body:
 
 Accepted spellings for `decision` are `grant`, `granted`, `approve`,
 `approved`, `allow`, `allowed`; `deny`, `denied`, `reject`, `rejected`,
-`block`, `blocked`; and `timeout`, `timed_out`. Any other value is an error and
+`block`, `blocked`; `grant_session`, `granted_session`, `allow_session`,
+`always_allow`; `deny_session`, `denied_session`, `always_deny`; and `timeout`, `timed_out`. Any other value is an error and
 therefore a denial. A non-`2xx` status is a denial whose reason names the
 status and the elapsed time. The connection stays open until the endpoint
 answers or `timeout_secs` elapses.
+
+### CONNECT grant scope and local caching
+
+An ordinary `granted` / `allow` response (`ApprovalDecision::Granted`) authorizes
+only the connection that initiated the attempt. It is never cached locally.
+Each new connection consults the backend, so remote policy changes and
+revocations take effect on the next connection. If concurrent connections are
+waiting on that attempt, its single-use grant authorizes only the leader;
+followers start new approval attempts with fresh UUIDs.
+
+`allow_session` / `always_allow` (`GrantedForSession`) explicitly authorizes
+reuse for the remaining proxy session for the same normalized `(host, port)`.
+The backend must understand that later connections can proceed without further
+consultation; a remote revocation will not invalidate this local session grant.
+It also authorizes waiting followers. Every authorized connection, whether
+single-use, a follower, or cached, still independently resolves and checks its
+addresses against the SSRF guard. Session denials (`deny_session` /
+`always_deny`) are cached for the same scope; ordinary denials are not cached.
+
+In an `all` backend chain, every backend must grant for the session before the
+combined result can be `GrantedForSession`. Any ordinary `Granted` limits the
+combined result to single-use, regardless of backend order. An `any` chain
+uses the scope of its first granting backend. Callers without session caching,
+such as L7 endpoint approvals, treat a session grant as an ordinary grant.
+These session response spellings apply to the unsigned response contract;
+the signed `state: "granted"` contract below grants only the current attempt.
 
 ## Signed variant
 

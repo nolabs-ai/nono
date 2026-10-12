@@ -2953,6 +2953,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
+ "uuid",
  "webpki-roots",
  "x509-parser",
  "zeroize",

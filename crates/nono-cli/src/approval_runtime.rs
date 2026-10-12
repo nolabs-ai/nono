@@ -583,14 +583,14 @@ impl ApprovalBackend for ChainApproval {
 
 impl ChainApproval {
     fn request_all(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
-        // A unanimous grant carries session scope if any backend granted for the
-        // session, so the caller can cache it. A session-scoped denial from any
-        // backend short-circuits and propagates so the denial is cached too.
-        let mut grant_for_session = false;
+        // A unanimous grant carries session scope only if every backend grants
+        // for the session. A single-use grant must never be widened. A session
+        // denial short-circuits and propagates so the denial is cached too.
+        let mut grant_for_session = !self.backends.is_empty();
         for backend in &self.backends {
             match backend.request_approval(request)? {
-                ApprovalDecision::Granted => {}
-                ApprovalDecision::GrantedForSession => grant_for_session = true,
+                ApprovalDecision::Granted => grant_for_session = false,
+                ApprovalDecision::GrantedForSession => {}
                 ApprovalDecision::Denied { reason } => {
                     return Ok(ApprovalDecision::Denied {
                         reason: format!(
@@ -707,28 +707,45 @@ mod tests {
     }
 
     #[test]
-    fn chain_all_carries_session_scope_when_a_backend_grants_for_session() {
-        // Every backend grants; one grants for the session, so the unanimous
-        // result is session-scoped and the caller can cache it.
-        let chain = ChainApproval {
-            name: "all".to_string(),
-            mode: ApprovalChainMode::All,
-            backends: vec![
-                Arc::new(StaticBackend {
-                    name: "a",
-                    decision: ApprovalDecision::Granted,
-                }),
-                Arc::new(StaticBackend {
-                    name: "b",
-                    decision: ApprovalDecision::GrantedForSession,
-                }),
+    fn chain_all_uses_the_narrowest_grant_scope_in_either_order() {
+        for decisions in [
+            [ApprovalDecision::Granted, ApprovalDecision::Granted],
+            [
+                ApprovalDecision::Granted,
+                ApprovalDecision::GrantedForSession,
             ],
-        };
-
-        assert!(matches!(
-            chain.request_approval(&request()).unwrap(),
-            ApprovalDecision::GrantedForSession
-        ));
+            [
+                ApprovalDecision::GrantedForSession,
+                ApprovalDecision::Granted,
+            ],
+            [
+                ApprovalDecision::GrantedForSession,
+                ApprovalDecision::GrantedForSession,
+            ],
+        ] {
+            let all_session = decisions
+                .iter()
+                .all(|d| matches!(d, ApprovalDecision::GrantedForSession));
+            let chain = ChainApproval {
+                name: "all".to_string(),
+                mode: ApprovalChainMode::All,
+                backends: decisions
+                    .into_iter()
+                    .map(|decision| {
+                        Arc::new(StaticBackend {
+                            name: "child",
+                            decision,
+                        }) as Arc<dyn ApprovalBackend>
+                    })
+                    .collect(),
+            };
+            let decision = chain.request_approval(&request()).unwrap();
+            assert!(decision.is_granted());
+            assert_eq!(
+                matches!(decision, ApprovalDecision::GrantedForSession),
+                all_session
+            );
+        }
     }
 
     #[test]
@@ -1277,3 +1294,7 @@ mod tests {
         assert_eq!(fixture.body_digest, empty_digest);
     }
 }
+
+#[cfg(test)]
+#[path = "approval_runtime_network_tests.rs"]
+mod network_tests;

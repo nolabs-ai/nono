@@ -44,7 +44,7 @@ const NETWORK_APPROVAL_BACKSTOP_GRACE: Duration = Duration::from_secs(30);
 const NETWORK_APPROVAL_UNBOUNDED_BACKSTOP: Duration = Duration::from_secs(600);
 
 /// Map coordinating in-flight approval prompts, keyed by `(host, port)`, so
-/// concurrent first-touch connections to the same host share a single prompt.
+/// concurrent connections await the active prompt before attempting their own.
 pub type InFlightMap = Mutex<HashMap<(String, u16), Arc<InFlight>>>;
 
 /// Shared slot coordinating concurrent first-touch approval attempts for one
@@ -52,13 +52,15 @@ pub type InFlightMap = Mutex<HashMap<(String, u16), Arc<InFlight>>>;
 ///
 /// The first connection to a not-yet-decided host (the leader) fires the
 /// prompt; concurrent connections (followers) await the leader's decision
-/// instead of firing a duplicate prompt. This is a UX de-duplication only —
+/// instead of firing a duplicate prompt. Only a session grant authorizes
+/// followers; a single-use grant makes them enter a new approval attempt.
+/// This is a UX de-duplication only —
 /// each connection still independently re-resolves and re-vets the host against
 /// the SSRF guard before connecting, so coalescing the *decision* never widens
 /// the security check.
 pub struct InFlight {
-    /// `None` until the leader decides, then `Some(allow)`.
-    tx: watch::Sender<Option<bool>>,
+    /// `None` until the leader decides, retaining the scope of its decision.
+    tx: watch::Sender<Option<ApprovalDecision>>,
 }
 
 impl InFlight {
@@ -68,26 +70,57 @@ impl InFlight {
         })
     }
 
-    /// Publish the leader's decision to any waiting followers.
-    fn resolve(&self, allow: bool) {
-        // Ignored error means no followers are listening — nothing to do.
-        let _ = self.tx.send(Some(allow));
+    /// Publish even when no follower has subscribed yet.
+    fn resolve(&self, decision: ApprovalDecision) {
+        self.tx.send_replace(Some(decision));
     }
 
-    /// Await the leader's decision. Returns the leader's `allow` boolean, or
-    /// `false` (fail secure) if the leader vanished without deciding.
-    async fn await_decision(&self) -> bool {
+    /// Await the leader's decision. Cancellation is published by its guard.
+    async fn await_decision(&self) -> ApprovalDecision {
         let mut rx = self.tx.subscribe();
         loop {
-            if let Some(allow) = *rx.borrow_and_update() {
-                return allow;
+            if let Some(decision) = rx.borrow_and_update().clone() {
+                return decision;
             }
             if rx.changed().await.is_err() {
-                // All senders dropped without a decision (leader task gone):
-                // deny rather than hang or fail open.
-                return false;
+                return ApprovalDecision::Denied {
+                    reason: "network approval leader disappeared".to_string(),
+                };
             }
         }
+    }
+}
+
+/// Release the slot and wake followers even if the leader future is cancelled.
+/// Followers retain an Arc to the sender, so channel closure alone cannot
+/// detect a vanished leader.
+struct InFlightLeader<'a> {
+    map: &'a InFlightMap,
+    key: (String, u16),
+    shared: Arc<InFlight>,
+    decision: Option<ApprovalDecision>,
+}
+
+impl InFlightLeader<'_> {
+    fn resolve(mut self, decision: ApprovalDecision) {
+        self.decision = Some(decision);
+    }
+}
+
+impl Drop for InFlightLeader<'_> {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        // Remove before waking followers so a single-use grant cannot make
+        // them rejoin the completed attempt. Keep election locked until the
+        // decision is published.
+        map.remove(&self.key);
+        self.shared.resolve(
+            self.decision
+                .take()
+                .unwrap_or_else(|| ApprovalDecision::Denied {
+                    reason: "network approval leader cancelled".to_string(),
+                }),
+        );
     }
 }
 
@@ -105,7 +138,7 @@ pub struct NetworkApproval<'a> {
     /// suppress re-prompting for the rest of the session.
     pub session_decisions: &'a Mutex<HashMap<(String, u16), bool>>,
     /// In-flight prompt coordination so concurrent first-touch connections to
-    /// the same host share one prompt instead of stacking duplicate prompts.
+    /// the same host await the active prompt. Only session grants are shared.
     pub in_flight: &'a InFlightMap,
     /// Session identifier recorded in the approval request.
     pub session_id: &'a str,
@@ -354,6 +387,9 @@ enum ApprovalOutcome {
 ///
 /// Concurrent first-touch connections to the same host coalesce onto a single
 /// prompt: the first (leader) prompts; the rest (followers) await its decision.
+/// A single-use grant authorizes only the leader; followers re-enter election
+/// for a fresh attempt. Ordinary grants are never cached, so each connection
+/// consults the backend again for policy changes or revocations.
 /// Every authorized connection independently re-resolves and re-vets the host
 /// (see [`resolve_approved`]), so coalescing the decision never widens the SSRF
 /// check.
@@ -381,42 +417,40 @@ async fn maybe_approve_host(
     let backend_name = approval.backend.backend_name().to_string();
     let key = (host.to_string(), port);
 
-    // Fast path: a session-scoped decision already exists — no re-prompt.
-    if let Some(allow) = approval.cached_decision(&key) {
-        if !allow {
-            debug!("network approval: {host}:{port} denied by session cache");
-        }
-        return outcome_from_allow(allow, backend_name, filter, host, port).await;
-    }
-
-    // Coalesce concurrent first-touch prompts: become the leader that prompts,
-    // or a follower that awaits the leader's decision.
-    let leader = {
-        let mut map = approval.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        match map.get(&key) {
-            Some(existing) => Err(Arc::clone(existing)),
-            None => {
-                let shared = InFlight::new();
-                map.insert(key.clone(), Arc::clone(&shared));
-                Ok(shared)
+    let allow = loop {
+        // Check the cache while holding the election lock: a leader may have
+        // completed a session decision since this connection first arrived.
+        let leader = {
+            let mut map = approval.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(allow) = approval.cached_decision(&key) {
+                break allow;
             }
-        }
-    };
+            match map.get(&key) {
+                Some(existing) => Err(Arc::clone(existing)),
+                None => {
+                    let shared = InFlight::new();
+                    map.insert(key.clone(), Arc::clone(&shared));
+                    Ok(InFlightLeader {
+                        map: approval.in_flight,
+                        key: key.clone(),
+                        shared,
+                        decision: None,
+                    })
+                }
+            }
+        };
 
-    let allow = match leader {
-        Err(follower) => follower.await_decision().await,
-        Ok(shared) => {
-            let allow = run_prompt(approval, &backend_name, host, port, &key).await;
-            // Publish to any waiting followers, then release the slot so a
-            // later burst re-prompts. Both happen unconditionally so a follower
-            // can never be left waiting on a vanished leader.
-            shared.resolve(allow);
-            approval
-                .in_flight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&key);
-            allow
+        match leader {
+            Err(follower) => match follower.await_decision().await {
+                ApprovalDecision::Granted => continue,
+                decision => break decision.is_granted(),
+            },
+            Ok(leader) => {
+                let decision = run_prompt(approval, &backend_name, host, port, &key).await;
+                let allow = decision.is_granted();
+                leader.resolve(decision);
+                break allow;
+            }
         }
     };
 
@@ -424,7 +458,7 @@ async fn maybe_approve_host(
 }
 
 /// Run the interactive prompt as the leader and return the authorization
-/// boolean, populating the session cache for session-scoped decisions.
+/// decision, populating the session cache only for session-scoped decisions.
 ///
 /// `request_approval` is synchronous and may block (webhook HTTP, terminal
 /// read), so it never runs on a Tokio worker thread — it is
@@ -439,9 +473,10 @@ async fn run_prompt(
     host: &str,
     port: u16,
     key: &(String, u16),
-) -> bool {
+) -> ApprovalDecision {
     let request = ApprovalRequest::Network {
-        request_id: format!("net-{host}:{port}"),
+        // One identity per attempt; the backend retains it across retries/polls.
+        request_id: uuid::Uuid::new_v4().to_string(),
         host: host.to_string(),
         port,
         protocol: "tcp".to_string(),
@@ -466,30 +501,33 @@ async fn run_prompt(
         Ok(Ok(Ok(decision))) => decision,
         Ok(Ok(Err(e))) => {
             warn!("network approval backend '{backend_name}' error for {host}:{port}: {e}");
-            return false;
+            return ApprovalDecision::Denied {
+                reason: e.to_string(),
+            };
         }
         Ok(Err(e)) => {
             warn!("network approval task failed for {host}:{port}: {e}");
-            return false;
+            return ApprovalDecision::Denied {
+                reason: e.to_string(),
+            };
         }
         Err(_) => {
             warn!("network approval timed out for {host}:{port}");
-            return false;
+            return ApprovalDecision::Timeout;
         }
     };
 
-    match decision {
-        ApprovalDecision::Granted => true,
+    match &decision {
         ApprovalDecision::GrantedForSession => {
             approval.remember(key.clone(), true);
-            true
         }
         ApprovalDecision::DeniedForSession => {
             approval.remember(key.clone(), false);
-            false
         }
-        ApprovalDecision::Denied { .. } | ApprovalDecision::Timeout => false,
+        ApprovalDecision::Granted | ApprovalDecision::Denied { .. } | ApprovalDecision::Timeout => {
+        }
     }
+    decision
 }
 
 /// Turn an authorization boolean into an [`ApprovalOutcome`], re-resolving and
@@ -1188,6 +1226,156 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "concurrent first-touch prompts must coalesce onto a single backend call"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_decision_is_retained_for_a_late_subscriber() {
+        let shared = InFlight::new();
+        // No receiver exists at publication time.
+        shared.resolve(ApprovalDecision::Granted);
+        let decision = tokio::time::timeout(Duration::from_secs(1), shared.await_decision())
+            .await
+            .unwrap();
+        assert!(matches!(decision, ApprovalDecision::Granted));
+    }
+
+    struct GatedBackend {
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl nono::ApprovalBackend for GatedBackend {
+        fn request_approval(&self, _: &ApprovalRequest) -> nono::Result<ApprovalDecision> {
+            if self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .is_ok()
+            {
+                Ok(ApprovalDecision::GrantedForSession)
+            } else {
+                Ok(ApprovalDecision::Denied {
+                    reason: "test gate closed".to_string(),
+                })
+            }
+        }
+        fn backend_name(&self) -> &str {
+            "gated"
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_leader_denies_followers_and_releases_slot() {
+        use std::future::Future as _;
+        use std::task::Poll;
+        let (release, gate) = std::sync::mpsc::channel();
+        let backend: Arc<dyn nono::ApprovalBackend> = Arc::new(GatedBackend {
+            release: Mutex::new(gate),
+        });
+        let decisions = Mutex::new(HashMap::new());
+        let in_flight = empty_in_flight();
+        let approval = NetworkApproval {
+            backend: &backend,
+            session_decisions: &decisions,
+            in_flight: &in_flight,
+            session_id: "test",
+        };
+        let filter = ProxyFilter::new_strict(&[]);
+        let result = deny_not_allowed("127.0.0.1");
+        let mut leader = Box::pin(maybe_approve_host(
+            "127.0.0.1",
+            443,
+            &result,
+            Some(&approval),
+            &filter,
+        ));
+        let mut follower = Box::pin(maybe_approve_host(
+            "127.0.0.1",
+            443,
+            &result,
+            Some(&approval),
+            &filter,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(leader.as_mut().poll(cx).is_pending());
+            assert!(follower.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            in_flight
+                .lock()
+                .unwrap()
+                .values()
+                .map(Arc::strong_count)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        // Dropping the active future models task abortion/client cancellation.
+        drop(leader);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), follower)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outcome.is_denied());
+        assert!(in_flight.lock().unwrap().is_empty());
+        assert!(decisions.lock().unwrap().is_empty());
+        // The blocking backend may still finish, but its abandoned result can
+        // no longer populate the cache or authorize any connection.
+        release.send(()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_session_grant_still_vets_each_connections_addresses() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let backend: Arc<dyn nono::ApprovalBackend> = Arc::new(GatedBackend {
+            release: Mutex::new(gate),
+        });
+        let decisions = Mutex::new(HashMap::new());
+        let in_flight = empty_in_flight();
+        let approval = NetworkApproval {
+            backend: &backend,
+            session_decisions: &decisions,
+            in_flight: &in_flight,
+            session_id: "test",
+        };
+        let allowed = ProxyFilter::new_strict(&[]);
+        let denied = ProxyFilter::new_strict(&[]).with_denied_hosts(&["127.0.0.1".to_string()]);
+        let result = deny_not_allowed("127.0.0.1");
+        let ready = async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if in_flight
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .any(|slot| Arc::strong_count(slot) == 3)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            release.send(()).unwrap();
+        };
+        // Simulate a stricter re-vetting result for one connection. It must not
+        // inherit another connection's vetted addresses with the shared grant.
+        let (leader, follower, ()) = tokio::join!(
+            maybe_approve_host("127.0.0.1", 443, &result, Some(&approval), &allowed),
+            maybe_approve_host("127.0.0.1", 443, &result, Some(&approval), &denied),
+            ready,
+        );
+        assert!(matches!(leader.unwrap(), ApprovalOutcome::Approved { .. }));
+        assert!(follower.unwrap().is_denied());
+        // Cached session grants must go through the same per-connection check.
+        assert!(
+            maybe_approve_host("127.0.0.1", 443, &result, Some(&approval), &denied)
+                .await
+                .unwrap()
+                .is_denied()
         );
     }
 }

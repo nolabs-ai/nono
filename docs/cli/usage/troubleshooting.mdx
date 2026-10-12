@@ -352,20 +352,20 @@ nono run --profile my-profile -- my-app
 
 1. Run your command — nono will sandbox it and report any denials at exit:
    ```bash
-   nono run --profile nolabs-ai/opencode -- opencode
+   nono run --profile my-profile -- my-app
    ```
 
 2. If paths were blocked, nono reports them at exit with suggested fix flags:
    ```
    Sandbox denial: 2 paths blocked.
-     /home/user/.config/opencode (read)
-     /home/user/.cache/opencode (read+write)
-   Fix flags: --read ~/.config/opencode --allow ~/.cache/opencode
+     /home/user/shared-config (read)
+     /home/user/build-cache (read+write)
+   Fix flags: --read ~/shared-config --allow ~/build-cache
    ```
 
 3. Re-run with the suggested flags, or accept the prompt to save them as a profile patch:
    ```bash
-   nono run --read ~/.config/opencode --allow ~/.cache/opencode -- opencode
+   nono run --profile my-profile --read ~/shared-config --allow ~/build-cache -- my-app
    ```
 
 ---

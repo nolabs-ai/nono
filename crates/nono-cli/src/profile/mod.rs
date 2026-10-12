@@ -5301,7 +5301,8 @@ mod tests {
         // These profiles were removed from built-ins; they ship via registry packs:
         //   claude-code / claude → nolabs-ai/claude   (formerly always-further/claude, removed v0.43.0)
         //   codex               → nolabs-ai/codex    (formerly always-further/codex, removed v0.43.0)
-        //   opencode            → nolabs-ai/opencode (formerly always-further/opencode, removed)
+        //   opencode            → nolabs-ai/opencode (v2; removed)
+        //   opencode-v1         → nolabs-ai/opencode-v1
         //   openclaw            → nolabs-ai/openclaw (removed v0.71.0)
         //   swival              → jedisct1/swival   (removed v0.71.0; official namespace of Swival's creator)
         assert!(!profiles.contains(&"claude-code".to_string()));

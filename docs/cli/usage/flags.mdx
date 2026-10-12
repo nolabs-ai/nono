@@ -946,10 +946,10 @@ How long (in seconds) to wait for a detached session to become attachable before
 
 ```bash
 # Give a slow app 60 seconds to initialise
-nono run --detached --detach-timeout 60 --allow-cwd -- opencode
+nono run --detached --detach-timeout 60 --allow-cwd -- my-agent
 
 # Via environment variable
-NONO_DETACH_STARTUP_TIMEOUT=60 nono run --detached --allow-cwd -- opencode
+NONO_DETACH_STARTUP_TIMEOUT=60 nono run --detached --allow-cwd -- my-agent
 ```
 
 #### `--name`
@@ -1166,16 +1166,16 @@ Applies to `nono run` and `nono shell`. Not available on `nono wrap` (which uses
 
 ```bash
 # Kill the process if it hasn't become interactive after 10 seconds
-nono run --startup-timeout 10 --allow-cwd -- opencode
+nono run --startup-timeout 10 --allow-cwd -- my-agent
 
 # Disable the timeout entirely
-nono run --startup-timeout 0 --allow-cwd -- opencode
+nono run --startup-timeout 0 --allow-cwd -- my-agent
 
 # Via environment variable
-NONO_STARTUP_TIMEOUT=10 nono run --allow-cwd -- opencode
+NONO_STARTUP_TIMEOUT=10 nono run --allow-cwd -- my-agent
 ```
 
-No timeout is applied by default. When a known built-in profile exists for the binary (e.g. `opencode`, `claude`), the warning message also suggests the recommended profile.
+No timeout is applied by default. When a known registry pack exists for the binary (for example `claude`), the warning message also suggests the recommended profile.
 
 #### `--network-denial-audit-rate` and `--network-denial-audit-burst`
 

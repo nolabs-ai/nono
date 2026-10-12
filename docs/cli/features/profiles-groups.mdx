@@ -348,7 +348,7 @@ Some deny groups (like `deny_credentials`) are marked as required and cannot be 
     "name": "docker-agent",
     "version": "1.0.0"
   },
-  "extends": "opencode",
+  "extends": "nolabs-ai/claude",
   "filesystem": {
     "allow": ["$HOME/.docker"],
     "bypass_protection": ["$HOME/.docker"]
@@ -361,7 +361,7 @@ This allows access to `~/.docker` even though `deny_credentials` blocks it by de
 This is equivalent to the CLI flag `--bypass-protection`:
 
 ```bash
-nono run --profile nolabs-ai/opencode --allow ~/.docker --bypass-protection ~/.docker -- opencode
+nono run --profile nolabs-ai/claude --allow ~/.docker --bypass-protection ~/.docker -- claude
 ```
 
 #### Suppressing Save Suggestions Without Granting Access
@@ -819,19 +819,37 @@ nono run --profile nolabs-ai/codex -- codex
 
 **Special:** OAuth2 login support via `open_urls` (allows `https://auth.openai.com` and localhost). Profile opts into `allow_launch_services`.
 
-### opencode
+### OpenCode 2
 
 ```bash
-nono run --profile nolabs-ai/opencode -- opencode
+nono run --profile nolabs-ai/opencode -- opencode --standalone
 ```
 
 **Groups:** `user_caches_macos`, `user_caches_linux`, `node_runtime`, `opencode_linux`, `git_config`, `unlink_protection` (plus `default` groups)
 
-**Filesystem:** `~/.config/opencode`, `~/.cache/opencode`, `~/.local/share/opencode`, `~/.local/share/opentui` (all read+write), plus git config files from `git_config` group
+**Filesystem:** `~/.opencode` (read-only); OpenCode config, cache, data, state, and OpenTUI data (read+write); plus git config files from `git_config`
 
 **Network:** Allowed
 
 **CWD:** Read+write
+
+**Special:** Use `--standalone` to keep the OpenCode 2 server inside the sandbox. The pack disables project discovery and roots instruction initialization in the worktree to prevent denied parent-directory probes from breaking startup.
+
+### OpenCode 1
+
+```bash
+nono run --profile nolabs-ai/opencode-v1 -- opencode
+```
+
+**Groups:** Same runtime groups as the OpenCode 2 pack
+
+**Filesystem:** OpenCode installation, config, cache, data, state, and OpenTUI data (read+write), plus git config files
+
+**Network:** Allowed
+
+**CWD:** Read+write
+
+**Special:** Do not use `--standalone`; it is an OpenCode 2 flag. The v1 and v2 packs share plugin installation paths, so remove one before switching to the other.
 
 ### openclaw
 

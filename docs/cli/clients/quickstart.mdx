@@ -9,9 +9,11 @@ nono works with any CLI tool, but these guides walk through setup and best pract
 
 | Client | Profile | Network | Description |
 |--------|---------|---------|-------------|
+| [Pi](https://pi.dev) | `nolabs-ai/pi` | Allowed | Open-source, provider-neutral coding agent |
 | [Claude Code](/cli/clients/claude) | `nolabs-ai/claude` | Allowed | Anthropic's CLI coding agent |
-| [Codex](/cli/clients/codex) | `codex` | Allowed | OpenAI's CLI coding agent |
-| [OpenCode](/cli/clients/opencode) | `opencode` | Allowed | Open-source AI coding assistant |
+| [Codex](/cli/clients/codex) | `nolabs-ai/codex` | Allowed | OpenAI's CLI coding agent |
+| [OpenCode 2](/cli/clients/opencode) | `nolabs-ai/opencode` | Allowed | Current OpenCode release |
+| [OpenCode 1](/cli/clients/opencode) | `nolabs-ai/opencode-v1` | Allowed | Legacy OpenCode release |
 | [OpenClaw](/cli/clients/openclaw) | `nolabs-ai/openclaw` | Allowed | Multi-channel AI agent platform |
 
 ## Quick Start
@@ -25,14 +27,20 @@ nono run --profile <name> -- <command>
 For example:
 
 ```bash
+# Pi
+nono run --profile nolabs-ai/pi -- pi
+
 # Claude Code
 nono run --profile nolabs-ai/claude -- claude
 
 # Codex
 nono run --profile nolabs-ai/codex -- codex
 
-# OpenCode
-nono run --profile nolabs-ai/opencode -- opencode
+# OpenCode 2
+nono run --profile nolabs-ai/opencode -- opencode --standalone
+
+# OpenCode 1
+nono run --profile nolabs-ai/opencode-v1 -- opencode
 
 # OpenClaw gateway
 nono run --profile nolabs-ai/openclaw -- openclaw gateway

@@ -187,15 +187,15 @@ fn logical_workdir(
     Some(absolute.components().collect())
 }
 
-fn recommended_pack_profile(program: &Path) -> Option<&'static str> {
+fn recommended_pack_profile(program: &Path) -> Option<(&'static str, &'static [&'static str])> {
     let name = program.file_name()?.to_str()?;
     match name {
-        "claude" => Some("nolabs-ai/claude"),
-        "codex" => Some("nolabs-ai/codex"),
-        "opencode" => Some("nolabs-ai/opencode"),
-        "openclaw" => Some("nolabs-ai/openclaw"),
+        "claude" => Some(("nolabs-ai/claude", &[])),
+        "codex" => Some(("nolabs-ai/codex", &[])),
+        "opencode" => Some(("nolabs-ai/opencode", &["--standalone"])),
+        "openclaw" => Some(("nolabs-ai/openclaw", &[])),
         // swival ships under the creator's own namespace, not nolabs-ai.
-        "swival" => Some("jedisct1/swival"),
+        "swival" => Some(("jedisct1/swival", &[])),
         _ => None,
     }
 }
@@ -249,20 +249,26 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     // against comes from JSON, so it is valid UTF-8.
     let program_display = command[0].to_string_lossy().into_owned();
 
-    let known_builtin_profile = recommended_pack_profile(&resolved_program);
+    let known_pack_profile = recommended_pack_profile(&resolved_program);
     let recommended_profile = if flags.session.profile_name.is_none() {
-        known_builtin_profile
+        known_pack_profile
     } else {
         None
     };
+    let recommended_profile_ref = recommended_profile.map(|(pack_ref, _)| pack_ref);
 
     let recommended_program_name = resolved_program
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(&program_display);
 
-    if let Some(pack_ref) = recommended_profile {
-        output::print_profile_hint(recommended_program_name, pack_ref, flags.silent);
+    if let Some((pack_ref, command_args)) = recommended_profile {
+        output::print_profile_hint(
+            recommended_program_name,
+            pack_ref,
+            command_args,
+            flags.silent,
+        );
     }
     let plain_domain_entries = proxy
         .and_then(|p| p.domain_filter.as_ref())
@@ -726,7 +732,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             .session
             .profile_name
             .as_deref()
-            .or(recommended_profile),
+            .or(recommended_profile_ref),
         ignored_denial_paths: &flags.ignored_denial_paths,
         suppressed_system_service_operations: &flags.suppressed_system_service_operations,
         startup_timeout: flags
@@ -735,7 +741,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             .map(|secs| exec_strategy::StartupTimeoutConfig {
                 timeout: Duration::from_secs(secs),
                 program: recommended_program_name,
-                recommended_profile: known_builtin_profile,
+                recommended_profile: known_pack_profile.map(|(pack_ref, _)| pack_ref),
             }),
         #[cfg(target_os = "linux")]
         seccomp_policy: exec_strategy::SeccompPolicy {
@@ -1059,11 +1065,15 @@ mod tests {
     fn recommended_pack_profile_matches_known_agent_commands() {
         assert_eq!(
             recommended_pack_profile(Path::new("/usr/local/bin/claude")),
-            Some("nolabs-ai/claude")
+            Some(("nolabs-ai/claude", &[] as &[&str]))
         );
         assert_eq!(
             recommended_pack_profile(Path::new("/usr/local/bin/codex")),
-            Some("nolabs-ai/codex")
+            Some(("nolabs-ai/codex", &[] as &[&str]))
+        );
+        assert_eq!(
+            recommended_pack_profile(Path::new("/usr/local/bin/opencode")),
+            Some(("nolabs-ai/opencode", &["--standalone"] as &[&str]))
         );
     }
 

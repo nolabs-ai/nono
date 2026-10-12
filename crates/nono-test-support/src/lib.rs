@@ -106,7 +106,9 @@ impl NonoTest {
     }
 
     /// A `nono` invocation with a hermetic environment and no arguments.
-    fn hermetic_command(&self) -> Command {
+    ///
+    /// Public for subcommands that have no typed builder yet.
+    pub fn hermetic_command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
 
         // Fail secure: strip the whole `NONO_*` / `XDG_*` namespace.

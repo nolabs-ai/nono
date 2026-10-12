@@ -22,6 +22,28 @@ pub(crate) struct PreparedProfileSave {
     pub(crate) profile_name: String,
     pub(crate) profile_path: PathBuf,
     pub(crate) profile: profile::Profile,
+    pub(crate) patch: profile::Profile,
+}
+
+/// Where a save prompt writes its rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SaveTarget {
+    /// An existing profile file the session ran with.
+    File(PathBuf),
+    /// A user profile the user names at the prompt.
+    NewUserProfile,
+}
+
+/// Save targets in precedence order. A new user profile is offered only when
+/// the session ran with no writable profile file.
+fn save_targets(save_files: &[profile::ProfileSourceFile]) -> Vec<SaveTarget> {
+    if save_files.is_empty() {
+        return vec![SaveTarget::NewUserProfile];
+    }
+    save_files
+        .iter()
+        .map(|file| SaveTarget::File(file.path.clone()))
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -271,7 +293,7 @@ pub(crate) fn offer_save_run_profile(offer: &ProfileSaveOffer<'_>) -> Result<()>
     )?
     else {
         // No filesystem patch — but we may still have URL denials
-        return offer_url_only_save(offer.url_denials, offer.command, offer.compared_profile);
+        return offer_url_only_save(offer);
     };
 
     // Merge URL grants into the filesystem patch profile so extract_denial_items
@@ -292,32 +314,23 @@ pub(crate) fn offer_save_run_profile(offer: &ProfileSaveOffer<'_>) -> Result<()>
             let Some(combined_patch) = build_combined_patch_from_items(&items) else {
                 return Ok(());
             };
-            offer_save_with_patch(
-                &combined_patch,
-                &cmd_name,
-                offer.command,
-                offer.compared_profile,
-            )
+            offer_save_with_patch(&combined_patch, &cmd_name, offer)
         }
-        None => offer_save_text_prompt(&patch, &cmd_name, offer.command, offer.compared_profile),
+        None => offer_save_text_prompt(&patch, &cmd_name, offer),
     }
 }
 
 /// Offer profile save when only URL denials exist (no filesystem patch).
-fn offer_url_only_save(
-    url_denials: &[UrlDenialRecord],
-    command: &[std::ffi::OsString],
-    compared_profile: Option<&str>,
-) -> Result<()> {
-    if url_denials.is_empty() {
+fn offer_url_only_save(offer: &ProfileSaveOffer<'_>) -> Result<()> {
+    if offer.url_denials.is_empty() {
         return Ok(());
     }
 
-    let Some(url_patch) = build_url_patch(url_denials) else {
+    let Some(url_patch) = build_url_patch(offer.url_denials) else {
         return Ok(());
     };
 
-    let Some(cmd_name) = offer_command_name(command) else {
+    let Some(cmd_name) = offer_command_name(offer.command) else {
         return Ok(());
     };
 
@@ -326,17 +339,16 @@ fn offer_url_only_save(
             let Some(combined_patch) = build_combined_patch_from_items(&items) else {
                 return Ok(());
             };
-            offer_save_with_patch(&combined_patch, &cmd_name, command, compared_profile)
+            offer_save_with_patch(&combined_patch, &cmd_name, offer)
         }
-        None => offer_save_text_prompt(&url_patch, &cmd_name, command, compared_profile),
+        None => offer_save_text_prompt(&url_patch, &cmd_name, offer),
     }
 }
 
 fn offer_save_with_patch(
     patch: &profile::Profile,
     cmd_name: &str,
-    command: &[std::ffi::OsString],
-    compared_profile: Option<&str>,
+    offer: &ProfileSaveOffer<'_>,
 ) -> Result<()> {
     let has_overrides = patch_has_policy_overrides(patch);
     if has_overrides
@@ -348,42 +360,21 @@ fn offer_save_with_patch(
         return Ok(());
     }
 
-    let has_suppressions = !patch.filesystem.suppress_save_prompt.is_empty();
-
-    if let Some(existing_profile) = compared_profile
-        .filter(|name| profile::is_valid_profile_name(name) && profile::is_user_override(name))
-    {
-        let prepared =
-            prepare_profile_save_from_patch(patch, cmd_name, existing_profile, compared_profile)?;
-        write_profile(&prepared)?;
-        print_profile_save(&prepared, command);
-        if has_suppressions {
-            print_suppression_save_note(patch);
-        }
-        return Ok(());
-    }
-
-    let suggested = suggested_run_profile_name(compared_profile, cmd_name);
-    let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
+    let Some(target) = choose_save_target(
+        save_targets(offer.profile_save_files),
+        top_level_profile(offer.profile_save_files),
+        &mut TtyPrompt,
+    )?
+    else {
         return Ok(());
     };
-
-    let prepared =
-        prepare_profile_save_from_patch(patch, cmd_name, &profile_name, compared_profile)?;
-    write_profile(&prepared)?;
-    print_profile_save(&prepared, command);
-    if has_suppressions {
-        print_suppression_save_note(patch);
-    }
-
-    Ok(())
+    save_patch_to_target(&target, patch, cmd_name, offer)
 }
 
 fn offer_save_text_prompt(
     patch: &profile::Profile,
     cmd_name: &str,
-    command: &[std::ffi::OsString],
-    compared_profile: Option<&str>,
+    offer: &ProfileSaveOffer<'_>,
 ) -> Result<()> {
     let has_overrides = patch_has_policy_overrides(patch);
     let suppress_patch = build_suppress_save_prompt_patch(patch);
@@ -392,51 +383,175 @@ fn offer_save_text_prompt(
     prompt_println("");
     print_patch_preview(patch);
 
-    if let Some(existing_profile) = compared_profile
-        .filter(|name| profile::is_valid_profile_name(name) && profile::is_user_override(name))
-    {
-        let choice = prompt_profile_save_choice(Some(existing_profile), suppress_patch.is_some())?;
-        let Some(selected_patch) =
-            selected_profile_save_patch(choice, patch, suppress_patch.as_ref(), has_overrides)?
-        else {
-            return Ok(());
-        };
-
-        let prepared = prepare_profile_save_from_patch(
-            selected_patch,
-            cmd_name,
-            existing_profile,
-            compared_profile,
-        )?;
-        write_profile(&prepared)?;
-        print_profile_save(&prepared, command);
-        if choice == ProfileSaveChoice::Suppress {
-            print_suppression_save_note(selected_patch);
-        }
-        return Ok(());
-    }
-
-    let choice = prompt_profile_save_choice(None, suppress_patch.is_some())?;
+    let targets = save_targets(offer.profile_save_files);
+    let choice = prompt_profile_save_choice(&targets, suppress_patch.is_some(), &mut TtyPrompt)?;
     let Some(selected_patch) =
         selected_profile_save_patch(choice, patch, suppress_patch.as_ref(), has_overrides)?
     else {
         return Ok(());
     };
 
-    let suggested = suggested_run_profile_name(compared_profile, cmd_name);
-    let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
+    let Some(target) = choose_save_target(
+        targets,
+        top_level_profile(offer.profile_save_files),
+        &mut TtyPrompt,
+    )?
+    else {
         return Ok(());
     };
+    save_patch_to_target(&target, selected_patch, cmd_name, offer)
+}
 
-    let prepared =
-        prepare_profile_save_from_patch(selected_patch, cmd_name, &profile_name, compared_profile)?;
-    write_profile(&prepared)?;
-    print_profile_save(&prepared, command);
-    if choice == ProfileSaveChoice::Suppress {
-        print_suppression_save_note(selected_patch);
+/// The top-level profile's file, when it is one of the writable save files.
+fn top_level_profile(save_files: &[profile::ProfileSourceFile]) -> Option<&Path> {
+    save_files
+        .iter()
+        .find(|file| file.top_level)
+        .map(|file| file.path.as_path())
+}
+
+/// A lone target is written without asking only when it is the top-level
+/// profile; a base reached through `--extends` under a pack or built-in is
+/// shared, so the user picks it explicitly.
+fn save_target_menu_needed(files: &[PathBuf], top_level: Option<&Path>) -> bool {
+    match files {
+        [] => false,
+        [only] => Some(only.as_path()) != top_level,
+        _ => true,
     }
+}
 
+/// The target to save to: the top-level profile when it is the only writable
+/// file, otherwise the user's menu choice. `None` when the user skips.
+fn choose_save_target(
+    targets: Vec<SaveTarget>,
+    top_level: Option<&Path>,
+    io: &mut impl PromptLines,
+) -> Result<Option<SaveTarget>> {
+    let files: Vec<PathBuf> = targets
+        .iter()
+        .filter_map(|target| match target {
+            SaveTarget::File(path) => Some(path.clone()),
+            SaveTarget::NewUserProfile => None,
+        })
+        .collect();
+    if !save_target_menu_needed(&files, top_level) {
+        return Ok(targets.into_iter().next());
+    }
+    Ok(prompt_save_target(&files, top_level, io)?.map(SaveTarget::File))
+}
+
+fn render_save_target_menu(files: &[PathBuf], top_level: Option<&Path>) -> String {
+    let paths: Vec<String> = files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    let width = paths
+        .iter()
+        .map(|path| path.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut menu = String::from("Save the selected rules to:\n");
+    for (index, (file, path)) in files.iter().zip(&paths).enumerate() {
+        let label = if Some(file.as_path()) == top_level {
+            "this profile"
+        } else {
+            "base — applies to every profile that extends it"
+        };
+        menu.push_str(&format!("  {}) {path:<width$}    ({label})\n", index + 1));
+    }
+    menu.push_str("Choice [1]: ");
+    menu
+}
+
+/// `Some(Some(i))` picks file `i`, `Some(None)` skips, `None` is invalid input.
+fn parse_save_target_choice(input: &str, count: usize) -> Option<Option<usize>> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" => Some(Some(0)),
+        "skip" => Some(None),
+        number => number
+            .parse::<usize>()
+            .ok()
+            .filter(|choice| (1..=count).contains(choice))
+            .map(|choice| Some(choice - 1)),
+    }
+}
+
+/// `input` is the raw line read, so an empty string means the input closed
+/// (EOF) and cancels, while Enter arrives as a newline and picks file 1.
+fn chosen_save_target(files: &[PathBuf], input: &str) -> Option<Option<PathBuf>> {
+    if input.is_empty() {
+        return Some(None);
+    }
+    parse_save_target_choice(input, files.len())
+        .map(|choice| choice.and_then(|index| files.get(index).cloned()))
+}
+
+fn prompt_save_target(
+    files: &[PathBuf],
+    top_level: Option<&Path>,
+    io: &mut impl PromptLines,
+) -> Result<Option<PathBuf>> {
+    let menu = render_save_target_menu(files, top_level);
+    let (options, choice_prompt) = menu.rsplit_once('\n').unwrap_or(("", menu.as_str()));
+    for line in options.lines() {
+        io.println(line);
+    }
+    loop {
+        io.print(choice_prompt);
+        let input = io.read_line()?;
+        if let Some(choice) = chosen_save_target(files, &input) {
+            return Ok(choice);
+        }
+        let help = format!(
+            "Enter a number from 1 to {}, press Enter for 1, or type skip.",
+            files.len()
+        );
+        io.println(&format!("{}", help.red()));
+    }
+}
+
+/// Write `patch` to `target`, prompting for a name when it is a new user
+/// profile, and report the save.
+fn save_patch_to_target(
+    target: &SaveTarget,
+    patch: &profile::Profile,
+    cmd_name: &str,
+    offer: &ProfileSaveOffer<'_>,
+) -> Result<()> {
+    let Some(prepared) = prepare_save_to_target(target, patch, cmd_name, offer.compared_profile)?
+    else {
+        return Ok(());
+    };
+    write_profile(&prepared)?;
+    print_profile_save(&prepared, offer.command);
+    print_suppression_save_note(patch);
     Ok(())
+}
+
+/// Prepare the save of `patch` to `target`. `None` when the user cancels the
+/// new-profile name prompt.
+fn prepare_save_to_target(
+    target: &SaveTarget,
+    patch: &profile::Profile,
+    cmd_name: &str,
+    compared_profile: Option<&str>,
+) -> Result<Option<PreparedProfileSave>> {
+    match target {
+        SaveTarget::File(path) => {
+            let path_text = path.display().to_string();
+            let run_with = compared_profile.unwrap_or(&path_text);
+            prepare_profile_save_to_file(patch, path, run_with).map(Some)
+        }
+        SaveTarget::NewUserProfile => {
+            let suggested = suggested_run_profile_name(compared_profile, cmd_name);
+            let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
+                return Ok(None);
+            };
+            prepare_profile_save_from_patch(patch, cmd_name, &profile_name, compared_profile)
+                .map(Some)
+        }
+    }
 }
 
 fn selected_profile_save_patch<'a>(
@@ -544,32 +659,49 @@ fn prompt_profile_name(suggested: Option<&str>) -> Result<Option<String>> {
     }
 }
 
-fn prompt_profile_save_choice(
-    existing_profile: Option<&str>,
-    can_suppress: bool,
-) -> Result<ProfileSaveChoice> {
-    loop {
-        let prompt = match (existing_profile, can_suppress) {
-            (Some(name), true) => format!(
-                "Update user profile '{}' with suggestions? [g] grant / [s] suppress / [Enter] skip: ",
-                name
-            ),
-            (Some(name), false) => format!(
-                "Update existing user profile '{}' with the shown rules? [g] save / [Enter] skip: ",
-                name
-            ),
-            (None, true) => {
-                "Save suggestions to a user profile? [g] grant / [s] suppress / [Enter] skip: "
-                    .to_string()
-            }
-            (None, false) => {
-                "Save the shown rules in a user profile? [g] save / [Enter] skip: ".to_string()
-            }
+/// The save question names the file only when it is the sole target; with
+/// several, the menu that follows picks the file.
+fn profile_save_question(targets: &[SaveTarget], can_suppress: bool) -> String {
+    if targets.len() > 1 {
+        return if can_suppress {
+            "Save suggestions to a profile? [g] grant / [s] suppress / [Enter] skip: ".to_string()
+        } else {
+            "Save the shown rules to a profile? [g] save / [Enter] skip: ".to_string()
         };
+    }
+    let existing_profile = match targets.first() {
+        Some(SaveTarget::File(path)) => Some(path.as_path()),
+        Some(SaveTarget::NewUserProfile) | None => None,
+    };
+    match (existing_profile, can_suppress) {
+        (Some(path), true) => format!(
+            "Update profile '{}' with suggestions? [g] grant / [s] suppress / [Enter] skip: ",
+            path.display()
+        ),
+        (Some(path), false) => format!(
+            "Update existing profile '{}' with the shown rules? [g] save / [Enter] skip: ",
+            path.display()
+        ),
+        (None, true) => {
+            "Save suggestions to a user profile? [g] grant / [s] suppress / [Enter] skip: "
+                .to_string()
+        }
+        (None, false) => {
+            "Save the shown rules in a user profile? [g] save / [Enter] skip: ".to_string()
+        }
+    }
+}
 
-        prompt_print(&prompt, &[]);
+fn prompt_profile_save_choice(
+    targets: &[SaveTarget],
+    can_suppress: bool,
+    io: &mut impl PromptLines,
+) -> Result<ProfileSaveChoice> {
+    let prompt = profile_save_question(targets, can_suppress);
+    loop {
+        io.print(&prompt);
 
-        let input = read_input_line()?;
+        let input = io.read_line()?;
         if let Some(choice) = parse_profile_save_choice(&input, can_suppress) {
             return Ok(choice);
         }
@@ -579,7 +711,7 @@ fn prompt_profile_save_choice(
         } else {
             "Enter g to save, or press Enter to skip."
         };
-        prompt_println(&format!("{}", help.red()));
+        io.println(&format!("{}", help.red()));
     }
 }
 
@@ -739,12 +871,51 @@ pub(crate) fn write_profile(prepared: &PreparedProfileSave) -> Result<()> {
         ))
     })?;
 
-    let profile_json = serde_json::to_string_pretty(&prepared.profile)
-        .map_err(|e| NonoError::LearnError(format!("Failed to serialize profile: {}", e)))?;
-    atomic_write(
-        &prepared.profile_path,
-        format!("{profile_json}\n").as_bytes(),
-    )
+    let contents = match prepared.action {
+        SaveAction::Created => {
+            let profile_json = serde_json::to_string_pretty(&prepared.profile).map_err(|e| {
+                NonoError::LearnError(format!("Failed to serialize profile: {}", e))
+            })?;
+            format!("{profile_json}\n")
+        }
+        SaveAction::Updated => {
+            // Checked again here as well as in prepare: the file may have been
+            // swapped in between, and every writer must go through the check.
+            writable_profile_path(&prepared.profile_path)?;
+            updated_profile_text(&prepared.profile_path, &prepared.patch)?
+        }
+    };
+    atomic_write(&prepared.profile_path, contents.as_bytes())
+}
+
+/// Apply `patch` to the profile file's current text, keeping its comments.
+/// The result must still parse as a profile; otherwise the file is left as is.
+fn updated_profile_text(profile_path: &Path, patch: &profile::Profile) -> Result<String> {
+    let original = std::fs::read_to_string(profile_path).map_err(|e| {
+        NonoError::LearnError(format!(
+            "Failed to read profile {}: {}",
+            profile_path.display(),
+            e
+        ))
+    })?;
+    let updated = crate::profile_file_edit::apply_patch_to_profile_text(&original, patch).map_err(
+        |e| match e {
+            NonoError::LearnError(message) => NonoError::LearnError(format!(
+                "Failed to update profile {}: {}",
+                profile_path.display(),
+                message
+            )),
+            other => other,
+        },
+    )?;
+    profile::parse_profile_bytes(updated.as_bytes()).map_err(|e| {
+        NonoError::LearnError(format!(
+            "Updated profile {} would be invalid: {}",
+            profile_path.display(),
+            e
+        ))
+    })?;
+    Ok(updated)
 }
 
 /// Write `contents` to `path` atomically: write to a sibling temp file, fsync,
@@ -761,13 +932,6 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         .file_name()
         .ok_or_else(|| NonoError::LearnError(format!("Invalid profile path {}", path.display())))?;
 
-    // Use a sibling temp file so the final rename is same-filesystem and
-    // therefore atomic on POSIX.
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(file_name);
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
-    let tmp_path = dir.join(&tmp_name);
-
     let write_err = |stage: &str, e: std::io::Error| {
         NonoError::LearnError(format!(
             "Failed to {} profile {}: {}",
@@ -777,26 +941,32 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         ))
     };
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)
+    // The directory may be writable by the sandboxed agent, so the temp file
+    // gets a random name and is created exclusively (O_EXCL): a name the agent
+    // planted, such as a symlink to a shell rc file, is never opened. A sibling
+    // keeps the final rename same-filesystem and therefore atomic on POSIX.
+    let mut prefix = std::ffi::OsString::from(".");
+    prefix.push(file_name);
+    prefix.push(".");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    // Match a plain create: mode 0666 filtered by the umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut file = builder
+        .tempfile_in(dir)
         .map_err(|e| write_err("open temp file for", e))?;
-    if let Err(e) = file.write_all(contents) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(write_err("write", e));
-    }
-    if let Err(e) = file.sync_all() {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(write_err("sync", e));
-    }
-    drop(file);
-
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(write_err("rename into place", e));
-    }
+    // Dropping `file` on an early return removes the temp file.
+    file.write_all(contents)
+        .map_err(|e| write_err("write", e))?;
+    file.as_file()
+        .sync_all()
+        .map_err(|e| write_err("sync", e))?;
+    file.persist(path)
+        .map_err(|e| write_err("rename into place", e.error))?;
     Ok(())
 }
 
@@ -1676,6 +1846,57 @@ fn prompt_line_for_tty(message: &str) -> String {
     format!("\r{message}\x1b[K\r\n")
 }
 
+/// Prepare an update of the existing profile file at `path`. `run_with` is the
+/// `--profile` value shown in the "Run with:" hint.
+pub(crate) fn prepare_profile_save_to_file(
+    patch: &profile::Profile,
+    path: &Path,
+    run_with: &str,
+) -> Result<PreparedProfileSave> {
+    let path = writable_profile_path(path)?;
+    let mut existing = profile::load_raw_profile_from_path(&path)?;
+    merge_profile_patch(&mut existing, patch);
+    Ok(PreparedProfileSave {
+        action: SaveAction::Updated,
+        profile_name: run_with.to_string(),
+        profile_path: path,
+        profile: existing,
+        patch: patch.clone(),
+    })
+}
+
+/// Re-check a save target just before writing to it. `path` is the canonical
+/// path recorded when the profile loaded, but the sandboxed agent may since
+/// have swapped it, or a parent directory, for a symlink to another file (a
+/// user profile, the pack store), or for a FIFO that would hang the read.
+fn writable_profile_path(path: &Path) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path).map_err(|e| {
+        NonoError::LearnError(format!(
+            "Cannot resolve profile file {}: {e}",
+            path.display()
+        ))
+    })?;
+    if canonical != path {
+        return Err(NonoError::LearnError(format!(
+            "Refusing to save to {}: it now resolves to {}",
+            path.display(),
+            canonical.display()
+        )));
+    }
+    let is_file = std::fs::metadata(&canonical)
+        .map_err(|e| {
+            NonoError::LearnError(format!("Cannot read profile file {}: {e}", path.display()))
+        })?
+        .is_file();
+    if !is_file {
+        return Err(NonoError::LearnError(format!(
+            "Refusing to save to {}: it is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(canonical)
+}
+
 pub(crate) fn prepare_profile_save_from_patch(
     patch: &profile::Profile,
     cmd_name: &str,
@@ -1693,6 +1914,7 @@ pub(crate) fn prepare_profile_save_from_patch(
             profile_name: profile_name.to_string(),
             profile_path,
             profile: existing,
+            patch: patch.clone(),
         });
     }
 
@@ -1728,11 +1950,37 @@ pub(crate) fn prepare_profile_save_from_patch(
         profile_name: profile_name.to_string(),
         profile_path,
         profile: new_profile,
+        patch: patch.clone(),
     })
 }
 
 fn read_input_line() -> Result<String> {
     prompt_read_line()
+}
+
+/// Line I/O for the save-menu loops, so tests can script the answers.
+/// `read_line` returns the raw line: an empty string is EOF, Enter is "\n".
+trait PromptLines {
+    fn print(&mut self, text: &str);
+    fn println(&mut self, line: &str);
+    fn read_line(&mut self) -> Result<String>;
+}
+
+/// The controlling terminal, as every other save prompt uses it.
+struct TtyPrompt;
+
+impl PromptLines for TtyPrompt {
+    fn print(&mut self, text: &str) {
+        prompt_write(text);
+    }
+
+    fn println(&mut self, line: &str) {
+        prompt_println(line);
+    }
+
+    fn read_line(&mut self) -> Result<String> {
+        read_input_line()
+    }
 }
 
 fn build_run_profile_patch(
@@ -1964,6 +2212,8 @@ fn merge_access(existing: AccessMode, requested: AccessMode) -> AccessMode {
     }
 }
 
+/// Keep the merged fields in step with `PATCHED_LISTS` in `profile_file_edit`,
+/// which applies the same patch to profile text when updating a file.
 pub(crate) fn merge_profile_patch(profile: &mut profile::Profile, patch: &profile::Profile) {
     profile.filesystem.allow =
         profile::dedup_append(&profile.filesystem.allow, &patch.filesystem.allow);
@@ -2691,6 +2941,683 @@ mod tests {
         );
     }
 
+    fn project_source_file(path: &str) -> profile::ProfileSourceFile {
+        profile::ProfileSourceFile {
+            path: PathBuf::from(path),
+            kind: profile::ProfileSourceKind::Project,
+            top_level: false,
+        }
+    }
+
+    #[test]
+    fn save_targets_empty_is_new_user_profile() {
+        assert_eq!(save_targets(&[]), vec![SaveTarget::NewUserProfile]);
+    }
+
+    #[test]
+    fn save_targets_files_never_include_new_user_profile() {
+        let files = [
+            project_source_file("/work/proj/agent.json"),
+            project_source_file("/work/shared/base.json"),
+        ];
+
+        assert_eq!(
+            save_targets(&files),
+            vec![
+                SaveTarget::File(PathBuf::from("/work/proj/agent.json")),
+                SaveTarget::File(PathBuf::from("/work/shared/base.json")),
+            ]
+        );
+    }
+
+    #[test]
+    fn prepare_profile_save_to_file_updates_path_profile() {
+        let dir = TempDir::new().expect("tempdir");
+        let profile_dir = dir.path().join("proj/.nono");
+        std::fs::create_dir_all(&profile_dir).expect("mkdir");
+        let profile_path = profile_dir.join("agent.json");
+        std::fs::write(
+            &profile_path,
+            r#"{ "meta": { "name": "agent" }, "filesystem": { "read": ["/old"] } }"#,
+        )
+        .expect("write profile");
+
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+
+        let prepared = prepare_profile_save_to_file(
+            &patch,
+            &profile_path.canonicalize().expect("canonicalize"),
+            "./proj/.nono/agent.json",
+        )
+        .expect("prepare");
+
+        assert!(matches!(prepared.action, SaveAction::Updated));
+        assert_eq!(
+            prepared.profile_path,
+            profile_path.canonicalize().expect("canonicalize")
+        );
+        assert_eq!(prepared.profile_name, "./proj/.nono/agent.json");
+        assert_eq!(
+            prepared.profile.filesystem.read,
+            vec!["/old".to_string(), "/new".to_string()]
+        );
+        assert_eq!(prepared.patch.filesystem.read, vec!["/new".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_profile_symlinked_into_pack_store_not_offered() {
+        let (source_files, writable) = crate::test_env::with_isolated_config_home(|config| {
+            let install_dir = crate::test_env::write_fake_pack(
+                config,
+                "acme",
+                "packy",
+                "packy",
+                r#"{ "meta": { "name": "packy" } }"#,
+                &[],
+                None,
+            );
+            let dir = TempDir::new().expect("tempdir");
+            let link = dir.path().join("agent.json");
+            std::os::unix::fs::symlink(install_dir.join("profiles/packy.json"), &link)
+                .expect("symlink");
+
+            let loaded = profile::load_profile_from_path(&link).expect("load via symlink");
+            (loaded.source_files.clone(), loaded.writable_source_files())
+        });
+
+        assert_eq!(source_files.len(), 1);
+        assert_eq!(source_files[0].kind, profile::ProfileSourceKind::Pack);
+        assert!(writable.is_empty(), "got {writable:?}");
+        assert_eq!(save_targets(&writable), vec![SaveTarget::NewUserProfile]);
+    }
+
+    #[test]
+    fn render_menu_labels_top_and_bases() {
+        let files = [
+            PathBuf::from("/work/proj/.nono/agent.json"),
+            PathBuf::from("/work/shared/base.json"),
+        ];
+
+        let menu = render_save_target_menu(&files, Some(files[0].as_path()));
+        let lines: Vec<&str> = menu.split('\n').collect();
+
+        assert_eq!(lines.len(), 4, "{menu}");
+        assert_eq!(lines[0], "Save the selected rules to:");
+        assert_eq!(
+            lines[1],
+            "  1) /work/proj/.nono/agent.json    (this profile)"
+        );
+        assert!(
+            lines[2].starts_with("  2) /work/shared/base.json "),
+            "{menu}"
+        );
+        assert!(
+            lines[2].ends_with("(base — applies to every profile that extends it)"),
+            "{menu}"
+        );
+        assert_eq!(lines[1].find('('), lines[2].find('('), "{menu}");
+        assert_eq!(lines[3], "Choice [1]: ");
+    }
+
+    #[test]
+    fn render_menu_labels_only_the_top_level_profile_as_this_profile() {
+        let files = [PathBuf::from("/work/extra.json")];
+
+        let menu = render_save_target_menu(&files, Some(Path::new("/work/agent.json")));
+        assert!(
+            menu.contains("(base — applies to every profile that extends it)"),
+            "{menu}"
+        );
+        assert!(!menu.contains("this profile"), "{menu}");
+
+        let menu = render_save_target_menu(&files, None);
+        assert!(!menu.contains("this profile"), "{menu}");
+    }
+
+    #[test]
+    fn save_target_menu_shown_unless_the_only_target_is_the_top_level_profile() {
+        let top = PathBuf::from("/work/agent.json");
+        let extra = PathBuf::from("/work/extra.json");
+        let top_level = Some(top.as_path());
+
+        assert!(!save_target_menu_needed(
+            std::slice::from_ref(&top),
+            top_level
+        ));
+        assert!(save_target_menu_needed(
+            std::slice::from_ref(&extra),
+            top_level
+        ));
+        assert!(save_target_menu_needed(std::slice::from_ref(&extra), None));
+        assert!(save_target_menu_needed(
+            &[top.clone(), extra.clone()],
+            top_level
+        ));
+        assert!(!save_target_menu_needed(&[], None));
+    }
+
+    #[test]
+    fn prepare_save_to_file_target_runs_with_full_path_and_writes_patch() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("agent.json");
+        std::fs::write(&path, r#"{ "meta": { "name": "agent" } }"#).expect("write agent");
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+
+        let prepared =
+            prepare_save_to_target(&SaveTarget::File(path.clone()), &patch, "claude", None)
+                .expect("prepare")
+                .expect("file target never cancels");
+        write_profile(&prepared).expect("write");
+
+        assert_eq!(prepared.profile_path, path);
+        assert_eq!(prepared.profile_name, path.display().to_string());
+        let written = std::fs::read_to_string(&path).expect("read agent");
+        let reparsed = profile::parse_profile_bytes(written.as_bytes()).expect("reparse");
+        assert_eq!(reparsed.filesystem.read, vec!["/new"]);
+    }
+
+    #[test]
+    fn parse_choice_enter_is_first() {
+        assert_eq!(parse_save_target_choice("", 2), Some(Some(0)));
+        assert_eq!(parse_save_target_choice("2", 2), Some(Some(1)));
+        assert_eq!(parse_save_target_choice(" skip ", 2), Some(None));
+        assert_eq!(parse_save_target_choice("3", 2), None);
+        assert_eq!(parse_save_target_choice("0", 2), None);
+        assert_eq!(parse_save_target_choice("x", 2), None);
+    }
+
+    /// Scripted answers for the save-menu loops; `output` collects every
+    /// prompt and help line they print.
+    struct ScriptedPrompt {
+        input: std::io::Cursor<&'static str>,
+        output: String,
+    }
+
+    impl ScriptedPrompt {
+        fn new(input: &'static str) -> Self {
+            Self {
+                input: std::io::Cursor::new(input),
+                output: String::new(),
+            }
+        }
+    }
+
+    impl PromptLines for ScriptedPrompt {
+        fn print(&mut self, text: &str) {
+            self.output.push_str(text);
+        }
+
+        fn println(&mut self, line: &str) {
+            self.output.push_str(line);
+            self.output.push('\n');
+        }
+
+        fn read_line(&mut self) -> Result<String> {
+            let mut line = String::new();
+            self.input.read_line(&mut line).map_err(NonoError::Io)?;
+            Ok(line)
+        }
+    }
+
+    const MENU_HELP: &str = "Enter a number from 1 to 2, press Enter for 1, or type skip.";
+
+    fn menu_files() -> [PathBuf; 2] {
+        [
+            PathBuf::from("/work/agent.json"),
+            PathBuf::from("/work/base.json"),
+        ]
+    }
+
+    fn run_menu(input: &'static str) -> (Option<PathBuf>, String) {
+        let files = menu_files();
+        let mut io = ScriptedPrompt::new(input);
+        let choice = prompt_save_target(&files, Some(files[0].as_path()), &mut io).expect("menu");
+        (choice, io.output)
+    }
+
+    #[test]
+    fn menu_invalid_answer_prints_help_once_then_takes_the_valid_one() {
+        let (choice, output) = run_menu("x\n2\n");
+        assert_eq!(choice, Some(PathBuf::from("/work/base.json")));
+        assert_eq!(output.matches(MENU_HELP).count(), 1, "{output}");
+        assert_eq!(output.matches("Choice [1]: ").count(), 2, "{output}");
+        assert!(output.contains("Save the selected rules to:"), "{output}");
+    }
+
+    #[test]
+    fn menu_enter_picks_the_first_file() {
+        let (choice, output) = run_menu("\n");
+        assert_eq!(choice, Some(PathBuf::from("/work/agent.json")));
+        assert!(!output.contains(MENU_HELP), "{output}");
+    }
+
+    #[test]
+    fn menu_eof_cancels() {
+        assert_eq!(run_menu("").0, None);
+    }
+
+    #[test]
+    fn menu_skip_cancels() {
+        assert_eq!(run_menu("skip\n").0, None);
+    }
+
+    #[test]
+    fn lone_base_target_still_shows_the_menu() {
+        let base = PathBuf::from("/work/base.json");
+        let mut io = ScriptedPrompt::new("1\n");
+        let target = choose_save_target(
+            vec![SaveTarget::File(base.clone())],
+            Some(Path::new("/work/agent.json")),
+            &mut io,
+        )
+        .expect("choose");
+        assert!(
+            matches!(target, Some(SaveTarget::File(ref path)) if *path == base),
+            "lone base must be picked through the menu"
+        );
+        assert!(
+            io.output.contains("Save the selected rules to:"),
+            "{}",
+            io.output
+        );
+        assert!(io.output.contains("Choice [1]: "), "{}", io.output);
+    }
+
+    fn run_save_question(input: &'static str, can_suppress: bool) -> (ProfileSaveChoice, String) {
+        let mut io = ScriptedPrompt::new(input);
+        let choice =
+            prompt_profile_save_choice(&[SaveTarget::NewUserProfile], can_suppress, &mut io)
+                .expect("question");
+        (choice, io.output)
+    }
+
+    #[test]
+    fn save_question_maps_g_s_and_enter() {
+        assert_eq!(run_save_question("g\n", true).0, ProfileSaveChoice::Grant);
+        assert_eq!(
+            run_save_question("s\n", true).0,
+            ProfileSaveChoice::Suppress
+        );
+        assert_eq!(run_save_question("\n", true).0, ProfileSaveChoice::Skip);
+        assert_eq!(run_save_question("", true).0, ProfileSaveChoice::Skip);
+    }
+
+    #[test]
+    fn save_question_reprompts_after_invalid_answer() {
+        let (choice, output) = run_save_question("x\ng\n", true);
+        assert_eq!(choice, ProfileSaveChoice::Grant);
+        let help = "Enter g to grant, s to suppress, or press Enter to skip.";
+        assert_eq!(output.matches(help).count(), 1, "{output}");
+        let question = profile_save_question(&[SaveTarget::NewUserProfile], true);
+        assert_eq!(output.matches(question.as_str()).count(), 2, "{output}");
+    }
+
+    #[test]
+    fn save_question_rejects_s_when_suppress_is_not_offered() {
+        let (choice, output) = run_save_question("s\n\n", false);
+        assert_eq!(choice, ProfileSaveChoice::Skip);
+        let help = "Enter g to save, or press Enter to skip.";
+        assert_eq!(output.matches(help).count(), 1, "{output}");
+    }
+
+    #[test]
+    fn menu_choice_two_writes_base_only() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonicalize");
+        let top = root.join("top.json");
+        let base = root.join("base.json");
+        let top_text = "{ \"meta\": { \"name\": \"top\" }, \"extends\": [\"./base.json\"] }\n";
+        std::fs::write(&top, top_text).expect("write top");
+        std::fs::write(
+            &base,
+            "{\n  // shared rules\n  \"meta\": { \"name\": \"base\" }\n}\n",
+        )
+        .expect("write base");
+        let files = vec![top.clone(), base.clone()];
+
+        assert_eq!(chosen_save_target(&files, "2"), Some(Some(base.clone())));
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+        let prepared = prepare_profile_save_to_file(&patch, &base, "./top.json").expect("prepare");
+        write_profile(&prepared).expect("write base");
+
+        let written = std::fs::read_to_string(&base).expect("read base");
+        assert!(written.contains("// shared rules"), "{written}");
+        let reparsed = profile::parse_profile_bytes(written.as_bytes()).expect("reparse");
+        assert_eq!(reparsed.filesystem.read, vec!["/new"]);
+        assert_eq!(std::fs::read_to_string(&top).expect("read top"), top_text);
+    }
+
+    #[test]
+    fn menu_choice_skip_and_invalid() {
+        let files = vec![PathBuf::from("/a.json"), PathBuf::from("/b.json")];
+
+        assert_eq!(
+            chosen_save_target(&files, "\n"),
+            Some(Some(PathBuf::from("/a.json")))
+        );
+        assert_eq!(chosen_save_target(&files, "skip\n"), Some(None));
+        assert_eq!(chosen_save_target(&files, "9"), None);
+    }
+
+    #[test]
+    fn menu_choice_closed_input_cancels() {
+        let files = vec![PathBuf::from("/a.json"), PathBuf::from("/b.json")];
+
+        assert_eq!(chosen_save_target(&files, ""), Some(None));
+    }
+
+    #[test]
+    fn save_question_names_file_only_for_single_target() {
+        let one = [SaveTarget::File(PathBuf::from("/work/agent.json"))];
+        let two = [
+            SaveTarget::File(PathBuf::from("/work/agent.json")),
+            SaveTarget::File(PathBuf::from("/work/base.json")),
+        ];
+
+        assert_eq!(
+            profile_save_question(&one, true),
+            "Update profile '/work/agent.json' with suggestions? [g] grant / [s] suppress / [Enter] skip: "
+        );
+        assert_eq!(
+            profile_save_question(&two, true),
+            "Save suggestions to a profile? [g] grant / [s] suppress / [Enter] skip: "
+        );
+        assert_eq!(
+            profile_save_question(&two, false),
+            "Save the shown rules to a profile? [g] save / [Enter] skip: "
+        );
+        assert_eq!(
+            profile_save_question(&[SaveTarget::NewUserProfile], true),
+            "Save suggestions to a user profile? [g] grant / [s] suppress / [Enter] skip: "
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_target_dir_swapped_into_pack_store() {
+        crate::test_env::with_isolated_config_home(|config| {
+            let install_dir = crate::test_env::write_fake_pack(
+                config,
+                "acme",
+                "packy",
+                "agent",
+                r#"{ "meta": { "name": "packy" } }"#,
+                &[],
+                None,
+            );
+            let pack_file = install_dir.join("profiles/agent.json");
+            let pack_before = std::fs::read(&pack_file).expect("read pack profile");
+
+            let project = TempDir::new().expect("tempdir");
+            let nono_dir = project.path().join(".nono");
+            std::fs::create_dir_all(&nono_dir).expect("mkdir");
+            let agent = nono_dir.join("agent.json");
+            std::fs::write(&agent, r#"{ "meta": { "name": "agent" } }"#).expect("write agent");
+            let files = [profile::ProfileSourceFile::new(
+                agent.canonicalize().expect("canonicalize"),
+            )];
+            let targets = save_targets(&files);
+            let SaveTarget::File(path) = &targets[0] else {
+                panic!("expected a file target, got {targets:?}");
+            };
+
+            std::fs::remove_dir_all(&nono_dir).expect("remove .nono");
+            std::os::unix::fs::symlink(install_dir.join("profiles"), &nono_dir)
+                .expect("symlink .nono into pack store");
+
+            let mut patch = profile::Profile::default();
+            patch.filesystem.read = vec!["/new".to_string()];
+            let result = prepare_profile_save_to_file(&patch, path, "./.nono/agent.json")
+                .and_then(|prepared| write_profile(&prepared));
+
+            assert!(
+                matches!(result, Err(NonoError::LearnError(_))),
+                "expected LearnError, got {result:?}"
+            );
+            assert_eq!(
+                std::fs::read(&pack_file).expect("read pack profile"),
+                pack_before
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_target_swapped_for_symlink_to_another_profile() {
+        let project = TempDir::new().expect("tempdir");
+        let root = project.path().canonicalize().expect("canonicalize");
+        let agent = root.join("agent.json");
+        std::fs::write(&agent, r#"{ "meta": { "name": "agent" } }"#).expect("write agent");
+        let other = root.join("other.json");
+        let other_text = r#"{ "meta": { "name": "other" } }"#;
+        std::fs::write(&other, other_text).expect("write other");
+
+        std::fs::remove_file(&agent).expect("remove agent");
+        std::os::unix::fs::symlink(&other, &agent).expect("symlink agent to other");
+
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+        let result = prepare_profile_save_to_file(&patch, &agent, "./agent.json")
+            .and_then(|prepared| write_profile(&prepared));
+
+        match result {
+            Err(NonoError::LearnError(msg)) => {
+                assert!(msg.contains(&agent.display().to_string()), "{msg}")
+            }
+            other => panic!("expected LearnError, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&other).expect("read other"),
+            other_text
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_refuses_target_swapped_after_prepare() {
+        let project = TempDir::new().expect("tempdir");
+        let root = project.path().canonicalize().expect("canonicalize");
+        let agent = root.join("agent.json");
+        std::fs::write(&agent, r#"{ "meta": { "name": "agent" } }"#).expect("write agent");
+        let other = root.join("other.json");
+        let other_text = r#"{ "meta": { "name": "other" } }"#;
+        std::fs::write(&other, other_text).expect("write other");
+
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+        let prepared =
+            prepare_profile_save_to_file(&patch, &agent, "./agent.json").expect("prepare");
+
+        std::fs::remove_file(&agent).expect("remove agent");
+        std::os::unix::fs::symlink(&other, &agent).expect("symlink agent to other");
+
+        match write_profile(&prepared) {
+            Err(NonoError::LearnError(msg)) => {
+                assert!(msg.contains(&agent.display().to_string()), "{msg}")
+            }
+            other => panic!("expected LearnError, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&other).expect("read other"),
+            other_text
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_non_regular_target() {
+        let project = TempDir::new().expect("tempdir");
+        let fifo = project
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("agent.json");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+
+        let patch = profile::Profile::default();
+        let result = prepare_profile_save_to_file(&patch, &fifo, "./agent.json");
+
+        match result {
+            Err(NonoError::LearnError(msg)) => {
+                assert!(msg.contains(&fifo.display().to_string()), "{msg}")
+            }
+            other => panic!("expected LearnError, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    fn write_jsonc_user_profile(name: &str, contents: &str) -> PathBuf {
+        let dir = profile::user_profile_dir().expect("profile dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(format!("{name}.jsonc"));
+        std::fs::write(&path, contents).expect("write profile");
+        path
+    }
+
+    #[test]
+    fn write_profile_update_keeps_jsonc_comments() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let path = write_jsonc_user_profile(
+            "commented",
+            "{\n  // why this profile exists\n  \"meta\": { \"name\": \"commented\", \"version\": \"1.0.0\" },\n  \"filesystem\": {\n    // project data\n    \"read\": [\"/old\"]\n  }\n}\n",
+        );
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+
+        let prepared =
+            prepare_profile_save_from_patch(&patch, "claude", "commented", None).expect("prepare");
+        assert!(matches!(prepared.action, SaveAction::Updated));
+        write_profile(&prepared).expect("write profile");
+
+        let written = std::fs::read_to_string(&path).expect("read profile");
+        assert!(written.contains("// why this profile exists"), "{written}");
+        assert!(written.contains("// project data"), "{written}");
+        let reparsed = profile::parse_profile_bytes(written.as_bytes()).expect("reparse");
+        assert_eq!(reparsed.filesystem.read, vec!["/old", "/new"]);
+    }
+
+    #[test]
+    fn write_profile_update_invalid_file_left_unchanged() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let path = write_jsonc_user_profile(
+            "broken",
+            "{ \"meta\": { \"name\": \"broken\", \"version\": \"1.0.0\" } }\n",
+        );
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+        let prepared =
+            prepare_profile_save_from_patch(&patch, "claude", "broken", None).expect("prepare");
+
+        std::fs::write(&path, "{ invalid").expect("corrupt profile");
+        let result = write_profile(&prepared);
+
+        assert!(result.is_err(), "expected error, got {:?}", result.err());
+        assert_eq!(std::fs::read(&path).expect("read profile"), b"{ invalid");
+    }
+
+    #[test]
+    fn write_profile_update_edit_error_names_file() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let path = write_jsonc_user_profile(
+            "array-section",
+            "{ \"meta\": { \"name\": \"array-section\", \"version\": \"1.0.0\" } }\n",
+        );
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+        let prepared = prepare_profile_save_from_patch(&patch, "claude", "array-section", None)
+            .expect("prepare");
+
+        let array_section = "{ \"meta\": { \"name\": \"array-section\", \"version\": \"1.0.0\" }, \"filesystem\": [] }\n";
+        std::fs::write(&path, array_section).expect("rewrite profile");
+        let message = write_profile(&prepared)
+            .expect_err("non-object section")
+            .to_string();
+
+        assert!(
+            message.contains(&path.display().to_string()),
+            "message: {message}"
+        );
+        assert_eq!(
+            message.matches("Profile save error:").count(),
+            1,
+            "message: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read profile"),
+            array_section
+        );
+    }
+
+    #[test]
+    fn write_profile_update_rejects_invalid_profile_left_unchanged() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let path = write_jsonc_user_profile(
+            "unknown-field",
+            "{ \"meta\": { \"name\": \"unknown-field\", \"version\": \"1.0.0\" } }\n",
+        );
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["/new".to_string()];
+        let prepared = prepare_profile_save_from_patch(&patch, "claude", "unknown-field", None)
+            .expect("prepare");
+
+        let unknown_field = "{ \"meta\": { \"name\": \"unknown-field\", \"version\": \"1.0.0\" }, \"bogus_field\": 1 }\n";
+        std::fs::write(&path, unknown_field).expect("rewrite profile");
+        let result = write_profile(&prepared);
+
+        assert!(result.is_err(), "expected error, got {:?}", result.err());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read profile"),
+            unknown_field
+        );
+    }
+
     #[test]
     fn prepare_profile_save_from_suppression_patch_uses_suppression_description() {
         let _env_lock = ENV_LOCK.lock().expect("env lock");
@@ -2926,9 +3853,28 @@ mod tests {
             .any(|e| {
                 e.file_name()
                     .to_string_lossy()
-                    .starts_with(".profile.json.tmp.")
+                    .starts_with(".profile.json.")
             });
         assert!(!leftover, "temp file should be renamed into place");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_does_not_follow_a_planted_temp_symlink() {
+        let dir = TempDir::new().expect("temp dir");
+        let target = dir.path().join("agent.json");
+        std::fs::write(&target, b"original\n").expect("seed");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim\n").expect("seed victim");
+        let planted = dir
+            .path()
+            .join(format!(".agent.json.tmp.{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).expect("plant symlink");
+
+        atomic_write(&target, b"updated\n").expect("atomic write");
+
+        assert_eq!(std::fs::read(&victim).expect("read victim"), b"victim\n");
+        assert_eq!(std::fs::read(&target).expect("read target"), b"updated\n");
     }
 
     // ─── URL denial patch tests ───────────────────────────────────────────

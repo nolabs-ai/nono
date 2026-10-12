@@ -231,7 +231,7 @@ fn walk_extends_chain(
     }
     visited.push(name_or_path.to_string());
 
-    let Some(bases) = profile::load_profile_extends(name_or_path) else {
+    let Some(bases) = profile::load_profile_extends_resolved(name_or_path) else {
         return false;
     };
     bases
@@ -432,6 +432,32 @@ mod tests {
             assert!(
                 selects_claude_code("my-agent"),
                 "a user profile extending the pack ref must be treated as Claude Code"
+            );
+        });
+    }
+
+    #[test]
+    fn claude_code_detection_follows_relative_path_extends() {
+        with_isolated_config_home(|config_home| {
+            let nono_dir = config_home.join("proj/.nono");
+            let shared = config_home.join("proj/shared");
+            std::fs::create_dir_all(&nono_dir).expect("mkdir .nono");
+            std::fs::create_dir_all(&shared).expect("mkdir shared");
+            std::fs::write(
+                shared.join("base.json"),
+                r#"{ "meta": { "name": "base" }, "extends": "nolabs-ai/claude" }"#,
+            )
+            .expect("write base");
+            let agent = nono_dir.join("agent.json");
+            std::fs::write(
+                &agent,
+                r#"{ "meta": { "name": "agent" }, "extends": "../shared/base.json" }"#,
+            )
+            .expect("write agent");
+
+            assert!(
+                selects_claude_code(agent.to_str().expect("utf-8 path")),
+                "a relative path base reaching the pack ref must be treated as Claude Code"
             );
         });
     }

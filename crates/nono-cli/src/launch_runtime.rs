@@ -245,6 +245,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) proc_comm_notify: bool,
     pub(crate) bypass_protection_paths: Vec<crate::policy::AppliedBypass>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
+    pub(crate) profile_save_files: Vec<crate::profile::ProfileSourceFile>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) profile_display_name: Option<String>,
     pub(crate) session: SessionLaunchOptions,
@@ -305,6 +306,7 @@ impl ExecutionFlags {
             proc_comm_notify: prepared.proc_comm_notify,
             bypass_protection_paths: prepared.bypass_protection_paths.clone(),
             ignored_denial_paths: prepared.ignored_denial_paths.clone(),
+            profile_save_files: prepared.profile_save_files.clone(),
             suppressed_system_service_operations: prepared
                 .suppressed_system_service_operations
                 .clone(),

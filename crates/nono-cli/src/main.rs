@@ -50,6 +50,7 @@ mod platform_client;
 mod policy;
 mod profile;
 mod profile_cmd;
+mod profile_file_edit;
 mod profile_runtime;
 mod profile_save_runtime;
 mod protected_paths;
@@ -326,6 +327,7 @@ mod tests {
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
+            profile_save_files: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
             redaction_extra_env_vars: Vec::new(),
             network_denial_audit: Default::default(),
@@ -405,6 +407,7 @@ mod tests {
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
+            profile_save_files: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
             redaction_extra_env_vars: Vec::new(),
             network_denial_audit: Default::default(),

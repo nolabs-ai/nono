@@ -639,7 +639,7 @@ fn download_and_verify_artifacts(
     printer: Option<&crate::pull_ui::ProgressPrinter>,
 ) -> Result<VerifiedDownloads> {
     let trusted_root = nono::trust::load_production_trusted_root()?;
-    let policy = nono::trust::VerificationPolicy::default();
+    let policy = nono::trust::VerificationPolicy::any_identity();
     let bundle_path = Path::new(".nono-trust.bundle");
     let tempdir = TempDir::new().map_err(NonoError::Io)?;
 

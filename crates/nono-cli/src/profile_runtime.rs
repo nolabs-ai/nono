@@ -273,7 +273,7 @@ fn verify_stored_bundles(
     })?;
 
     let trusted_root = nono::trust::load_production_trusted_root()?;
-    let policy = nono::trust::VerificationPolicy::default();
+    let policy = nono::trust::VerificationPolicy::any_identity();
 
     for entry in &entries {
         let artifact_name = entry

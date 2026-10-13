@@ -1910,6 +1910,11 @@
           "type": "string",
           "description": "Optional exact executable file for this command. When set, command mediation binds the command name to this canonical file instead of resolving the first PATH match."
         },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9A-Fa-f]{64}$",
+          "description": "Optional SHA-256 digest of the resolved executable. A mismatch aborts the session before the command can run."
+        },
         "allow_writable_executable": {
           "type": "boolean",
           "description": "Explicit per-command trust downgrade for a pinned executable or parent directory writable through the sandbox capability set. Valid only when executable is set to an absolute file path. On macOS this remains path-racy and is not suitable for high-assurance policies."

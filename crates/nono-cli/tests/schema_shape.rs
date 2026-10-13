@@ -632,6 +632,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "from",
             "intercept",
             "sandbox",
+            "sha256",
         ],
     );
     assert_schema_properties(&schema, "DaemonPidSource", &["argv", "env"]);

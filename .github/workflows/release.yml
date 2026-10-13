@@ -512,8 +512,6 @@ jobs:
       matrix:
         repo:
           - nolabs-ai/nono-py
-          - nolabs-ai/nono-ts
-          - nolabs-ai/nono-go
           - nolabs-ai/nono-docs
     steps:
       - name: Dispatch to ${{ matrix.repo }}

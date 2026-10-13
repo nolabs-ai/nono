@@ -121,6 +121,33 @@ Controls startup-time command gating. These checks run only at launch time and a
 
 Command policies live under `command_policies`. Use `commands.<name>.executable` to bind a command name to one exact executable file instead of the first PATH match. By default, command mediation rejects pinned executables and direct parent directories that are writable through the session sandbox's capability set. If a low-assurance profile intentionally grants write access overlapping a pinned executable, `commands.<name>.allow_writable_executable` is available as a per-command trust downgrade. It is valid only with an absolute `executable` path; relative paths and bare command names fail validation. For local demos, `command_policies.allow_writable_executables` disables the writable executable and parent-directory trust check across policy, deny-only, and session executable allow-list paths. The agent still invokes the command name through the command-mediation shim. On macOS, command mediation verifies the file before sandboxing but must still exec by path, so sandbox-writable pinned executables are not suitable for high-assurance policies.
 
+Set `commands.<name>.sha256` to a 64-character SHA-256 digest to pin the resolved executable's content. A mismatch aborts the session. Hash the same path configured in `executable` and copy the first field of the output:
+
+```sh
+# Linux
+sha256sum /bin/sh
+
+# macOS
+shasum -a 256 /bin/sh
+```
+
+Then add that digest to the command policy. The field is optional; omit it when executable content pinning is not needed.
+
+```json
+{
+  "command_policies": {
+    "commands": {
+      "sh": {
+        "executable": "/bin/sh",
+        "sha256": "<64-character digest from the command above>"
+      }
+    }
+  }
+}
+```
+
+Update the digest after intentionally upgrading or replacing the executable.
+
 Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_file`) may use dynamic provider tokens. `@git:config-files` expands to trusted global/system Git config files, Git file settings (attributes, excludes, commit templates), and the declared target of every `include.path` and `includeIf.*.path` directive — including conditional includes that do not currently fire. `@git:hooks-path` expands to trusted global/system `core.hooksPath` directories. `@git:common-dir` expands to the git common directory (`.git` in a regular repo, or the absolute path to the main repo's `.git` in a worktree). `@git:worktree` expands to the main worktree root (empty in a regular repo). `@git:toplevel` expands to the current checkout root. `@git:toplevel-parent` expands to the parent of the current checkout root. These tokens are opt-in per profile and ignore repo-local/worktree Git config so a checkout cannot grant itself extra host filesystem access.
 
 #### Command-scoped proxy policy

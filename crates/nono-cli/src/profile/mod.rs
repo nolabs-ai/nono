@@ -9544,6 +9544,22 @@ mod tests {
 
     // --- JSON Schema validation tests ---
 
+    #[test]
+    fn test_profile_rejects_invalid_command_sha256() {
+        let error = parse_profile_bytes(
+            br#"{
+                "command_policies": {
+                    "commands": {
+                        "git": { "sha256": "not-a-sha256" }
+                    }
+                }
+            }"#,
+        )
+        .expect_err("invalid command sha256 must fail profile loading");
+
+        assert!(error.to_string().contains("invalid_command_sha256"));
+    }
+
     /// Helper: validate a JSON string against the embedded profile schema.
     fn validate_against_schema(json_str: &str) -> std::result::Result<(), String> {
         let schema_str = crate::config::embedded::embedded_profile_schema();
@@ -9562,6 +9578,34 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("; "))
         }
+    }
+
+    #[test]
+    fn test_schema_validates_command_sha256() {
+        let json = r#"{
+            "command_policies": {
+                "commands": {
+                    "git": {
+                        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ABCDEF"
+                    }
+                }
+            }
+        }"#;
+
+        validate_against_schema(json).expect("valid command sha256 should pass schema validation");
+    }
+
+    #[test]
+    fn test_schema_rejects_invalid_command_sha256() {
+        let json = r#"{
+            "command_policies": {
+                "commands": {
+                    "git": { "sha256": "not-a-sha256" }
+                }
+            }
+        }"#;
+
+        assert!(validate_against_schema(json).is_err());
     }
 
     #[test]

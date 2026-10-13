@@ -632,6 +632,9 @@ pub struct InterceptRuleMatchConfig {
 pub struct CommandPolicyConfig {
     #[serde(default)]
     pub executable: Option<String>,
+    /// Expected SHA-256 digest of the resolved executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     #[serde(default)]
     pub allow_writable_executable: bool,
     #[serde(default)]
@@ -685,6 +688,7 @@ impl CommandPolicyConfig {
 
         Self {
             executable: self.executable.clone().or_else(|| child.executable.clone()),
+            sha256: self.sha256.clone().or_else(|| child.sha256.clone()),
             allow_writable_executable: self.allow_writable_executable
                 || child.allow_writable_executable,
             can_use: dedup_append(&self.can_use, &child.can_use),
@@ -1490,6 +1494,17 @@ fn resolve_command_chunk(
             }
         };
 
+        if let Some((selected, _)) = &resolution
+            && let Some(expected) = &command.sha256
+            && !expected.eq_ignore_ascii_case(&selected.sha256)
+        {
+            return Err(nono::NonoError::ProfileParse(format!(
+                "command policy '{command_name}' SHA-256 mismatch for '{}': expected {expected}, got {}",
+                selected.canonical_path.display(),
+                selected.sha256
+            )));
+        }
+
         results.push(((*command_name).clone(), resolution, warnings));
     }
     Ok((results, new_cache_entries))
@@ -1642,6 +1657,17 @@ fn validate_command(
     scope: CommandPolicyValidationScope,
     report: &mut CommandPolicyValidationReport,
 ) {
+    if let Some(sha256) = &command.sha256
+        && (sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        report.error(
+            "invalid_command_sha256",
+            format!(
+                "command '{command_name}' sha256 must contain exactly 64 hexadecimal characters"
+            ),
+        );
+    }
+
     validate_identifier_list(
         &format!("commands.{command_name}.can_use"),
         &command.can_use,
@@ -3747,6 +3773,34 @@ mod tests {
     }
 
     #[test]
+    fn command_sha256_must_be_64_hexadecimal_characters() {
+        for sha256 in ["abc".to_string(), "g".repeat(64), "a".repeat(65)] {
+            let mut config = active_git_config();
+            config.commands.get_mut("git").expect("git command").sha256 = Some(sha256);
+
+            let report =
+                validate_command_policies(Some(&config), CommandPolicyValidationScope::Syntax);
+
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|finding| finding.code == "invalid_command_sha256")
+            );
+        }
+    }
+
+    #[test]
+    fn command_sha256_accepts_uppercase_hexadecimal() {
+        let mut config = active_git_config();
+        config.commands.get_mut("git").expect("git command").sha256 = Some("A".repeat(64));
+
+        let report = validate_command_policies(Some(&config), CommandPolicyValidationScope::Syntax);
+
+        assert!(report.is_ok());
+    }
+
+    #[test]
     fn session_identifier_is_reserved_case_insensitively() {
         let mut config = active_git_config();
         config
@@ -4535,6 +4589,25 @@ mod tests {
     }
 
     #[test]
+    fn command_sha256_merge_prefers_inherited_pin() {
+        let mut base = CommandPolicyConfig {
+            sha256: Some("a".repeat(64)),
+            ..Default::default()
+        };
+        let child = CommandPolicyConfig {
+            sha256: Some("b".repeat(64)),
+            ..Default::default()
+        };
+
+        let merged = base.merge_child(&child);
+        assert_eq!(merged.sha256, Some("a".repeat(64)));
+
+        base.sha256 = None;
+        let merged = base.merge_child(&child);
+        assert_eq!(merged.sha256, Some("b".repeat(64)));
+    }
+
+    #[test]
     fn command_resolution_uses_first_original_path_match() {
         let dir = tempdir().expect("tempdir");
         let first = dir.path().join("first");
@@ -4658,6 +4731,37 @@ mod tests {
                 .expect("canonical exact git")
         );
         assert!(git.duplicate_paths.is_empty());
+    }
+
+    #[test]
+    fn command_resolution_accepts_matching_sha256_pin() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("git");
+        write_executable(&path, b"trusted executable");
+
+        let mut config = active_git_config();
+        config.commands.get_mut("git").expect("git command").sha256 =
+            Some(nono::trust::bytes_digest(b"trusted executable"));
+        let path_env = std::env::join_paths([dir.path()]).expect("join PATH entries");
+
+        let resolved = resolve_policy_command_binaries(&config, Some(path_env)).expect("resolve");
+        assert!(resolved.commands.contains_key("git"));
+    }
+
+    #[test]
+    fn command_resolution_rejects_mismatched_sha256_pin() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("git");
+        write_executable(&path, b"untrusted executable");
+
+        let mut config = active_git_config();
+        config.commands.get_mut("git").expect("git command").sha256 =
+            Some(nono::trust::bytes_digest(b"trusted executable"));
+        let path_env = std::env::join_paths([dir.path()]).expect("join PATH entries");
+
+        let error = resolve_policy_command_binaries(&config, Some(path_env))
+            .expect_err("digest mismatch must fail command policy resolution");
+        assert!(error.to_string().contains("SHA-256 mismatch"));
     }
 
     #[test]

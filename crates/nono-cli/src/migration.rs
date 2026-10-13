@@ -10,7 +10,6 @@ use std::io::{self, IsTerminal, Write};
 
 const ENV_AUTO_MIGRATE: &str = "NONO_AUTO_MIGRATE";
 const ENV_NO_MIGRATE: &str = "NONO_NO_MIGRATE";
-const LEARN_MORE_URL: &str = "https://github.com/nolabs-ai/nono/discussions/780";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationOutcome {
@@ -58,8 +57,16 @@ fn env_flag(key: &str) -> bool {
 }
 
 fn confirm_pull(package_ref: &PackageRef) -> Result<bool> {
-    let pack_ref = package_ref.key();
     let mut err = io::stderr().lock();
+    write_pull_prompt(&mut err, package_ref);
+    drop(err);
+
+    let line = crate::terminal_prompt::read_consent_line("  Continue? [y/N] ")?;
+    Ok(is_affirmative_response(&line))
+}
+
+fn write_pull_prompt<W: Write>(err: &mut W, package_ref: &PackageRef) {
+    let pack_ref = package_ref.key();
     let _ = writeln!(err);
     let _ = writeln!(err, "  {}  Install {}?", "⊕".cyan(), pack_ref.bold());
     let _ = writeln!(err);
@@ -70,30 +77,14 @@ fn confirm_pull(package_ref: &PackageRef) -> Result<bool> {
     let _ = writeln!(err);
 
     let label_w = "Provenance".len();
-    write_field(&mut err, "Namespace", &package_ref.namespace, label_w);
+    write_field(err, "Namespace", &package_ref.namespace, label_w);
     write_field(
-        &mut err,
+        err,
         "Provenance",
         "Sigstore cryptographic supply chain (verified on pull)",
         label_w,
     );
-
     let _ = writeln!(err);
-    let _ = writeln!(
-        err,
-        "  {}  First time seeing this prompt? Background, trust model,",
-        "ⓘ".cyan()
-    );
-    let _ = writeln!(
-        err,
-        "     and what gets installed: {}",
-        LEARN_MORE_URL.dimmed()
-    );
-    let _ = writeln!(err);
-    drop(err);
-
-    let line = crate::terminal_prompt::read_consent_line("  Continue? [y/N] ")?;
-    Ok(is_affirmative_response(&line))
 }
 
 fn is_affirmative_response(response: &str) -> bool {
@@ -128,7 +119,6 @@ fn emit_skipped_hint(package_ref: &PackageRef, reason: SkipReason) {
             );
         }
     }
-    let _ = writeln!(err, "  Learn more: {}", LEARN_MORE_URL.dimmed());
     let _ = writeln!(err);
 }
 
@@ -188,5 +178,20 @@ mod tests {
         assert!(!is_affirmative_response(""));
         assert!(!is_affirmative_response("n"));
         assert!(!is_affirmative_response("anything else"));
+    }
+
+    #[test]
+    fn install_prompt_omits_legacy_first_time_guidance() {
+        let package_ref =
+            crate::package::parse_package_ref("nolabs-ai/claude").expect("valid package reference");
+        let mut output = Vec::new();
+
+        write_pull_prompt(&mut output, &package_ref);
+        let output = String::from_utf8(output).expect("prompt is UTF-8");
+
+        assert!(output.contains("Install nolabs-ai/claude?"));
+        assert!(output.contains("Sigstore cryptographic supply chain"));
+        assert!(!output.contains("First time seeing this prompt?"));
+        assert!(!output.contains("github.com/nolabs-ai/nono/discussions/780"));
     }
 }

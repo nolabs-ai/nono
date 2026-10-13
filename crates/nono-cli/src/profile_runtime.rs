@@ -680,9 +680,8 @@ fn prepare_profile_with_options(
     }
 
     let (loaded_profile, resolved_command_binaries) = if let Some(ref profile_name) = args.profile {
-        // The claude-code → registry-pack migration is wired into
-        // `load_profile` itself so it fires from every call site (run,
-        // wrap, shell, profile show, why) without duplication.
+        // Missing fully-qualified package profiles may offer to install the
+        // exact registry package from every normal loading call site.
         let profile = profile::load_profile_with_extends(profile_name, &args.extends)?;
         crate::package_status::enforce_for_active_profile(
             Some(profile_name),
@@ -692,8 +691,7 @@ fn prepare_profile_with_options(
         // If the profile was addressed by pack ref (e.g. --profile nolabs-ai/hermes),
         // ensure that pack is verified even if the profile JSON doesn't list it in `packs`.
         // Pack refs are injected into profile.packs at load time for every
-        // pack-store resolution — both direct registry refs and name/alias
-        // paths — so no post-hoc lookup is needed here.
+        // fully-qualified package resolution, so no post-hoc lookup is needed.
         let mut packs_to_verify = profile.packs.clone();
         let resolved_command_binaries = validate_command_policy_runtime_support(&profile)?;
 

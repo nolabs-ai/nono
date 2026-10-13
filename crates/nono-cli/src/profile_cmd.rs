@@ -123,8 +123,8 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
         }
     }
 
-    // Validate --extends target exists in any of the three sources the
-    // resolver knows about (user dir, pack store, built-in).
+    // Validate --extends against user profiles, fully-qualified installed
+    // packages, and built-ins.
     if let Some(ref base) = args.extends
         && !profile_exists(base)
     {
@@ -320,7 +320,7 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
 
         // NOTE: open_urls, allow_launch_services, and allow_gpu are intentionally
         // omitted. Emitting them would replace inherited values from base profiles like
-        // claude-code (which grants OAuth2 origins, launch services, and GPU access).
+        // package profiles (which may grant OAuth2 origins, launch services, and GPU access).
         // Absent = inherit from base. Authors who need to override these
         // should add them explicitly.
     }
@@ -328,13 +328,8 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
     serde_json::Value::Object(root)
 }
 
-/// Check if a profile exists (built-in, user, or pack-provided).
-///
-/// Mirrors the resolver in `profile::load_profile_inner`: user dir →
-/// pack-store → built-in. Without the pack-store check, formerly-builtin
-/// profiles that have moved to registry packs (claude-code, codex)
-/// would falsely fail `nono profile init --extends <name>` validation
-/// even when `nono profile show <name>` resolves them fine.
+/// Check whether a bare user/built-in profile or a fully-qualified installed
+/// package profile exists.
 fn profile_exists(name: &str) -> bool {
     if profile::builtin::get_builtin(name).is_some() {
         return true;
@@ -344,15 +339,14 @@ fn profile_exists(name: &str) -> bool {
     {
         return true;
     }
-    profile::find_pack_store_profile(name).is_some()
+    profile::find_installed_package_profile(name).is_some()
 }
 
-/// Update the validation error so users know all three sources were
-/// considered. Used by `cmd_init`'s `--extends` check.
+/// Explain the accepted inheritance sources for `cmd_init --extends`.
 fn extends_target_not_found_message(name: &str) -> String {
     format!(
-        "Base profile '{name}' not found (built-in, user, or installed pack). \
-         If it's provided by a registry pack, run `nono pull <namespace>/<pack>` first."
+        "Base profile '{name}' not found (built-in, user, or fully-qualified installed package). \
+         Package profiles must use `<namespace>/<pack>`."
     )
 }
 
@@ -701,8 +695,7 @@ fn profile_source(name: &str) -> &'static str {
 pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
     let builtin_names = profile::builtin::list_builtin();
     let all_names = profile::list_profiles();
-    // (install_as -> pack ref) for the catalogue. Used to bucket pack
-    // profiles under their own section and surface the providing pack.
+    // (fully-qualified profile name -> pack ref) for the catalogue.
     let pack_profiles: std::collections::HashMap<String, String> =
         profile::list_pack_store_profiles().into_iter().collect();
 
@@ -2362,7 +2355,7 @@ fn classify_profile_error(e: &NonoError) -> &'static str {
 /// types `nono profile validate claude-docs` arrives here with the bare
 /// name. We mirror the same precedence as `--profile`: the literal path
 /// wins if it exists, otherwise look up the user profile dir, then the
-/// installed pack store, then the `.json` form of the bare name. If
+/// an exact fully-qualified installed package. If
 /// nothing matches, return the original input so the existing
 /// not-found error path produces a readable message.
 fn resolve_validate_target(input: &std::path::Path) -> std::path::PathBuf {
@@ -2380,7 +2373,7 @@ fn resolve_validate_target(input: &std::path::Path) -> std::path::PathBuf {
     {
         return p;
     }
-    if let Some((p, _)) = profile::find_pack_store_profile(name) {
+    if let Some((p, _)) = profile::find_installed_package_profile(name) {
         return p;
     }
     input.to_path_buf()
@@ -2701,7 +2694,7 @@ fn reserved_profile_source(name: &str) -> Result<Option<&'static str>> {
     if pol.profiles.contains_key(name) {
         return Ok(Some("built-in"));
     }
-    if profile::find_pack_store_profile(name).is_some() {
+    if profile::find_installed_package_profile(name).is_some() {
         return Ok(Some("installed pack"));
     }
     Ok(None)

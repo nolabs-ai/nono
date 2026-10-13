@@ -147,7 +147,7 @@ pub(crate) fn write_fake_pack(
 }
 
 /// Write a user profile to `<config_home>/nono/profiles/<name>.json`, the
-/// location that shadows both pack-store and built-in profiles of that name.
+/// location that shadows a built-in profile of that name.
 pub(crate) fn write_user_profile(config_home: &std::path::Path, name: &str, profile_json: &str) {
     let profiles = config_home.join("nono").join("profiles");
     std::fs::create_dir_all(&profiles).expect("create profiles dir");

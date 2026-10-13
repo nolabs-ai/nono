@@ -496,7 +496,7 @@ nono run -vv --network-profile claude-code --allow-cwd -- my-agent
 By default, the proxy uses HTTP/1.1 with keep-alive connection pooling for all upstream connections. The `--allow-http2` flag enables HTTP/2 multiplexing via ALPN negotiation:
 
 ```bash
-nono run --profile claude-code --allow-http2 -- claude
+nono run --profile nolabs-ai/claude --allow-http2 -- claude
 ```
 
 It can also be set in a profile with `network.allow_http2`, which both `nono run` and `nono proxy` honor.

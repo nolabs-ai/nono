@@ -20,7 +20,7 @@ Profiles compile down to manifests. A manifest is what a fully-resolved profile 
 
 ```bash
 # Export a profile as a manifest
-nono profile show claude-code --format manifest > manifest.json
+nono profile show nolabs-ai/claude --format manifest > manifest.json
 
 # Use a manifest directly
 nono run --config manifest.json -- my-agent

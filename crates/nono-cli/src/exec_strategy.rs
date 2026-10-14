@@ -6171,6 +6171,7 @@ mod tests {
         let backend = TestBackend;
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,

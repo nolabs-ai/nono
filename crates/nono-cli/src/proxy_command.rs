@@ -167,16 +167,11 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
     // Mirror `start_proxy_runtime`: a trusted CA needs mid-session renewal too,
     // since this command stays alive until Ctrl-C just like a sandboxed run.
     #[cfg(target_os = "macos")]
-    if proxy
-        .tls_intercept
-        .as_ref()
-        .is_some_and(|t| t.trust_proxy_ca)
+    if let Some(tls) = proxy.tls_intercept.as_ref().filter(|t| t.trust_proxy_ca)
         && let Some(rotator) = handle.intercept_rotator()
     {
-        let validity = proxy
-            .tls_intercept
-            .as_ref()
-            .and_then(|t| t.ca_validity)
+        let validity = tls
+            .ca_validity
             .unwrap_or(nono_proxy::tls_intercept::ca::CA_VALIDITY_DEFAULT);
         crate::macos_ca_renewal::spawn_supervisor(rotator, validity);
     }

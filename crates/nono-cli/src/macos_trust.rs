@@ -6,21 +6,40 @@
 //! This enables Go CLI tools (`gh`, `terraform`, etc.) that ignore
 //! `SSL_CERT_FILE` and only use `com.apple.trustd` for TLS verification.
 
-use core_foundation::base::TCFType;
+use core_foundation::array::CFArray;
+use core_foundation::base::{CFType, CFTypeRef, TCFType};
+use core_foundation::boolean::CFBoolean;
+use core_foundation::data::CFData;
+use core_foundation::date::CFDate;
+use core_foundation::dictionary::{CFDictionary, CFMutableDictionary};
+use core_foundation::string::CFString;
+use core_foundation_sys::array::CFArrayRef;
 use core_foundation_sys::base::OSStatus;
+use core_foundation_sys::data::CFDataRef;
+use core_foundation_sys::date::CFDateRef;
+use core_foundation_sys::dictionary::CFDictionaryRef;
 use nono::{NonoError, Result};
 use nono_proxy::config::PreloadedCa;
 use nono_proxy::tls_intercept::ca::NOT_BEFORE_SKEW;
 use security_framework::certificate::SecCertificate;
 use security_framework::item::{ItemClass, ItemSearchOptions, Limit, Reference, SearchResult};
+use security_framework::os::macos::access::SecAccess;
 use security_framework::os::macos::keychain::SecKeychain;
-use security_framework::passwords;
+
+use security_framework::os::macos::keychain_item::SecKeychainItem;
 use security_framework::trust_settings::{Domain, TrustSettings, TrustSettingsForCertificate};
-use security_framework_sys::base::SecCertificateRef;
+use security_framework_sys::base::{
+    SecAccessRef, SecCertificateRef, SecKeychainItemRef, errSecDuplicateItem, errSecItemNotFound,
+};
+use security_framework_sys::item::{
+    kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword, kSecReturnAttributes,
+    kSecReturnData, kSecReturnPersistentRef, kSecReturnRef, kSecValueData,
+};
+use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemUpdate};
 use security_framework_sys::trust_settings::{SecTrustSettingsDomain, kSecTrustSettingsDomainUser};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, warn};
 use x509_parser::pem::parse_x509_pem;
 use zeroize::Zeroizing;
@@ -131,7 +150,7 @@ fn trust_attempt_outcome(
 }
 
 // Service name for Keychain items. Sufficiently specific to avoid collision
-// with other apps. set_generic_password overwrites on conflict (desired).
+// with other apps. Duplicate items are gated and updated in place (desired).
 const KEYCHAIN_SERVICE: &str = "nono-proxy-ca";
 const KEYCHAIN_ACCOUNT: &str = "ca-bundle";
 
@@ -171,6 +190,1063 @@ fn record_renewal_backoff(cert_pem: &str) -> Result<()> {
             path.display()
         ))
     })
+}
+
+// --- CA-bundle item access control ----------------------------------------
+//
+// The bundle is a generic-password item holding the interception CA's
+// private key. Data-only updates never touch an item's access list: an
+// item created without one (`SecItemAdd` without `kSecAttrAccess`)
+// leaves every other process to prompt for each read, and macOS records
+// the user's "Always Allow" grants in the very access list a naive
+// rewrite would discard. All ACL work happens under the renewal lock, so
+// exactly one process repairs at a time. Reads and writes are bound to
+// the item reference the gate resolved and verified, so a replacement
+// item cannot slip between the gate and the bytes.
+
+/// How long a gated read waits for another process's repair or renewal to
+/// release the lock before giving up. Failing closed (ephemeral CA) keeps
+/// a launch from hanging on an unattended prompt elsewhere.
+const ACCESS_GATE_WAIT: Duration = Duration::from_secs(60);
+
+/// One repair attempt per window after a failed authorization, so a
+/// machine where the repair keeps being declined isn't re-prompted on
+/// every launch. Mirrors the renewal backoff cadence.
+const ACCESS_REPAIR_BACKOFF: Duration = Duration::from_secs(6 * 3600);
+
+fn access_repair_marker_path() -> Result<PathBuf> {
+    let dir = crate::state_paths::user_state_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        NonoError::SandboxInit(format!("cannot create state dir '{}': {e}", dir.display()))
+    })?;
+    Ok(dir.join("proxy-ca-access-repair-backoff"))
+}
+
+fn access_repair_backed_off() -> Result<bool> {
+    let path = access_repair_marker_path()?;
+    let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+        return Ok(false);
+    };
+    let elapsed = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::ZERO);
+    Ok(elapsed < ACCESS_REPAIR_BACKOFF)
+}
+
+fn record_access_repair_backoff() -> Result<()> {
+    let path = access_repair_marker_path()?;
+    std::fs::write(&path, []).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "cannot write access-repair backoff marker '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
+/// Marker file recording which CA item's access list was last verified (or
+/// established). Reading an item's access list with
+/// `SecKeychainItemCopyAccess` prompts for non-Apple-anchored binaries even
+/// when the caller is in the access list, so launches cannot verify on
+/// every start; they consult this marker instead and only take the renewal
+/// lock (prompting at most once, machine-wide) when the item changed since
+/// the last verification. The item is identified by its creation date
+/// together with its persistent reference: creation dates have second
+/// resolution, so a replacement created in the same second would otherwise
+/// inherit the marker, while the reference is unique to the item instance.
+/// Data-only updates change neither, so renewals never invalidate it.
+///
+/// The marker is keyed by item, not by binary. A different binary that
+/// arrives while the marker is fresh skips the verifying read deliberately:
+/// its grant is the user's call (the platform prompts once for the data
+/// read, or the launch fails closed when unattended) rather than the binary
+/// editing the access list to admit itself.
+const ACL_STATE_MARKER: &str = "proxy-ca-acl-state";
+
+/// The access-management policy the marker was written under. Kept as a
+/// marker line so the format can distinguish policies without a format
+/// change if one is ever introduced.
+const ACL_STATE_POLICY_ID: &str = "preserve";
+
+/// What the ACL state marker keys on: the item's creation-date epoch and
+/// the hex of its persistent reference, read from the item itself so the
+/// marker and the verified item can never disagree.
+struct ItemIdentity {
+    epoch: f64,
+    persistent_ref: String,
+}
+
+fn acl_state_marker_path() -> Result<PathBuf> {
+    let dir = crate::state_paths::user_state_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        NonoError::SandboxInit(format!("cannot create state dir '{}': {e}", dir.display()))
+    })?;
+    Ok(dir.join(ACL_STATE_MARKER))
+}
+
+/// Whether a stored marker still covers this item and policy. Pure so the
+/// matching rules can be unit-tested.
+fn marker_matches(stored: Option<&str>, item: &ItemIdentity, policy_id: &str) -> bool {
+    let Some(content) = stored else { return false };
+    let Some((epoch_str, rest)) = content.split_once('\n') else {
+        return false;
+    };
+    let Some((ref_str, policy_str)) = rest.split_once('\n') else {
+        return false;
+    };
+    let Ok(stored_epoch) = epoch_str.trim().parse::<f64>() else {
+        return false;
+    };
+    stored_epoch == item.epoch
+        && ref_str.trim() == item.persistent_ref
+        && policy_str.trim_end_matches(['\n', '\r']) == policy_id
+}
+
+fn acl_state_marker_satisfied(item: &ItemIdentity) -> bool {
+    let Ok(path) = acl_state_marker_path() else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    marker_matches(Some(&content), item, ACL_STATE_POLICY_ID)
+}
+
+fn write_acl_state_marker(item: &ItemIdentity) -> Result<()> {
+    let path = acl_state_marker_path()?;
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n{ACL_STATE_POLICY_ID}",
+            item.epoch, item.persistent_ref
+        ),
+    )
+    .map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "cannot write proxy-CA access state marker '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
+/// The shared query prefix for operations bound to one item: the item the
+/// gate resolved (and verified), never whatever a fresh attribute search
+/// would resolve to, so no read or write can land on a replacement item
+/// this process never gated.
+fn item_bound_query(item: &SecKeychainItem) -> CFMutableDictionary {
+    // SAFETY: `CFRetain` on a valid reference so the array can own it.
+    unsafe { core_foundation_sys::base::CFRetain(item.as_concrete_TypeRef() as CFTypeRef) };
+    // SAFETY: the retain above made this a Create-rule reference.
+    let item_cf =
+        unsafe { CFType::wrap_under_create_rule(item.as_concrete_TypeRef() as CFTypeRef) };
+    let items = CFArray::from_CFTypes(&[item_cf]);
+    let mut query = CFMutableDictionary::from_CFType_pairs(&[]);
+    let class_key = unsafe { CFString::wrap_under_get_rule(kSecClass) };
+    let class_val = unsafe { CFString::wrap_under_get_rule(kSecClassGenericPassword) };
+    let items_key = unsafe { CFString::wrap_under_get_rule(acl_ffi::kSecMatchItemList) };
+    query.add(&class_key.as_CFTypeRef(), &class_val.as_CFTypeRef());
+    query.add(&items_key.as_CFTypeRef(), &items.as_CFTypeRef());
+    query
+}
+
+/// The item's identity for the ACL state marker: creation-date epoch plus
+/// persistent reference, read from the item itself in one bound query.
+/// Reading them from the resolved reference keeps the marker and the
+/// verified item from ever disagreeing.
+fn item_identity(item: &SecKeychainItem) -> Result<ItemIdentity> {
+    let mut query = item_bound_query(item);
+    let attrs_key = unsafe { CFString::wrap_under_get_rule(kSecReturnAttributes) };
+    query.add(
+        &attrs_key.as_CFTypeRef(),
+        &CFBoolean::true_value().as_CFTypeRef(),
+    );
+    let ref_req_key = unsafe { CFString::wrap_under_get_rule(kSecReturnPersistentRef) };
+    query.add(
+        &ref_req_key.as_CFTypeRef(),
+        &CFBoolean::true_value().as_CFTypeRef(),
+    );
+    let mut out: CFTypeRef = std::ptr::null_mut();
+    // SAFETY: `query` is a valid CFMutableDictionaryRef; `out` receives a
+    // Create-rule reference on success.
+    let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut out) };
+    if status != 0 || out.is_null() {
+        return Err(NonoError::SandboxInit(format!(
+            "cannot read the proxy-CA item's identity (OSStatus {status})"
+        )));
+    }
+    // SAFETY: `out` is a Create-rule CFDictionary of the item's attributes.
+    let dict =
+        unsafe { CFDictionary::<CFString, CFType>::wrap_under_create_rule(out as CFDictionaryRef) };
+    let creation_key = unsafe { CFString::wrap_under_get_rule(acl_ffi::kSecAttrCreationDate) };
+    let ref_attr_key = unsafe { CFString::wrap_under_get_rule(acl_ffi::kSecValuePersistentRef) };
+    let (keys, values) = dict.get_keys_and_values();
+    let mut epoch = None;
+    let mut persistent_ref = None;
+    for (k, v) in keys.iter().zip(values.iter()) {
+        let key = unsafe { CFString::wrap_under_get_rule((*k).cast()) };
+        if key == creation_key {
+            // kSecAttrCreationDate is a CFDate for generic passwords; the
+            // type check keeps a malformed result from misreading memory.
+            if unsafe { core_foundation_sys::base::CFGetTypeID(*v) } != CFDate::type_id() {
+                continue;
+            }
+            let date = unsafe { CFDate::wrap_under_get_rule(*v as CFDateRef) };
+            epoch = Some(date.abs_time());
+        } else if key == ref_attr_key {
+            // kSecValuePersistentRef comes back as CFData; same type-check
+            // discipline as the date above.
+            if unsafe { core_foundation_sys::base::CFGetTypeID(*v) } != CFData::type_id() {
+                continue;
+            }
+            let data = unsafe { CFData::wrap_under_get_rule(*v as CFDataRef) };
+            persistent_ref = Some(data.bytes().iter().map(|b| format!("{b:02x}")).collect());
+        }
+    }
+    match (epoch, persistent_ref) {
+        (Some(epoch), Some(persistent_ref)) => Ok(ItemIdentity {
+            epoch,
+            persistent_ref,
+        }),
+        _ => Err(NonoError::SandboxInit(
+            "the proxy-CA keychain item carries no creation date or persistent reference"
+                .to_string(),
+        )),
+    }
+}
+
+/// Read the CA bundle's bytes from exactly this item: the reference the
+/// gate verified. Attribute-based reads could resolve to a replacement
+/// item whose access list this process never verified. `Ok(None)` means
+/// the item was definitively deleted (the reference went stale between
+/// the gate and this read); every other failure, an authorization denial
+/// above all, stays an error so callers fail closed instead of treating
+/// an unreadable item as absent.
+fn read_item_data(item: &SecKeychainItem) -> Result<Option<Vec<u8>>> {
+    let mut query = item_bound_query(item);
+    let data_key = unsafe { CFString::wrap_under_get_rule(kSecReturnData) };
+    query.add(
+        &data_key.as_CFTypeRef(),
+        &CFBoolean::true_value().as_CFTypeRef(),
+    );
+    let mut out: CFTypeRef = std::ptr::null_mut();
+    // SAFETY: `query` is a valid CFMutableDictionaryRef; `out` receives a
+    // Create-rule reference on success.
+    let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut out) };
+    if status == errSecItemNotFound {
+        return Ok(None);
+    }
+    if status != 0 || out.is_null() {
+        return Err(NonoError::SandboxInit(format!(
+            "cannot read the proxy-CA bundle from Keychain (OSStatus {status})"
+        )));
+    }
+    // SAFETY: `out` is a Create-rule CFData holding the bundle's bytes.
+    let data =
+        unsafe { CFData::wrap_under_create_rule(out as core_foundation_sys::data::CFDataRef) };
+    Ok(Some(data.bytes().to_vec()))
+}
+
+/// Replace the item's data through the verified reference. Data-only, so
+/// the access list and the creation date the ACL state marker keys on
+/// survive the update.
+fn update_item_data(item: &SecKeychainItem, data: &[u8]) -> Result<()> {
+    let query = item_bound_query(item);
+    let data_key = unsafe { CFString::wrap_under_get_rule(kSecValueData) };
+    let data_val = CFData::from_buffer(data);
+    let mut update = CFMutableDictionary::from_CFType_pairs(&[]);
+    update.add(&data_key.as_CFTypeRef(), &data_val.as_CFTypeRef());
+    // SAFETY: both dictionaries are valid for the duration of the call.
+    let status =
+        unsafe { SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef()) };
+    if status != 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "failed to update the proxy-CA bundle in Keychain (OSStatus {status})"
+        )));
+    }
+    Ok(())
+}
+
+// Keychain ACL APIs `security-framework` does not wrap.
+mod acl_ffi {
+    use core_foundation::array::CFArrayRef;
+    use core_foundation::base::OSStatus;
+    use core_foundation::data::CFDataRef;
+    use core_foundation::string::CFStringRef;
+    use security_framework_sys::base::{SecAccessRef, SecKeychainItemRef};
+
+    /// Opaque CF type for a trusted-application record.
+    pub type SecTrustedApplicationRef = *mut std::ffi::c_void;
+    /// Opaque CF type for one ACL entry.
+    pub type SecACLRef = *mut std::ffi::c_void;
+    /// `SecKeychainPromptSelector` (`CF_OPTIONS(uint16, ...)` in SecACL.h).
+    pub type SecKeychainPromptSelector = u16;
+    /// `CSSM_ACL_AUTHORIZATION_TAG` (`int` in SecACL.h): the CSSM_WORDID_*
+    /// values, 24 decrypt and 35 encrypt among them, plus Apple's
+    /// vendor-defined tags from 65536 (change ACL) up.
+    pub type AclAuthorizationTag = i32;
+    /// The only authorization a standard keychain item hands to every
+    /// application: the app-less encrypt entry. Any other tag on an
+    /// any-application entry leaves the secret itself unrestricted.
+    pub const ACL_AUTHORIZATION_ENCRYPT: AclAuthorizationTag = 35;
+    /// The authorization that reveals the stored secret; an entry carrying
+    /// it gates the item's data, and only such entries' records count as
+    /// grants.
+    pub const ACL_AUTHORIZATION_DECRYPT: AclAuthorizationTag = 24;
+    /// The remaining data-rights tags observed on the secret-gating entry
+    /// of a real generic-password item (derive, both exports, MAC, sign).
+    /// An application may hold these together with decrypt on a canonical
+    /// item; anything else, change-acl (65536) above all, it may not.
+    ///
+    /// Whether the tag belongs to the observed data-rights set that the
+    /// secret-gating entry of a real item carries: decrypt, derive, both
+    /// exports, MAC, sign.
+    pub fn is_data_right(tag: AclAuthorizationTag) -> bool {
+        matches!(tag, 24 | 28 | 37 | 38 | 59 | 115)
+    }
+
+    unsafe extern "C" {
+        pub fn SecTrustedApplicationCreateFromPath(
+            path: *const std::ffi::c_char,
+            app: *mut SecTrustedApplicationRef,
+        ) -> OSStatus;
+        pub fn SecAccessCreate(
+            descriptor: CFStringRef,
+            trustedlist: CFArrayRef,
+            access: *mut SecAccessRef,
+        ) -> OSStatus;
+        pub fn SecKeychainItemCopyAccess(
+            item: SecKeychainItemRef,
+            access: *mut SecAccessRef,
+        ) -> OSStatus;
+        pub fn SecKeychainItemSetAccess(item: SecKeychainItemRef, access: SecAccessRef)
+        -> OSStatus;
+        pub fn SecAccessCopyACLList(access: SecAccessRef, acls: *mut CFArrayRef) -> OSStatus;
+        /// `SecACLCopyTrustedApplications` was removed from the framework;
+        /// this is the supported way to read an entry's application list.
+        pub fn SecACLCopyContents(
+            acl: SecACLRef,
+            application_list: *mut CFArrayRef,
+            description: *mut CFStringRef,
+            prompt_selector: *mut SecKeychainPromptSelector,
+        ) -> OSStatus;
+        /// Caller-provided tag buffer with in/out capacity (`int *` per
+        /// SecACL.h); entries hold a handful of tags, so 32 slots bound it
+        /// far above the enum's range.
+        pub fn SecACLGetAuthorizations(
+            acl: SecACLRef,
+            tags: *mut AclAuthorizationTag,
+            tag_count: *mut u32,
+        ) -> OSStatus;
+        pub fn SecTrustedApplicationCopyData(
+            app: SecTrustedApplicationRef,
+            data: *mut CFDataRef,
+        ) -> OSStatus;
+        /// Attribute key attaching a `SecAccessRef` to a new item in
+        /// `SecItemAdd` (legacy Keychain Services attribute).
+        pub static kSecAttrAccess: CFStringRef;
+        /// Creation-date attribute key of SecItem results; a CFDate.
+        pub static kSecAttrCreationDate: CFStringRef;
+        /// Result-dictionary key under which `SecItemCopyMatching` returns
+        /// the persistent reference when `kSecReturnPersistentRef` is set;
+        /// a CFData unique to the item instance. Not exposed by the
+        /// security-framework crate.
+        pub static kSecValuePersistentRef: CFStringRef;
+        /// Query key selecting the exact items named by the query instead
+        /// of searching, so a read or update lands on the item the gate
+        /// verified and never on whatever a fresh search would resolve to.
+        pub static kSecMatchItemList: CFStringRef;
+
+    }
+}
+
+/// An owned `SecTrustedApplicationRef` (Create rule, released on drop)
+/// together with its requirement bytes, copied out once so every access
+/// decision is a plain byte comparison.
+struct TrustedAppRecord {
+    app: CFType,
+    data: Vec<u8>,
+}
+
+fn trusted_app_data(app: acl_ffi::SecTrustedApplicationRef) -> Result<Vec<u8>> {
+    let mut data: core_foundation_sys::data::CFDataRef = std::ptr::null_mut();
+    // SAFETY: `app` is a valid reference; `data` is an out-param receiving
+    // a Create-rule reference on success.
+    let status = unsafe { acl_ffi::SecTrustedApplicationCopyData(app, &mut data) };
+    if status != 0 || data.is_null() {
+        return Err(NonoError::SandboxInit(format!(
+            "cannot copy a trusted-application record (OSStatus {status})"
+        )));
+    }
+    // SAFETY: `data` is a Create-rule reference.
+    let cf_data = unsafe { CFData::wrap_under_create_rule(data) };
+    Ok(cf_data.bytes().to_vec())
+}
+
+/// The running binary's trusted-application record.
+fn current_trusted_application() -> Result<TrustedAppRecord> {
+    let exe = std::env::current_exe().map_err(|e| {
+        NonoError::SandboxInit(format!("cannot resolve the running binary's path: {e}"))
+    })?;
+    let path =
+        std::ffi::CString::new(exe.as_os_str().as_encoded_bytes().to_vec()).map_err(|e| {
+            NonoError::SandboxInit(format!("running binary path is not C-representable: {e}"))
+        })?;
+    let mut app: acl_ffi::SecTrustedApplicationRef = std::ptr::null_mut();
+    // SAFETY: `path` is a valid NUL-terminated C string for the duration of
+    // the call; `app` is an out-param receiving a Create-rule reference on
+    // success.
+    let status = unsafe { acl_ffi::SecTrustedApplicationCreateFromPath(path.as_ptr(), &mut app) };
+    if status != 0 || app.is_null() {
+        return Err(NonoError::SandboxInit(format!(
+            "SecTrustedApplicationCreateFromPath failed for the running binary (OSStatus {status})"
+        )));
+    }
+    // SAFETY: `app` is a Create-rule reference on success, wrapped before
+    // any fallible work so an error path releases it.
+    let owned = unsafe { CFType::wrap_under_create_rule(app as CFTypeRef) };
+    let data = trusted_app_data(app)?;
+    Ok(TrustedAppRecord { app: owned, data })
+}
+
+/// Find the CA-bundle generic-password item. Metadata search only: no data
+/// access, so no prompt.
+fn find_ca_bundle_item() -> Result<Option<SecKeychainItem>> {
+    let results = match ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(KEYCHAIN_SERVICE)
+        .account(KEYCHAIN_ACCOUNT)
+        .load_refs(true)
+        .limit(Limit::Max(1))
+        .search()
+    {
+        Ok(results) => results,
+        // Nothing stored yet on this machine: the create path attaches the
+        // access list at SecItemAdd time.
+        Err(e) if e.code() == errSecItemNotFound => return Ok(None),
+        Err(e) => {
+            return Err(NonoError::SandboxInit(format!(
+                "keychain search for the CA bundle failed: {e}"
+            )));
+        }
+    };
+    Ok(results.into_iter().find_map(|result| match result {
+        SearchResult::Ref(Reference::KeychainItem(item)) => Some(item),
+        _ => None,
+    }))
+}
+
+/// One copied ACL entry: its trusted applications, whether its
+/// application list was absent (an any-application grant, versus a list
+/// that merely names no applications) and the authorization tags it gates.
+struct AclEntry {
+    apps: Vec<TrustedAppRecord>,
+    any_application: bool,
+    tags: Vec<acl_ffi::AclAuthorizationTag>,
+}
+
+/// The verify/repair flow's classification of keychain failures, so an
+/// unavailable interaction never rate-limits the whole machine.
+enum ItemAccessError {
+    /// errSecInteractionNotAllowed: no interactive session exists to show
+    /// the authorization prompt. Nobody declined anything, and a later
+    /// interactive launch can still be asked.
+    NoInteraction,
+    Other(NonoError),
+}
+
+impl ItemAccessError {
+    /// Only a declined authorization or a genuinely broken keychain backs
+    /// the machine off; an unavailable interaction must not.
+    fn should_back_off(&self) -> bool {
+        !matches!(self, Self::NoInteraction)
+    }
+}
+
+fn item_access_call_failed(what: &str, status: i32) -> ItemAccessError {
+    if status == ERR_SEC_INTERACTION_NOT_ALLOWED {
+        ItemAccessError::NoInteraction
+    } else {
+        ItemAccessError::Other(NonoError::SandboxInit(format!(
+            "cannot {what} (OSStatus {status})"
+        )))
+    }
+}
+
+/// Copy the item's access list and reduce it to per-entry owned records.
+fn collect_item_access(
+    item: &SecKeychainItem,
+) -> std::result::Result<Vec<AclEntry>, ItemAccessError> {
+    let mut access: SecAccessRef = std::ptr::null_mut();
+    // SAFETY: `item` is a valid SecKeychainItemRef; `access` is an out-param
+    // receiving a Create-rule reference on success.
+    let status =
+        unsafe { acl_ffi::SecKeychainItemCopyAccess(item.as_concrete_TypeRef(), &mut access) };
+    if status != 0 || access.is_null() {
+        return Err(item_access_call_failed(
+            "read the proxy-CA item's access list",
+            status,
+        ));
+    }
+    // SAFETY: `access` is a Create-rule reference.
+    let access = unsafe { SecAccess::wrap_under_create_rule(access) };
+
+    let mut acl_list: CFArrayRef = std::ptr::null_mut();
+    // SAFETY: `access` is valid; `acl_list` is an out-param receiving a
+    // Create-rule reference on success.
+    let status =
+        unsafe { acl_ffi::SecAccessCopyACLList(access.as_concrete_TypeRef(), &mut acl_list) };
+    if status != 0 || acl_list.is_null() {
+        return Err(ItemAccessError::Other(NonoError::SandboxInit(format!(
+            "cannot enumerate the proxy-CA item's ACL entries (OSStatus {status})"
+        ))));
+    }
+    // SAFETY: `acl_list` is a Create-rule reference.
+    let acl_list = unsafe { CFArray::<CFType>::wrap_under_create_rule(acl_list) };
+
+    let mut entries = Vec::new();
+    for index in 0..acl_list.len() {
+        // A NULL slot in the copied list (never expected): abort rather
+        // than fold a partial view into the plan, since a rebuild driven
+        // by incomplete facts could drop grants this process never saw.
+        let Some(acl) = acl_list.get(index) else {
+            return Err(ItemAccessError::Other(NonoError::SandboxInit(
+                "the proxy-CA item's access list could not be copied completely".to_string(),
+            )));
+        };
+        let acl_ref = acl.as_concrete_TypeRef() as acl_ffi::SecACLRef;
+        let mut apps: CFArrayRef = std::ptr::null_mut();
+        let mut description: core_foundation::string::CFStringRef = std::ptr::null();
+        let mut prompt_selector: acl_ffi::SecKeychainPromptSelector = 0;
+        // SAFETY: `acl_ref` came from the copied ACL list; the out-params
+        // receive Create-rule references on success.
+        let status = unsafe {
+            acl_ffi::SecACLCopyContents(acl_ref, &mut apps, &mut description, &mut prompt_selector)
+        };
+        // The description is a byproduct we don't use.
+        if !description.is_null() {
+            // SAFETY: Create-rule reference from the call above.
+            unsafe { core_foundation_sys::base::CFRelease(description as CFTypeRef) };
+        }
+        if status != 0 {
+            // An entry macOS won't enumerate aborts the whole copy: a
+            // rebuild must never run on partial facts.
+            return Err(ItemAccessError::Other(NonoError::SandboxInit(format!(
+                "cannot read an entry of the proxy-CA item's access list (OSStatus {status})"
+            ))));
+        }
+        // SAFETY: `apps` is a Create-rule reference, wrapped before any
+        // fallible work so an error path releases it. A null list grants
+        // the entry's authorizations to every application; the standard
+        // item keeps only the harmless encrypt entry in that shape.
+        let apps = if apps.is_null() {
+            None
+        } else {
+            Some(unsafe { CFArray::<CFType>::wrap_under_create_rule(apps) })
+        };
+        let tags = entry_authorizations(acl_ref).map_err(ItemAccessError::Other)?;
+        let Some(apps) = apps else {
+            entries.push(AclEntry {
+                apps: Vec::new(),
+                any_application: true,
+                tags,
+            });
+            continue;
+        };
+        let mut records = Vec::new();
+        for app_index in 0..apps.len() {
+            let Some(record) = apps.get(app_index) else {
+                continue;
+            };
+            let app_ref = record.as_concrete_TypeRef() as acl_ffi::SecTrustedApplicationRef;
+            if app_ref.is_null() {
+                continue;
+            }
+            let data = trusted_app_data(app_ref).map_err(ItemAccessError::Other)?;
+            // SAFETY: `CFRetain` on a valid reference so the record outlives
+            // the borrowed array; the wrapper releases it on drop.
+            unsafe { core_foundation_sys::base::CFRetain(app_ref as CFTypeRef) };
+            // SAFETY: the retain above made this a Create-rule reference.
+            let owned = unsafe { CFType::wrap_under_create_rule(app_ref as CFTypeRef) };
+            records.push(TrustedAppRecord { app: owned, data });
+        }
+        entries.push(AclEntry {
+            apps: records,
+            any_application: false,
+            tags,
+        });
+    }
+    Ok(entries)
+}
+
+/// Copy one entry's authorization tags. A non-zero status aborts the whole
+/// verification like the other entry reads: a rebuild must never run on
+/// partial facts, and the tags decide whether an any-application entry is
+/// harmless.
+fn entry_authorizations(acl: acl_ffi::SecACLRef) -> Result<Vec<acl_ffi::AclAuthorizationTag>> {
+    const MAX_TAGS: usize = 32;
+    let mut tags = [0 as acl_ffi::AclAuthorizationTag; MAX_TAGS];
+    let mut count: u32 = MAX_TAGS as u32;
+    // SAFETY: `acl` came from the copied ACL list; `tags` has room for the
+    // full in/out capacity declared to the call.
+    let status = unsafe { acl_ffi::SecACLGetAuthorizations(acl, tags.as_mut_ptr(), &mut count) };
+    if status != 0 || count as usize > MAX_TAGS {
+        return Err(NonoError::SandboxInit(format!(
+            "cannot read the authorizations of an access-list entry (OSStatus {status})"
+        )));
+    }
+    Ok(tags[..count as usize].to_vec())
+}
+
+/// Decision about the item's access list, computed from copied facts.
+enum AccessPlan {
+    /// The list already has its canonical shape: nothing to do, no prompt.
+    Canonical,
+    /// Rebuild. `keep` holds the requirement bytes of the existing records
+    /// that gate the secret; the running binary's own record is always
+    /// added on top by the caller.
+    Rebuild { keep: Vec<Vec<u8>> },
+}
+
+/// One entry of a copied access list, reduced to what the plan decides on:
+/// the applications an entry names by their requirement bytes together
+/// with the authorizations it grants them, or, when the entry names no
+/// application list at all, the authorization tags it hands to every
+/// application.
+enum PlanEntry {
+    /// Names applications (possibly none: an empty list grants nothing)
+    /// holding these authorization tags.
+    Named {
+        tags: Vec<acl_ffi::AclAuthorizationTag>,
+        apps: Vec<Vec<u8>>,
+    },
+    /// Grants every application these authorization tags.
+    Any(Vec<acl_ffi::AclAuthorizationTag>),
+}
+
+impl PlanEntry {
+    fn named(tags: Vec<acl_ffi::AclAuthorizationTag>, apps: Vec<Vec<u8>>) -> Self {
+        PlanEntry::Named { tags, apps }
+    }
+}
+
+/// Whether an entry's authorizations include revealing the stored secret.
+/// Records on such entries are grants of the secret itself; records held
+/// only for harmless rights (encrypt) grant nothing and must never be
+/// promoted onto the secret-gating entry by a rebuild.
+fn gates_secret(tags: &[acl_ffi::AclAuthorizationTag]) -> bool {
+    tags.contains(&acl_ffi::ACL_AUTHORIZATION_DECRYPT)
+}
+
+/// Whether a named entry may grant this right to an application and still
+/// count as canonical: the standard encrypt right and the data rights. A
+/// named application holding anything else (change-acl above all, which
+/// could rewrite the list and grant itself the secret) forces a rebuild,
+/// even when the entry also gates the secret.
+fn canonical_named_right(tag: acl_ffi::AclAuthorizationTag) -> bool {
+    tag == acl_ffi::ACL_AUTHORIZATION_ENCRYPT || acl_ffi::is_data_right(tag)
+}
+
+/// Pure decision over the item's current access list. `current` is the
+/// running binary's own requirement bytes.
+///
+/// Every keychain item carries standard entries that never gate the secret
+/// (the any-application encrypt entry, the empty-listed change-acl entry),
+/// and records only ever appear on the entry that does gate it: macOS
+/// grants and repairs all land there. So an access list where no
+/// secret-gating entry carries any record is one where no application is
+/// pre-authorized and every read prompts: the state this fix exists to
+/// repair away. An any-application entry is harmless only while it gates
+/// nothing but the standard encrypt right; a decrypt or export tag on one
+/// leaves the secret readable by every application, so it always forces a
+/// rebuild. A named entry may name applications only for the standard
+/// encrypt right and the data rights; any other right handed to a named
+/// application (change-acl above all) forces a rebuild too: that
+/// application could rewrite the list and grant itself the secret. Rebuilds
+/// keep records only from secret-gating entries, so a record held for
+/// harmless rights alone is dropped rather than promoted.
+fn plan_item_access(entries: &[PlanEntry], current: &[u8]) -> AccessPlan {
+    let granted = |apps: &Vec<Vec<u8>>| !apps.is_empty();
+    let mut union: Vec<&[u8]> = Vec::new();
+    let mut any_granted = false;
+    for entry in entries {
+        let PlanEntry::Named { tags, apps } = entry else {
+            continue;
+        };
+        if !gates_secret(tags) {
+            continue;
+        }
+        any_granted = any_granted || granted(apps);
+        for data in apps {
+            if !union.contains(&data.as_slice()) {
+                union.push(data.as_slice());
+            }
+        }
+    }
+    let contains_current = union.contains(&current);
+    let appless_harmless = entries.iter().all(|entry| match entry {
+        PlanEntry::Any(tags) => tags
+            .iter()
+            .all(|tag| *tag == acl_ffi::ACL_AUTHORIZATION_ENCRYPT),
+        PlanEntry::Named { .. } => true,
+    });
+    let named_harmless = entries.iter().all(|entry| match entry {
+        PlanEntry::Named { tags, apps } => {
+            apps.is_empty() || tags.iter().all(|tag| canonical_named_right(*tag))
+        }
+        PlanEntry::Any(_) => true,
+    });
+    let harmless = appless_harmless && named_harmless;
+    if any_granted && contains_current && harmless {
+        AccessPlan::Canonical
+    } else {
+        AccessPlan::Rebuild {
+            keep: union.iter().map(|existing| existing.to_vec()).collect(),
+        }
+    }
+}
+
+/// Verify the item's access list has its canonical shape, rebuilding it
+/// when it doesn't, and record the outcome in the ACL state marker. The
+/// caller must be the renewal-lock holder (the gate below, a renewal, or a
+/// sweep): exactly one process repairs at a time, and the others wait for
+/// that holder instead of prompting independently. The marker write is what
+/// lets later launches skip this prompting read entirely.
+fn verify_or_repair_item_access(item: &SecKeychainItem, identity: &ItemIdentity) -> Result<()> {
+    let result: std::result::Result<(), ItemAccessError> = (|| {
+        let entries = collect_item_access(item)?;
+        let current = current_trusted_application().map_err(ItemAccessError::Other)?;
+        let facts: Vec<PlanEntry> = entries
+            .iter()
+            .map(|entry| {
+                if entry.any_application {
+                    PlanEntry::Any(entry.tags.clone())
+                } else {
+                    PlanEntry::named(
+                        entry.tags.clone(),
+                        entry.apps.iter().map(|app| app.data.clone()).collect(),
+                    )
+                }
+            })
+            .collect();
+        match plan_item_access(&facts, &current.data) {
+            AccessPlan::Canonical => Ok(()),
+            AccessPlan::Rebuild { keep } => rebuild_item_access(item, entries, current, &keep),
+        }
+    })();
+    if let Err(e) = &result {
+        // A failed attempt must not become a prompt per launch: back the
+        // whole machine off for the window. An unavailable interaction is
+        // excluded: nobody declined, and a later interactive launch can
+        // still be asked.
+        if e.should_back_off() {
+            let _ = record_access_repair_backoff();
+        }
+    }
+    match result {
+        Err(ItemAccessError::NoInteraction) => {
+            return Err(NonoError::SandboxInit(
+                "no interactive session is available to verify the proxy-CA item's \
+                 access list; no authorization was declined"
+                    .to_string(),
+            ));
+        }
+        Err(ItemAccessError::Other(e)) => return Err(e),
+        Ok(()) => {}
+    }
+    // Verification (or repair) succeeded: record this item as settled so
+    // launches skip the prompting access-list read until the item is
+    // recreated. The identity is the one this process read from this
+    // exact item before verifying it, so the marker can only ever bless
+    // that item: a replacement carries a different persistent reference,
+    // leaves the marker unsatisfied, and forces the next launch to verify
+    // from scratch.
+    if let Err(e) = write_acl_state_marker(identity) {
+        // Without the marker every launch would repeat the prompting
+        // verification, so back off like a failed attempt. A state dir too
+        // broken to record this either fails the renewal lock first (no
+        // verification, no prompt) or leaves serialized, wait-bounded
+        // verifies as the floor: the lock still prevents simultaneous
+        // prompts, and no other channel exists to record state in.
+        let _ = record_access_repair_backoff();
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Replace the item's access list with the canonical set: the surviving
+/// records named by `keep` plus the running binary. May prompt once for
+/// authorization on machines whose item predates ACL-aware nono; the
+/// caller holds the renewal lock, so that prompt is bounded to one
+/// process at a time.
+fn rebuild_item_access(
+    item: &SecKeychainItem,
+    entries: Vec<AclEntry>,
+    current: TrustedAppRecord,
+    keep: &[Vec<u8>],
+) -> std::result::Result<(), ItemAccessError> {
+    let mut available: Vec<TrustedAppRecord> =
+        entries.into_iter().flat_map(|entry| entry.apps).collect();
+    let mut selected: Vec<TrustedAppRecord> = Vec::new();
+    for data in keep {
+        if let Some(pos) = available.iter().position(|app| app.data == *data) {
+            selected.push(available.swap_remove(pos));
+        }
+    }
+    // The keep set names the running binary whenever the item already
+    // granted it, so add the current record only when the selection does
+    // not already carry these bytes: a rebuild must never install
+    // duplicate records.
+    if !selected.iter().any(|app| app.data == current.data) {
+        match available.iter().position(|app| app.data == current.data) {
+            Some(pos) => selected.push(available.swap_remove(pos)),
+            None => selected.push(current),
+        }
+    }
+    let records: Vec<CFType> = selected.iter().map(|app| app.app.clone()).collect();
+    replace_item_access(item, &records)
+}
+
+/// Build a fresh `SecAccess` over `records` and install it on the item.
+fn replace_item_access(
+    item: &SecKeychainItem,
+    records: &[CFType],
+) -> std::result::Result<(), ItemAccessError> {
+    let descriptor = CFString::new("nono proxy CA bundle");
+    let trusted_list = CFArray::from_CFTypes(records);
+    let mut access: SecAccessRef = std::ptr::null_mut();
+    // SAFETY: `descriptor` and `trusted_list` are valid for the duration of
+    // the call; `access` is an out-param receiving a Create-rule reference
+    // on success.
+    let status = unsafe {
+        acl_ffi::SecAccessCreate(
+            descriptor.as_concrete_TypeRef(),
+            trusted_list.as_concrete_TypeRef(),
+            &mut access,
+        )
+    };
+    if status != 0 || access.is_null() {
+        return Err(ItemAccessError::Other(NonoError::SandboxInit(format!(
+            "cannot build a replacement access list for the proxy-CA item (OSStatus {status})"
+        ))));
+    }
+    // SAFETY: `access` is a Create-rule reference.
+    let access = unsafe { SecAccess::wrap_under_create_rule(access) };
+    // SAFETY: both references are valid for the duration of the call.
+    let status = unsafe {
+        acl_ffi::SecKeychainItemSetAccess(item.as_concrete_TypeRef(), access.as_concrete_TypeRef())
+    };
+    if status != 0 {
+        return Err(item_access_call_failed(
+            "install the repaired access list on the proxy-CA item",
+            status,
+        ));
+    }
+    info!("Repaired the proxy-CA keychain item's access list to its canonical form");
+    Ok(())
+}
+
+/// Gate every read and write of the CA bundle: make the item's access list
+/// canonical before the first byte is read, so a burst of concurrent
+/// launches can't turn into a burst of per-process prompts. Returns the
+/// gated item's reference: callers read and write through it, bound to the
+/// exact item this gate verified, so a replacement item can never slip
+/// between the gate and the bytes.
+///
+/// Reading the access list itself prompts (securityd gates the owner read
+/// for non-Apple binaries even when the caller is in the list), so
+/// verification is keyed to the ACL state marker: while the marker says the
+/// current item was last verified, the gated read proceeds straight to the
+/// data. When it doesn't, one process takes the renewal lock and verifies
+/// or repairs for everyone; the others wait up to [`ACCESS_GATE_WAIT`]
+/// instead of prompting independently, then fail closed. Calls from a
+/// thread that already holds the lock (renewal, sweep, the launch
+/// re-check) verify in place, since a second exclusive flock from the same
+/// process would block on itself.
+fn ensure_bundle_access() -> Result<Option<SecKeychainItem>> {
+    let Some(item) = find_ca_bundle_item()? else {
+        // Nothing to gate yet: the create path attaches the access list
+        // at SecItemAdd time.
+        return Ok(None);
+    };
+    let identity = item_identity(&item)?;
+    if acl_state_marker_satisfied(&identity) {
+        // The last verification (or creation) still covers this item;
+        // skip the prompting access-list read.
+        return Ok(Some(item));
+    }
+    if access_repair_backed_off()? {
+        return Err(NonoError::SandboxInit(
+            "proxy-CA keychain access repair is rate-limited after a failed \
+             authorization; will retry later"
+                .to_string(),
+        ));
+    }
+    if crate::macos_ca_renewal::renewal_lock_held_by_current_thread() {
+        verify_or_repair_item_access(&item, &identity)?;
+        return Ok(Some(item));
+    }
+    let deadline = Instant::now() + ACCESS_GATE_WAIT;
+    loop {
+        if access_repair_backed_off()? {
+            // The lock holder we waited for failed its attempt; don't line
+            // up behind it just to fail (or prompt) the same way.
+            return Err(NonoError::SandboxInit(
+                "proxy-CA keychain access repair is rate-limited after a failed \
+                 authorization; will retry later"
+                    .to_string(),
+            ));
+        }
+        if acl_state_marker_satisfied(&identity) {
+            // The holder verified or repaired while we waited; its work
+            // covers this reader too.
+            return Ok(Some(item));
+        }
+        match RenewalLock::acquire()? {
+            Some(_lock) => {
+                if acl_state_marker_satisfied(&identity) {
+                    return Ok(Some(item));
+                }
+                // The previous holder may have failed and recorded the
+                // backoff after this waiter's last check; re-read it under
+                // the lock so its failure rate-limits this attempt too
+                // instead of prompting again inside the window.
+                if access_repair_backed_off()? {
+                    return Err(NonoError::SandboxInit(
+                        "proxy-CA keychain access repair is rate-limited after a failed \
+                         authorization; will retry later"
+                            .to_string(),
+                    ));
+                }
+                verify_or_repair_item_access(&item, &identity)?;
+                return Ok(Some(item));
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    return Err(NonoError::SandboxInit(
+                        "timed out waiting for another process to finish repairing the \
+                         proxy-CA keychain item"
+                            .to_string(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// Store a freshly created CA bundle, attaching the canonical access list
+/// at creation so the item is readable by the running binary from its
+/// first moment, with no authorization prompt. An existing item (possible
+/// when a concurrent creator raced us to the keychain before we took the
+/// lock) is gated and updated in place; the item's access list is never
+/// rewritten blind.
+fn store_bundle_with_access(combined: &Zeroizing<String>) -> Result<()> {
+    let current = current_trusted_application()?;
+    // A concurrent creator's duplicate item is gated and updated through
+    // the verified reference inside the create call below; the gate
+    // records the marker there. Only the fresh-create path needs the
+    // marker written here.
+    if let Some(created) = replace_item_access_create(combined, &[current.app])? {
+        // The access list was just established at creation; record the
+        // item as settled so the first gated read (possibly one
+        // of a concurrent burst of launches) skips the prompting
+        // access-list read. The identity is read from the reference the
+        // add returned, so the marker can only name the item this process
+        // just created.
+        let identity = item_identity(&created)?;
+        write_acl_state_marker(&identity)?;
+    }
+    Ok(())
+}
+
+/// Store a freshly created CA bundle, attaching the canonical access list
+/// at creation so the item is readable by the running binary from its
+/// first moment, with no authorization prompt. An existing item (possible
+/// when a concurrent creator raced us to the keychain before we took the
+/// lock) is gated first, then updated in place, so the CA key is only ever
+/// written through an access list this process verified. Returns the
+/// created item's reference, or `None` when a duplicate was gated and
+/// updated in place.
+fn replace_item_access_create(
+    combined: &Zeroizing<String>,
+    records: &[CFType],
+) -> Result<Option<SecKeychainItem>> {
+    let descriptor = CFString::new("nono proxy CA bundle");
+    let trusted_list = CFArray::from_CFTypes(records);
+    let mut access: SecAccessRef = std::ptr::null_mut();
+    // SAFETY: `descriptor` and `trusted_list` are valid for the duration of
+    // the call; `access` is an out-param receiving a Create-rule reference
+    // on success.
+    let status = unsafe {
+        acl_ffi::SecAccessCreate(
+            descriptor.as_concrete_TypeRef(),
+            trusted_list.as_concrete_TypeRef(),
+            &mut access,
+        )
+    };
+    if status != 0 || access.is_null() {
+        return Err(NonoError::SandboxInit(format!(
+            "cannot build the access list for a new proxy-CA item (OSStatus {status})"
+        )));
+    }
+    // SAFETY: `access` is a Create-rule reference.
+    let access = unsafe { SecAccess::wrap_under_create_rule(access) };
+
+    let class_key = unsafe { CFString::wrap_under_get_rule(kSecClass) };
+    let class_val = unsafe { CFString::wrap_under_get_rule(kSecClassGenericPassword) };
+    let svc_key = unsafe { CFString::wrap_under_get_rule(kSecAttrService) };
+    let svc_val = CFString::from(KEYCHAIN_SERVICE);
+    let acct_key = unsafe { CFString::wrap_under_get_rule(kSecAttrAccount) };
+    let acct_val = CFString::from(KEYCHAIN_ACCOUNT);
+    let data_key = unsafe { CFString::wrap_under_get_rule(kSecValueData) };
+    let data_val = CFData::from_buffer(combined.as_bytes());
+    let access_key = unsafe { CFString::wrap_under_get_rule(acl_ffi::kSecAttrAccess) };
+
+    let mut query = CFMutableDictionary::from_CFType_pairs(&[]);
+    query.add(&class_key.as_CFTypeRef(), &class_val.as_CFTypeRef());
+    query.add(&svc_key.as_CFTypeRef(), &svc_val.as_CFTypeRef());
+    query.add(&acct_key.as_CFTypeRef(), &acct_val.as_CFTypeRef());
+    query.add(&data_key.as_CFTypeRef(), &data_val.as_CFTypeRef());
+    query.add(&access_key.as_CFTypeRef(), &access.as_CFTypeRef());
+    let ref_key = unsafe { CFString::wrap_under_get_rule(kSecReturnRef) };
+    query.add(
+        &ref_key.as_CFTypeRef(),
+        &CFBoolean::true_value().as_CFTypeRef(),
+    );
+    let mut created: CFTypeRef = std::ptr::null_mut();
+    // SAFETY: `query` is a valid CFMutableDictionaryRef; `created` receives
+    // a Create-rule reference to the new item on success.
+    let status = unsafe { SecItemAdd(query.as_concrete_TypeRef(), &mut created) };
+    if status == errSecDuplicateItem {
+        // The item appeared between the gated read and the add. Its
+        // creator is unknown to this process, so verify (or repair) its
+        // access list before writing the CA key through it; the caller
+        // holds the renewal lock, which makes this an in-place verify.
+        // A failure fails the create path closed rather than storing the
+        // key in an item whose list this process could not vouch for.
+        // The write goes through the reference the gate just verified, so
+        // it can only land on the item that was verified.
+        let item = ensure_bundle_access()?.ok_or_else(|| {
+            NonoError::SandboxInit(
+                "the proxy-CA keychain item disappeared during creation".to_string(),
+            )
+        })?;
+        return update_item_data(&item, combined.as_bytes())
+            .map(|_| None)
+            .map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "failed to store the proxy CA bundle in Keychain: {e}"
+                ))
+            });
+    }
+    if status != 0 || created.is_null() {
+        return Err(NonoError::SandboxInit(format!(
+            "failed to create the proxy CA bundle in Keychain (OSStatus {status})"
+        )));
+    }
+    // SAFETY: `created` is a Create-rule reference to the item this add
+    // just made.
+    let item = unsafe { SecKeychainItem::wrap_under_create_rule(created as SecKeychainItemRef) };
+    Ok(Some(item))
 }
 
 /// Load or generate a shared CA and ensure it's trusted in the macOS user
@@ -320,7 +1396,8 @@ fn generate_new_trusted_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
     generate_and_trust_new_ca(validity)
 }
 
-/// The CA shared through Keychain, as `(key DER, cert PEM)`.
+/// The CA shared through Keychain, as `(key DER, cert PEM)`. Gated like
+/// every other read: the access repair runs before the first byte.
 pub(crate) fn read_shared_ca() -> Result<Option<(Zeroizing<Vec<u8>>, String)>> {
     load_existing_ca()
 }
@@ -410,10 +1487,23 @@ fn spki_of(cert_pem: &str) -> Result<Vec<u8>> {
     Ok(cert.public_key().subject_public_key.data.to_vec())
 }
 
+/// The single gated read of the CA bundle: every read of the item from
+/// every entry point (launch fast path, launch re-check, adoption,
+/// renewal, sweep) goes through here, so the access repair always runs
+/// before the first byte is read and a burst of concurrent launches
+/// can't turn into a burst of per-process prompts. The bytes come
+/// through the reference the gate verified, never a fresh attribute
+/// search, so a replacement item cannot slip between them.
 fn load_existing_ca() -> Result<Option<(Zeroizing<Vec<u8>>, String)>> {
-    let bundle = match passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
-        Ok(data) => data,
-        Err(_) => return Ok(None),
+    let Some(item) = ensure_bundle_access()? else {
+        return Ok(None);
+    };
+    let bundle = match read_item_data(&item)? {
+        // Deleted or replaced between the gate's resolve and this bound
+        // read: reads as absent, and the create path's duplicate branch
+        // re-gates whatever appeared next.
+        None => return Ok(None),
+        Some(data) => data,
     };
     let combined = String::from_utf8(bundle)
         .map_err(|e| NonoError::SandboxInit(format!("stored CA bundle is not valid UTF-8: {e}")))?;
@@ -522,12 +1612,23 @@ fn rotate_ca(
 
     let key_pem = ca.key_pem();
     let combined = Zeroizing::new(format!("{}{}", *key_pem, cert_pem));
-    passwords::set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, combined.as_bytes())
-        .map_err(|e| {
-            NonoError::SandboxInit(format!(
-                "failed to store renewed CA bundle in Keychain: {e}"
-            ))
-        })?;
+    // Write through the gate's verified reference: this flow holds the
+    // renewal lock, so the gate verifies in place when the marker does not
+    // cover the item, and the update lands on exactly that item.
+    let item = ensure_bundle_access()?.ok_or_else(|| {
+        NonoError::SandboxInit("the proxy-CA keychain item disappeared during renewal".to_string())
+    })?;
+    update_item_data(&item, combined.as_bytes()).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "failed to store renewed CA bundle in Keychain: {e}"
+        ))
+    })?;
+    // The update above replaces only the data attribute, so the access
+    // list survives it and the ACL state marker stays valid: the item's
+    // creation date, which the marker keys on, is unchanged. Re-reading
+    // the access list here would prompt on every renewal (securityd
+    // gates the owner read even for access-list members), so it is left
+    // to the gate, which verifies when the item changes.
 
     // Same-key renewal (Fix 6): the old cert's trust settings apply to a key
     // that's still current, so leave it in the keychain rather than dropping
@@ -550,12 +1651,11 @@ fn generate_and_trust_new_ca(validity: Duration) -> Result<Option<PreloadedCa>> 
 
     // Single atomic write — concurrent processes race, but the bundle is always
     // a coherent key+cert pair (second writer wins, no mismatch possible).
+    // The access list is attached at creation, so the item is readable by
+    // the running binary from its first moment, no prompt.
     let key_pem = ca.key_pem();
     let combined = Zeroizing::new(format!("{}{}", *key_pem, cert_pem));
-    passwords::set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, combined.as_bytes())
-        .map_err(|e| {
-            NonoError::SandboxInit(format!("failed to store CA bundle in Keychain: {e}"))
-        })?;
+    store_bundle_with_access(&combined)?;
 
     let cert_der = pem_to_der(&cert_pem)?;
     let sec_cert = SecCertificate::from_der(&cert_der)
@@ -744,7 +1844,8 @@ fn remove_trust_settings(cert: &SecCertificate) -> std::result::Result<(), OSSta
 }
 
 fn delete_existing_ca() {
-    let _ = passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
+    let _ =
+        security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
 }
 
 /// Remaining life below which the CA is renewed at launch, so every session starts
@@ -1243,6 +2344,28 @@ mod tests {
         assert!(!is_user_cancelled_osstatus(ERR_SEC_INTERACTION_NOT_ALLOWED));
     }
 
+    #[test]
+    fn item_access_call_failure_separates_unavailable_interaction() {
+        assert!(matches!(
+            item_access_call_failed("read", ERR_SEC_INTERACTION_NOT_ALLOWED),
+            ItemAccessError::NoInteraction
+        ));
+        assert!(matches!(
+            item_access_call_failed("read", ERR_SEC_AUTH_FAILED),
+            ItemAccessError::Other(_)
+        ));
+        assert!(matches!(
+            item_access_call_failed("install", -25299),
+            ItemAccessError::Other(_)
+        ));
+    }
+
+    #[test]
+    fn item_access_backoff_ignores_unavailable_interaction() {
+        assert!(!ItemAccessError::NoInteraction.should_back_off());
+        assert!(ItemAccessError::Other(NonoError::SandboxInit("x".to_string())).should_back_off());
+    }
+
     fn with_fake_state_home<T>(f: impl FnOnce() -> T) -> T {
         let home = tempfile::tempdir().unwrap();
         let _env_lock = crate::test_env::ENV_LOCK
@@ -1701,5 +2824,306 @@ mod tests {
             "nono-proxy-ca".to_string()
         )]));
         assert!(is_exact_nono_ca_dn(&nono_ca_dn()));
+    }
+
+    // --- access-plan decisions (pure, no Keychain) ---------------------------
+
+    /// The authorization-tag set of the entry that gates the secret, as
+    /// observed on real items: decrypt, derive, both exports, MAC, sign.
+    fn data_rights() -> Vec<acl_ffi::AclAuthorizationTag> {
+        vec![24, 28, 37, 38, 59, 115]
+    }
+
+    fn entry_sets(entries: &[&[&[u8]]]) -> Vec<PlanEntry> {
+        entries
+            .iter()
+            .map(|entry| {
+                PlanEntry::named(
+                    data_rights(),
+                    entry.iter().map(|app| app.to_vec()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The item shape a creating launch installs: the data entry naming its
+    /// record, the any-application encrypt entry (35), and the empty-listed
+    /// change-acl entry.
+    fn standard_shape(current: &[u8]) -> Vec<PlanEntry> {
+        vec![
+            PlanEntry::named(data_rights(), vec![current.to_vec()]),
+            PlanEntry::Any(vec![acl_ffi::ACL_AUTHORIZATION_ENCRYPT]),
+            PlanEntry::named(vec![65536], Vec::new()),
+        ]
+    }
+
+    #[test]
+    fn a_listed_item_with_user_grants_is_canonical() {
+        let current = b"current-binary".as_slice();
+        let facts = entry_sets(&[&[b"user-granted-app".as_slice(), current]]);
+        assert!(matches!(
+            plan_item_access(&facts, current),
+            AccessPlan::Canonical
+        ));
+    }
+
+    #[test]
+    fn a_missing_current_binary_rebuilds_while_keeping_user_grants() {
+        let current = b"current-binary".as_slice();
+        let facts = entry_sets(&[&[b"user-granted-app".as_slice()]]);
+        let AccessPlan::Rebuild { keep } = plan_item_access(&facts, current) else {
+            panic!("a missing current-binary entry must force a rebuild");
+        };
+        assert_eq!(
+            keep,
+            vec![b"user-granted-app".to_vec()],
+            "user grants are kept and only the current binary is added"
+        );
+    }
+
+    #[test]
+    fn an_item_with_no_granted_applications_forces_a_rebuild() {
+        let current = b"current-binary".as_slice();
+        // The pre-fix shape: the secret-gating entry carries no records
+        // (every read prompts), plus the standard encrypt and change-acl
+        // entries every keychain item has.
+        let facts = vec![
+            PlanEntry::named(data_rights(), Vec::new()),
+            PlanEntry::Any(vec![acl_ffi::ACL_AUTHORIZATION_ENCRYPT]),
+            PlanEntry::named(vec![65536], Vec::new()),
+        ];
+        let AccessPlan::Rebuild { keep } = plan_item_access(&facts, current) else {
+            panic!("an ungranted item must force a rebuild");
+        };
+        assert!(
+            keep.is_empty(),
+            "there are no user grants to preserve on an ungranted item"
+        );
+    }
+
+    #[test]
+    fn the_standard_keychain_shape_is_canonical() {
+        let current = b"current-binary".as_slice();
+        // The shape SecItemAdd with an access list produces: the secret
+        // entry carries the binary's record, plus the standard encrypt and
+        // change-acl entries. Misreading those as all-app grants would
+        // force a pointless repair prompt on every item.
+        let facts = standard_shape(current);
+        assert!(matches!(
+            plan_item_access(&facts, current),
+            AccessPlan::Canonical
+        ));
+    }
+
+    #[test]
+    fn user_grants_alongside_the_standard_shape_stay_canonical() {
+        let current = b"current-binary".as_slice();
+        let facts = vec![
+            PlanEntry::named(
+                data_rights(),
+                vec![current.to_vec(), b"security-cli".to_vec()],
+            ),
+            PlanEntry::Any(vec![acl_ffi::ACL_AUTHORIZATION_ENCRYPT]),
+            PlanEntry::named(vec![65536], Vec::new()),
+        ];
+        assert!(matches!(
+            plan_item_access(&facts, current),
+            AccessPlan::Canonical
+        ));
+    }
+
+    #[test]
+    fn a_record_held_only_for_the_encrypt_right_is_never_promoted() {
+        let current = b"current-binary".as_slice();
+        // A crafted split: another application is named for the encrypt
+        // right only. In place that is harmless, but the moment a rebuild
+        // is needed (here: the running binary is missing from the data
+        // entry) the encrypt-only record must be dropped, not
+        // re-installed with full secret access.
+        let facts = vec![
+            PlanEntry::named(data_rights(), vec![b"user-granted-app".to_vec()]),
+            PlanEntry::named(
+                vec![acl_ffi::ACL_AUTHORIZATION_ENCRYPT],
+                vec![b"backup-tool".to_vec()],
+            ),
+        ];
+        let AccessPlan::Rebuild { keep } = plan_item_access(&facts, current) else {
+            panic!("a missing current-binary grant must force a rebuild");
+        };
+        assert_eq!(
+            keep,
+            vec![b"user-granted-app".to_vec()],
+            "records gating only harmless rights are dropped, never promoted"
+        );
+        // With the running binary granted, the same shape is safe as it
+        // stands: an encrypt-only record grants nothing.
+        let facts = vec![
+            PlanEntry::named(data_rights(), vec![current.to_vec()]),
+            PlanEntry::named(
+                vec![acl_ffi::ACL_AUTHORIZATION_ENCRYPT],
+                vec![b"backup-tool".to_vec()],
+            ),
+        ];
+        assert!(matches!(
+            plan_item_access(&facts, current),
+            AccessPlan::Canonical
+        ));
+    }
+
+    #[test]
+    fn records_only_on_entries_that_gate_nothing_are_a_storm_state() {
+        let current = b"current-binary".as_slice();
+        // The data entry is ungranted; a record held only for encrypt
+        // grants no access to the secret, so every read still prompts and
+        // the item must be rebuilt.
+        let facts = vec![
+            PlanEntry::named(data_rights(), Vec::new()),
+            PlanEntry::named(
+                vec![acl_ffi::ACL_AUTHORIZATION_ENCRYPT],
+                vec![current.to_vec()],
+            ),
+            PlanEntry::Any(vec![acl_ffi::ACL_AUTHORIZATION_ENCRYPT]),
+        ];
+        let AccessPlan::Rebuild { keep } = plan_item_access(&facts, current) else {
+            panic!("a record on an encrypt-only entry cannot gate the secret");
+        };
+        assert!(
+            keep.is_empty(),
+            "the encrypt-only record is not a grant of the secret"
+        );
+    }
+
+    #[test]
+    fn an_any_application_entry_gating_the_secret_forces_a_rebuild() {
+        let current = b"current-binary".as_slice();
+        // A crafted hybrid: the data entry is granted, but a second
+        // any-application entry also carries the decrypt tag (24), which
+        // leaves the secret readable by every application.
+        let mut facts = standard_shape(current);
+        facts.push(PlanEntry::Any(vec![24]));
+        let AccessPlan::Rebuild { keep } = plan_item_access(&facts, current) else {
+            panic!("an any-application decrypt entry must never be canonical");
+        };
+        assert_eq!(
+            keep,
+            vec![current.to_vec()],
+            "the rebuild preserves granted records while dropping the wildcard entry"
+        );
+    }
+
+    #[test]
+    fn a_named_change_acl_grant_forces_a_rebuild() {
+        let current = b"current-binary".as_slice();
+        // A crafted item: the data entry names the current binary, but a
+        // second entry hands the change-acl right to another application,
+        // which could rewrite the list and grant itself the secret.
+        let facts = vec![
+            PlanEntry::named(data_rights(), vec![current.to_vec()]),
+            PlanEntry::named(vec![65536], vec![b"rogue-tool".to_vec()]),
+        ];
+        let AccessPlan::Rebuild { keep } = plan_item_access(&facts, current) else {
+            panic!("a named change-acl grant must never be canonical");
+        };
+        assert_eq!(
+            keep,
+            vec![current.to_vec()],
+            "the rebuild keeps the data grant and drops the admin grant"
+        );
+    }
+
+    #[test]
+    fn a_mixed_data_and_admin_grant_forces_a_rebuild() {
+        let current = b"current-binary".as_slice();
+        // The data entry grants the current binary, but a second entry
+        // hands another application decrypt together with change-acl: the
+        // mixed entry must not pass as canonical just because it gates the
+        // secret, since its holder could rewrite the list and grant
+        // itself more.
+        let facts = vec![
+            PlanEntry::named(data_rights(), vec![current.to_vec()]),
+            PlanEntry::named(vec![24, 65536], vec![b"admin-tool".to_vec()]),
+        ];
+        let AccessPlan::Rebuild { keep } = plan_item_access(&facts, current) else {
+            panic!("a mixed decrypt and change-acl grant must never be canonical");
+        };
+        assert_eq!(
+            keep,
+            vec![current.to_vec(), b"admin-tool".to_vec()],
+            "the rebuild keeps the admin-tool data grant but strips its admin right"
+        );
+    }
+
+    #[test]
+    fn an_any_application_export_right_forces_a_rebuild() {
+        let current = b"current-binary".as_slice();
+        // Tag 37 is export-clear, part of the secret-gating set.
+        let facts = vec![
+            PlanEntry::named(data_rights(), vec![current.to_vec()]),
+            PlanEntry::Any(vec![37]),
+        ];
+        assert!(matches!(
+            plan_item_access(&facts, current),
+            AccessPlan::Rebuild { .. }
+        ));
+    }
+
+    fn identity(epoch: f64, persistent_ref: &str) -> ItemIdentity {
+        ItemIdentity {
+            epoch,
+            persistent_ref: persistent_ref.to_string(),
+        }
+    }
+
+    #[test]
+    fn acl_state_marker_matches_only_the_same_item_and_policy() {
+        let policy = "preserve";
+        let item = identity(725011200.5, "aabbccdd");
+        let content = format!("725011200.5\naabbccdd\n{policy}");
+        assert!(
+            marker_matches(Some(&content), &item, policy),
+            "same item and policy: no verification prompt"
+        );
+        assert!(
+            !marker_matches(Some(&content), &identity(725011200.6, "aabbccdd"), policy),
+            "a recreated item must be re-verified"
+        );
+        assert!(
+            !marker_matches(Some(&content), &identity(725011200.5, "11223344"), policy),
+            "a replacement created in the same second carries a different \
+             persistent reference and must be re-verified"
+        );
+        assert!(
+            !marker_matches(Some(&content), &item, "other-policy"),
+            "a changed policy line must be re-verified"
+        );
+        assert!(
+            !marker_matches(None, &item, policy),
+            "no stored marker: first launch verifies"
+        );
+        assert!(
+            !marker_matches(Some(""), &item, policy),
+            "empty marker content never matches"
+        );
+        assert!(
+            !marker_matches(Some("not-a-date\naabbccdd\npreserve"), &item, policy),
+            "malformed marker content never matches"
+        );
+        assert!(
+            !marker_matches(Some("725011200.5\naabbccdd\n"), &item, policy),
+            "a marker without a policy line never matches"
+        );
+        assert!(
+            marker_matches(
+                Some(&format!("725011200.5\naabbccdd\n{policy}\n")),
+                &item,
+                policy
+            ),
+            "a trailing newline in the stored marker never defeats the match"
+        );
+        assert!(
+            !marker_matches(Some("725011200.5\npreserve"), &item, policy),
+            "a marker in the two-line format never matches: the ref line is \
+             structural, and an unknown format is never treated as satisfied"
+        );
     }
 }

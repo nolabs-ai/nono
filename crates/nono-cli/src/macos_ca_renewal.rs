@@ -6,10 +6,24 @@
 
 use crate::macos_trust::{self, CertValidity, RenewOutcome};
 use nono_proxy::tls_intercept::InterceptCaRotator;
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+thread_local! {
+    /// Whether the current thread holds [`RenewalLock`]'s flock. Gated
+    /// keychain reads use this to verify the CA-bundle item's access list
+    /// in place instead of re-acquiring: a second exclusive flock from the
+    /// same process would block on itself.
+    static RENEWAL_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the current thread holds the renewal lock.
+pub(crate) fn renewal_lock_held_by_current_thread() -> bool {
+    RENEWAL_LOCK_HELD.with(Cell::get)
+}
 
 /// Each check is a Keychain read, and a 7-day certificate needs nothing tighter.
 const MAX_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
@@ -103,8 +117,12 @@ fn supervise_once(
         .current_cert_pem()
         .map_err(|e| nono::NonoError::SandboxInit(format!("{e}")))?;
 
-    if let Some(outcome) = try_adopt(rotator, &live)? {
-        return Ok(outcome);
+    match try_adopt(rotator, &live) {
+        Ok(Some(outcome)) => return Ok(outcome),
+        Ok(None) => {}
+        // Adoption is opportunistic: a busy repair elsewhere or a failed
+        // gated read must not stall the renewal loop for a backoff window.
+        Err(e) => debug!("proxy CA adoption check failed (non-fatal): {e}"),
     }
     if macos_trust::cert_validity(&live)? == CertValidity::Valid {
         return Ok(Outcome::NothingToDo);
@@ -123,8 +141,10 @@ fn supervise_once(
         return Ok(Outcome::Busy);
     };
     // It may have finished while we waited for the lock.
-    if let Some(outcome) = try_adopt(rotator, &live)? {
-        return Ok(outcome);
+    match try_adopt(rotator, &live) {
+        Ok(Some(outcome)) => return Ok(outcome),
+        Ok(None) => {}
+        Err(e) => debug!("proxy CA adoption re-check failed (non-fatal): {e}"),
     }
 
     match macos_trust::renew_shared_ca(validity)? {
@@ -208,13 +228,22 @@ impl RenewalLock {
                 ))
             })?;
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => Ok(Some(Self { _lock: lock })),
+            Ok(lock) => {
+                RENEWAL_LOCK_HELD.with(|held| held.set(true));
+                Ok(Some(Self { _lock: lock }))
+            }
             Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
             Err((_, e)) => Err(nono::NonoError::SandboxInit(format!(
                 "cannot lock '{}': {e}",
                 path.display()
             ))),
         }
+    }
+}
+
+impl Drop for RenewalLock {
+    fn drop(&mut self) {
+        RENEWAL_LOCK_HELD.with(|held| held.set(false));
     }
 }
 

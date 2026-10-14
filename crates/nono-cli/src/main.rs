@@ -38,6 +38,8 @@ mod launch_runtime;
 mod lineage_cgroup;
 mod login_cmd;
 #[cfg(target_os = "macos")]
+mod macos_ca_renewal;
+#[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
 mod network_policy;

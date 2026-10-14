@@ -3,132 +3,118 @@ title: OpenCode
 description: Sandboxing OpenCode AI coding assistant with nono
 ---
 
-[OpenCode](https://github.com/opencode-ai/opencode) is an open-source AI coding assistant that runs in your terminal. It reads your codebase, writes files, and executes commands. Running it under nono ensures it stays within the boundaries you define.
+[OpenCode](https://github.com/opencode-ai/opencode) can read files, write code, and execute commands. Use the pack matching your installed OpenCode major version.
 
-## Why Sandbox OpenCode?
+## Choose Your Version
 
-OpenCode has full access to your filesystem and can run arbitrary commands. Without isolation:
+| OpenCode | Pack | Run |
+|----------|------|-----|
+| 2.x | `nolabs-ai/opencode` | `nono run --profile nolabs-ai/opencode -- opencode --standalone` |
+| 1.x | `nolabs-ai/opencode-v1` | `nono run --profile nolabs-ai/opencode-v1 -- opencode` |
 
-- It could access files outside your project directory
-- A malicious prompt or compromised dependency could exfiltrate credentials
-- Unintended writes could affect configuration or system files
-
-nono prevents all of this at the kernel level.
-
-## Quick Start
+Both packs install a plugin and skill into the same OpenCode locations. Remove the installed pack before switching versions:
 
 ```bash
-nono run --profile nolabs-ai/opencode -- opencode
+nono remove nolabs-ai/opencode
+nono pull nolabs-ai/opencode-v1
 ```
 
-The profile provides:
-- **Read+write access** to the current working directory
-- **Read+write access** to `~/.opencode` (binary and package data)
-- **Read+write access** to `~/.config/opencode` (configuration)
-- **Read+write access** to `~/.cache/opencode` (cache)
-- **Read+write access** to `~/.local/share/opencode` (data)
-- **Read+write access** to `~/.local/share/opentui` (OpenTUI parser/runtime data)
-- **Read+write access** to `/tmp` (temp files)
-- **Network access** enabled (required for AI provider API calls)
+## OpenCode 2
 
-<Note>
-  The profile grants access to `/tmp` because opencode writes temp files directly to `$TMPDIR` with dynamic filenames (e.g., `{timestamp}.md` for editor buffers, `opencode-clipboard.png` for clipboard images). Landlock cannot grant access to files with unpredictable names without granting the parent directory.
-</Note>
+Install and run the current pack with a private server inside the sandbox:
 
-## Custom Profile
+```bash
+nono pull nolabs-ai/opencode
+nono run --profile nolabs-ai/opencode -- opencode --standalone
+```
 
-Create `~/.config/nono/profiles/opencode.json` for different permissions:
+<Warning>
+  OpenCode 2 normally connects its client to a background server that owns tool execution, plugins, and model requests. Use `--standalone` for interactive sessions that require full containment. Without it, nono constrains the client but cannot guarantee that work performed by an existing external server is inside the active sandbox.
+</Warning>
+
+The pack does not append `--standalone` automatically because administrative commands such as `serve`, `auth`, and `acp` do not support it.
+
+### Startup Compatibility
+
+nono grants the active worktree rather than its parent directories or the entire home directory. OpenCode 2 probes those broader locations during project and instruction discovery, so the pack sets:
+
+- `OPENCODE_DISABLE_PROJECT_CONFIG=1` to stop parent-directory project discovery
+- `OPENCODE_TEST_HOME=$WORKDIR` to keep instruction initialization inside the granted worktree
+
+These variables prevent expected sandbox denials from becoming startup failures; nono remains the security boundary. Project `opencode.json`, `AGENTS.md`, plugins, and other project-discovered components are disabled. Global OpenCode configuration and the nono plugin remain available.
+
+The OpenCode installation at `~/.opencode` is read-only because its `bin` directory can be on `PATH`. Run OpenCode upgrades outside the sandbox. Runtime configuration, cache, data, and state directories remain writable.
+
+## OpenCode 1
+
+The v1 pack preserves the configuration known to work with OpenCode 1.18.x:
+
+```bash
+nono pull nolabs-ai/opencode-v1
+nono run --profile nolabs-ai/opencode-v1 -- opencode
+```
+
+OpenCode 1 keeps its client, tools, and plugin runtime in the sandboxed process. Do not add `--standalone`; that flag belongs to OpenCode 2.
+
+## Customize a Profile
+
+Extend the pack rather than copying its runtime grants and compatibility settings:
 
 ```json
 {
+  "extends": "nolabs-ai/opencode",
   "meta": {
-    "name": "opencode",
-    "version": "1.0.0",
-    "description": "OpenCode with restricted access"
-  },
-  "workdir": {
-    "access": "readwrite"
+    "name": "opencode-local",
+    "version": "1.0.0"
   },
   "filesystem": {
-    "read": [
-      "$XDG_CONFIG_HOME/opencode",
-      "$XDG_DATA_HOME/opencode",
-      "$XDG_DATA_HOME/opentui"
-    ]
-  },
-  "network": {
-    "block": false
-  },
-  "env_credentials": {
-    "openai_api_key": "OPENAI_API_KEY"
+    "read": ["$HOME/shared-libs"]
   }
 }
 ```
 
-**Usage:**
+Save it as `~/.config/nono/profiles/opencode-local.json`, then run:
+
 ```bash
-nono run --profile nolabs-ai/opencode -- opencode
+nono run --profile opencode-local -- opencode --standalone
 ```
 
-## Security Tips
+For OpenCode 1, extend `nolabs-ai/opencode-v1` and omit `--standalone`.
 
-### Use Secrets Management
+## Credentials
 
-Load your AI provider API key from the system keystore instead of environment exports:
+Load provider keys from the system keystore instead of exporting them into the whole shell:
 
-**macOS:**
 ```bash
+# macOS
 security add-generic-password -s "nono" -a "openai_api_key" -w
-```
 
-**Linux:**
-```bash
+# Linux
 secret-tool store --label="nono: openai_api_key" service nono username openai_api_key
 ```
 
-Then run:
+Then inject the credential for the session:
+
 ```bash
-nono run --profile nolabs-ai/opencode --env-credential openai_api_key -- opencode
+nono run --profile nolabs-ai/opencode --env-credential openai_api_key -- opencode --standalone
 ```
 
-See [Credential Injection](/cli/features/credential-injection) for full documentation.
+See [Credential Injection](/cli/features/credential-injection) for details.
 
-### Read-Only Mode
+## Additional Access
 
-For reviewing code without allowing modifications:
+Add only the paths a session needs:
 
 ```bash
-nono run --read . --read ~/.config/opencode -- opencode
+nono run --profile nolabs-ai/opencode --allow ~/shared-libs -- opencode --standalone
 ```
 
-### Restrict to a Specific Project
+OpenCode may harmlessly probe denied parent and system paths during startup. Do not grant broad paths such as all of `$HOME` merely to silence the exit report.
+
+## Gemini Credential Injection
+
+OpenCode sends Gemini requests directly to the Google API, so proxy-based credential injection is not supported for Gemini models. Use environment credential injection:
 
 ```bash
-nono run --allow ~/projects/my-app --read ~/.config/opencode -- opencode
-```
-
-### Overriding Profile Settings
-
-CLI flags always take precedence:
-
-```bash
-# Add extra directory access
-nono run --profile nolabs-ai/opencode --allow ~/shared-libs -- opencode
-
-# Block network
-nono run --profile nolabs-ai/opencode --block-net -- opencode
-```
-
-See [Security Profiles](/cli/features/profiles-groups) for details on profile format and precedence rules.
-
-## Known Issues
-
-### Google Gemini Proxy Credential Injection
-
-OpenCode routes Google Gemini requests directly to the Google API rather than through a configurable base URL. This means proxy-based credential injection does not work with Gemini models. Only environment variable injection is supported.
-
-Use `--env-credential` instead of proxy injection when working with Gemini:
-
-```bash
-nono run --profile nolabs-ai/opencode --env-credential gemini_api_key -- opencode
+nono run --profile nolabs-ai/opencode --env-credential gemini_api_key -- opencode --standalone
 ```

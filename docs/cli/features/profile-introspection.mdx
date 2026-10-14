@@ -79,12 +79,14 @@ Example output:
 nono profile: 15 profiles
 
   Built-in:
-    claude-code      Anthropic Claude Code CLI agent            extends default
-    codex            OpenAI Codex CLI agent                     extends default
     default          Default conservative base profile
-    opencode         OpenCode AI coding assistant               extends default
     python-dev       Python SDK development profile             extends default
     ...
+
+  Packages:
+    claude            Anthropic Claude Code CLI agent            nolabs-ai/claude
+    opencode          OpenCode 2 AI coding assistant             nolabs-ai/opencode
+    opencode-v1       OpenCode 1 AI coding assistant             nolabs-ai/opencode-v1
 
   User (~/.config/nono/profiles/):
     my-agent         Custom agent profile                       extends default

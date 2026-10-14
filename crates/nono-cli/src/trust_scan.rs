@@ -289,7 +289,7 @@ pub fn verify_policy_signature(policy_path: &Path) -> Result<()> {
         }
         trust::SignerIdentity::Keyless { .. } => {
             // Policy signature proves provenance and tamper-resistance, not signer
-            // allowlisting. VerificationPolicy::default() verifies the Sigstore
+            // allowlisting. VerificationPolicy::any_identity() verifies the Sigstore
             // cryptographic chain (Fulcio CA chain + Rekor inclusion proof + digest
             // match) without pinning to a specific OIDC identity. This is correct:
             // the trust policy is the root document that defines which identities
@@ -302,7 +302,7 @@ pub fn verify_policy_signature(policy_path: &Path) -> Result<()> {
                 }
             })?;
 
-            let sigstore_policy = trust::VerificationPolicy::default();
+            let sigstore_policy = trust::VerificationPolicy::any_identity();
 
             trust::verify_bundle_with_digest(
                 &file_digest,
@@ -800,7 +800,7 @@ fn verify_keyless_crypto(
         }
     })?;
 
-    let policy = trust::VerificationPolicy::default();
+    let policy = trust::VerificationPolicy::any_identity();
 
     trust::verify_bundle_with_digest(file_digest, bundle, &trusted_root, &policy, file_path)
         .map_err(|e| VerificationOutcome::InvalidSignature {

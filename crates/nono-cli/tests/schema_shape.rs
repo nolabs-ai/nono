@@ -630,6 +630,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "from",
             "intercept",
             "sandbox",
+            "sha256",
         ],
     );
     assert_schema_properties(&schema, "DaemonPidSource", &["argv", "env"]);
@@ -651,6 +652,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "fs_read_file",
             "fs_write",
             "fs_write_file",
+            "keychain_access",
             "network",
             "open_urls",
             "resources",

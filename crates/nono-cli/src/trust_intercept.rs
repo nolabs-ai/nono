@@ -364,7 +364,7 @@ fn load_signer(
         trust::SignerIdentity::Keyless { .. } => {
             let trusted_root = trust::load_production_trusted_root()
                 .map_err(|e| format!("failed to load Sigstore trusted root: {e}"))?;
-            let sigstore_policy = trust::VerificationPolicy::default();
+            let sigstore_policy = trust::VerificationPolicy::any_identity();
             trust::verify_bundle_with_digest(
                 file_digest,
                 &bundle,

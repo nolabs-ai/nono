@@ -71,8 +71,15 @@ const OFFICIAL_PACKS: &[OfficialPack] = &[
         profile_name: "opencode",
         namespace: "nolabs-ai",
         pack_name: "opencode",
-        description: Some("OpenCode AI coding assistant sandbox profile + plugin"),
+        description: Some("OpenCode 2 AI coding assistant sandbox profile + plugin"),
         installs_summary: Some("sandbox profile + OpenCode plugin (hooks, skill)"),
+    },
+    OfficialPack {
+        profile_name: "opencode-v1",
+        namespace: "nolabs-ai",
+        pack_name: "opencode-v1",
+        description: Some("OpenCode 1 AI coding assistant sandbox profile + plugin"),
+        installs_summary: Some("sandbox profile + OpenCode v1 plugin (hooks, skill)"),
     },
 ];
 
@@ -323,6 +330,7 @@ mod tests {
         assert!(official_pack_for("claude-code").is_some());
         assert!(official_pack_for("codex").is_some());
         assert!(official_pack_for("opencode").is_some());
+        assert!(official_pack_for("opencode-v1").is_some());
         assert!(official_pack_for("definitely-not-real").is_none());
     }
 
@@ -334,6 +342,18 @@ mod tests {
             .as_provider();
         assert_eq!(canonical.pack_ref(), legacy.pack_ref());
         assert_eq!(canonical.pack_ref(), "nolabs-ai/claude");
+    }
+
+    #[test]
+    fn opencode_major_versions_route_to_separate_packs() {
+        let v2 = official_pack_for("opencode")
+            .expect("opencode")
+            .as_provider();
+        let v1 = official_pack_for("opencode-v1")
+            .expect("opencode-v1")
+            .as_provider();
+        assert_eq!(v2.pack_ref(), "nolabs-ai/opencode");
+        assert_eq!(v1.pack_ref(), "nolabs-ai/opencode-v1");
     }
 
     #[test]

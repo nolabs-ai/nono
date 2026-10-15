@@ -2687,6 +2687,66 @@ mod tests {
             .to_string()
     }
 
+    /// The reverse path serves one request per inbound connection, so the
+    /// pooled-upstream response must tell the client `Connection: close` even
+    /// when the upstream advertised keep-alive, and the proxy must close the
+    /// inbound connection once the body is relayed.
+    #[tokio::test]
+    async fn reverse_pool_response_tells_client_connection_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nKeep-Alive: timeout=30\r\nContent-Length: 2\r\n\r\nok",
+                    )
+                    .await;
+                // Behave like a keep-alive server: hold the socket open.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET /svc/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("proxy must close the inbound connection after the response")
+        .unwrap();
+        let response = String::from_utf8_lossy(&response).to_lowercase();
+        assert!(response.starts_with("http/1.1 200"), "got: {response:?}");
+        assert_eq!(
+            response.matches("connection:").count(),
+            1,
+            "exactly one Connection header expected, got: {response:?}"
+        );
+        assert!(
+            response.contains("connection: close\r\n"),
+            "got: {response:?}"
+        );
+        assert!(!response.contains("keep-alive"), "got: {response:?}");
+        assert!(response.ends_with("\r\n\r\nok"), "got: {response:?}");
+        handle.shutdown();
+    }
+
     #[tokio::test]
     async fn test_no_auth_skips_reverse_proxy_authentication() {
         // Regression: `nono proxy --no-auth` (require_auth == false) must skip

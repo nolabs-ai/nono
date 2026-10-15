@@ -502,6 +502,16 @@ mod acl_ffi {
     pub fn is_data_right(tag: AclAuthorizationTag) -> bool {
         matches!(tag, 24 | 28 | 37 | 38 | 59 | 115)
     }
+    /// Whether the tag extracts the stored secret from the item: both
+    /// exports, clear (37) and wrapped (38).
+    pub fn is_export_right(tag: AclAuthorizationTag) -> bool {
+        matches!(tag, 37 | 38)
+    }
+    /// Whether the tag reveals the stored secret itself: decrypt reads
+    /// it, and either export extracts it.
+    pub fn is_secret_right(tag: AclAuthorizationTag) -> bool {
+        tag == ACL_AUTHORIZATION_DECRYPT || is_export_right(tag)
+    }
 
     unsafe extern "C" {
         pub fn SecTrustedApplicationCreateFromPath(
@@ -828,12 +838,13 @@ impl PlanEntry {
     }
 }
 
-/// Whether an entry's authorizations include revealing the stored secret.
-/// Records on such entries are grants of the secret itself; records held
-/// only for harmless rights (encrypt) grant nothing and must never be
-/// promoted onto the secret-gating entry by a rebuild.
+/// Whether an entry's authorizations include revealing the stored secret:
+/// decrypt reads it, and either export extracts it. Records on such
+/// entries are grants of the secret itself; records held only for
+/// harmless rights (encrypt) grant nothing and must never be promoted
+/// onto the secret-gating entry by a rebuild.
 fn gates_secret(tags: &[acl_ffi::AclAuthorizationTag]) -> bool {
-    tags.contains(&acl_ffi::ACL_AUTHORIZATION_DECRYPT)
+    tags.iter().any(|tag| acl_ffi::is_secret_right(*tag))
 }
 
 /// Whether a named entry may grant this right to an application and still
@@ -3064,6 +3075,46 @@ mod tests {
         assert!(matches!(
             plan_item_access(&facts, current),
             AccessPlan::Rebuild { .. }
+        ));
+    }
+
+    #[test]
+    fn named_export_grants_are_grants_of_the_secret() {
+        let current = b"current-binary".as_slice();
+        // Export rights (37 export-clear, 38 export-wrapped) extract the
+        // key material from the item, so an application named for them
+        // holds a grant of the secret: a rebuild keeps its record, exactly
+        // like a decrypt grant, instead of silently dropping it.
+        for tag in [37i32, 38] {
+            let facts = vec![
+                PlanEntry::named(vec![tag], vec![b"key-extractor".to_vec()]),
+                PlanEntry::Any(vec![acl_ffi::ACL_AUTHORIZATION_ENCRYPT]),
+            ];
+            let AccessPlan::Rebuild { keep } = plan_item_access(&facts, current) else {
+                panic!("a missing current-binary grant must force a rebuild");
+            };
+            assert_eq!(
+                keep,
+                vec![b"key-extractor".to_vec()],
+                "tag {tag}: a named export grant is a grant of the secret"
+            );
+        }
+    }
+
+    #[test]
+    fn user_export_grants_alongside_the_current_binary_stay_canonical() {
+        let current = b"current-binary".as_slice();
+        // An export grant behaves like every other data right a user
+        // granted through macOS: with the current binary granted, the
+        // state is canonical and must not prompt.
+        let facts = vec![
+            PlanEntry::named(data_rights(), vec![current.to_vec()]),
+            PlanEntry::named(vec![38], vec![b"key-extractor".to_vec()]),
+            PlanEntry::Any(vec![acl_ffi::ACL_AUTHORIZATION_ENCRYPT]),
+        ];
+        assert!(matches!(
+            plan_item_access(&facts, current),
+            AccessPlan::Canonical
         ));
     }
 

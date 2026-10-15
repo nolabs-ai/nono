@@ -150,14 +150,30 @@ fn rewrite_absolute_to_origin_form(line: &str) -> Result<String> {
     ))
 }
 
-/// Strip hop-by-hop proxy headers (`Proxy-Connection`, `Proxy-Authorization`)
-/// from a raw header block before forwarding upstream.
+/// Header fields the forward path never passes upstream: proxy hop-by-hop
+/// fields, connection management (re-added as `Connection: close`), and body
+/// framing (re-added as `Content-Length` after the body is read).
+fn is_forward_stripped_header(name: &str) -> bool {
+    [
+        "proxy-connection",
+        "proxy-authorization",
+        "connection",
+        "keep-alive",
+        "content-length",
+        "transfer-encoding",
+    ]
+    .iter()
+    .any(|stripped| name.eq_ignore_ascii_case(stripped))
+}
+
+/// Strip hop-by-hop headers from a raw header block before forwarding upstream.
 ///
 /// These headers are meaningful only on the client<->proxy hop and must never
-/// be forwarded: `Proxy-Authorization` carries the session token, and
-/// `Proxy-Connection` is a non-standard hop-by-hop hint. Other headers
-/// (including `Host`) are preserved verbatim so the forwarded request matches
-/// what the client sent.
+/// be forwarded: `Proxy-Authorization` carries the session token,
+/// `Proxy-Connection` is a non-standard hop-by-hop hint, and the client's
+/// `Connection`/`Keep-Alive` would keep the upstream connection open after a
+/// response the proxy relays until EOF. Other headers (including `Host`) are
+/// preserved verbatim so the forwarded request matches what the client sent.
 fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
     let header_str = match std::str::from_utf8(header_bytes) {
         Ok(s) => s,
@@ -168,11 +184,7 @@ fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(header_bytes.len());
     for line in header_str.split_inclusive("\r\n") {
         let name = line.split(':').next().unwrap_or("").trim();
-        if name.eq_ignore_ascii_case("proxy-connection")
-            || name.eq_ignore_ascii_case("proxy-authorization")
-            || name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-        {
+        if is_forward_stripped_header(name) {
             continue;
         }
         out.extend_from_slice(line.as_bytes());
@@ -229,12 +241,7 @@ fn strip_and_redeem_proxy_headers(
             out.extend_from_slice(line.as_bytes());
             continue;
         };
-        let trimmed_name = name.trim();
-        if trimmed_name.eq_ignore_ascii_case("proxy-connection")
-            || trimmed_name.eq_ignore_ascii_case("proxy-authorization")
-            || trimmed_name.eq_ignore_ascii_case("content-length")
-            || trimmed_name.eq_ignore_ascii_case("transfer-encoding")
-        {
+        if is_forward_stripped_header(name.trim()) {
             continue;
         }
         let (value, line_ending) = match rest.strip_suffix("\r\n") {
@@ -2145,6 +2152,9 @@ async fn handle_forward_http(
     let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 64);
     request_bytes.extend_from_slice(origin_line.as_bytes());
     request_bytes.extend_from_slice(&filtered_headers);
+    // One request per inbound connection: ask the upstream to close after the
+    // response so the EOF-delimited relay ends when the response does.
+    request_bytes.extend_from_slice(b"Connection: close\r\n");
     // Always re-frame when the client declared a body (CL or chunked TE),
     // including empty bodies — otherwise upstreams may answer 411 or hang.
     if reverse::should_reframe_with_content_length(header_bytes) {
@@ -2221,7 +2231,15 @@ async fn handle_forward_http(
         path: &inbound_path,
     };
 
-    match forward::forward_request(stream, &request_bytes, &body, upstream, audit_ctx).await {
+    match forward::forward_request_closing_inbound(
+        stream,
+        &request_bytes,
+        &body,
+        upstream,
+        audit_ctx,
+    )
+    .await
+    {
         Ok(_status) => Ok(()),
         Err(e) => {
             warn!("forward-http upstream connection failed: {}", e);
@@ -5560,6 +5578,85 @@ mod tests {
             }
         });
         (addr, rx)
+    }
+
+    /// Regression: a keep-alive upstream (e.g. uvicorn serving an MCP
+    /// Streamable HTTP endpoint) must not leave the forward path waiting for
+    /// EOF, and the client must be told not to reuse the connection.
+    ///
+    /// The origin behaves like a keep-alive server: it closes after the
+    /// response only when the request says `Connection: close`, otherwise it
+    /// holds the socket open well past the test timeout.
+    #[tokio::test]
+    async fn forward_http_keep_alive_upstream_does_not_stall() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = listener.local_addr().unwrap();
+        let (tx, origin_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let received = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = "event: message\r\ndata: {}\r\n\r\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nmcp-session-id: s1\r\nconnection: keep-alive\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let close_requested = received
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("connection: close"));
+            let _ = tx.send(received);
+            if !close_requested {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let request = format!(
+            "POST http://127.0.0.1:{port}/mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\nKeep-Alive: timeout=30\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+            port = origin_addr.port(),
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .expect("proxy must close the inbound connection once the response ends")
+        .unwrap();
+        let response = String::from_utf8_lossy(&response).to_lowercase();
+        assert!(response.starts_with("http/1.1 200"), "got: {response}");
+        assert!(response.contains("mcp-session-id: s1"), "got: {response}");
+        assert!(response.contains("connection: close"), "got: {response}");
+        assert!(!response.contains("keep-alive"), "got: {response}");
+        assert!(
+            response.ends_with("0\r\n\r\n"),
+            "body truncated: {response}"
+        );
+
+        let received = origin_rx.await.unwrap().to_lowercase();
+        assert!(received.contains("connection: close"), "got: {received}");
+        assert!(!received.contains("keep-alive"), "got: {received}");
+        assert!(received.ends_with(body), "body not forwarded: {received}");
     }
 
     /// Absolute-form http:// to an ALLOWED host is forwarded and returns the

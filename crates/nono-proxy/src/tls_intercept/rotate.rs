@@ -17,6 +17,11 @@ pub struct InterceptCaRotator {
     bundle_dir: PathBuf,
     bundle_filename: &'static str,
     parent_ca_pems: Option<Vec<u8>>,
+    /// Serializes rotations. The bundle write and the live-CA swap in
+    /// `install` are two steps; interleaved across threads they can leave
+    /// the on-disk bundle describing a different CA than the one serving
+    /// certificates.
+    rotation: std::sync::Mutex<()>,
 }
 
 impl InterceptCaRotator {
@@ -32,6 +37,7 @@ impl InterceptCaRotator {
             bundle_dir,
             bundle_filename,
             parent_ca_pems,
+            rotation: std::sync::Mutex::new(()),
         }
     }
 
@@ -70,6 +76,10 @@ impl InterceptCaRotator {
     /// served, so a stale or expired re-issue cannot walk the session
     /// backwards.
     pub fn rotate(&self, key_der: &[u8], cert_pem: &str) -> Result<PathBuf> {
+        let _serialized = self
+            .rotation
+            .lock()
+            .map_err(|_| ProxyError::Config("tls_intercept: rotation lock poisoned".to_string()))?;
         let ca = Arc::new(EphemeralCa::from_existing(key_der, cert_pem)?);
         self.ensure_same_key_as_current(&ca)?;
         self.ensure_supersedes_current(&ca)?;
@@ -86,6 +96,10 @@ impl InterceptCaRotator {
     /// case where the session's own cert has expired and nothing else can
     /// keep it serving intercepted TLS.
     pub fn rotate_across_keys(&self, key_der: &[u8], cert_pem: &str) -> Result<PathBuf> {
+        let _serialized = self
+            .rotation
+            .lock()
+            .map_err(|_| ProxyError::Config("tls_intercept: rotation lock poisoned".to_string()))?;
         let current_not_after = self.current_not_after()?;
         if current_not_after > SystemTime::now() {
             return Err(ProxyError::Config(
@@ -359,8 +373,11 @@ mod tests {
             EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(0)).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert!(
-            r.rotate_across_keys(expired_replacement.key_der(), expired_replacement.cert_pem())
-                .is_err(),
+            r.rotate_across_keys(
+                expired_replacement.key_der(),
+                expired_replacement.cert_pem()
+            )
+            .is_err(),
             "adopting an expired replacement over an expired cert fixes nothing; it must be \
              refused"
         );
@@ -383,5 +400,65 @@ mod tests {
             cert_pem,
             "a rejected rotation must leave the live CA untouched"
         );
+    }
+
+    #[test]
+    fn concurrent_rotations_keep_the_bundle_describing_the_served_ca() {
+        // A renewal can overlap another rotation of the same bundle path;
+        // the bundle write and the live-CA swap must not interleave across
+        // threads, or the on-disk bundle ends up describing a different CA
+        // than the one serving certificates.
+        let dir = tempfile::tempdir().unwrap();
+        let original =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(3600)).unwrap();
+        let key_der = original.key_der().to_vec();
+        let r = std::sync::Arc::new(rotator(Arc::new(original), dir.path()));
+
+        const ROUNDS: usize = 8;
+        for round in 0..ROUNDS {
+            // Every round's renewals strictly outlive the previous round's,
+            // so both rotations pass validation and genuinely race.
+            let low_secs = (100 + 2 * round as u64) * 86_400;
+            let high_secs = low_secs + 86_400;
+            let low = EphemeralCa::reissue_with_cn(
+                &key_der,
+                "nono-proxy-ca",
+                Duration::from_secs(low_secs),
+            )
+            .unwrap();
+            let high = EphemeralCa::reissue_with_cn(
+                &key_der,
+                "nono-proxy-ca",
+                Duration::from_secs(high_secs),
+            )
+            .unwrap();
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = [low, high]
+                .iter()
+                .map(|ca| {
+                    let r = std::sync::Arc::clone(&r);
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let cert_pem = ca.cert_pem().to_string();
+                    let key_der = key_der.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        r.rotate(&key_der, &cert_pem)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                // Whichever rotation takes the lock first may leave the other
+                // freshness-refused: both renewals outlive the previous
+                // round, but not necessarily each other.
+                let _ = handle.join().unwrap();
+            }
+            let live = r.current_cert_pem().unwrap();
+            let bundle = std::fs::read_to_string(dir.path().join("intercept-ca.pem")).unwrap();
+            assert!(
+                bundle.contains(live.trim()),
+                "the trust bundle a child reads must describe the CA actually being served"
+            );
+        }
     }
 }

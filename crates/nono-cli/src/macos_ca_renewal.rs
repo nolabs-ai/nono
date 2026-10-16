@@ -9,7 +9,7 @@ use nono_proxy::tls_intercept::InterceptCaRotator;
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, warn};
 
 thread_local! {
@@ -53,7 +53,17 @@ pub(crate) fn spawn_supervisor(rotator: Arc<InterceptCaRotator>, validity: Durat
             // cert has already expired.
             let mut backoff_started: Option<Instant> = None;
             loop {
-                std::thread::sleep(interval);
+                let until_expiry = rotator
+                    .current_not_after()
+                    .ok()
+                    // ZERO once the cert has expired: duration_since errs
+                    // when the end is already in the past.
+                    .map(|not_after| {
+                        not_after
+                            .duration_since(SystemTime::now())
+                            .unwrap_or(Duration::ZERO)
+                    });
+                std::thread::sleep(next_check_delay(until_expiry, interval));
                 let backed_off = prompt_backed_off(backoff_started, Instant::now());
                 match supervise_once(&rotator, validity, renewal_disabled, backed_off) {
                     Err(e) => {
@@ -76,6 +86,21 @@ pub(crate) fn spawn_supervisor(rotator: Arc<InterceptCaRotator>, validity: Durat
 fn check_interval(validity: Duration) -> Duration {
     let headroom = macos_trust::renewal_headroom(validity.as_secs().min(i64::MAX as u64) as i64);
     (headroom / 2).clamp(MIN_CHECK_INTERVAL, MAX_CHECK_INTERVAL)
+}
+
+/// Delay before the next supervision check.
+///
+/// While the cert is healthy this is the normal interval, keeping Keychain
+/// reads cheap. As expiry approaches it shrinks to land a check at the
+/// expiry moment, and once the cert has expired it polls at the floor:
+/// renewal and cross-key adoption both unlock at expiry, so waiting out a
+/// full interval there would stretch a recoverable expiry into broken
+/// intercepted TLS for as long as the interval allows.
+fn next_check_delay(until_expiry: Option<Duration>, interval: Duration) -> Duration {
+    match until_expiry {
+        Some(until) => until.min(interval).max(Duration::from_secs(1)),
+        None => interval,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -301,6 +326,42 @@ mod tests {
             Duration::from_secs(15)
         );
         assert_eq!(check_interval(Duration::from_secs(1)), MIN_CHECK_INTERVAL);
+    }
+
+    #[test]
+    fn next_check_delay_keeps_the_interval_while_the_cert_is_healthy() {
+        let interval = Duration::from_secs(3600);
+        assert_eq!(next_check_delay(None, interval), interval);
+        assert_eq!(
+            next_check_delay(Some(Duration::from_secs(8 * 3600)), interval),
+            interval
+        );
+    }
+
+    #[test]
+    fn next_check_delay_tightens_to_land_a_check_at_expiry() {
+        let interval = Duration::from_secs(3600);
+        assert_eq!(
+            next_check_delay(Some(Duration::from_secs(1800)), interval),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            next_check_delay(Some(Duration::from_secs(30)), interval),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn next_check_delay_polls_at_a_floor_once_expired() {
+        let interval = Duration::from_secs(3600);
+        assert_eq!(
+            next_check_delay(Some(Duration::ZERO), interval),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            next_check_delay(Some(Duration::from_millis(100)), interval),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]

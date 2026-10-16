@@ -32,19 +32,28 @@
 > [!NOTE]
 > In the lead-up to a 1.0 release, APIs are stabilizing. API changes may still occur where necessary, but will be kept to a minimum.
 
-**Run AI agents in a zero latency sandbox in seconds and with zero setup** — *Claude Code, Codex, Pi, CoPilot, Hermes, OpenCode, OpenClaw* and more — nono gets you up and running within seconds, with no daemon, no container, no VM, and no disk space usage. Out of the box, nono enforces a least-privilege sandbox and supports macOS, Linux, and Windows (WSL2).
+**nono is a complete agent runtime security tool.** Secure your agents, their tools, their credentials, and the skills and instructions they follow, with low latency, a minimal footprint, and zero setup. Kernel-enforced sandboxing is the foundation for a complete workflow of protection, verification, audit, and recovery.
 
-From here **fork the config**, tweak it, theme it, make it your own, and share it with your team or the community via the [nono registry](https://registry.nono.sh).
+Bring your agent: Claude Code, Codex, Copilot, OpenCode, Goose, OpenClaw, Hermes, Pi, or your own built with frameworks like ADK, Mastra, Pydantic AI and LangChain. With ease you can onboard your own custom developed agents into nono’s secure environment, and immediately benefit from its comprehensive security features.
 
-**Want to operationalise and run at scale or within your team?** Engineers at some of the largest tech companies in the world use nono as part of their workflows or to run AI agents in production.
+nono supports macOS, Linux, and Windows (WSL2).
 
-> “Datadog engineers want their agents to move fast, and we want our credentials and production systems kept safe while they do. nono is the only sandbox that gives us both fine-grained, per-command policies and sophisticated credential management that fits existing, complex real-world toolchains.”
-> James Carnegie -- Staff Security Engineer, Datadog
+**Unprivileged, and runs anywhere.** A single binary, with no root privileges required. Run nono on a developer’s laptop, inside a Kubernetes pod, in a CI workflow, a container, or a microVM. It composes with your existing infrastructure for defence in depth.
 
-> "Security is embedded in everything we build at Okta. nono gives us the confidence to innovate with AI agents by isolating their execution in a highly secure, policy-controlled sandbox. It ensures our credentials remain locked down and protected, without sacrificing developer velocity"
-> Leonardo Zanivan, Principal Engineer, Okta
+## What nono protects
 
-**Copied by many** — nono pioneered the zero-latency, zero-setup agent sandbox, and continues to innovate and lead the way in agent sandboxing.
+- **[Tools](https://nono.sh/docs/cli/features/tool-sandbox)** — Run each tool in its own ephemeral sandbox, isolated from the agent and other tools, with explicit permissions for files, network access, environment variables, and credentials. Control which commands the agent can call and which tools can call one another.
+- **[Credentials](https://nono.sh/docs/cli/features/credential-injection)** — Keep API keys outside the agent’s sandbox with proxy-based injection and accessable to a single tool if need be. Use phantom tokens to restrict credential use to approved tools.
+- **[Network access](https://nono.sh/docs/cli/features/networking)** — Control where agents connect and what they can do there, with domain filtering and API rules for HTTP methods and paths.
+- **[Supply chain and skill attestation](https://nono.sh/docs/cli/features/trust)** — Verify the origin and integrity of skills, hooks, and instruction files with Sigstore. Define which publishers you trust and reject unsigned or tampered files covered by your policy.
+- **[Cryptographic audit](https://nono.sh/docs/cli/features/audit)** — Keep a tamper-evident record of agent sessions and security decisions, with integrity verification and optional signing.
+- **[Rollback and recovery](https://nono.sh/docs/cli/features/atomic-rollbacks)** — Review file changes and restore tracked files from verified snapshots when an agent takes a wrong turn.
+
+**Your policies stay outside the agent’s control.** Define them in composable profiles and enforce rules such as:
+
+- The `aws` CLI can use a credential, but `curl` can’t.
+- `gh` can read issues and PRs, but can only post to `org/foo`.
+- `git` can call `ssh` under its own policy, while the agent cannot call `ssh` directly.
 
 ---
 
@@ -110,70 +119,6 @@ nono run --profile pi-local -- pi
 `nono profile init` exports an extended and editable profile file for your agent, that inherits from the specified base profile. That profile is composable JSON, so you can review the exact filesystem, network, credentials, and tool rules before sharing it with a team or publishing it for the community.
 
 Are you an agent developer and want to publish your own agent package? We would love to have you and promote your work! [See the docs](https://nono.sh/docs/cli/features/package-publishing).
-
-## Sandbox the tools agents call
-
-nono does not stop at "put the agent in a sandbox". Agents delegate real work to tools: `git`, `gh`, `curl`, `kubectl`, package managers, build scripts, MCP clients / servers, and whatever else is on `PATH`. Those tools are often where secrets, network access, and side effects show up. Most sandboxes just give the agent a blanket policy where a secret is universally available to the entire agent and every tool, but nono is different:
-
-nono can put delegated tools in their own isolated command sandboxes, outside the agent's control. The agent gets its session sandbox; when it calls a controlled tool, nono's broker launches that tool under a command policy with its own filesystem policy, network policy, and credentials. The command sandbox does not inherit the session sandbox's broad `--allow` grants, CWD access, raw credential paths, or network access unless its command sandbox policy says so.
-
-That means a profile can express rules like:
-
-- the agent may call `git`, but `git` only gets the repo, trusted Git config files, and the Git object store
-- the agent may call `gh`, but `gh` only receives a GitHub token through nono's credential proxy
-- that token may only be used against selected GitHub API methods and paths through L7 filtering
-- `git` may call `ssh` under a chained policy, while direct `ssh` from the agent stays denied
-
-The policy lives in the profile, not in the prompt. The agent can ask for a tool, but it cannot widen that tool's sandbox, mint new keys, or bypass endpoint policy from inside the session.
-
-```json
-{
-  "command_policies": {
-    "credentials": {
-      "github-api": {
-        "type": "proxy",
-        "upstream": "https://api.github.com",
-        "credential_key": "keyring://gh:github.com/example?decode=go-keyring",
-        "env_var": "GH_TOKEN",
-        "inject_header": "Authorization",
-        "credential_format": "Bearer {}"
-      }
-    },
-    "commands": {
-      "gh": {
-        "from": {
-          "session": {
-            "sandbox": {
-              "fs_read": ["."],
-              "credentials": [
-                {
-                  "name": "github-api",
-                  "endpoint_policy": {
-                    "default": "deny",
-                    "allow": [
-                      { "method": "GET", "path": "/repos/nolabs-ai/nono/issues/**" }
-                    ]
-                  }
-                }
-              ]
-            },
-            "invocation_policy": {
-              "default": "deny",
-              "allow": [
-                { "argv": { "prefix": ["issue", "list"] } },
-                { "argv": { "prefix": ["issue", "view"] } }
-              ]
-            }
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-Read more in [Sandboxed Tool Execution](https://nono.sh/docs/cli/features/tool-sandbox).
-
 ## Ready to go deep?
 
 Head over to the [docs](https://nono.sh/docs) and discover nono's rich composable policy system, credentials injection, L7 filtering, supply chain security, rollback, multiplexing, audit and more.

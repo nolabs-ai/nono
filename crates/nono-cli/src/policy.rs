@@ -1821,6 +1821,49 @@ fn emit_macos_socket_bypass_rules(
     Ok(())
 }
 
+/// Seatbelt hole shape for one bypass path.
+///
+/// Non-directories stay exact: regular files, pathname sockets, and missing
+/// paths. `Path::is_file()` is false for sockets, so this uses `!is_dir()`.
+///
+/// A directory stays exact when a user-intent exact-file grant names that
+/// path and no directory grant names that same path. `allow_file` stores a
+/// directory used as a lock file with `is_file: true`. A directory grant of
+/// the bypass path itself still opens `subpath`. A parent directory grant
+/// does not widen an exact-file bypass.
+fn bypass_hole_is_literal(caps: &CapabilitySet, canonical: &Path) -> bool {
+    if !canonical.is_dir() {
+        return true;
+    }
+    let mut saw_exact_file = false;
+    let mut saw_directory_grant = false;
+    for cap in caps.fs_capabilities() {
+        if !cap.source.is_user_intent() {
+            continue;
+        }
+        if cap.resolved != canonical && cap.original != canonical {
+            continue;
+        }
+        if cap.is_file {
+            saw_exact_file = true;
+        } else {
+            saw_directory_grant = true;
+        }
+    }
+    saw_exact_file && !saw_directory_grant
+}
+
+/// True when `deny` is covered by this bypass and should leave `deny_paths`.
+///
+/// A subtree hole covers the bypass path and its descendants. A literal hole
+/// covers only the bypass path, so a child `filesystem.deny` stays in force.
+fn bypass_removes_deny(deny: &Path, canonical: &Path, expanded: &Path, literal: bool) -> bool {
+    if literal {
+        return deny == canonical || deny == expanded;
+    }
+    deny.starts_with(canonical) || deny.starts_with(expanded)
+}
+
 /// Apply deny overrides for specific paths, punching targeted holes through deny groups.
 ///
 /// For each override path:
@@ -1917,7 +1960,7 @@ pub fn apply_deny_overrides(
             canonical.display()
         );
 
-        let is_file = !canonical.is_dir();
+        let is_file = bypass_hole_is_literal(caps, &canonical);
 
         // On macOS: emit Seatbelt allow rules to punch through deny.
         // Only emit rules matching the effective access mode from the union
@@ -1953,14 +1996,16 @@ pub fn apply_deny_overrides(
             emit_macos_socket_bypass_rules(caps, &canonical, &expanded, is_file)?;
         }
 
-        // Remove deny entries that the override covers (equal or child of the override path).
-        // Check both the canonical and expanded (symlink) forms so that deny entries
-        // recorded for either the symlink or its target are removed.
-        // Do NOT remove broader deny entries when the override is a child — e.g.,
-        // overriding ~/.aws must not remove a deny on the entire home directory.
+        // Remove deny entries that the override covers. Check both the
+        // canonical and expanded (symlink) forms so that deny entries recorded
+        // for either the symlink or its target are removed. A subtree hole
+        // also removes descendants. A literal hole removes only the bypass
+        // path, so a child deny stays. Do NOT remove a broader parent deny
+        // when the override is a child: overriding ~/.aws must not remove a
+        // deny on the entire home directory.
         let mut removed_denies = Vec::new();
         deny_paths.retain(|dp| {
-            if dp.starts_with(&canonical) || dp.starts_with(&expanded) {
+            if bypass_removes_deny(dp, &canonical, &expanded, is_file) {
                 removed_denies.push(dp.clone());
                 false
             } else {
@@ -4929,6 +4974,112 @@ mod tests {
         // sub should be removed, but parent dir must remain
         assert_eq!(deny_paths.len(), 1);
         assert_eq!(deny_paths[0], dir_canonical);
+    }
+
+    #[test]
+    fn test_exact_file_directory_bypass_stays_literal_and_keeps_child_denies() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let lock_dir = dir.path().join("claude.lock");
+        std::fs::create_dir_all(&lock_dir).expect("mkdir lock dir");
+        let child = lock_dir.join("secret");
+        std::fs::write(&child, "hidden").expect("write child");
+
+        let lock_canonical = lock_dir.canonicalize().expect("canonicalize lock dir");
+        let child_canonical = child.canonicalize().expect("canonicalize child");
+        let parent_canonical = dir.path().canonicalize().expect("canonicalize parent");
+
+        let mut deny_paths = vec![
+            parent_canonical.clone(),
+            lock_canonical.clone(),
+            child_canonical.clone(),
+        ];
+        let mut caps = CapabilitySet::new();
+        // Parent directory grant must not widen the exact-file hole.
+        caps.add_fs(
+            FsCapability::new_dir(dir.path(), AccessMode::ReadWrite).expect("parent grant"),
+        );
+        caps.add_fs(FsCapability {
+            original: lock_dir.clone(),
+            resolved: lock_canonical.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        let bypasses =
+            apply_deny_overrides(std::slice::from_ref(&lock_dir), &mut deny_paths, &mut caps)
+                .expect("exact-file directory bypass");
+
+        assert!(
+            bypasses
+                .iter()
+                .any(|bypass| bypass.path == lock_canonical && bypass.is_file),
+            "exact-file directory bypass must stay literal, got: {bypasses:?}"
+        );
+        assert!(
+            deny_paths.contains(&child_canonical),
+            "child deny must survive a literal bypass, remaining: {deny_paths:?}"
+        );
+        assert!(
+            !deny_paths.contains(&lock_canonical),
+            "the bypass path itself is removed, remaining: {deny_paths:?}"
+        );
+        assert!(
+            deny_paths.contains(&parent_canonical),
+            "parent deny must survive, remaining: {deny_paths:?}"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let rules = caps.platform_rules().join("\n");
+            assert!(
+                rules.contains("literal"),
+                "Seatbelt hole must be a literal path, got: {rules}"
+            );
+            assert!(
+                !rules.contains("subpath"),
+                "exact-file directory bypass must not emit subpath, got: {rules}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_directory_grant_bypass_still_opens_subtree() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let granted = dir.path().join("aws");
+        std::fs::create_dir_all(&granted).expect("mkdir aws");
+        let child = granted.join("credentials");
+        std::fs::write(&child, "secret").expect("write credentials");
+
+        let granted_canonical = granted.canonicalize().expect("canonicalize grant");
+        let child_canonical = child.canonicalize().expect("canonicalize child");
+        let mut deny_paths = vec![granted_canonical.clone(), child_canonical.clone()];
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability::new_dir(&granted, AccessMode::ReadWrite).expect("dir grant"));
+
+        let bypasses =
+            apply_deny_overrides(std::slice::from_ref(&granted), &mut deny_paths, &mut caps)
+                .expect("directory bypass");
+
+        assert!(
+            bypasses
+                .iter()
+                .any(|bypass| bypass.path == granted_canonical && !bypass.is_file),
+            "a directory grant bypass stays a subtree, got: {bypasses:?}"
+        );
+        assert!(
+            deny_paths.is_empty(),
+            "subtree bypass removes the directory and its child denies, remaining: {deny_paths:?}"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let rules = caps.platform_rules().join("\n");
+            assert!(
+                rules.contains("subpath"),
+                "directory grant bypass must emit subpath, got: {rules}"
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::token::NonceResolver;
 use serde_json::Value;
 use std::collections::HashSet;
 use tracing::debug;
+use zeroize::Zeroizing;
 
 impl OAuthCaptureStore {
     pub fn rewrite_request_body(
@@ -144,8 +145,7 @@ impl OAuthCaptureStore {
             .iter()
             .map(|field| field.path.as_str())
             .collect::<HashSet<_>>();
-        let mut changed = false;
-        let mut rewritten_fields = 0usize;
+        let mut minted = Vec::new();
         for field in &endpoint.response_fields {
             let Some(value) = value_at_path_mut(&mut json, &field.path) else {
                 continue;
@@ -180,11 +180,12 @@ impl OAuthCaptureStore {
                     }
                 }
             };
-            self.store_phantom(&key, real.as_bytes(), &endpoint.admitted_consumers)?;
+            minted.push((key, Zeroizing::new(real.as_bytes().to_vec())));
             *value = Value::String(visible);
-            changed = true;
-            rewritten_fields += 1;
         }
+        let rewritten_fields = minted.len();
+        let changed = rewritten_fields > 0;
+        self.store_phantoms(minted, &endpoint.admitted_consumers)?;
         reject_unrewritten_token_fields(
             &json,
             &configured_paths,

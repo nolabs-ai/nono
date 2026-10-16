@@ -43,7 +43,7 @@ nono supports macOS, Linux, and Windows (WSL2).
 ## What nono protects
 
 - **[Tools](https://nono.sh/docs/cli/features/tool-sandbox)** — Run each tool in its own ephemeral sandbox, isolated from the agent and other tools, with explicit permissions for files, network access, environment variables, and credentials. Control which commands the agent can call and which tools can call one another.
-- **[Credentials](https://nono.sh/docs/cli/features/credential-injection)** — Keep API keys outside the agent’s sandbox with proxy-based injection and accessable to a single tool if need be. Use phantom tokens to restrict credential use to approved tools.
+- **[Credentials](https://nono.sh/docs/cli/features/credential-injection)** — Keep API keys outside the agent’s sandbox with proxy-based injection and accessible to a single tool if need be. Use phantom tokens to restrict credential use to approved tools.
 - **[Network access](https://nono.sh/docs/cli/features/networking)** — Control where agents connect and what they can do there, with domain filtering and API rules for HTTP methods and paths.
 - **[Supply chain and skill attestation](https://nono.sh/docs/cli/features/trust)** — Verify the origin and integrity of skills, hooks, and instruction files with Sigstore. Define which publishers you trust and reject unsigned or tampered files covered by your policy.
 - **[Cryptographic audit](https://nono.sh/docs/cli/features/audit)** — Keep a tamper-evident record of agent sessions and security decisions, with integrity verification and optional signing.

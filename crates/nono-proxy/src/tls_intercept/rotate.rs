@@ -65,10 +65,14 @@ impl InterceptCaRotator {
     /// "re-signed over the same key" path, and the session's served key must
     /// never change silently (see the `supersedes` invariant this rotator
     /// exists to uphold). A cert whose key differs from what is currently
-    /// live must go through [`Self::rotate_across_keys`] instead.
+    /// live must go through [`Self::rotate_across_keys`] instead. The
+    /// replacement must also still be valid and outlive the cert currently
+    /// served, so a stale or expired re-issue cannot walk the session
+    /// backwards.
     pub fn rotate(&self, key_der: &[u8], cert_pem: &str) -> Result<PathBuf> {
         let ca = Arc::new(EphemeralCa::from_existing(key_der, cert_pem)?);
         self.ensure_same_key_as_current(&ca)?;
+        self.ensure_supersedes_current(&ca)?;
         self.install(ca, cert_pem)
     }
 
@@ -91,7 +95,30 @@ impl InterceptCaRotator {
             ));
         }
         let ca = Arc::new(EphemeralCa::from_existing(key_der, cert_pem)?);
+        // Adopting a replacement that is itself expired would trade one
+        // dead anchor for another.
+        if ca.not_after() <= SystemTime::now() {
+            return Err(ProxyError::Config(
+                "rotate_across_keys: refusing to adopt a CA cert that is itself expired"
+                    .to_string(),
+            ));
+        }
         self.install(ca, cert_pem)
+    }
+
+    /// A same-key rotation is a renewal: the candidate must itself be valid
+    /// and strictly outlive the cert currently served.
+    fn ensure_supersedes_current(&self, candidate: &EphemeralCa) -> Result<()> {
+        let current = self.current_not_after()?;
+        let now = SystemTime::now();
+        if candidate.not_after() <= current || candidate.not_after() <= now {
+            return Err(ProxyError::Config(
+                "rotate: refusing to install a CA cert that is expired or does not \
+                 outlive the currently served one"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn ensure_same_key_as_current(&self, candidate: &EphemeralCa) -> Result<()> {
@@ -285,6 +312,58 @@ mod tests {
             "rotate_across_keys must refuse while the currently served cert is still valid"
         );
         assert_eq!(r.current_cert_pem().unwrap(), cert_pem);
+    }
+
+    #[test]
+    fn rotate_rejects_a_same_key_renewal_that_does_not_outlive_the_served_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let original =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(86_400)).unwrap();
+        let key_der = original.key_der().to_vec();
+        let cert_pem = original.cert_pem().to_string();
+        let r = rotator(Arc::new(original), dir.path());
+
+        // Shorter-lived than the cert currently served.
+        let shorter =
+            EphemeralCa::reissue_with_cn(&key_der, "nono-proxy-ca", Duration::from_secs(60))
+                .unwrap();
+        assert!(
+            r.rotate(&key_der, shorter.cert_pem()).is_err(),
+            "a renewal that does not outlive the served cert must be refused"
+        );
+        // Expired.
+        let expired =
+            EphemeralCa::reissue_with_cn(&key_der, "nono-proxy-ca", Duration::from_secs(0))
+                .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            r.rotate(&key_der, expired.cert_pem()).is_err(),
+            "an expired renewal must be refused"
+        );
+        assert_eq!(
+            r.current_cert_pem().unwrap(),
+            cert_pem,
+            "refused renewals must leave the live CA untouched"
+        );
+    }
+
+    #[test]
+    fn rotate_across_keys_refuses_an_expired_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let original =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(0)).unwrap();
+        let r = rotator(Arc::new(original), dir.path());
+        std::thread::sleep(Duration::from_millis(50));
+
+        let expired_replacement =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(0)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            r.rotate_across_keys(expired_replacement.key_der(), expired_replacement.cert_pem())
+                .is_err(),
+            "adopting an expired replacement over an expired cert fixes nothing; it must be \
+             refused"
+        );
     }
 
     #[test]

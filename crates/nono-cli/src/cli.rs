@@ -517,8 +517,8 @@ SESSION PICKER:
                                                # Extend an existing profile
   nono profile init my-agent --full            # Generate a full skeleton
   nono profile list                            # List all profiles (built-in and user)
-  nono profile show claude-code                # Show a fully resolved profile
-  nono profile diff default claude-code        # Compare two profiles
+  nono profile show nolabs-ai/claude            # Show an installed package profile
+  nono profile diff default nolabs-ai/claude    # Compare two profiles
   nono profile validate my-agent               # Validate a profile by name
   nono profile validate ~/my-profile.json      # Validate a profile file
   nono profile validate --draft my-profile     # Validate a profile draft
@@ -888,14 +888,9 @@ pub struct CompletionsArgs {
 }
 
 #[derive(Parser, Debug)]
-#[command(disable_help_flag = true)]
 pub struct ProfileCmdArgs {
     #[command(subcommand)]
     pub command: ProfileCommands,
-
-    /// Print help
-    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
-    pub help: Option<bool>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -4447,6 +4442,21 @@ mod tests {
     fn test_profile_no_subcommand() {
         let result = Cli::try_parse_from(["nono", "profile"]);
         assert!(result.is_err(), "profile without subcommand should fail");
+    }
+
+    #[test]
+    fn test_profile_subcommand_help_is_available() {
+        for subcommand in [
+            "init", "list", "show", "diff", "validate", "promote", "groups", "schema", "guide",
+        ] {
+            let error = Cli::try_parse_from(["nono", "profile", subcommand, "--help"])
+                .expect_err("--help should exit through clap");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "profile {subcommand} --help should display help"
+            );
+        }
     }
 
     #[test]

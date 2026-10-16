@@ -1782,11 +1782,19 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 None
                             };
 
+                        let requires_http1 = state.route_store.requires_http1(&host_port);
+                        if state.enable_h2 && requires_http1 {
+                            debug!(
+                                "tls_intercept: disabling h2 for {}:{}: AWS SigV4 requires HTTP/1.1",
+                                host, port
+                            );
+                        }
                         let mut h2_enabled_for_target = state.enable_h2
+                            && !requires_http1
                             && !oauth_host_policy
                                 .as_ref()
                                 .is_some_and(|policy| policy.force_http1);
-                        let (tls_connector_h2, h2_connector_cache_key) = if state.enable_h2 {
+                        let (tls_connector_h2, h2_connector_cache_key) = if h2_enabled_for_target {
                             match tls_intercept::handle::select_h2_tls_connector_for_target(
                                 &state.route_store,
                                 &host,
@@ -2336,6 +2344,195 @@ mod tests {
                 ))
             }
         }
+    }
+
+    /// Exercise CONNECT dispatch, ALPN, and the existing HTTP/1.1 signing path
+    /// against an upstream that would otherwise permit h2.
+    #[test]
+    fn aws_intercept_falls_back_to_http1_and_signs_request() {
+        use base64::Engine;
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let empty_profile = dir.path().join("aws-empty");
+        std::fs::write(&empty_profile, "").unwrap();
+
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+            (
+                "AWS_SECRET_ACCESS_KEY",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            ),
+            ("AWS_SESSION_TOKEN", "fake-session-token"),
+            ("AWS_REGION", "us-east-1"),
+            ("AWS_CONFIG_FILE", empty_profile.to_str().unwrap()),
+            (
+                "AWS_SHARED_CREDENTIALS_FILE",
+                empty_profile.to_str().unwrap(),
+            ),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ]);
+
+        // Hold the environment lock until the runtime and guard are dropped.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                let ca = Arc::new(EphemeralCa::generate().unwrap());
+                let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+                let acceptor = tokio_rustls::TlsAcceptor::from(
+                    tls_intercept::acceptor::build_server_config(cache, true).unwrap(),
+                );
+
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream_port = listener.local_addr().unwrap().port();
+                let body = br#"{"messages":[{"text":"hi"}]}"#;
+
+                let upstream = tokio::spawn(async move {
+                    // A pre-flight h2 probe would consume this connection and
+                    // fail the HTTP/1.1 assertion, so this also checks probe suppression.
+                    let (sock, _) = listener.accept().await.unwrap();
+                    let mut tls = acceptor.accept(sock).await.unwrap();
+                    assert_ne!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+
+                    let mut request = Vec::new();
+                    let header_end = loop {
+                        let mut byte = [0];
+                        tls.read_exact(&mut byte).await.unwrap();
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break request.len();
+                        }
+                        assert!(request.len() < 16384);
+                    };
+
+                    let mut received_body = vec![0; body.len()];
+                    tls.read_exact(&mut received_body).await.unwrap();
+                    assert_eq!(received_body, body);
+
+                    let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+                    assert!(headers.starts_with("POST /model/test/converse HTTP/1.1\r\n"));
+                    assert!(headers.contains("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/"));
+                    assert!(headers.contains("/us-east-1/bedrock/aws4_request"));
+                    assert!(!headers.contains("agent-signature"));
+
+                    let lower = headers.to_ascii_lowercase();
+                    let body_hash: String = Sha256::digest(body)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                    assert!(lower.contains(&format!("x-amz-content-sha256: {body_hash}")));
+                    assert!(lower.contains("x-amz-security-token: fake-session-token"));
+                    assert!(!lower.contains("proxy-authorization"));
+
+                    tls.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+                    tls.shutdown().await.unwrap();
+                });
+
+                let ca_file = dir.path().join("upstream-ca.pem");
+                std::fs::write(&ca_file, ca.cert_pem()).unwrap();
+                let route = serde_json::from_value(serde_json::json!({
+                    "prefix": "aws",
+                    "upstream": format!("https://localhost:{upstream_port}"),
+                    "aws_auth": {"region": "us-east-1", "service": "bedrock"},
+                    "tls_ca": ca_file,
+                    "endpoint_rules": [{"method": "POST", "path": "/model/**"}]
+                }))
+                .unwrap();
+
+                let handle = start(ProxyConfig {
+                    routes: vec![route],
+                    enable_h2: true,
+                    intercept_ca_dir: Some(dir.path().to_path_buf()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+                let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+                    .await
+                    .unwrap();
+                let auth = base64::engine::general_purpose::STANDARD
+                    .encode(format!("nono:{}", handle.token.as_str()));
+                sock.write_all(
+                    format!(
+                        "CONNECT localhost:{upstream_port} HTTP/1.1\r\nHost: localhost:{upstream_port}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+                let mut response = Vec::new();
+                while !response.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    sock.read_exact(&mut byte).await.unwrap();
+                    response.push(byte[0]);
+                    assert!(response.len() < 16384);
+                }
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+
+                let bundle = std::fs::read(handle.intercept_ca_path().unwrap()).unwrap();
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in CertificateDer::pem_slice_iter(&bundle) {
+                    roots.add(cert.unwrap()).unwrap();
+                }
+
+                let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+                client.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+                    .connect(ServerName::try_from("localhost").unwrap(), sock)
+                    .await
+                    .unwrap();
+                assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"http/1.1".as_slice()));
+
+                tls.write_all(
+                    format!(
+                        "POST /model/test/converse HTTP/1.1\r\nHost: localhost:{upstream_port}\r\nAuthorization: agent-signature\r\nX-Amz-Date: agent-signature\r\nX-Amz-Content-Sha256: agent-signature\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+                tls.write_all(body).await.unwrap();
+
+                let mut response = Vec::new();
+                while !response.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    tls.read_exact(&mut byte).await.unwrap();
+                    response.push(byte[0]);
+                    assert!(response.len() < 16384);
+                }
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+
+                let mut response_body = [0; 2];
+                tls.read_exact(&mut response_body).await.unwrap();
+                assert_eq!(&response_body, b"ok");
+
+                upstream.await.unwrap();
+                handle.shutdown();
+            })
+            .await
+            .unwrap();
+        });
     }
 
     #[test]

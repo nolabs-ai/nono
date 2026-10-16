@@ -125,19 +125,19 @@ nono profile show my-agent
 nono profile show ./profiles/custom.json
 
 # Show raw paths (before variable expansion)
-nono profile show claude-code --raw
+nono profile show nolabs-ai/claude --raw
 
 # Machine-readable output
-nono profile show claude-code --json
+nono profile show nolabs-ai/claude --json
 
 # Emit fully resolved effective rules as JSON (same resolution as nono run)
-nono profile show claude-code --format manifest
+nono profile show nolabs-ai/claude --format manifest
 ```
 
 Example output:
 
 ```
-nono profile: profile 'claude-code'
+nono profile: profile 'nolabs-ai/claude'
 
   Description:  Anthropic Claude Code CLI agent
   Extends:      default
@@ -321,7 +321,7 @@ nono profile validate ./profile.json --json | jq '.valid'
 `--format manifest` emits the fully resolved effective rules as JSON, using the same extends + group resolution that `nono run` uses. This is useful for policy-as-code pipelines, diffing resolved rules across environments, or feeding the output into other tooling:
 
 ```bash
-nono profile show claude-code --format manifest
+nono profile show nolabs-ai/claude --format manifest
 ```
 
 ### Auditing security posture
@@ -330,13 +330,13 @@ Review exactly what a profile grants before deploying it:
 
 ```bash
 # What does this profile actually allow?
-nono profile show claude-code
+nono profile show nolabs-ai/claude
 
 # What groups protect sensitive data?
 nono profile groups deny_credentials
 
 # How does our custom profile differ from the pack profile?
-nono profile diff claude-code ./our-custom-profile.json
+nono profile diff nolabs-ai/claude ./our-custom-profile.json
 ```
 
 ### Debugging sandbox failures

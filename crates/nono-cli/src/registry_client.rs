@@ -71,9 +71,7 @@ pub enum PullReason {
     Explicit,
     /// `nono update` re-pulling an outdated pack.
     Update,
-    /// First-run legacy-config migration auto-installing a suggested pack.
-    Migration,
-    /// Silent implicit pull because a `--profile <ns>/<name>` reference
+    /// Confirmed implicit pull because a `--profile <ns>/<name>` reference
     /// (including an `extends` chain) wasn't installed locally.
     ProfileAuto,
 }
@@ -83,7 +81,6 @@ impl PullReason {
         match self {
             PullReason::Explicit => "explicit",
             PullReason::Update => "update",
-            PullReason::Migration => "migration",
             PullReason::ProfileAuto => "profile-auto",
         }
     }
@@ -274,20 +271,6 @@ impl RegistryClient {
             path.push_str(&encoded);
         }
         self.get_json(&path)
-    }
-
-    /// Look up which packs (if any) ship a profile with the given
-    /// `install_as` name. Used by the migration prompt to discover
-    /// which pack to offer when `--profile <name>` misses every local
-    /// resolver. Returns `Ok(vec![])` if the registry has no providers
-    /// for that name.
-    pub fn fetch_profile_providers(
-        &self,
-        profile_name: &str,
-    ) -> Result<Vec<crate::package::ProfileProvider>> {
-        let response: crate::package::ProfileProvidersResponse =
-            self.get_json(&format!("/api/v1/profiles/{profile_name}/providers"))?;
-        Ok(response.providers)
     }
 
     pub fn download_bundle(&self, url: &str) -> Result<String> {
@@ -585,7 +568,6 @@ mod tests {
     fn pull_reason_header_values_are_distinct_and_stable() {
         assert_eq!(PullReason::Explicit.header_value(), "explicit");
         assert_eq!(PullReason::Update.header_value(), "update");
-        assert_eq!(PullReason::Migration.header_value(), "migration");
         assert_eq!(PullReason::ProfileAuto.header_value(), "profile-auto");
     }
 }

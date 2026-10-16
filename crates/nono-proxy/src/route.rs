@@ -78,6 +78,10 @@ pub struct LoadedRoute {
     /// authentication itself rather than accept agent-provided credentials.
     pub requires_managed_credential: bool,
 
+    /// AWS SigV4 is currently supported only by the HTTP/1.1 intercept path.
+    /// Retained even when credential loading fails.
+    pub requires_http1: bool,
+
     /// Audit auth mechanism implied by the managed credential configuration.
     /// Kept even if credential material failed to load so fail-closed denial
     /// events can describe what auth shape the route expected.
@@ -111,6 +115,7 @@ impl std::fmt::Debug for LoadedRoute {
             .field("upgrade_rules", &self.upgrade_rules)
             .field("has_custom_tls_ca", &self.tls_connector.is_some())
             .field("requires_intercept", &self.requires_intercept)
+            .field("requires_http1", &self.requires_http1)
             .field(
                 "requires_managed_credential",
                 &self.requires_managed_credential,
@@ -357,6 +362,7 @@ impl RouteStore {
                     tls_config_key,
                     requires_intercept,
                     requires_managed_credential,
+                    requires_http1: route.aws_auth.is_some(),
                     managed_auth_mechanism,
                     managed_injection_mode,
                     managed_auth,
@@ -456,6 +462,14 @@ impl RouteStore {
                 .is_some_and(|hp| host_port_matches(hp, &normalised))
                 && route.requires_intercept
         })
+    }
+
+    /// Whether any configured route matching this authority requires HTTP/1.1.
+    #[must_use]
+    pub fn requires_http1(&self, host_port: &str) -> bool {
+        self.lookup_all_by_upstream(host_port)
+            .iter()
+            .any(|(_, route)| route.requires_http1)
     }
 
     /// All unique upstream `host:port` strings across loaded routes.
@@ -1319,6 +1333,46 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn http1_required_for_all_matching_aws_routes() {
+        let aws: RouteConfig = serde_json::from_value(serde_json::json!({
+            "prefix": "z-aws",
+            "upstream": "https://*.example.com",
+            "aws_auth": {"region": "us-east-1", "service": "bedrock"},
+            "endpoint_rules": [{"method": "POST", "path": "/aws/**"}]
+        }))
+        .unwrap();
+
+        let other: RouteConfig = serde_json::from_value(serde_json::json!({
+            "prefix": "a-other",
+            "upstream": "https://api.example.com",
+            "endpoint_rules": [{"method": "GET", "path": "/other/**"}]
+        }))
+        .unwrap();
+
+        // Only route configuration is loaded, with no credential store at all.
+        for routes in [vec![other.clone(), aws.clone()], vec![aws, other]] {
+            let store = RouteStore::load(&routes).await.unwrap();
+
+            assert!(store.requires_http1("API.EXAMPLE.COM:443"));
+            assert!(store.requires_http1("another.example.com:443"));
+            assert!(!store.requires_http1("api.example.com:8443"));
+            assert!(!store.requires_http1("unrelated.test:443"));
+            assert!(!store.requires_http1("example.com:443"));
+            assert!(!store.requires_http1("api.example.com.evil:443"));
+        }
+
+        let store = RouteStore::load(&[serde_json::from_value(serde_json::json!({
+            "prefix": "other",
+            "upstream": "https://api.example.com"
+        }))
+        .unwrap()])
+        .await
+        .unwrap();
+
+        assert!(!store.requires_http1("api.example.com:443"));
+    }
+
     #[test]
     fn test_loaded_route_debug() {
         let route = LoadedRoute {
@@ -1333,6 +1387,7 @@ mod tests {
             tls_config_key: None,
             requires_intercept: false,
             requires_managed_credential: false,
+            requires_http1: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
@@ -1589,6 +1644,7 @@ mod tests {
             tls_config_key: None,
             requires_intercept: true,
             requires_managed_credential: true,
+            requires_http1: false,
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
             managed_auth: None,
@@ -1612,6 +1668,7 @@ mod tests {
             tls_config_key: None,
             requires_intercept: true,
             requires_managed_credential: false,
+            requires_http1: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,

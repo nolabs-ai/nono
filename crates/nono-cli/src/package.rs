@@ -71,6 +71,16 @@ impl PackageManifest {
             .iter()
             .any(|a| a.artifact_type == ArtifactType::Profile)
     }
+
+    /// The profile exposed by the package's fully-qualified name.
+    /// Other profile artifacts are package-local inheritance helpers.
+    #[must_use]
+    pub fn public_profile_artifact(&self) -> Option<&ArtifactEntry> {
+        self.artifacts.iter().find(|artifact| {
+            artifact.artifact_type == ArtifactType::Profile
+                && artifact.install_as.as_deref() == Some(self.name.as_str())
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,15 +94,6 @@ pub struct ArtifactEntry {
     pub placement: Option<String>,
     #[serde(default)]
     pub prefix: Option<String>,
-    /// Additional names that resolve to this same artifact. Currently
-    /// only meaningful for `Profile` artifacts: each alias is accepted
-    /// by `--profile` and routes to the file installed under
-    /// `install_as`. Lets a pack rename its canonical profile name
-    /// (e.g. `claude-code` → `claude`) without breaking commands users
-    /// already have in their shell history. The pack only stores the
-    /// content once — aliases never produce extra files on disk.
-    #[serde(default)]
-    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,35 +211,6 @@ pub struct PackageAdvisory {
     pub severity: Option<String>,
     #[serde(default)]
     pub summary: Option<String>,
-}
-
-/// One pack that ships a given profile name (the `install_as` of a
-/// profile artifact in its manifest). Returned by
-/// `GET /api/v1/profiles/<name>/providers`. Used by the migration
-/// prompt to discover which pack to offer when a user runs
-/// `--profile <formerly-builtin-name>`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfileProvider {
-    pub namespace: String,
-    pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    /// Short user-visible summary of what the pack installs. Renders
-    /// in the migration prompt's "Installs" row.
-    #[serde(default)]
-    pub installs_summary: Option<String>,
-}
-
-impl ProfileProvider {
-    #[must_use]
-    pub fn pack_ref(&self) -> String {
-        format!("{}/{}", self.namespace, self.name)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfileProvidersResponse {
-    pub providers: Vec<ProfileProvider>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,5 +409,25 @@ mod tests {
     fn rejects_empty_package_install_dir_components() {
         assert!(package_install_dir("", "name").is_err());
         assert!(package_install_dir("namespace", "").is_err());
+    }
+
+    #[test]
+    fn public_profile_must_match_package_name() {
+        let manifest: PackageManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "name": "copilot-cli",
+            "artifacts": [
+                {"type": "profile", "path": "base.json", "install_as": "copilot-base"},
+                {"type": "profile", "path": "cli.json", "install_as": "copilot-cli"}
+            ]
+        }))
+        .expect("manifest");
+
+        assert_eq!(
+            manifest
+                .public_profile_artifact()
+                .and_then(|artifact| artifact.install_as.as_deref()),
+            Some("copilot-cli")
+        );
     }
 }

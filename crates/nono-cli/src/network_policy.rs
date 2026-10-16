@@ -230,6 +230,14 @@ pub fn resolve_credentials(
                     ))
                 })?;
             }
+            if let Some(ref base_url_env_var) = cred.base_url_env_var {
+                nono::validate_destination_env_var(base_url_env_var).map_err(|e| {
+                    NonoError::ConfigParse(format!(
+                        "custom credential '{}' has invalid base_url_env_var: {}",
+                        name, e
+                    ))
+                })?;
+            }
 
             let oauth2 = cred.auth.clone();
 
@@ -246,6 +254,7 @@ pub fn resolve_credentials(
                 query_param_name: cred.query_param_name.clone(),
                 proxy: cred.proxy.clone(),
                 env_var: cred.env_var.clone(),
+                base_url_env_var: cred.base_url_env_var.clone(),
                 endpoint_rules: cred.endpoint_rules.clone(),
                 endpoint_policy: cred.endpoint_policy.clone(),
                 tls_ca: cred
@@ -301,6 +310,7 @@ pub fn resolve_credentials(
                 query_param_name: None,
                 proxy: None,
                 env_var: cred.env_var.clone(),
+                base_url_env_var: None,
                 endpoint_rules: cred.endpoint_rules.clone(),
                 endpoint_policy: None,
                 tls_ca: None, // Built-in credentials don't support custom CAs
@@ -464,6 +474,7 @@ pub fn partition_allow_domain(
                         query_param_name: None,
                         proxy: None,
                         env_var: None,
+                        base_url_env_var: None,
                         endpoint_rules: endpoints.clone(),
                         endpoint_policy: None,
                         tls_ca: None,
@@ -631,6 +642,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -676,6 +688,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -717,6 +730,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -768,6 +782,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -859,6 +874,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -897,6 +913,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -935,6 +952,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -978,6 +996,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("OPENAI_API_KEY".to_string()),
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -996,6 +1015,98 @@ mod tests {
             routes[0].env_var,
             Some("OPENAI_API_KEY".to_string()),
             "env_var must be propagated from CustomCredentialDef to RouteConfig"
+        );
+    }
+
+    #[test]
+    fn test_resolve_credentials_propagates_base_url_env_var() {
+        // base_url_env_var must reach the RouteConfig so credential_env_vars()
+        // exports the loopback URL under the profile's chosen name.
+        use crate::profile::CustomCredentialDef;
+
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).expect("policy should load");
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "langfuse".to_string(),
+            CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
+                upstream: "https://cloud.langfuse.com".to_string(),
+                credential_key: Some("env://LANGFUSE_SECRET".to_string()),
+                auth: None,
+                inject_mode: InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Basic {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: Some("LANGFUSE_API_KEY".to_string()),
+                base_url_env_var: Some("LANGFUSE_ENDPOINT".to_string()),
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                aws_auth: None,
+                spiffe: None,
+                rate_limit: None,
+            },
+        );
+
+        let routes = resolve_credentials(&policy, &["langfuse".to_string()], &custom)
+            .expect("should resolve");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[0].base_url_env_var,
+            Some("LANGFUSE_ENDPOINT".to_string()),
+            "base_url_env_var must be propagated from CustomCredentialDef to RouteConfig"
+        );
+    }
+
+    #[test]
+    fn test_resolve_credentials_rejects_dangerous_base_url_env_var() {
+        use crate::profile::CustomCredentialDef;
+
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).expect("policy should load");
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "evil".to_string(),
+            CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
+                upstream: "https://api.example.com".to_string(),
+                credential_key: Some("safe_key".to_string()),
+                auth: None,
+                inject_mode: InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                base_url_env_var: Some("LD_PRELOAD".to_string()),
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                aws_auth: None,
+                spiffe: None,
+                rate_limit: None,
+            },
+        );
+
+        let result = resolve_credentials(&policy, &["evil".to_string()], &custom);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("blocklist"),
+            "should mention blocklist, got: {}",
+            err
         );
     }
 
@@ -1115,6 +1226,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("LD_PRELOAD".to_string()),
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1210,6 +1322,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1263,6 +1376,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1422,6 +1536,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("MOCK_API_KEY".to_string()),
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1466,6 +1581,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("SVC_A_KEY".to_string()),
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1491,6 +1607,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("SVC_B_KEY".to_string()),
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,

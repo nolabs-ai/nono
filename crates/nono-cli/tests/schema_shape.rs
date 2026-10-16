@@ -481,6 +481,7 @@ fn test_schema_custom_credential_def_matches_rust_model() {
             "query_param_name",
             "proxy",
             "env_var",
+            "base_url_env_var",
             "endpoint_rules",
             "endpoint_policy",
             "tls_ca",
@@ -490,6 +491,28 @@ fn test_schema_custom_credential_def_matches_rust_model() {
             "redeem_phantoms",
         ],
     );
+}
+
+#[test]
+fn test_schema_validates_custom_credential_with_base_url_env_var() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": {
+            "custom_credentials": {
+                "langfuse": {
+                    "upstream": "https://cloud.langfuse.com",
+                    "credential_key": "env://LANGFUSE_SECRET",
+                    "env_var": "LANGFUSE_API_KEY",
+                    "base_url_env_var": "LANGFUSE_ENDPOINT"
+                }
+            }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("custom credential with base_url_env_var should validate");
 }
 
 #[test]

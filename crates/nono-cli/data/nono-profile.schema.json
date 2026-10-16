@@ -1142,6 +1142,13 @@
           ],
           "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op://, bw://, apple-password://, file://, or cmd://). Optional for env:// (derived from the URI)."
         },
+        "base_url_env_var": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Explicit environment variable name for the proxy base URL (e.g., \"LANGFUSE_ENDPOINT\"). When set, the loopback base URL is exported under this name instead of the derived <PREFIX>_BASE_URL. Use it for tools that expect the base URL under a name not ending in _BASE_URL."
+        },
         "endpoint_rules": {
           "type": "array",
           "items": {

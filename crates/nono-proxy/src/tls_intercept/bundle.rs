@@ -142,10 +142,15 @@ pub fn write_bundle(inputs: BundleInputs<'_>) -> Result<PathBuf> {
 /// fence narrow.
 fn write_with_restrictive_perms(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     // Rename over the target: a child reading SSL_CERT_FILE during a mid-session
-    // rewrite must never see a missing or partial bundle.
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    // rewrite must never see a missing or partial bundle. The temp name is
+    // unique per call: one shared across concurrent rotations lets one call
+    // unlink or rename another's partially written file.
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
     let _ = std::fs::remove_file(&tmp);
 
     #[cfg(unix)]
@@ -277,7 +282,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn bundle_file_has_restrictive_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -293,5 +297,47 @@ mod tests {
         let metadata = std::fs::metadata(&path).unwrap();
         let mode = metadata.permissions().mode() & 0o777;
         assert_eq!(mode, 0o400, "bundle must be owner-read-only");
+    }
+
+    #[test]
+    fn concurrent_bundles_writes_to_one_path_all_install_complete_content() {
+        // A mid-session renewal can overlap another rewrite of the same
+        // bundle path; the temp files must not collide, or one rotation
+        // renames another's partially written file into place.
+        const THREADS: usize = 6;
+        const ROUNDS: usize = 16;
+        for _ in 0..ROUNDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("intercept-ca.pem");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let payloads: Vec<_> = (0..THREADS)
+                .map(|i| std::sync::Arc::new(format!("payload-{i}-").repeat(16 * 1024)))
+                .collect();
+            let handles: Vec<_> = payloads
+                .iter()
+                .cloned()
+                .map(|payload| {
+                    let path = path.clone();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        write_with_restrictive_perms(&path, payload.as_bytes())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .unwrap()
+                    .expect("every concurrent write must succeed");
+            }
+            let installed = std::fs::read(&path).unwrap();
+            assert!(
+                payloads
+                    .iter()
+                    .any(|p| p.as_bytes() == installed.as_slice()),
+                "the installed bundle must be one complete write, not a partial or torn file"
+            );
+        }
     }
 }

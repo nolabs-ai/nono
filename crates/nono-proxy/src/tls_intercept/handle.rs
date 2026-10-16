@@ -1274,6 +1274,14 @@ where
                     resolve_nonce_in_header_value(value, consumer, redeem_phantoms, resolver)
                 })
             })
+            .or_else(|| {
+                // Token endpoint requests bypass route selection, so without
+                // this the Bearer phantom would reach the upstream verbatim.
+                oauth_endpoint.and_then(|endpoint| {
+                    ctx.oauth_capture_store
+                        .rewrite_request_header_value(endpoint, value)
+                })
+            })
             .unwrap_or_else(|| value.clone());
         request.push_str(&format!("{}: {}\r\n", name, resolved_value));
     }
@@ -3633,5 +3641,374 @@ mod tests {
         .unwrap();
 
         assert!(tunnel_result.is_ok());
+    }
+
+    // --- OAuth token endpoint request forwarding (issue #1954) ---
+
+    fn oauth_capture_config(port: u16) -> crate::config::OAuthCaptureConfig {
+        use crate::config::{
+            OAuthCaptureConfig, OAuthTokenEndpointConfig, OAuthTokenRequestBodyFormat,
+            OAuthTokenResponseFieldConfig, OAuthTokenResponseFieldKind,
+        };
+
+        OAuthCaptureConfig {
+            provider: "github".to_string(),
+            token_endpoints: vec![OAuthTokenEndpointConfig {
+                host: format!("https://localhost:{port}"),
+                path: "/copilot_internal/v2/token".to_string(),
+                response_fields: vec![
+                    OAuthTokenResponseFieldConfig {
+                        path: "access_token".to_string(),
+                        kind: OAuthTokenResponseFieldKind::Opaque,
+                        format: None,
+                    },
+                    OAuthTokenResponseFieldConfig {
+                        path: "refresh_token".to_string(),
+                        kind: OAuthTokenResponseFieldKind::Opaque,
+                        format: None,
+                    },
+                ],
+                request_body: OAuthTokenRequestBodyFormat::Auto,
+                request_nonce_fields: vec!["refresh_token".to_string()],
+            }],
+            admitted_consumers: vec!["proxy.github_oauth".to_string()],
+        }
+    }
+
+    /// Mint access and refresh phantoms the way a real capture would, and
+    /// return the strings a sandboxed client would hold afterwards.
+    fn mint_oauth_phantoms(store: &OAuthCaptureStore, port: u16) -> (String, String) {
+        let endpoint = store
+            .lookup(&format!("localhost:{port}"), "/copilot_internal/v2/token")
+            .unwrap();
+        let rewritten = store
+            .rewrite_response_body(
+                endpoint,
+                br#"{"access_token":"gho_real_access","refresh_token":"gho_real_refresh"}"#,
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        (
+            json["access_token"].as_str().unwrap().to_string(),
+            json["refresh_token"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// TLS server config for a mock HTTP/1.1 upstream, signed by the
+    /// session CA so the proxy's connector trusts it.
+    fn http1_upstream_server_config(
+        ca: &crate::tls_intercept::ca::EphemeralCa,
+    ) -> Arc<rustls::server::ServerConfig> {
+        use rcgen::{CertificateParams, KeyPair};
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use time::OffsetDateTime;
+
+        let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.not_before = OffsetDateTime::now_utc();
+        params.not_after = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.signed_by(&key_pair, ca.issuer()).unwrap();
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+
+        let config = rustls::server::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], private_key)
+        .unwrap();
+        Arc::new(config)
+    }
+
+    /// Client TLS config trusting only the session CA, mirroring the
+    /// production HTTP/1.1 upstream connector (no ALPN).
+    fn https_connector_trusting(ca_pem: &str) -> tokio_rustls::TlsConnector {
+        use rustls::pki_types::pem::PemObject;
+
+        let mut roots = rustls::RootCertStore::empty();
+        let cert = rustls::pki_types::CertificateDer::from_pem_slice(ca_pem.as_bytes()).unwrap();
+        roots.add(cert).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    /// Serve one HTTPS request over HTTP/1.1, then send `response_body` with
+    /// a 200 and hand the raw received request back through the channel.
+    async fn spawn_mock_https_upstream(
+        ca: &crate::tls_intercept::ca::EphemeralCa,
+        response_body: &'static str,
+    ) -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::AsyncReadExt;
+
+        let server_config = http1_upstream_server_config(ca);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            let tls_acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            let mut tls_stream = tls_acceptor.accept(tcp_stream).await.unwrap();
+
+            let mut received: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                let n = tls_stream.read(&mut buf).await.unwrap();
+                received.extend_from_slice(&buf[..n]);
+                if let Some(pos) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&received[..header_end]).to_string();
+            let content_length = head
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while received.len() < header_end + content_length {
+                let n = tls_stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            tls_stream.write_all(response.as_bytes()).await.unwrap();
+            let _ = tls_stream.shutdown().await;
+            let _ = tx.send(String::from_utf8_lossy(&received).to_string());
+        });
+        (port, rx)
+    }
+
+    fn oauth_intercept_ctx<'a>(
+        ca: Arc<crate::tls_intercept::ca::EphemeralCa>,
+        connector: &'a tokio_rustls::TlsConnector,
+        filter: &'a ProxyFilter,
+        session_token: &'a Zeroizing<String>,
+        store: Arc<OAuthCaptureStore>,
+        port: u16,
+    ) -> InterceptCtx<'a> {
+        InterceptCtx {
+            route_id: None,
+            host: "localhost",
+            port,
+            route_store: Arc::new(RouteStore::empty()),
+            credential_store: Arc::new(CredentialStore::empty()),
+            oauth_capture_store: store,
+            session_token,
+            cert_cache: Arc::new(CertCache::new(ca)),
+            tls_connector: connector,
+            tls_connector_h2: connector,
+            filter,
+            audit_log: None,
+            upstream_proxy: None,
+            approval_backends: None,
+            credential_capture_backend: None,
+            nonce_resolver: None,
+            enable_h2: false,
+        }
+    }
+
+    /// Feed `request` to [`handle_inner_request`] through a duplex standing in
+    /// for the decrypted client TLS stream, and return the response bytes the
+    /// client received.
+    async fn drive_token_endpoint_request(ctx: &InterceptCtx<'_>, request: String) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let (mut client_io, mut server_io) = tokio::io::duplex(65536);
+        client_io.write_all(request.as_bytes()).await.unwrap();
+        handle_inner_request(&mut server_io, ctx).await.unwrap();
+        drop(server_io);
+
+        let mut response = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = client_io.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&response).to_string()
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_request_resolves_authorization_phantom() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, upstream_rx) = spawn_mock_https_upstream(&ca, r#"{"ok":true}"#).await;
+        let store = Arc::new(OAuthCaptureStore::load(&[oauth_capture_config(port)]).unwrap());
+        let (phantom, _) = mint_oauth_phantoms(&store, port);
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+
+        let request = format!(
+            "GET /copilot_internal/v2/token HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer {phantom}\r\n\r\n"
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.contains("200"),
+            "upstream call should succeed: {response}"
+        );
+
+        let upstream_received = upstream_rx.await.unwrap();
+        assert!(
+            upstream_received.contains("Authorization: Bearer gho_real_access\r\n"),
+            "upstream must receive the real access token, got: {upstream_received}"
+        );
+        assert!(
+            !upstream_received.contains(&phantom),
+            "the phantom must not reach the upstream, got: {upstream_received}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_request_forwards_plain_authorization_verbatim() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, upstream_rx) = spawn_mock_https_upstream(&ca, r#"{"ok":true}"#).await;
+        let store = Arc::new(OAuthCaptureStore::load(&[oauth_capture_config(port)]).unwrap());
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+
+        let request = format!(
+            "GET /copilot_internal/v2/token HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer gho_plain_client_credential\r\nUser-Agent: copilot-test/1.0\r\n\r\n"
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.contains("200"),
+            "upstream call should succeed: {response}"
+        );
+
+        let upstream_received = upstream_rx.await.unwrap();
+        assert!(
+            upstream_received.contains("Authorization: Bearer gho_plain_client_credential\r\n"),
+            "plain Authorization must pass through byte-identical, got: {upstream_received}"
+        );
+        assert!(
+            upstream_received.contains("User-Agent: copilot-test/1.0\r\n"),
+            "unrelated headers must pass through unchanged, got: {upstream_received}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_request_forwards_unknown_phantom_unchanged() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, upstream_rx) = spawn_mock_https_upstream(&ca, r#"{"ok":true}"#).await;
+        let store = Arc::new(OAuthCaptureStore::load(&[oauth_capture_config(port)]).unwrap());
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+
+        let unknown = format!("nono_{}", "f".repeat(64));
+        let request = format!(
+            "GET /copilot_internal/v2/token HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer {unknown}\r\n\r\n"
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.contains("200"),
+            "upstream call should succeed: {response}"
+        );
+
+        let upstream_received = upstream_rx.await.unwrap();
+        assert!(
+            upstream_received.contains(&format!("Authorization: Bearer {unknown}\r\n")),
+            "an unresolvable phantom must pass through unchanged, got: {upstream_received}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_request_still_rewrites_body_and_captures_response() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, upstream_rx) =
+            spawn_mock_https_upstream(&ca, r#"{"access_token":"gho_new_upstream_token"}"#).await;
+        let store = Arc::new(OAuthCaptureStore::load(&[oauth_capture_config(port)]).unwrap());
+        let (access_phantom, refresh_phantom) = mint_oauth_phantoms(&store, port);
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+
+        let body =
+            format!(r#"{{"grant_type":"refresh_token","refresh_token":"{refresh_phantom}"}}"#);
+        let request = format!(
+            "POST /copilot_internal/v2/token HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer {access_phantom}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.contains("200"),
+            "upstream call should succeed: {response}"
+        );
+
+        let upstream_received = upstream_rx.await.unwrap();
+        assert!(
+            upstream_received.contains("Authorization: Bearer gho_real_access\r\n"),
+            "upstream must receive the real access token, got: {upstream_received}"
+        );
+        assert!(
+            upstream_received.contains(r#""refresh_token":"gho_real_refresh""#),
+            "body refresh phantom must resolve to the real token, got: {upstream_received}"
+        );
+        assert!(
+            !upstream_received.contains(&refresh_phantom),
+            "no phantom may reach the upstream, got: {upstream_received}"
+        );
+
+        assert!(
+            response.contains("nono_"),
+            "response access_token must be captured to a phantom, got: {response}"
+        );
+        assert!(
+            !response.contains("gho_new_upstream_token"),
+            "the new upstream token must not reach the client, got: {response}"
+        );
     }
 }

@@ -3995,23 +3995,6 @@ fn add_policy_fs(
     deny_paths: &[PathBuf],
 ) -> Result<()> {
     use super::dynamic_providers::expand_dynamic_tokens;
-    // A write grant that resolves under the live cwd is downgraded to read
-    // unless the agent itself can write that exact resolved path, so a
-    // command's cwd access never exceeds the agent's own (write
-    // non-escalation). Checked per resolved path, not just the cwd as a
-    // whole, so a subdirectory the agent can explicitly write stays
-    // writable even when the surrounding cwd itself is not. Grants outside
-    // the cwd (e.g. `$WORKDIR`, absolute paths) are unaffected.
-    let write_access = |path: &Path| {
-        let normalized = super::lexically_normalize(path);
-        if normalized.starts_with(cwd)
-            && !super::agent_can_write(&normalized, policy_root, outer_caps, deny_paths)
-        {
-            AccessMode::Read
-        } else {
-            AccessMode::ReadWrite
-        }
-    };
     // `@git:*` tokens run git in the command's live cwd so they resolve to the
     // repo the command is actually operating in (e.g. its worktree / .git
     // common-dir), not the repo the agent was launched in.
@@ -4019,21 +4002,28 @@ fn add_policy_fs(
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd), outer_caps)? {
-        let path = resolve_policy_path(entry, policy_root, cwd)?;
-        let access = write_access(&path);
-        add_optional_dir(caps, path, access)?;
+    for entry in &policy.fs_write {
+        for expanded in expand_dynamic_tokens(std::slice::from_ref(entry), Some(cwd), outer_caps)? {
+            let path = resolve_policy_path(&expanded, policy_root, cwd)?;
+            let access =
+                super::policy_write_access(entry, &path, policy_root, cwd, outer_caps, deny_paths)?;
+            add_optional_dir(caps, path, access)?;
+        }
     }
     for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd), outer_caps)? {
-        let path = resolve_policy_path(entry, policy_root, cwd)?;
-        if matches!(write_access(&path), AccessMode::Read) {
-            add_optional_read_file(caps, path)?;
-        } else {
-            super::add_optional_write_file(caps, path)?;
+    for entry in &policy.fs_write_file {
+        for expanded in expand_dynamic_tokens(std::slice::from_ref(entry), Some(cwd), outer_caps)? {
+            let path = resolve_policy_path(&expanded, policy_root, cwd)?;
+            let access =
+                super::policy_write_access(entry, &path, policy_root, cwd, outer_caps, deny_paths)?;
+            if matches!(access, AccessMode::Read) {
+                add_optional_read_file(caps, path)?;
+            } else {
+                super::add_optional_write_file(caps, path)?;
+            }
         }
     }
     Ok(())
@@ -5974,12 +5964,21 @@ fn le_u64(data: &[u8], offset: usize) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::command_policy::{
         CommandEnvironmentConfig, CommandPolicyConfig, CommandSandboxConfig, InterceptActionConfig,
         InterceptRuleConfig, ResolvedCommandBinaries, ResolvedCommandBinary,
         ResolvedExecutableKind, ResolvedExecutableShape,
     };
+
+    #[test]
+    fn fixed_policy_writes_beneath_cwd() -> Result<()> {
+        crate::tool_sandbox::policy_fs_tests::fixed_writes_preserve_grants(add_policy_fs)
+    }
+
+    #[test]
+    fn derived_policy_writes_beneath_cwd() -> Result<()> {
+        crate::tool_sandbox::policy_fs_tests::relative_writes_remain_bounded(add_policy_fs)
+    }
 
     #[test]
     fn env_display_redacts_values_matching_profile_patterns() {

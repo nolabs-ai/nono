@@ -366,6 +366,254 @@ pub(crate) fn agent_can_write(
         && (path.starts_with(policy_root) || caps_grant(outer_caps, path, nono::AccessMode::Write))
 }
 
+/// Select access for a command-policy write grant without confusing a fixed
+/// command capability with authority derived from the live cwd.
+///
+/// Fixed absolute/home/XDG paths are explicitly delegated to the command and
+/// must not depend on whether cwd happens to be their ancestor. Relative paths,
+/// $WORKDIR entries, and dynamic providers retain the existing per-path cwd
+/// non-escalation check. Keep the original entry: a provider can expand to an
+/// absolute path without making its grant an explicit fixed-path capability.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn policy_write_access(
+    entry: &str,
+    path: &std::path::Path,
+    policy_root: &std::path::Path,
+    cwd: &std::path::Path,
+    outer_caps: &nono::CapabilitySet,
+    deny_paths: &[std::path::PathBuf],
+) -> nono::Result<nono::AccessMode> {
+    let cwd_scoped = entry.starts_with('@')
+        || entry.contains("$WORKDIR")
+        || !std::path::Path::new(&crate::profile::expand_vars(entry, policy_root)?).is_absolute();
+    let normalized = lexically_normalize(path);
+    if cwd_scoped
+        && normalized.starts_with(cwd)
+        && !agent_can_write(&normalized, policy_root, outer_caps, deny_paths)
+    {
+        Ok(nono::AccessMode::Read)
+    } else {
+        Ok(nono::AccessMode::ReadWrite)
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod policy_fs_tests {
+    use crate::command_policy::CommandSandboxConfig;
+    use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result};
+    use std::path::{Path, PathBuf};
+
+    type AddPolicyFs = fn(
+        &mut CapabilitySet,
+        &CommandSandboxConfig,
+        &Path,
+        &Path,
+        &CapabilitySet,
+        &[PathBuf],
+    ) -> Result<()>;
+
+    // These tests read HOME/XDG through profile expansion. Coordinate with
+    // environment-mutating tests even though this module does not mutate env.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    struct Paths {
+        _temp: tempfile::TempDir,
+        policy_root: PathBuf,
+        home: PathBuf,
+        private: PathBuf,
+        file: PathBuf,
+        read_only: PathBuf,
+    }
+
+    fn io_error(path: &Path, source: std::io::Error) -> NonoError {
+        NonoError::ConfigWrite {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+
+    fn paths() -> Result<Paths> {
+        let temp = tempfile::tempdir().map_err(|source| io_error(Path::new("/tmp"), source))?;
+        let root = temp
+            .path()
+            .canonicalize()
+            .map_err(|source| io_error(temp.path(), source))?;
+        let home = root.join("home");
+        let private = home.join("private");
+        std::fs::create_dir_all(&private).map_err(|source| io_error(&private, source))?;
+        let repo = home.join("repo");
+        std::fs::create_dir(&repo).map_err(|source| io_error(&repo, source))?;
+        let file = private.join("credentials.db");
+        std::fs::write(&file, b"fixture, not a credential")
+            .map_err(|source| io_error(&file, source))?;
+        let read_only = home.join("read-only");
+        std::fs::write(&read_only, b"read only").map_err(|source| io_error(&read_only, source))?;
+        Ok(Paths {
+            _temp: temp,
+            policy_root: root.join("work"),
+            home,
+            private,
+            file,
+            read_only,
+        })
+    }
+
+    #[test]
+    fn policy_write_classifies_fixed_and_cwd_scoped_entries() -> Result<()> {
+        let _env_guard = lock_env();
+        let cwd = Path::new("/home/example");
+        let root = cwd.join("work");
+        let path = cwd.join("private");
+        let outer = CapabilitySet::new();
+        for (entry, expected) in [
+            ("~/.config/gh", AccessMode::ReadWrite),
+            ("$HOME/.config/gh", AccessMode::ReadWrite),
+            ("$XDG_CONFIG_HOME/gh", AccessMode::ReadWrite),
+            ("private", AccessMode::Read),
+            (".", AccessMode::Read),
+            ("$WORKDIR/private", AccessMode::Read),
+            ("$HOME/$WORKDIR/private", AccessMode::Read),
+            ("@git:common-dir", AccessMode::Read),
+            ("@git:toplevel", AccessMode::Read),
+        ] {
+            assert_eq!(
+                super::policy_write_access(
+                    entry,
+                    &path,
+                    &root,
+                    cwd,
+                    &outer,
+                    std::slice::from_ref(&path)
+                )?,
+                expected,
+                "{entry}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn derived_policy_write_respects_outer_permissions_and_denies() -> Result<()> {
+        let _env_guard = lock_env();
+        let paths = paths()?;
+        let mut outer = CapabilitySet::new();
+        outer.add_fs(FsCapability::new_dir(
+            &paths.private,
+            AccessMode::ReadWrite,
+        )?);
+        assert_eq!(
+            super::policy_write_access(
+                "private",
+                &paths.private,
+                &paths.policy_root,
+                &paths.home,
+                &outer,
+                &[]
+            )?,
+            AccessMode::ReadWrite
+        );
+        assert_eq!(
+            super::policy_write_access(
+                "private",
+                &paths.private,
+                &paths.policy_root,
+                &paths.home,
+                &outer,
+                std::slice::from_ref(&paths.private)
+            )?,
+            AccessMode::Read
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn derived_policy_write_normalizes_before_checking_authority() -> Result<()> {
+        let _env_guard = lock_env();
+        let cwd = Path::new("/home/example");
+        let root = cwd.join("work");
+        let path = root.join("../private");
+        assert_eq!(
+            super::policy_write_access(
+                "work/../private",
+                &path,
+                &root,
+                cwd,
+                &CapabilitySet::new(),
+                &[cwd.join("private")]
+            )?,
+            AccessMode::Read
+        );
+        Ok(())
+    }
+
+    pub(super) fn fixed_writes_preserve_grants(add_policy_fs: AddPolicyFs) -> Result<()> {
+        let _env_guard = lock_env();
+        let paths = paths()?;
+        let mut outer = CapabilitySet::new();
+        outer.add_fs(FsCapability::new_dir(&paths.home, AccessMode::Read)?);
+        let denies = [paths.private.clone()];
+        let policy = CommandSandboxConfig {
+            fs_write: vec![".".into(), paths.private.to_string_lossy().into_owned()],
+            fs_write_file: vec![paths.file.to_string_lossy().into_owned()],
+            fs_read_file: vec![paths.read_only.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        // Moving cwd above a fixed grant must not revoke that command capability.
+        for cwd in [&paths.home, &paths.home.join("repo")] {
+            let mut caps = CapabilitySet::new();
+            add_policy_fs(&mut caps, &policy, &paths.policy_root, cwd, &outer, &denies)?;
+            for path in [&paths.private, &paths.file] {
+                assert!(
+                    caps.fs_capabilities().iter().any(|cap| {
+                        cap.resolved == *path && cap.access == AccessMode::ReadWrite
+                    }),
+                    "explicit write was downgraded with cwd {}: {}",
+                    cwd.display(),
+                    path.display()
+                );
+            }
+            assert!(!super::caps_grant(
+                &caps,
+                &paths.read_only,
+                AccessMode::Write
+            ));
+            assert!(!super::caps_grant(&caps, cwd, AccessMode::Write));
+        }
+        Ok(())
+    }
+
+    pub(super) fn relative_writes_remain_bounded(add_policy_fs: AddPolicyFs) -> Result<()> {
+        let _env_guard = lock_env();
+        let paths = paths()?;
+        let mut outer = CapabilitySet::new();
+        outer.add_fs(FsCapability::new_dir(&paths.home, AccessMode::Read)?);
+        let denies = [paths.private.clone()];
+        let policy = CommandSandboxConfig {
+            fs_write: vec!["private".into()],
+            fs_write_file: vec!["private/credentials.db".into()],
+            ..Default::default()
+        };
+        let mut caps = CapabilitySet::new();
+        add_policy_fs(
+            &mut caps,
+            &policy,
+            &paths.policy_root,
+            &paths.home,
+            &outer,
+            &denies,
+        )?;
+        assert_eq!(caps.fs_capabilities().len(), 2);
+        assert!(!super::caps_grant(&caps, &paths.private, AccessMode::Write));
+        assert!(!super::caps_grant(&caps, &paths.file, AccessMode::Write));
+        Ok(())
+    }
+}
+
 // A policy's fs_write_file entries are best-effort: not every candidate
 // path exists on every machine (e.g. a log file some other tool creates
 // lazily). Skip a missing one rather than denying the whole command —

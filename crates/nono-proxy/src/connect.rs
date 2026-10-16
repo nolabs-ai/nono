@@ -42,6 +42,23 @@ pub enum ConnectAuthMode {
     Strict,
 }
 
+/// Write the `407 Proxy Authentication Required` challenge that reactive
+/// proxy-auth clients (RFC 9110 section 15.5.8) retry with credentials.
+pub(crate) async fn write_proxy_auth_challenge<W>(writer: &mut W) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+              Proxy-Authenticate: Basic realm=\"nono\"\r\n\
+              Content-Length: 0\r\n\r\n",
+        )
+        .await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 /// Handle an HTTP CONNECT request.
 ///
 /// `first_line` is the already-read CONNECT line (e.g., "CONNECT api.openai.com:443 HTTP/1.1").
@@ -66,13 +83,7 @@ pub async fn handle_connect(
     {
         if auth_mode == ConnectAuthMode::Strict {
             debug!("CONNECT auth failed: {}", e);
-            stream
-                .write_all(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                      Proxy-Authenticate: Basic realm=\"nono\"\r\n\
-                      Content-Length: 0\r\n\r\n",
-                )
-                .await?;
+            write_proxy_auth_challenge(stream).await?;
             return Ok(());
         }
         debug!("CONNECT auth skipped: {}", e);

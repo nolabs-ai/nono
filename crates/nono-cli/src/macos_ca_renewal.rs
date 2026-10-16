@@ -195,9 +195,20 @@ fn worth_adopting(stored: &str, live: &str) -> nono::Result<bool> {
 }
 
 fn install(rotator: &InterceptCaRotator, key_der: &[u8], cert_pem: &str) -> nono::Result<PathBuf> {
-    rotator
-        .rotate(key_der, cert_pem)
-        .map_err(|e| nono::NonoError::SandboxInit(format!("failed to install renewed CA: {e}")))
+    // The stored or renewed CA can carry a different key than this session
+    // started with, for example after another session repaired the shared
+    // Keychain item. Adopting it is only legal once our own cert has
+    // expired, which rotate_across_keys enforces; pick the entry point by
+    // key and let each enforce its own rule.
+    let same_key = rotator
+        .serves_key(key_der)
+        .map_err(|e| nono::NonoError::SandboxInit(format!("failed to install renewed CA: {e}")))?;
+    let install = if same_key {
+        rotator.rotate(key_der, cert_pem)
+    } else {
+        rotator.rotate_across_keys(key_der, cert_pem)
+    };
+    install.map_err(|e| nono::NonoError::SandboxInit(format!("failed to install renewed CA: {e}")))
 }
 
 /// Advisory lock so two sessions renewing at once produce one prompt, and one
@@ -349,6 +360,47 @@ mod tests {
                 .contains(renewed.cert_pem()),
             "the bundle a child reads must carry the renewed anchor"
         );
+    }
+
+    #[test]
+    fn install_adopts_a_replacement_ca_key_once_the_live_cert_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        // An expired session cannot re-sign over its own key; the only way
+        // back to serving intercepted TLS is adopting a trusted CA issued
+        // over a different key.
+        let expired =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(0)).unwrap();
+        let r = rotator_with(expired, dir.path());
+        std::thread::sleep(Duration::from_millis(50));
+
+        let replacement =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(7 * 86400)).unwrap();
+        let bundle = install(&r, replacement.key_der(), replacement.cert_pem()).unwrap();
+
+        assert_eq!(r.current_cert_pem().unwrap(), replacement.cert_pem());
+        assert!(
+            std::fs::read_to_string(&bundle)
+                .unwrap()
+                .contains(replacement.cert_pem()),
+            "the bundle a child reads must carry the replacement anchor"
+        );
+    }
+
+    #[test]
+    fn install_refuses_a_replacement_key_while_the_live_cert_is_still_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let live =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(86_400)).unwrap();
+        let cert_pem = live.cert_pem().to_string();
+        let r = rotator_with(live, dir.path());
+
+        let replacement =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(7 * 86400)).unwrap();
+        assert!(
+            install(&r, replacement.key_der(), replacement.cert_pem()).is_err(),
+            "a live session's CA key must not change while the served cert is still valid"
+        );
+        assert_eq!(r.current_cert_pem().unwrap(), cert_pem);
     }
 
     #[test]

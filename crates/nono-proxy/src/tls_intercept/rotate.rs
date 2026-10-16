@@ -45,6 +45,14 @@ impl InterceptCaRotator {
         Ok(self.cache.current_ca()?.not_after())
     }
 
+    /// Whether `key_der` is the key the currently served CA cert was issued
+    /// over. Callers choose between [`Self::rotate`] and
+    /// [`Self::rotate_across_keys`] with this; each still enforces its own
+    /// key and expiry rules.
+    pub fn serves_key(&self, key_der: &[u8]) -> Result<bool> {
+        Ok(self.cache.current_ca()?.key_der() == key_der)
+    }
+
     /// Install `cert_pem` (signed by `key_der`) as the live interception CA.
     ///
     /// Rejects a key/cert pair that doesn't agree, so a torn write to whatever

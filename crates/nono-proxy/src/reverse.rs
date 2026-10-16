@@ -910,8 +910,14 @@ async fn handle_spiffe_route(
         method,
         path: upstream_path,
     };
-    if let Err(e) =
-        forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
+    if let Err(e) = forward::forward_request_closing_inbound(
+        stream,
+        request.as_bytes(),
+        &body,
+        upstream_spec,
+        audit_ctx,
+    )
+    .await
     {
         warn!("SPIFFE upstream connection failed: {}", e);
         send_error(stream, 502, "Bad Gateway").await?;
@@ -1839,14 +1845,17 @@ async fn pool_forward(
     for (name, value) in response.headers() {
         // Skip h2-specific pseudo-headers and connection-level headers
         let name_str = name.as_str();
-        if name_str == "transfer-encoding" || name_str == "connection" {
+        if name_str == "transfer-encoding" || name_str == "connection" || name_str == "keep-alive" {
             continue;
         }
         inbound
             .write_all(format!("{}: {}\r\n", name, value.to_str().unwrap_or("")).as_bytes())
             .await?;
     }
-    inbound.write_all(b"\r\n").await?;
+    // The inbound connection carries one request and is closed after this
+    // response (which, with transfer-encoding stripped, may be close-delimited).
+    // Say so, or keep-alive clients reuse a socket the proxy is dropping.
+    inbound.write_all(b"connection: close\r\n\r\n").await?;
 
     // Stream body frames without buffering
     let mut body = response.into_body();

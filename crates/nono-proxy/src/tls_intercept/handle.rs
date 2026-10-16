@@ -2835,6 +2835,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "*".to_string(),
                 path: "/**".to_string(),
@@ -2873,6 +2874,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "GET".to_string(),
                     path: path.to_string(),
@@ -2964,6 +2966,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "GET".to_string(),
                     path: path.to_string(),
@@ -3025,6 +3028,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "GET".to_string(),
                 path: "/foo".to_string(),
@@ -3125,6 +3129,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             upgrades: vec![],
             tls_ca: None,

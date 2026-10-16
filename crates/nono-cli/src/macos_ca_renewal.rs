@@ -9,7 +9,7 @@ use nono_proxy::tls_intercept::InterceptCaRotator;
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 thread_local! {
@@ -31,8 +31,9 @@ const MAX_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
 /// Floor, so a misconfigured tiny `ca_validity` can't spin.
 const MIN_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// After a declined prompt or failed trust write: re-prompting hourly would be
-/// worse than the expiry.
+/// After a declined prompt or failed trust write: re-prompting hourly would
+/// be worse than the expiry. Checks continue on the normal interval; only
+/// the interactive attempt is suppressed for this long.
 pub(crate) const BACKOFF_AFTER_FAILURE: Duration = Duration::from_secs(6 * 3600);
 
 /// Watch the live interception CA and keep it renewed for the life of the process.
@@ -44,18 +45,26 @@ pub(crate) fn spawn_supervisor(rotator: Arc<InterceptCaRotator>, validity: Durat
     std::thread::Builder::new()
         .name("nono-ca-renewal".to_string())
         .spawn(move || {
-            let mut delay = interval;
-            // Sticky once set: this session can never satisfy a trust prompt, but
-            // it should keep polling so it can still adopt a cert some other,
-            // interactive session renews in the meantime.
             let mut renewal_disabled = false;
+            // Set when a prompt is declined or a trust write fails. It
+            // suppresses only the interactive attempt: adoption checks stay
+            // on the normal interval, or a cert renewed by another session
+            // during the window would be missed until this session's own
+            // cert has already expired.
+            let mut backoff_started: Option<Instant> = None;
             loop {
-                std::thread::sleep(delay);
-                let outcome = supervise_once(&rotator, validity, renewal_disabled);
-                if matches!(outcome, Ok(Outcome::NoInteraction)) {
-                    renewal_disabled = true;
+                std::thread::sleep(interval);
+                let backed_off = prompt_backed_off(backoff_started, Instant::now());
+                match supervise_once(&rotator, validity, renewal_disabled, backed_off) {
+                    Err(e) => {
+                        warn!("Proxy CA renewal check failed: {e}");
+                        backoff_started = Some(Instant::now());
+                    }
+                    Ok(Outcome::NoInteraction) => renewal_disabled = true,
+                    Ok(Outcome::Deferred) => backoff_started = Some(Instant::now()),
+                    Ok(Outcome::Renewed | Outcome::Adopted) => backoff_started = None,
+                    Ok(Outcome::Busy | Outcome::NothingToDo | Outcome::Backoff) => {}
                 }
-                delay = next_delay(outcome, interval);
             }
         })
         .map(|_| ())
@@ -81,37 +90,35 @@ enum Outcome {
     /// normal interval, by which point that session's certificate is adoptable.
     Busy,
     /// A trust prompt was declined or a trust write failed; still serving the old
-    /// cert. Backs off, since re-prompting hourly would be worse than the expiry.
+    /// cert. The interactive attempt backs off, since re-prompting hourly would
+    /// be worse than the expiry, while adoption checks continue on the normal
+    /// interval in case another session renews the CA.
     Deferred,
     /// No interactive session exists to show the trust prompt (e.g. a headless
     /// `nono proxy`). This session will never prompt again, but keeps polling
     /// at the normal interval in case another, interactive session renews the
     /// CA in the meantime and this one can adopt it.
     NoInteraction,
+    /// The interactive renewal attempt is suppressed by backoff after a
+    /// declined prompt or failed trust write; adoption and validity checks
+    /// continue on the normal interval.
+    Backoff,
 }
 
-/// How long to sleep before the next check, given the last one's outcome.
-///
-/// Only a declined prompt or a failed trust write backs off; losing the lock
-/// race to another session, and having no interactive session to prompt, are
-/// both routine and retry on the normal interval — the former so this session
-/// adopts what the winner just wrote, the latter so it can still adopt a cert
-/// renewed elsewhere even though it can never renew one itself.
-fn next_delay(outcome: nono::Result<Outcome>, interval: Duration) -> Duration {
-    match outcome {
-        Ok(Outcome::Deferred) => BACKOFF_AFTER_FAILURE,
-        Ok(_) => interval,
-        Err(e) => {
-            warn!("Proxy CA renewal check failed: {e}");
-            BACKOFF_AFTER_FAILURE
-        }
-    }
+/// Whether the interactive renewal attempt is still backed off. Adoption
+/// checks are never backed off: a cert another session renews mid-window
+/// must be adoptable here on the normal interval, or this session's own
+/// cert can expire while the backoff runs.
+fn prompt_backed_off(backoff_started: Option<Instant>, now: Instant) -> bool {
+    backoff_started
+        .is_some_and(|started| now.saturating_duration_since(started) < BACKOFF_AFTER_FAILURE)
 }
 
 fn supervise_once(
     rotator: &InterceptCaRotator,
     validity: Duration,
     renewal_disabled: bool,
+    renewal_backed_off: bool,
 ) -> nono::Result<Outcome> {
     let live = rotator
         .current_cert_pem()
@@ -133,6 +140,13 @@ fn supervise_once(
              this run; only adopting certs renewed by another session"
         );
         return Ok(Outcome::NoInteraction);
+    }
+    if renewal_backed_off {
+        debug!(
+            "proxy CA renewal attempt is backed off after a declined prompt or failed \
+             trust write; still watching for a CA renewed by another session"
+        );
+        return Ok(Outcome::Backoff);
     }
 
     // Renewal writes to the trust store and prompts; one winner per machine.
@@ -290,30 +304,19 @@ mod tests {
     }
 
     #[test]
-    fn losing_the_lock_race_retries_on_the_normal_interval_not_backoff() {
-        assert_eq!(
-            next_delay(Ok(Outcome::Busy), Duration::from_secs(42)),
-            Duration::from_secs(42),
-            "lock contention is routine; it must not trigger the failure backoff"
-        );
-    }
-
-    #[test]
-    fn a_declined_or_failed_trust_attempt_backs_off() {
-        assert_eq!(
-            next_delay(Ok(Outcome::Deferred), Duration::from_secs(42)),
-            BACKOFF_AFTER_FAILURE
-        );
-    }
-
-    #[test]
-    fn no_interactive_session_retries_on_the_normal_interval_not_forever() {
-        assert_eq!(
-            next_delay(Ok(Outcome::NoInteraction), Duration::from_secs(42)),
-            Duration::from_secs(42),
-            "a headless session can't renew, but must keep polling so it can still adopt a cert \
-             renewed by another, interactive session"
-        );
+    fn backoff_suppresses_only_the_prompt_not_the_checks() {
+        let now = Instant::now();
+        assert!(!prompt_backed_off(None, now));
+        assert!(prompt_backed_off(Some(now), now));
+        assert!(prompt_backed_off(
+            Some(now - Duration::from_secs(3600)),
+            now
+        ));
+        assert!(!prompt_backed_off(Some(now - BACKOFF_AFTER_FAILURE), now));
+        assert!(!prompt_backed_off(
+            Some(now - BACKOFF_AFTER_FAILURE - Duration::from_secs(1)),
+            now
+        ));
     }
 
     #[test]

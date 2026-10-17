@@ -179,10 +179,11 @@ pub async fn handle_intercept_connect(stream: &mut TcpStream, ctx: InterceptCtx<
             let reason = format!("tls handshake failed: {}", e);
             warn!(
                 "tls_intercept: handshake failed for {}:{} — {}. \
-                 Agent likely pins certs or carries a hard-coded trust list. \
-                 Remove endpoint_rules / credential_key from the route to fall \
-                 back to a transparent CONNECT tunnel.",
-                ctx.host, ctx.port, e
+                 {}",
+                ctx.host,
+                ctx.port,
+                e,
+                handshake_failure_hint(&e)
             );
             audit::log_denied(
                 ctx.audit_log,
@@ -244,6 +245,28 @@ pub async fn handle_intercept_connect(stream: &mut TcpStream, ctx: InterceptCtx<
         }
     }
     Ok(())
+}
+
+/// TLS alerts do not always identify the client's precise verification error.
+/// In particular, an EOF alone provides no evidence of certificate pinning.
+fn handshake_failure_hint(error: &std::io::Error) -> &'static str {
+    match error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<rustls::Error>())
+    {
+        Some(rustls::Error::AlertReceived(rustls::AlertDescription::CertificateExpired))
+        | Some(rustls::Error::InvalidCertificate(rustls::CertificateError::Expired))
+        | Some(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet))
+        | Some(rustls::Error::InvalidCertificate(rustls::CertificateError::ExpiredContext {
+            ..
+        }))
+        | Some(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYetContext {
+            ..
+        })) => "Check client and proxy clocks and certificate validity/expiry.",
+        _ => {
+            "Check client TLS diagnostics, client/proxy clocks, certificate validity, and trust configuration."
+        }
+    }
 }
 
 /// The parts of an inner HTTP/1.1 request that have been read off the wire
@@ -2210,6 +2233,46 @@ fn parse_request_line(line: &str) -> Result<(String, String, String)> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_validity_errors_suggest_clocks_and_expiry() {
+        let time = rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(1));
+        for error in [
+            rustls::Error::AlertReceived(rustls::AlertDescription::CertificateExpired),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::ExpiredContext {
+                time,
+                not_after: time,
+            }),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYetContext {
+                time,
+                not_before: time,
+            }),
+        ] {
+            let error = std::io::Error::new(std::io::ErrorKind::InvalidData, error);
+            let hint = handshake_failure_hint(&error);
+            assert!(hint.contains("clocks"));
+            assert!(hint.contains("expiry"));
+            assert!(!hint.contains("pinning"));
+        }
+    }
+
+    #[test]
+    fn handshake_eof_and_ambiguous_alerts_do_not_diagnose_pinning() {
+        for error in [
+            std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                rustls::Error::AlertReceived(rustls::AlertDescription::BadCertificate),
+            ),
+        ] {
+            let hint = handshake_failure_hint(&error);
+            assert!(hint.contains("client TLS diagnostics"));
+            assert!(!hint.contains("pinning"));
+            assert!(!hint.contains("Remove"));
+        }
+    }
 
     #[test]
     fn parse_request_line_extracts_components() {

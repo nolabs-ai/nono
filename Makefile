@@ -6,7 +6,7 @@
 #   make check        Run clippy and format check
 #   make release      Build release binaries
 
-.PHONY: all build build-lib build-cli build-ffi build-arm64 test test-workspace test-lib test-cli test-ffi test-doc test-one test-repeat test-spiffe check clippy fmt clean install audit help
+.PHONY: all build build-lib build-cli build-ffi build-arm64 test test-workspace test-lib test-cli test-ffi test-doc test-one test-repeat test-spiffe check clippy fmt clean install audit help roadmap roadmap-check
 
 # Keep Rust panic locations available in both local and CI test output. A
 # caller can still override this (for example, RUST_BACKTRACE=full make test).
@@ -100,6 +100,13 @@ fmt:
 
 fmt-check:
 	cargo fmt --all -- --check
+
+# Regenerate ROADMAP.md and the neps/README.md index from NEP frontmatter
+roadmap:
+	python3 scripts/gen-roadmap.py
+
+roadmap-check:
+	python3 scripts/gen-roadmap.py --check
 
 # Clean
 clean:

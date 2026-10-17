@@ -591,6 +591,16 @@ On Linux with Landlock ABI v4+, per-port filtering is enforced and only the spec
 `--listen-port` only has effect in proxy mode (when `--network-profile` or `--allow-domain` is active). Without proxy mode, network operations use the default OS-level allow/deny and bind is not restricted.
 </Note>
 
+#### `--listen-port-range`
+
+Allow TCP bind/listen on an inclusive range of ports. Repeat the flag for multiple ranges; the same range can be declared in a profile with `network.listen_port_range`.
+
+```bash
+nono run --allow-cwd --network-profile developer --listen-port-range 8000:8100 -- npm run dev
+```
+
+Both endpoints must be between 1 and 65535, with the start no greater than the end. This flag grants bind/listen only; it does not authorize outbound connections to those ports. It adds bind exceptions in proxy or blocked modes and has no effect on otherwise unrestricted network access. Linux with Landlock ABI v4+ enforces the specified ports. On macOS, Seatbelt permits binding and accepting inbound connections on any port, as with `--listen-port`.
+
 #### `--open-port`
 
 Allow bidirectional localhost TCP on a specific port. The sandboxed process can both **connect to** and **bind/listen on** `127.0.0.1:<PORT>`. Use this for IPC between sandboxed processes (e.g., MCP servers, dev tools, AI agents running in separate sandboxes).
@@ -619,6 +629,16 @@ Can be specified multiple times for multiple ports.
 
 **Linux limitation:** Landlock ABI v4+ enforces connect and bind by port but **cannot filter by destination or bind address**. `--open-port 3000` permits connecting to port 3000 on any IP, not just localhost, and permits binding port 3000 on any local interface. `--block-net` blocks other ports but does not narrow the granted port to loopback. Use proxy mode when destination-host enforcement is required. On kernels without Landlock V4, port exceptions fail closed.
 </Warning>
+
+#### `--open-port-range`
+
+Allow bidirectional TCP IPC on an inclusive range of ports. Repeat the flag for multiple ranges; it matches the profile field `network.open_port_range`.
+
+```bash
+nono run --allow-cwd --network-profile developer --open-port-range 49152:49200 -- my-agent
+```
+
+Both endpoints must be between 1 and 65535, with the start no greater than the end. In proxy mode, direct outbound connections on these ports are restricted to loopback. The platform limitations of `--open-port` also apply: Linux Landlock alone filters by port rather than address, and macOS bind/inbound permission is broader than the declared range. On macOS, combined open ranges are limited to 16,384 unique ports.
 
 ### Resource Limits
 

@@ -74,3 +74,4 @@ whoever merges second renumbering their file.
 | 0003 | Move macOS keychain authorisation to `nono-cli`          | accepted |
 | 0004 | Opt-in Linux namespace isolation                          | draft    |
 | 0005 | Windows enforcement backend                               | draft    |
+| 0006 | `@jj:*` dynamic tokens for Jujutsu workspaces             | draft    |

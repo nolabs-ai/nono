@@ -1136,6 +1136,21 @@ Creating a new exact socket with `unix_socket_bind` requires write access to
 its parent directory. If that parent is denied, bypass the parent directory or,
 preferably, use `unix_socket_dir_bind` with a dedicated directory.
 
+#### Linux namespace isolation
+
+`linux.isolate` runs the command in new namespaces (opt-in, Linux only). `network` leaves only loopback, so egress must go through the proxy, and the profile cannot also grant `network.open_port`, `network.connect_port`, `network.listen_port`, or `network.no_proxy`. The fields merge by OR: an extending profile can add isolation but never remove it.
+
+```json
+{
+  "network": { "allow_domain": ["api.openai.com"] },
+  "linux": { "isolate": { "network": true, "ipc": true, "uts": true } }
+}
+```
+
+Add `"loopback": true` (requires `network`) to let the command use TCP on the namespace's own loopback, for local dev servers and tests. Egress stays proxy-only and the host's localhost stays unreachable.
+
+Network isolation does not block pathname Unix sockets (such as `/run/docker.sock`); use `linux.af_unix_mediation` for those.
+
 #### Linux
 
 Landlock cannot express deny-within-allow, so `filesystem.deny` is a no-op on Linux. Instead, enable `linux.af_unix_mediation` to switch to a default-deny seccomp supervisor for AF_UNIX pathname sockets, then add back only the sockets the agent needs via `filesystem.unix_socket`:

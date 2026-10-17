@@ -304,9 +304,59 @@ pub struct ProxyHandle {
     intercept_ca_env_vars: Vec<String>,
     /// Credential load warnings collected at startup.
     diagnostics: Vec<crate::diagnostic::ProxyDiagnostic>,
+    /// What [`Self::add_listener`] needs to serve another listener with this
+    /// proxy's state. `None` only for handles built directly in tests.
+    listener_attach: Option<ListenerAttach>,
+}
+
+/// Shared proxy state plus the runtime its accept loops run on.
+struct ListenerAttach {
+    state: Arc<ProxyState>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl ProxyHandle {
+    /// Serve an additional, already-listening socket with this proxy.
+    ///
+    /// Used for the namespace-isolation bridge (NEP-0004): a listener created
+    /// inside the sandbox's network namespace and handed to the supervisor.
+    /// Connections on it are handled exactly like connections on the primary
+    /// listener, including session-token authentication and the connection
+    /// limit. Its local port must equal the proxy port, so requests addressed
+    /// to the proxy itself are still recognised as such.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the port differs from the proxy port, the listener
+    /// cannot be registered with the runtime, or this handle has no runtime.
+    pub fn add_listener(&self, listener: std::net::TcpListener) -> Result<()> {
+        let attach = self.listener_attach.as_ref().ok_or_else(|| {
+            ProxyError::Config("proxy handle cannot accept additional listeners".to_string())
+        })?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| ProxyError::Config(format!("bridge listener address: {e}")))?
+            .port();
+        if port != self.port {
+            return Err(ProxyError::Config(format!(
+                "bridge listener port {port} does not match proxy port {}",
+                self.port
+            )));
+        }
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| ProxyError::Config(format!("bridge listener: {e}")))?;
+        let _entered = attach.runtime.enter();
+        let listener = TcpListener::from_std(listener)
+            .map_err(|e| ProxyError::Config(format!("bridge listener: {e}")))?;
+        attach.runtime.spawn(accept_loop(
+            listener,
+            Arc::clone(&attach.state),
+            self.shutdown_tx.subscribe(),
+        ));
+        Ok(())
+    }
+
     /// Signal the proxy to shut down gracefully.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
@@ -1367,7 +1417,7 @@ pub async fn start_with_nonce_resolver(
     // Spawn accept loop as a task within the current runtime.
     // The caller MUST ensure this runtime is being driven (e.g., via
     // a dedicated thread calling block_on or a multi-thread runtime).
-    tokio::spawn(accept_loop(listener, state, shutdown_rx));
+    tokio::spawn(accept_loop(listener, Arc::clone(&state), shutdown_rx));
 
     Ok(ProxyHandle {
         port,
@@ -1381,6 +1431,10 @@ pub async fn start_with_nonce_resolver(
         intercept_ca_path,
         intercept_ca_env_vars,
         diagnostics: proxy_diagnostics,
+        listener_attach: Some(ListenerAttach {
+            state,
+            runtime: tokio::runtime::Handle::current(),
+        }),
     })
 }
 
@@ -2550,6 +2604,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_listener_rejects_port_mismatch() {
+        let handle = start(ProxyConfig::default()).await.unwrap();
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let error = handle.add_listener(other).expect_err("port must match");
+        assert!(error.to_string().contains("does not match proxy port"));
+        handle.shutdown();
+    }
+
+    /// An added listener is served with the proxy's own state: an
+    /// unauthenticated forward request gets the same 407 as on the primary
+    /// listener. Uses 127.0.0.2 to share the proxy's port number in one netns.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_listener_serves_with_proxy_state() {
+        let handle = start(ProxyConfig::default()).await.unwrap();
+        let extra = std::net::TcpListener::bind(("127.0.0.2", handle.port)).unwrap();
+        handle.add_listener(extra).unwrap();
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.2", handle.port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = vec![0_u8; 64];
+        let read = stream.read(&mut response).await.unwrap();
+        let status = String::from_utf8_lossy(&response[..read]);
+        assert!(status.starts_with("HTTP/1.1 407"), "got: {status:?}");
+        handle.shutdown();
+    }
+
+    #[tokio::test]
     async fn test_proxy_ignores_empty_session_token() {
         // An empty override must fall back to a random token, never an
         // effectively-absent credential.
@@ -3215,6 +3301,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         {
             let _handle = ProxyHandle {
+                listener_attach: None,
                 port: 12345,
                 token: Zeroizing::new("test_token".to_string()),
                 audit_log: Some(audit::new_audit_log()),
@@ -3852,6 +3939,7 @@ mod tests {
     fn test_proxy_env_vars_include_canonical_nono_no_proxy() -> Result<()> {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("a".repeat(64)),
             audit_log: Some(audit::new_audit_log()),
@@ -3932,6 +4020,7 @@ mod tests {
         // backward-compatible path for keyring-backed credentials.
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -3997,6 +4086,7 @@ mod tests {
         // without starting a real proxy (which would try to load credentials).
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4066,6 +4156,7 @@ mod tests {
         // like the system keyring. See: #234
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4159,6 +4250,7 @@ mod tests {
     fn test_proxy_credential_env_vars_injects_spiffe_phantom_token() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("session_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4222,6 +4314,7 @@ mod tests {
         // "/ANTHROPIC_BASE_URL=http://127.0.0.1:PORT//anthropic".
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 58406,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4326,6 +4419,7 @@ mod tests {
         // => ANTHROPIC_API_KEY must NOT appear (demonstrates the bug).
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle_no_env_var = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("phantom".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4377,6 +4471,7 @@ mod tests {
         // => ANTHROPIC_API_KEY must be set to the phantom token.
         let (shutdown_tx2, _) = tokio::sync::watch::channel(false);
         let handle_fixed = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("phantom".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4429,6 +4524,7 @@ mod tests {
     fn test_no_proxy_excludes_credential_upstreams() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4468,6 +4564,7 @@ mod tests {
     fn test_no_proxy_empty_when_no_non_credential_hosts() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4493,6 +4590,7 @@ mod tests {
     fn test_no_proxy_omits_loopback_for_managed_loopback_upstream() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),

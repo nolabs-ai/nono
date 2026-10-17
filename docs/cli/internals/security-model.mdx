@@ -355,6 +355,19 @@ A container and a microVM are not equivalent: a standard container still shares 
 
 For local development and CI, nono on the host can substantially reduce an agent's ambient authority. For hostile-code execution, multi-tenant services, or deployments that require a strong guest/host boundary, use a suitable container or microVM as the perimeter and use nono for fine-grained control inside it.
 
+### Opt-in namespace isolation (Linux)
+
+[Namespace isolation](/cli/features/namespace-isolation) (`linux.isolate`, `--isolate`) runs the workload in new user, network, IPC, and UTS namespaces underneath the same Landlock and seccomp policy. It removes reachability rather than mediating it: the host abstract-socket namespace, host netlink, and every direct IP route simply do not exist inside the sandbox. The only way out of an isolated network is a loopback listener that the supervisor serves with the session proxy.
+
+It is permanently opt-in, for two independent reasons:
+
+1. **Availability varies by host.** Ubuntu's AppArmor policy, default container seccomp profiles, and hardened kernels refuse unprivileged user namespaces. A default that changed enforcement from host to host would violate fail-secure behavior. When isolation is requested and the host refuses it, nono exits; it never downgrades.
+2. **Kernel attack surface.** Unprivileged user namespaces make more kernel interfaces reachable, and a long series of privilege-escalation bugs has lived behind them. That is why some distributions restrict them. Opting in trades a stronger userspace boundary for a larger exposed kernel surface. For semi-trusted agent workloads that is usually the right trade. For hostile multi-tenant code, use an outer boundary instead (see above).
+
+With `linux.isolate.loopback`, nono lifts its Landlock TCP rules and its proxy destination check for that session, and keeps the static seccomp filter that denies UDP, raw sockets, and netlink. This is sound only because the namespace contains nothing but loopback, has no routes, and the workload holds no capabilities to add any: every TCP endpoint it can reach is inside the sandbox. The relaxation is derived from the namespace nono actually created, so it never applies without it.
+
+The setup capabilities the child holds inside its own user namespace exist only to bring up loopback and create the bridge listener. They grant nothing over host resources and are dropped at `exec`. nono runs no privileged setup code: where unprivileged namespaces are unavailable, provision the namespace externally and run nono inside it.
+
 ## Design Guidance
 
 1. Grant capabilities to the narrowest tool and invocation path that needs them.

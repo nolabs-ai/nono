@@ -1245,6 +1245,25 @@ The policy can also be set in a profile under `linux.sandbox_policy`. The CLI fl
   `--sandbox-policy landlock` is useful for compliance contexts where you need a hard guarantee that seccomp BPF is not installed, or where you want to verify that the target kernel's Landlock ABI is sufficient before deploying to production.
 </Note>
 
+#### `--isolate`
+
+*Linux only.* Run the command in new namespaces, on top of the normal sandbox. A comma-separated list of:
+
+| Value | Namespace |
+|-------|-----------|
+| `net` | Network namespace containing only loopback. Egress is possible only through the nono proxy. |
+| `loopback` | TCP bind and connect on any port of that namespace's own loopback, for local dev servers and tests. Requires `net`. |
+| `ipc` | IPC namespace (SysV IPC and POSIX message queues). |
+| `uts` | UTS namespace (hostname). |
+
+A user namespace is always added. `--isolate net` requires `--block-net` or a proxied network policy, and cannot be combined with `--open-port`, `--listen-port`, `--allow-connect-port`, or `network.no_proxy`. If the host cannot create the namespaces, nono exits with an error instead of running without them.
+
+```bash
+nono run --isolate net,ipc,uts --allow-domain api.openai.com --allow-cwd -- my-agent
+```
+
+The flag adds to any `linux.isolate` set by the profile and cannot remove it. Supported by `nono run` and `nono shell`, not `nono wrap`. See [Namespace Isolation](/cli/features/namespace-isolation).
+
 <Warning>
   `--sandbox-policy external` provides no nono-managed TCP egress lockdown. Only use it when you have independently verified that the surrounding infrastructure forces outbound traffic through the intended proxy.
 </Warning>

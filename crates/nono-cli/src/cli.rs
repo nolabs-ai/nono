@@ -1348,6 +1348,27 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS", value_name = "POLICY")]
     pub sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
 
+    /// Run the command in new Linux namespaces (opt-in, NEP-0004).
+    ///
+    /// Comma-separated list of: net, loopback, ipc, uts. Always adds a user
+    /// namespace. `loopback` (requires `net`) allows TCP bind/connect on any
+    /// port of the namespace's own loopback, for local dev servers and tests.
+    /// `net` leaves only loopback; egress is possible only through the session
+    /// proxy, so it requires --block-net or a proxied network policy and cannot
+    /// be combined with direct-access grants (--open-port, --listen-port,
+    /// --allow-connect-port, network.no_proxy). Adds to any `linux.isolate`
+    /// set by the profile; it cannot remove it. Fails at startup if this host
+    /// cannot create the namespaces.
+    #[cfg(target_os = "linux")]
+    #[arg(
+        long,
+        help_heading = "OPTIONS",
+        value_name = "NAMESPACES",
+        value_enum,
+        value_delimiter = ','
+    )]
+    pub isolate: Vec<IsolateNamespace>,
+
     /// Allow HTTP/2 multiplexing for upstream proxy connections.
     ///
     /// When enabled, the proxy negotiates HTTP/2 via ALPN with upstream
@@ -1838,6 +1859,34 @@ pub struct WrapSandboxArgs {
     pub dry_run: bool,
 }
 
+/// A namespace that `--isolate` can request.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum IsolateNamespace {
+    /// Network namespace containing only loopback.
+    Net,
+    /// TCP on the isolated network namespace's own loopback (requires `net`).
+    Loopback,
+    /// IPC namespace.
+    Ipc,
+    /// UTS namespace.
+    Uts,
+}
+
+#[cfg(target_os = "linux")]
+impl SandboxArgs {
+    /// The isolation set requested on the command line.
+    pub fn isolate_config(&self) -> crate::profile::LinuxIsolateConfig {
+        let has = |namespace| self.isolate.contains(&namespace);
+        crate::profile::LinuxIsolateConfig {
+            network: has(IsolateNamespace::Net),
+            loopback: has(IsolateNamespace::Loopback),
+            ipc: has(IsolateNamespace::Ipc),
+            uts: has(IsolateNamespace::Uts),
+        }
+    }
+}
+
 impl From<WrapSandboxArgs> for SandboxArgs {
     fn from(args: WrapSandboxArgs) -> Self {
         Self {
@@ -1895,6 +1944,8 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             dry_run: args.dry_run,
             #[cfg(target_os = "linux")]
             sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Vec::new(),
         }
     }
 }

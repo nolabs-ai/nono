@@ -665,6 +665,36 @@
             { "type": "null" }
           ],
           "description": "Which Linux sandboxing mechanism to install. Defaults to 'auto' (Landlock plus a static seccomp network baseline, falling back to seccomp-only networking when the kernel ABI lacks Landlock network support)."
+        },
+        "isolate": {
+          "$ref": "#/$defs/LinuxIsolateConfig"
+        }
+      }
+    },
+    "LinuxIsolateConfig": {
+      "type": "object",
+      "description": "Opt-in namespace isolation (NEP-0004). Every field defaults to false. Fields merge by logical OR across profile layers and the CLI: any layer can enable a namespace and none can disable it. Requested isolation that the host cannot provide is a startup error, never a silent downgrade. Inert on macOS. Not supported by `nono wrap`.",
+      "additionalProperties": false,
+      "properties": {
+        "network": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run in a new user + network namespace containing only loopback. Egress is possible only through the session proxy. Requires a blocked or proxied network, and cannot be combined with network.open_port, network.connect_port, network.listen_port, or network.no_proxy."
+        },
+        "loopback": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow TCP bind and connect on any port of the isolated network namespace's own loopback, for local dev servers and tests. Requires network. Egress stays proxy-only; UDP, raw sockets, and netlink stay denied; host localhost services stay unreachable. The network.open_port / listen_port / connect_port fields remain rejected because they mean host localhost."
+        },
+        "ipc": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run in a new user + IPC namespace (SysV IPC and POSIX message queues are not shared with the host)."
+        },
+        "uts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run in a new user + UTS namespace (hostname changes do not affect the host)."
         }
       }
     },

@@ -570,6 +570,9 @@ pub(crate) struct PreparedSandbox {
     pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) explicit_sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
+    /// Opt-in namespace isolation, merged (OR) from the profile and `--isolate`.
+    #[cfg(target_os = "linux")]
+    pub(crate) isolate: crate::profile::LinuxIsolateConfig,
     pub(crate) allow_launch_services_active: bool,
     pub(crate) allow_gpu_active: bool,
     /// True when NVIDIA GPU support needs supervisor-mediated writes to
@@ -785,6 +788,8 @@ fn finalize_prepared_sandbox(
     output::print_abi_info(silent);
     #[cfg(target_os = "linux")]
     output::print_landlock_scope_policy(&prepared.caps, args.verbose, silent);
+    #[cfg(target_os = "linux")]
+    output::print_isolation(prepared.isolate, silent);
 
     if !Sandbox::is_supported() {
         return Err(NonoError::SandboxInit(Sandbox::support_info().details));
@@ -904,7 +909,7 @@ fn reject_cgroup_writable_grants_under_resource_limit(caps: &CapabilitySet) -> R
 }
 
 /// Returns true if any CLI flag or profile field requires the proxy to run.
-fn has_proxy_intent(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
+pub(crate) fn has_proxy_intent(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
     args.has_proxy_flags()
         || !prepared.credentials.is_empty()
         || !prepared.custom_credentials.is_empty()
@@ -938,7 +943,10 @@ pub(crate) fn validate_proxy_conflicts(
     prepared: &PreparedSandbox,
 ) -> Result<()> {
     validate_block_net_conflicts(args, prepared)?;
-    validate_external_proxy_bypass(args, prepared)
+    validate_external_proxy_bypass(args, prepared)?;
+    #[cfg(target_os = "linux")]
+    crate::isolation::validate_config(args, prepared)?;
+    Ok(())
 }
 
 /// Validate that `--block-net` is not combined with flags that imply proxy
@@ -1565,6 +1573,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 sandbox_policy: crate::profile::LinuxSandboxPolicy::default(),
                 #[cfg(target_os = "linux")]
                 explicit_sandbox_policy: None,
+                // A manifest carries no isolation; `--isolate` still applies.
+                #[cfg(target_os = "linux")]
+                isolate: args.isolate_config(),
                 allow_launch_services_active: false,
                 allow_gpu_active: false,
                 #[cfg(target_os = "linux")]
@@ -1605,6 +1616,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         sandbox_policy,
         #[cfg(target_os = "linux")]
         explicit_sandbox_policy,
+        #[cfg(target_os = "linux")]
+        isolate,
         workdir_access: profile_workdir_access,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
@@ -1786,6 +1799,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     let sandbox_policy = args.sandbox_policy.unwrap_or(sandbox_policy);
     #[cfg(target_os = "linux")]
     let explicit_sandbox_policy = args.sandbox_policy.or(explicit_sandbox_policy);
+    // CLI --isolate adds to the profile's isolation; it can never remove it.
+    #[cfg(target_os = "linux")]
+    let isolate = isolate.merge(args.isolate_config());
 
     // GPU access: macOS uses IOKit platform rules (tightened to AGXDeviceUserClient only),
     // Linux uses filesystem capabilities for render nodes and compute devices.
@@ -1966,6 +1982,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             sandbox_policy,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy,
+            #[cfg(target_os = "linux")]
+            isolate,
             allow_launch_services_active,
             allow_gpu_active,
             #[cfg(target_os = "linux")]
@@ -3022,6 +3040,8 @@ mod tests {
             sandbox_policy: profile::LinuxSandboxPolicy::default(),
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Default::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]

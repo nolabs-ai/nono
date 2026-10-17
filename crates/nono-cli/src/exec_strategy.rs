@@ -256,6 +256,14 @@ impl SeccompPolicy {
     }
 }
 
+/// Whether the child must be launched through the raw-clone bootstrap:
+/// network notifications need its listener handoff, and namespace isolation
+/// needs its synchronized parent/child id-map step.
+#[cfg(target_os = "linux")]
+fn uses_clone_bootstrap(config: &ExecConfig<'_>) -> bool {
+    config.seccomp_policy.needs_network_notify() || config.namespaces.is_some()
+}
+
 /// Configuration for command execution.
 pub struct ExecConfig<'a> {
     /// The command to execute (program + args).
@@ -304,6 +312,11 @@ pub struct ExecConfig<'a> {
     /// Linux network enforcement backend for this session.
     #[cfg(target_os = "linux")]
     pub sandbox_policy: crate::profile::LinuxSandboxPolicy,
+    /// Opt-in namespace isolation (NEP-0004). When set, the child is launched
+    /// through the raw-clone bootstrap, which enters these namespaces before
+    /// Landlock and seccomp apply. Partial application is fatal.
+    #[cfg(target_os = "linux")]
+    pub namespaces: Option<nono::NamespaceSpec>,
     /// Allow-list of environment variable names. When set, only variables
     /// matching a glob pattern (e.g. `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -612,7 +625,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     let socket_pair = if needs_child_ipc {
         let pair = SupervisorSocket::pair()?;
         #[cfg(target_os = "linux")]
-        let pair = if config.seccomp_policy.needs_network_notify() {
+        let pair = if uses_clone_bootstrap(config) {
             (
                 clone_files::promote_supervisor_socket(pair.0)?,
                 clone_files::promote_supervisor_socket(pair.1)?,
@@ -942,14 +955,17 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // Serialize notification listener ownership, including destruction, across
     // shared-table bootstraps. Ordinary proxy I/O threads remain concurrent.
     #[cfg(target_os = "linux")]
-    let _listener_ownership_guard = if config.seccomp_policy.child_requires_dumpable() {
-        Some(clone_files::lock_listener_ownership()?)
-    } else {
-        None
-    };
+    let _listener_ownership_guard =
+        if config.seccomp_policy.child_requires_dumpable() || config.namespaces.is_some() {
+            Some(clone_files::lock_listener_ownership()?)
+        } else {
+            None
+        };
     #[cfg(target_os = "linux")]
-    let mut clone_bootstrap = if config.seccomp_policy.needs_network_notify() {
-        if !supervisor.is_some_and(|sup| sup.seccomp_policy == config.seccomp_policy) {
+    let mut clone_bootstrap = if uses_clone_bootstrap(config) {
+        if config.seccomp_policy.needs_network_notify()
+            && !supervisor.is_some_and(|sup| sup.seccomp_policy == config.seccomp_policy)
+        {
             return Err(NonoError::SandboxInit(
                 "Network notifications require a supervisor with matching notification policy"
                     .into(),
@@ -1450,6 +1466,38 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 .as_mut()
                 .and_then(|bootstrap| bootstrap.network.take());
 
+            // Namespace isolation proxy bridge: serve the listener the child
+            // created inside its network namespace with the session proxy.
+            // Failing to attach it is fatal; the child would have no egress
+            // path and the profile asked for proxied egress.
+            #[cfg(target_os = "linux")]
+            if let Some(bridge) = clone_bootstrap
+                .as_mut()
+                .and_then(|bootstrap| bootstrap.bridge.take())
+            {
+                let attached = supervisor
+                    .and_then(|sup| sup.proxy_handle)
+                    .ok_or_else(|| {
+                        NonoError::SandboxInit(
+                            "namespace isolation bridge requires a running proxy".to_string(),
+                        )
+                    })
+                    .and_then(|handle| {
+                        handle
+                            .add_listener(std::net::TcpListener::from(bridge))
+                            .map_err(|e| {
+                                NonoError::SandboxInit(format!(
+                                    "cannot attach namespace isolation bridge to proxy: {e}"
+                                ))
+                            })
+                    });
+                if let Err(error) = attached {
+                    let _ = signal::kill(child, Signal::SIGKILL);
+                    let _ = waitpid(child, None);
+                    return Err(error);
+                }
+            }
+
             // Set up signal forwarding.
             setup_signal_forwarding(child, pty_proxy.as_ref().map(|p| p.poll_fds().0));
             let _signal_forwarding_guard = SignalForwardingGuard;
@@ -1728,6 +1776,15 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     )
                     .with_canonical_denial_paths(canonical_denial_paths)
                     .with_network_denials(network_denials);
+                #[cfg(target_os = "linux")]
+                {
+                    base_formatter = base_formatter.with_network_isolated(
+                        config
+                            .namespaces
+                            .as_ref()
+                            .is_some_and(nono::NamespaceSpec::has_network),
+                    );
+                }
                 if let Some(program) = config.command.first() {
                     let argv_display: Vec<String> = config
                         .command

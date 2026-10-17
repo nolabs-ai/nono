@@ -127,6 +127,26 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub direct_connect_ports: Vec<u16>,
 
+    /// Refuse to proxy to the loopback interface.
+    ///
+    /// The OS sandbox already pins the child to `loopback:<proxy port>` in
+    /// `NetworkMode::ProxyOnly`, which makes the proxy the only way off the
+    /// child's loopback interface. Without this the child can still ask the
+    /// proxy to `CONNECT` to another loopback service and reach it directly,
+    /// stepping around any credential-injecting route configured for it.
+    ///
+    /// Defaults to `false`: loopback stays reachable unless a profile opts in,
+    /// matching the documented treatment of private address space.
+    #[serde(default)]
+    pub block_loopback: bool,
+
+    /// Loopback ports that stay reachable when `block_loopback` is set.
+    ///
+    /// Configured credential-route upstreams are exempt automatically and do
+    /// not need to be listed here.
+    #[serde(default)]
+    pub loopback_allow: Vec<u16>,
+
     /// Additional client-side proxy bypass entries to append to generated
     /// NO_PROXY/no_proxy values.
     ///
@@ -270,6 +290,8 @@ impl Default for ProxyConfig {
             oauth_capture_store_path: None,
             external_proxy: None,
             direct_connect_ports: Vec::new(),
+            block_loopback: false,
+            loopback_allow: Vec::new(),
             no_proxy: Vec::new(),
             max_connections: 256,
             intercept_ca_dir: None,

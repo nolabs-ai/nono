@@ -233,9 +233,33 @@ pub async fn handle_external_proxy(
         ));
     }
 
+    // Under a loopback policy, name the checked IP rather than the hostname so
+    // the enterprise proxy cannot resolve it onto loopback. With nothing to
+    // pin to, refuse: forwarding the hostname would skip the loopback check.
+    let Some(target) = filter.upstream_proxy_target(&host, &check) else {
+        let reason = "loopback restriction requires the upstream proxy target to resolve \
+                      locally, and it did not"
+            .to_string();
+        audit::log_denied(
+            audit_log,
+            audit::ProxyMode::External,
+            &audit::EventContext {
+                auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                ..audit::EventContext::default()
+            },
+            &host,
+            port,
+            &reason,
+        );
+        send_response(stream, 502, &format!("Bad Gateway: {}", reason)).await?;
+        return Err(ProxyError::UpstreamConnect { host, reason });
+    };
+
     // Connect to enterprise proxy and CONNECT through it to the upstream.
     // Auth is gated above; pass None until configurable proxy auth lands.
-    let mut proxy_stream = match connect_via_proxy(&external_config.address, &host, port, None)
+    let mut proxy_stream = match connect_via_proxy(&external_config.address, &target, port, None)
         .await
     {
         Ok(s) => s,

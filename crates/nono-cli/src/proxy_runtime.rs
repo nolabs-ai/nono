@@ -1607,6 +1607,15 @@ pub(crate) fn prepare_proxy_launch_options(
         allow_bind_ports,
         proxy_port: args.proxy_port,
         strict_filter,
+        // `--allow-net` forces unrestricted networking for the run, so it
+        // clears the loopback restriction along with the other profile proxy
+        // settings (see `resolve_effective_proxy_settings`).
+        block_loopback: prepared.profile_block_loopback && !args.allow_net,
+        loopback_allow: if args.allow_net {
+            Vec::new()
+        } else {
+            prepared.profile_loopback_allow.clone()
+        },
         proxy_leaf_validity: tls_options.leaf_validity,
         command_policies: prepared.command_policies.clone(),
         proxy_source_env_vars,
@@ -1634,6 +1643,21 @@ pub(crate) fn prepare_proxy_launch_options(
             return Err(NonoError::ConfigParse(
                 "--proxy-port requires a proxy feature (--allow-domain, --credential, \
                  or --upstream-proxy)"
+                    .to_string(),
+            ));
+        }
+        // Fail closed rather than silently running unrestricted. `block_loopback`
+        // is enforced by the proxy, so without an activating feature there is no
+        // proxy to enforce it and the child would get full direct loopback
+        // access — the opposite of what the profile asks for.
+        if opts.block_loopback {
+            return Err(NonoError::ConfigParse(
+                "network.block_loopback requires a feature that starts the nono proxy \
+                 (for example network_profile, allow_domain, deny_domain, credentials, \
+                 or upstream_proxy): it is enforced by the proxy, so with no proxy \
+                 running it would leave loopback fully reachable instead of \
+                 restricted.\n\n\
+                 To block all network access instead, set network.block."
                     .to_string(),
             ));
         }
@@ -2501,6 +2525,8 @@ pub(crate) fn build_proxy_config_from_flags(
     let mut proxy_config =
         network_policy::build_proxy_config(&resolved, &plain_hosts, &denied_hosts);
     proxy_config.strict_filter = proxy.strict_filter;
+    proxy_config.block_loopback = proxy.block_loopback;
+    proxy_config.loopback_allow = proxy.loopback_allow.clone();
 
     if let Some(ref upstream) = proxy.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {
@@ -3880,6 +3906,45 @@ mod tests {
         );
     }
 
+    /// Profile `network.block_loopback` / `network.loopback_allow` must reach
+    /// `ProxyConfig`, which is what arms the filter's loopback policy.
+    #[test]
+    fn test_build_proxy_config_propagates_loopback_restriction() {
+        let proxy = ProxyLaunchOptions {
+            block_loopback: true,
+            loopback_allow: vec![8080],
+            ..ProxyLaunchOptions::default()
+        };
+        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        assert!(config.block_loopback);
+        assert_eq!(config.loopback_allow, vec![8080]);
+    }
+
+    /// Off unless a profile asks for it: loopback stays reachable by default.
+    #[test]
+    fn test_build_proxy_config_loopback_unrestricted_by_default() {
+        let proxy = ProxyLaunchOptions::default();
+        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        assert!(!config.block_loopback);
+        assert!(config.loopback_allow.is_empty());
+    }
+
+    /// The two switches are orthogonal: restricting loopback must not turn on
+    /// the strict host allowlist (that is `network.block`'s job).
+    #[test]
+    fn test_loopback_restriction_is_independent_of_strict_filter() {
+        let proxy = ProxyLaunchOptions {
+            block_loopback: true,
+            ..ProxyLaunchOptions::default()
+        };
+        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        assert!(config.block_loopback);
+        assert!(
+            !config.strict_filter,
+            "block_loopback must not imply strict host filtering"
+        );
+    }
+
     #[test]
     fn test_build_proxy_config_network_audit_on_by_default() {
         let proxy = ProxyLaunchOptions::default();
@@ -4165,6 +4230,8 @@ mod tests {
             case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
+            profile_block_loopback: false,
+            profile_loopback_allow: Vec::new(),
             allow_http2_requested: false,
         };
 
@@ -4242,6 +4309,8 @@ mod tests {
             case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
+            profile_block_loopback: false,
+            profile_loopback_allow: Vec::new(),
             allow_http2_requested: false,
         };
         let args = crate::cli::SandboxArgs {
@@ -4314,6 +4383,8 @@ mod tests {
             case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
+            profile_block_loopback: false,
+            profile_loopback_allow: Vec::new(),
             allow_http2_requested: false,
         };
         let args = crate::cli::SandboxArgs::default();
@@ -6205,5 +6276,136 @@ mod tests {
         }
 
         result
+    }
+
+    /// A prepared sandbox carrying only the network fields these loopback
+    /// tests vary.
+    fn prepared_with_loopback_restriction(
+        block_loopback: bool,
+        loopback_allow: Vec<u16>,
+        allow_domain: Vec<crate::profile::AllowDomainEntry>,
+    ) -> crate::sandbox_prepare::PreparedSandbox {
+        use std::collections::HashMap;
+
+        crate::sandbox_prepare::PreparedSandbox {
+            caps: nono::CapabilitySet::new(),
+            deny_paths: Vec::new(),
+            secrets: Vec::new(),
+            profile_display_name: None,
+            command_policies: None,
+            resolved_command_binaries: None,
+            approval_backends: std::collections::BTreeMap::new(),
+            approval_defaults: None,
+            credential_capture: HashMap::new(),
+            credential_providers: HashMap::new(),
+            credential_routes: Vec::new(),
+            tls_intercept: None,
+            session_hooks: crate::profile::SessionHooks::default(),
+            rollback_exclude_patterns: Vec::new(),
+            rollback_exclude_globs: Vec::new(),
+            network_profile: None,
+            allow_domain,
+            deny_domain: Vec::new(),
+            credentials: Vec::new(),
+            custom_credentials: HashMap::new(),
+            upstream_proxy: None,
+            no_proxy: Vec::new(),
+            upstream_bypass: Vec::new(),
+            listen_ports: Vec::new(),
+            capability_elevation: false,
+            #[cfg(target_os = "linux")]
+            wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy: None,
+            allow_launch_services_active: false,
+            allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify: false,
+            open_url_origins: Vec::new(),
+            open_url_allow_localhost: false,
+            bypass_protection_paths: Vec::new(),
+            ignored_denial_paths: Vec::new(),
+            suppressed_system_service_operations: Vec::new(),
+            redaction_extra_env_vars: Vec::new(),
+            redaction_derived_env_vars: Vec::new(),
+            allowed_env_vars: None,
+            denied_env_vars: None,
+            case_insensitive_env_vars: false,
+            set_vars: None,
+            profile_network_block: false,
+            profile_block_loopback: block_loopback,
+            profile_loopback_allow: loopback_allow,
+            allow_http2_requested: false,
+        }
+    }
+
+    /// The profile's loopback restriction reaches the launch options when a
+    /// feature starts the proxy.
+    #[test]
+    fn test_profile_loopback_restriction_reaches_launch_options() -> Result<()> {
+        let prepared = prepared_with_loopback_restriction(
+            true,
+            vec![8080],
+            vec![crate::profile::AllowDomainEntry::Plain(
+                "api.example.com".to_string(),
+            )],
+        );
+        let args = crate::cli::SandboxArgs::default();
+        let intent = prepare_proxy_launch_options(&args, &prepared, true, String::new())?;
+        let opts = intent
+            .proxy_options()
+            .ok_or_else(|| NonoError::ConfigParse("proxy options missing".to_string()))?;
+        assert!(opts.block_loopback);
+        assert_eq!(opts.loopback_allow, vec![8080]);
+        Ok(())
+    }
+
+    /// With nothing to start the proxy there is nothing to enforce the
+    /// restriction, so the launch fails instead of leaving loopback open.
+    #[test]
+    fn test_profile_loopback_restriction_without_proxy_fails_closed() {
+        let prepared = prepared_with_loopback_restriction(true, Vec::new(), Vec::new());
+        let args = crate::cli::SandboxArgs::default();
+        let result = prepare_proxy_launch_options(&args, &prepared, true, String::new());
+        assert!(
+            matches!(&result, Err(NonoError::ConfigParse(msg)) if msg.contains("block_loopback")),
+            "block_loopback without a proxy must be a launch error"
+        );
+    }
+
+    /// `--allow-net` forces unrestricted networking and clears the profile's
+    /// proxy settings, including the loopback restriction. It must not trip
+    /// the fail-closed check that the cleared settings would otherwise leave.
+    #[test]
+    fn test_allow_net_clears_profile_loopback_restriction() -> Result<()> {
+        let prepared = prepared_with_loopback_restriction(
+            true,
+            vec![8080],
+            vec![crate::profile::AllowDomainEntry::Plain(
+                "api.example.com".to_string(),
+            )],
+        );
+        let args = crate::cli::SandboxArgs {
+            allow_net: true,
+            ..crate::cli::SandboxArgs::default()
+        };
+        let intent = prepare_proxy_launch_options(&args, &prepared, true, String::new())?;
+        let opts = intent
+            .proxy_options()
+            .ok_or_else(|| NonoError::ConfigParse("proxy options missing".to_string()))?;
+        assert!(
+            !opts.block_loopback,
+            "--allow-net must clear the profile's loopback restriction"
+        );
+        assert!(opts.loopback_allow.is_empty());
+        assert!(
+            !opts.is_active(),
+            "--allow-net must leave no proxy feature active"
+        );
+        Ok(())
     }
 }

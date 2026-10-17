@@ -272,7 +272,13 @@ async fn resolve_upstream_or_deny<S>(
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
-    let check = ctx.filter.check_host(ctx.host, ctx.port).await?;
+    // Route-scoped dial: reaching here means the CONNECT matched a configured
+    // route upstream, TLS was intercepted, and the inner request has already
+    // passed that route's endpoint policy and had its credential injected.
+    // Same trust position as the reverse-proxy path, so the loopback policy is
+    // exempted here too — a CONNECT that matches no route never gets this far
+    // (it falls through to the transparent tunnel, which stays gated).
+    let check = ctx.filter.check_route_upstream(ctx.host, ctx.port).await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();
         warn!("tls_intercept: upstream host denied by filter: {}", reason);

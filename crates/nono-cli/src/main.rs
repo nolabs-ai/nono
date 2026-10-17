@@ -335,6 +335,8 @@ mod tests {
             case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
+            profile_block_loopback: false,
+            profile_loopback_allow: Vec::new(),
             allow_http2_requested: false,
         };
 
@@ -414,6 +416,8 @@ mod tests {
             case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
+            profile_block_loopback: false,
+            profile_loopback_allow: Vec::new(),
             allow_http2_requested: false,
         };
 

@@ -420,6 +420,77 @@ nono run --allow-cwd --network-profile developer --listen-port 3000 -- npm run d
 
 See [CLI Reference](/cli/usage/flags#--listen-port) for platform limitations.
 
+## Restricting Loopback
+
+When the proxy is active, the OS sandbox already pins the child to
+`loopback:<proxy port>` — the proxy is the only route off the child's loopback
+interface. That still leaves one gap: the child can ask the proxy to reach a
+*different* local service. If a credential route is mediating access to a
+service on `localhost`, the child can skip it by addressing that service
+directly through the proxy.
+
+Set `network.block_loopback` to close it:
+
+```json
+{
+  "network": {
+    "block_loopback": true,
+    "credentials": ["k8s"],
+    "custom_credentials": {
+      "k8s": { "upstream": "https://localhost:6443" }
+    }
+  }
+}
+```
+
+The child reaches the API server through the `k8s` route, which injects the
+credential; a direct request to `localhost:6443` is refused with `403`.
+
+The route keeps working because the exemption follows the *caller*, not the
+address: the proxy may dial a configured route's upstream, but a client asking
+the proxy for that same `localhost:6443` directly is refused. Exempting the
+address instead would hand the sandboxed process a way around the route's
+`endpoint_rules` / `endpoint_policy` and its credential injection, which is the
+bypass this setting exists to close.
+
+Anything else on loopback needs an explicit port:
+
+```json
+{
+  "network": {
+    "block_loopback": true,
+    "loopback_allow": [8080]
+  }
+}
+```
+
+Notes:
+
+- `block_loopback` is independent of `block`. It governs what the proxy will
+  reach, not whether the sandbox permits outbound at all.
+- It is enforced by the proxy, so it needs a feature that starts the proxy
+  (`network_profile`, `allow_domain`, `deny_domain`, `credentials` or
+  `upstream_proxy`). Setting it without one is a launch error, not a silent
+  no-op. To block all network access, use `network.block` instead.
+- `--allow-net` forces unrestricted networking for the run and turns
+  `block_loopback` off along with the other proxy settings.
+- Matching is on the destination, not its spelling: `127.0.0.1`, `[::1]`,
+  `localhost` and names under `.localhost` are all loopback, as is any address
+  in `127.0.0.0/8`. The unspecified addresses `0.0.0.0` and `::` count too,
+  because connecting to them reaches localhost. A public hostname that resolves
+  onto loopback is denied on the resolved address, so DNS rebinding does not
+  get around it.
+- With an `upstream_proxy`, the proxy normally passes the hostname on and lets
+  the upstream proxy resolve it. Under `block_loopback` it names the address
+  it checked instead, so the upstream proxy cannot resolve the name onto
+  loopback. A name that does not resolve locally is refused with `502`.
+- Direct port grants (`--open-port`, `--allow-connect-port`) are not covered.
+  They give the child TCP that never goes through the proxy. On macOS,
+  `--open-port` reaches loopback only and `--allow-connect-port` is
+  unsupported. On Linux, both are scoped by port alone, so the child can reach
+  **any** host on a granted port, not just loopback. Do not combine them with
+  `block_loopback` expecting the restriction to cover them.
+
 ## Always-Denied Destinations
 
 The following destinations are always blocked by the proxy, regardless of configuration. These cannot be overridden.

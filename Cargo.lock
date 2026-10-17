@@ -2894,6 +2894,7 @@ dependencies = [
  "dns-lookup",
  "futures-util",
  "globset",
+ "http 1.5.0",
  "ignore",
  "itoa",
  "jsonc-parser",

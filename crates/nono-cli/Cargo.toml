@@ -51,7 +51,7 @@ rand = "0.10"
 which = "8"
 toml.workspace = true
 xdg-home = "1.3.0"
-dirs = "6"
+dirs = "7"
 walkdir.workspace = true
 ignore.workspace = true
 chrono = { version = "0.4", features = ["serde"] }

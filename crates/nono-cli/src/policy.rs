@@ -1830,8 +1830,9 @@ fn emit_macos_socket_bypass_rules(
 /// path and no directory grant names that same path. `allow_file` stores a
 /// directory used as a lock file with `is_file: true`. A directory grant of
 /// the bypass path itself still opens `subpath`. A parent directory grant
-/// does not widen an exact-file bypass.
-fn bypass_hole_is_literal(caps: &CapabilitySet, canonical: &Path) -> bool {
+/// does not widen an exact-file bypass. The grant may name either the
+/// canonical path or the expanded symlink path.
+fn bypass_hole_is_literal(caps: &CapabilitySet, canonical: &Path, expanded: &Path) -> bool {
     if !canonical.is_dir() {
         return true;
     }
@@ -1841,7 +1842,11 @@ fn bypass_hole_is_literal(caps: &CapabilitySet, canonical: &Path) -> bool {
         if !cap.source.is_user_intent() {
             continue;
         }
-        if cap.resolved != canonical && cap.original != canonical {
+        let names_bypass = cap.resolved == canonical
+            || cap.original == canonical
+            || cap.resolved == expanded
+            || cap.original == expanded;
+        if !names_bypass {
             continue;
         }
         if cap.is_file {
@@ -1960,7 +1965,7 @@ pub fn apply_deny_overrides(
             canonical.display()
         );
 
-        let is_file = bypass_hole_is_literal(caps, &canonical);
+        let is_file = bypass_hole_is_literal(caps, &canonical, &expanded);
 
         // On macOS: emit Seatbelt allow rules to punch through deny.
         // Only emit rules matching the effective access mode from the union
@@ -5041,6 +5046,106 @@ mod tests {
                 "exact-file directory bypass must not emit subpath, got: {rules}"
             );
         }
+    }
+
+    #[test]
+    fn test_exact_file_symlink_form_stays_literal() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let real = dir.path().join("claude.lock");
+        std::fs::create_dir_all(&real).expect("mkdir lock");
+        let child = real.join("secret");
+        std::fs::write(&child, "hidden").expect("write child");
+        let link = dir.path().join("link.lock");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let real_canonical = real.canonicalize().expect("canonicalize lock");
+        let child_canonical = child.canonicalize().expect("canonicalize child");
+        assert_ne!(
+            link, real_canonical,
+            "the symlink form must differ from the canonical path"
+        );
+
+        let mut deny_paths = vec![real_canonical.clone(), child_canonical.clone()];
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(
+            FsCapability::new_dir(dir.path(), AccessMode::ReadWrite).expect("parent grant"),
+        );
+        caps.add_fs(FsCapability {
+            original: link.clone(),
+            resolved: link.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        let bypasses =
+            apply_deny_overrides(std::slice::from_ref(&link), &mut deny_paths, &mut caps)
+                .expect("symlink-form exact-file bypass");
+
+        assert!(
+            bypasses.iter().any(|bypass| bypass.is_file),
+            "an exact-file grant stored as the symlink must stay literal, got: {bypasses:?}"
+        );
+        assert!(
+            deny_paths.contains(&child_canonical),
+            "child deny must survive a literal bypass, remaining: {deny_paths:?}"
+        );
+        assert!(
+            !deny_paths.contains(&real_canonical),
+            "the bypass path itself is removed, remaining: {deny_paths:?}"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let rules = caps.platform_rules().join("\n");
+            assert!(
+                rules.contains("literal"),
+                "Seatbelt hole must be a literal path, got: {rules}"
+            );
+            assert!(
+                !rules.contains("subpath"),
+                "symlink-form exact-file bypass must not emit subpath, got: {rules}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_directory_grant_symlink_form_still_opens_subtree() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let real = dir.path().join("aws");
+        std::fs::create_dir_all(&real).expect("mkdir aws");
+        let child = real.join("credentials");
+        std::fs::write(&child, "secret").expect("write credentials");
+        let link = dir.path().join("aws-link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let real_canonical = real.canonicalize().expect("canonicalize aws");
+        let child_canonical = child.canonicalize().expect("canonicalize child");
+        let mut deny_paths = vec![real_canonical.clone(), child_canonical.clone()];
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(
+            FsCapability::new_dir(dir.path(), AccessMode::ReadWrite).expect("parent grant"),
+        );
+        caps.add_fs(FsCapability {
+            original: link.clone(),
+            resolved: link.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::Profile,
+        });
+
+        let bypasses =
+            apply_deny_overrides(std::slice::from_ref(&link), &mut deny_paths, &mut caps)
+                .expect("symlink-form directory bypass");
+
+        assert!(
+            bypasses.iter().any(|bypass| !bypass.is_file),
+            "a directory grant stored as the symlink stays a subtree, got: {bypasses:?}"
+        );
+        assert!(
+            deny_paths.is_empty(),
+            "subtree bypass removes the directory and its child denies, remaining: {deny_paths:?}"
+        );
     }
 
     #[test]

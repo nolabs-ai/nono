@@ -11,6 +11,8 @@ These options work with all commands.
 
 Suppress all nono output (banner, summary, status messages). Only the executed command's output will be shown.
 
+Logs still go to the file set by `--log-file` or `NONO_LOG_FILE`. Only terminal output is suppressed.
+
 ```bash
 nono -s run --allow-cwd -- my-agent
 nono --silent why --path ~/.ssh/id_rsa --op read

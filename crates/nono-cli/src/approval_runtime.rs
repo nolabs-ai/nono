@@ -1,8 +1,10 @@
 use crate::command_policy::{
     ApprovalBackendConfig, ApprovalBackendType, ApprovalChainMode, CommandPoliciesConfig,
 };
+use crate::network_approval::NetworkApprovalBackend;
 use crate::terminal_approval::TerminalApproval;
-use nono::{ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result};
+use nono::supervisor::ApprovalRequest;
+use nono::{ApprovalBackend, ApprovalDecision, NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -67,6 +69,58 @@ pub(crate) fn resolve_supervised_approval_backend(
     let registry = build_approval_registry_from(backends, default_backend_name)?;
     let (_name, backend) = registry.resolve(None)?;
     Ok(Some(backend))
+}
+
+/// Routes supervised-mode approval requests between the two backend kinds.
+///
+/// Capability/file prompts go to the profile-configured backend (or the
+/// terminal when none is configured); network prompts go to the interactive
+/// `NetworkApprovalBackend`. This keeps the two features composable when both
+/// are active at once.
+struct SupervisedApprovalRouter {
+    capability_backend: Option<Arc<dyn ApprovalBackend>>,
+    network_backend: Arc<NetworkApprovalBackend>,
+    terminal_fallback: Arc<dyn ApprovalBackend>,
+}
+
+impl ApprovalBackend for SupervisedApprovalRouter {
+    fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+        match &self.capability_backend {
+            Some(backend) => backend.request_approval(request),
+            None => self.terminal_fallback.request_approval(request),
+        }
+    }
+
+    fn request_network_approval(
+        &self,
+        request: &nono::NetworkApprovalRequest,
+    ) -> Result<nono::NetworkApprovalDecision> {
+        self.network_backend.request_network_approval(request)
+    }
+
+    fn backend_name(&self) -> &str {
+        "supervised-router"
+    }
+}
+
+/// Combine the profile-configured capability backend with the interactive
+/// network approval backend for supervised execution.
+///
+/// Returns `None` when neither is configured so the caller can fall back to
+/// the plain terminal prompt, preserving pre-existing behavior.
+pub(crate) fn build_supervised_approval_backend(
+    capability_backend: Option<Arc<dyn ApprovalBackend>>,
+    network_backend: Option<Arc<NetworkApprovalBackend>>,
+) -> Option<Arc<dyn ApprovalBackend>> {
+    match (capability_backend, network_backend) {
+        (None, None) => None,
+        (Some(capability), None) => Some(capability),
+        (capability, Some(network)) => Some(Arc::new(SupervisedApprovalRouter {
+            capability_backend: capability,
+            network_backend: network,
+            terminal_fallback: Arc::new(TerminalApproval),
+        })),
+    }
 }
 
 fn build_approval_backends_from(

@@ -58,6 +58,7 @@ pub mod net_filter;
 pub mod path;
 pub mod query;
 pub mod resource;
+pub mod runtime_filter;
 pub mod sandbox;
 pub mod scrub;
 pub mod state;
@@ -93,6 +94,7 @@ pub use keystore::{
 pub use net_filter::{FilterResult, HostFilter};
 pub use path::try_canonicalize;
 pub use resource::ResourceLimits;
+pub use runtime_filter::RuntimeHostFilter;
 #[cfg(target_os = "linux")]
 pub use sandbox::{
     DetectedAbi, LandlockScopePolicy, NamespaceProbe, NamespaceProbeStage, NamespaceSpec,
@@ -106,8 +108,9 @@ pub use scrub::{
 };
 pub use state::SandboxState;
 pub use supervisor::{
-    ApprovalBackend, ApprovalDecision, ApprovalRequest, CapabilityRequest, SupervisorListener,
-    SupervisorSocket, UrlOpenRequest,
+    ApprovalBackend, ApprovalDecision, ApprovalRequest, ApprovalScope, CapabilityRequest,
+    NetworkApprovalDecision, NetworkApprovalRequest, SupervisorListener, SupervisorSocket,
+    UrlOpenRequest,
 };
 pub use trust::{
     Enforcement, IncludePatterns, Publisher, SignerIdentity, TrustPolicy, VerificationOutcome,

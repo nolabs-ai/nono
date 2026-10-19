@@ -221,16 +221,12 @@ pub fn verify_bundle_keyed(
     trusted_root: &TrustedRoot,
     artifact_path: &Path,
 ) -> Result<SigstoreVerificationResult> {
-    sigstore_verify::verify_with_key(
-        artifact_bytes,
-        bundle,
-        public_key,
-        &PublicKeyVerificationPolicy::default(),
-        trusted_root,
-    )
-    .map_err(|e| NonoError::TrustVerification {
-        path: artifact_path.display().to_string(),
-        reason: format!("{e}"),
+    let policy = PublicKeyVerificationPolicy::new(public_key.clone());
+    sigstore_verify::verify(artifact_bytes, bundle, &policy, trusted_root).map_err(|e| {
+        NonoError::TrustVerification {
+            path: artifact_path.display().to_string(),
+            reason: format!("{e}"),
+        }
     })
 }
 

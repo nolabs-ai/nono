@@ -46,14 +46,14 @@ The pack profile provides:
 
 ## Automatic Pack Install and Plugin Wiring
 
-The `codex` profile is distributed as a signed registry pack at `nolabs-ai/codex` along with a Codex plugin that provides sandbox-aware diagnostic hooks and a skill for guiding the user through denial-recovery.
+The Codex profile is distributed as the signed `nolabs-ai/codex` package along with a Codex plugin that provides sandbox-aware diagnostic hooks and a skill for guiding the user through denial recovery.
 
 The first time you run `nono run --profile nolabs-ai/codex -- codex`, nono prompts to install the pack:
 
 ```
   ⊕  Install nolabs-ai/codex?
 
-     The `codex` profile is provided by this registry pack.
+     The sandbox profile is provided by this registry package.
 
      Publisher    nolabs-ai GitHub organisation
      Provenance   Sigstore cryptographic supply chain (verified on pull)
@@ -109,7 +109,7 @@ note: Codex hooks need this in ~/.codex/config.toml to fire — add it once and 
 
 ### Subsequent runs
 
-Once installed, `nono run --profile nolabs-ai/codex -- codex` runs silently — no prompt. nono's profile resolver finds `codex` in the pack store and re-asserts the marketplace + cache wiring on every run, so deleting any of the entries above is recovered transparently on the next `nono run`.
+Once installed, `nono run --profile nolabs-ai/codex -- codex` runs silently — no prompt. nono's profile resolver loads the exact package from the package store and re-asserts the marketplace + cache wiring on every run, so deleting any of the entries above is recovered transparently on the next `nono run`.
 
 If a newer version of the pack is available, nono prints a one-line hint after the capabilities block:
 
@@ -132,7 +132,7 @@ Run `nono update` to apply it, or `nono outdated` to check all installed packs a
 
 The pack's hooks wire into three Codex events:
 
-- **`PostToolUse`** for `Bash`, `apply_patch`, and MCP file tools — when the tool's output matches a sandbox-denial signature (`Operation not permitted`, `EACCES`, `EPERM`, `landlock`), the hook returns `decision: block` with a `reason` string. Codex pauses the agent loop and shows the reason to the user verbatim — no LLM paraphrasing, no "Want me to run nono why?" dangler. The `reason` includes the diagnostic, the allowed paths, and an inline JSON template for the Option B persistent-fix profile (extends `codex` and adds the blocked path).
+- **`PostToolUse`** for `Bash`, `apply_patch`, and MCP file tools — when the tool's output matches a sandbox-denial signature (`Operation not permitted`, `EACCES`, `EPERM`, `landlock`), the hook returns `decision: block` with a `reason` string. Codex pauses the agent loop and shows the reason to the user verbatim — no LLM paraphrasing, no "Want me to run nono why?" dangler. The `reason` includes the diagnostic, the allowed paths, and an inline JSON template for the Option B persistent-fix profile (extends `nolabs-ai/codex` and adds the blocked path).
 - **`PermissionRequest`** — when Codex's approval flow asks the user to escalate, the hook denies upstream with a message explaining that approval can't grant access the OS sandbox already blocks. The user is told to restart with `--allow <path>`.
 - **`SessionStart`** — pre-loads the sandbox boundary into the conversation as `additionalContext`, so the model understands the limits from turn 1 and won't reach for "macOS TCC" or "chmod" diagnoses on the first denial.
 
@@ -152,7 +152,7 @@ Create `~/.config/nono/profiles/my-codex.json` if you want different permissions
 
 ```json
 {
-  "extends": "codex",
+  "extends": "nolabs-ai/codex",
   "meta": {
     "name": "my-codex",
     "version": "1.0.0",
@@ -167,7 +167,7 @@ Create `~/.config/nono/profiles/my-codex.json` if you want different permissions
 Then start sessions with `nono run --profile my-codex -- codex`.
 
 <Note>
-The `extends` chain pulls in everything the pack profile declares (allow paths, runtime groups, OAuth origin, hook plugin) and merges your additions on top. If you instead create a profile literally named `codex` in `~/.config/nono/profiles/`, it shadows the pack profile entirely — you take responsibility for the full configuration.
+The `extends` chain pulls in everything the package profile declares (allow paths, runtime groups, OAuth origin, hook plugin) and merges your additions on top. Package profiles require their fully-qualified name; a user profile named `codex` is separate and does not shadow `nolabs-ai/codex`.
 </Note>
 
 ## Security Tips

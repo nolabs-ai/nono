@@ -516,7 +516,7 @@ SESSION PICKER:
   nono profile init my-agent --extends default --groups deny_credentials
                                                # Extend an existing profile
   nono profile init my-agent --full            # Generate a full skeleton
-  nono profile list                            # List all profiles (built-in and user)
+  nono profile list                            # List built-in, package, and user profiles
   nono profile show nolabs-ai/claude            # Show an installed package profile
   nono profile diff default nolabs-ai/claude    # Compare two profiles
   nono profile validate my-agent               # Validate a profile by name
@@ -897,7 +897,7 @@ pub struct ProfileCmdArgs {
 pub enum ProfileCommands {
     /// Generate a skeleton profile JSON file
     Init(ProfileInitArgs),
-    /// List all available profiles (built-in and user)
+    /// List all available profiles (built-in, package, and user)
     List(ProfileListArgs),
     /// Show a fully resolved profile
     Show(ProfileShowArgs),

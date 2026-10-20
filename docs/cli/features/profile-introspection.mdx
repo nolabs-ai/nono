@@ -66,7 +66,7 @@ nono profile: group 'deny_credentials'
 
 ### `nono profile list`
 
-List all available profiles, showing preset, pack-provided, and user-defined profiles separately. User profiles that shadow a preset or pack profile are flagged.
+List all available profiles, showing built-in, package-provided, and user-defined profiles separately. User profiles that shadow a built-in profile are flagged. Package profiles always use fully-qualified names and cannot be shadowed by bare user-profile names.
 
 ```bash
 nono profile list
@@ -79,17 +79,17 @@ Example output:
 nono profile: 15 profiles
 
   Built-in:
-    default          Default conservative base profile
-    python-dev       Python SDK development profile             extends default
+    default                Default conservative base profile
+    python-dev             Python SDK development profile
     ...
 
   Packages:
-    claude            Anthropic Claude Code CLI agent            nolabs-ai/claude
-    opencode          OpenCode 2 AI coding assistant             nolabs-ai/opencode
-    opencode-v1       OpenCode 1 AI coding assistant             nolabs-ai/opencode-v1
+    nolabs-ai/claude       Anthropic Claude Code CLI agent
+    nolabs-ai/opencode     OpenCode 2 AI coding assistant
+    nolabs-ai/opencode-v1  OpenCode 1 AI coding assistant
 
   User (~/.config/nono/profiles/):
-    my-agent         Custom agent profile                       extends default
+    my-agent                Custom agent profile                       extends default
     ...
 ```
 
@@ -97,11 +97,11 @@ Malformed user profiles are surfaced with their error instead of being silently 
 
 ```
   User (~/.config/nono/profiles/):
-    broken-profile   [error: Profile error: missing field `meta`]
+    broken-profile          [error: Profile error: missing field `meta`]
 ```
 
 <Note>
-  Load precedence is user-first. If a user profile file exists at `~/.config/nono/profiles/claude-code.json`, it shadows the pack-provided `claude-code` profile. The `profiles` command reports the actual source in JSON output, and lists the profile under the User section.
+  Bare names resolve from the user profile directory first, then built-ins. Package profiles resolve only by their fully-qualified package name, such as `nolabs-ai/claude`, so a user `claude.json` does not shadow the package profile.
 </Note>
 
 #### Options
@@ -109,6 +109,8 @@ Malformed user profiles are surfaced with their error instead of being silently 
 | Option | Description |
 |--------|-------------|
 | `--json` | Output as JSON |
+
+JSON entries contain `name`, `source`, and either the loaded profile's `description` and `extends` fields or an `error`. For package profiles, `source` is `"pack"` and `name` is already the fully-qualified package identity; there is no separate `pack` field.
 
 ### `nono profile show`
 
@@ -187,19 +189,19 @@ Compare two profiles side-by-side. Shows additions, removals, and changes across
 
 ```bash
 # Compare two profiles
-nono profile diff default claude-code
+nono profile diff default nolabs-ai/claude
 
 # Compare a user profile against a pack profile
 nono profile diff default ./my-profile.json
 
 # Machine-readable output
-nono profile diff default claude-code --json
+nono profile diff default nolabs-ai/claude --json
 ```
 
 Example output:
 
 ```
-nono profile: diff 'default' vs 'claude-code'
+nono profile: diff 'default' vs 'nolabs-ai/claude'
 
   Groups:
     + claude_code_macos
@@ -308,7 +310,7 @@ nono profile groups --json | jq '.[].name'
 nono profile show my-profile --json | jq '.network.block'
 
 # Get added groups between two profiles
-nono profile diff default claude-code --json | jq '.groups.added'
+nono profile diff default nolabs-ai/claude --json | jq '.groups.added'
 
 # Validate in CI and check result
 nono profile validate ./profile.json --json | jq '.valid'
@@ -351,7 +353,7 @@ nono profile groups
 nono profile show my-profile | grep python_runtime
 
 # Compare against a working profile
-nono profile diff my-profile claude-code
+nono profile diff my-profile nolabs-ai/claude
 ```
 
 ### CI/CD validation
@@ -365,9 +367,9 @@ for f in profiles/*.json; do
 done
 ```
 
-### Detecting user overrides
+### Detecting built-in overrides
 
-Check whether pack profiles have been shadowed by user files:
+Check whether built-in profiles have been shadowed by user files:
 
 ```bash
 # JSON output flags the actual source

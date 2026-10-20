@@ -496,13 +496,12 @@ fn prompt_profile_name(suggested: Option<&str>) -> Result<Option<String>> {
                 if !would_shadow_existing_profile(suggested_name) {
                     return Ok(Some(suggested_name.to_string()));
                 }
-                // The suggestion itself would shadow an existing profile
-                // (possible if pack data changed since the suggestion was
-                // generated). Require the user to enter a different name.
+                // The suggestion itself would shadow an existing built-in.
+                // Require the user to enter a different name.
                 prompt_println(&format!(
                     "{}",
                     format!(
-                        "The suggested name '{}' would shadow an existing built-in or pack profile. Enter a different name, or type 'skip' to cancel.",
+                        "The suggested name '{}' would shadow an existing built-in profile. Enter a different name, or type 'skip' to cancel.",
                         suggested_name
                     )
                     .red()
@@ -532,7 +531,7 @@ fn prompt_profile_name(suggested: Option<&str>) -> Result<Option<String>> {
             prompt_println(&format!(
                 "{}",
                 format!(
-                    "Cannot save '{}' as a user profile because it would shadow an existing built-in or pack profile of the same name. Choose a different name.",
+                    "Cannot save '{}' as a user profile because it would shadow an existing built-in profile of the same name. Choose a different name.",
                     candidate
                 )
                 .red()

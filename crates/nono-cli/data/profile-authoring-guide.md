@@ -989,7 +989,7 @@ To replace inherited URL-opening permissions, provide `open_urls` with an explic
 
 ### Linux host compatibility
 
-On Linux, the built-in `default` profile keeps host runtime, sysfs, and shared temp reads out of the base policy. If your tool needs access to paths like `/run`, `/var/run`, `/sys`, or `/tmp`, extend the built-in compatibility preset:
+On Linux, the built-in `default` profile keeps host runtime, sysfs, and shared temp reads out of the base policy. If your tool needs access to paths like `/run`, `/var/run`, `/sys`, or `/tmp`, extend the built-in compatibility profile:
 
 ```json
 {
@@ -1072,7 +1072,7 @@ Block access to a file in the working directory while keeping the rest accessibl
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": {
     "name": "no-dotenv",
     "description": "Claude Code without .env access"
@@ -1089,7 +1089,7 @@ Block access to a file in the working directory while keeping the rest accessibl
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": {
     "name": "no-dotenv",
     "description": "Claude Code without .env access"
@@ -1115,7 +1115,7 @@ Use `filesystem.deny` on the socket path. Seatbelt treats `connect(2)` as a netw
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": {
     "name": "no-docker",
     "description": "Claude Code without Docker access"
@@ -1157,7 +1157,7 @@ Landlock cannot express deny-within-allow, so `filesystem.deny` is a no-op on Li
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": {
     "name": "no-docker",
     "description": "Claude Code without Docker access"
@@ -1193,7 +1193,7 @@ restriction can be relaxed when the profile opts in with
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": {
     "name": "home-access",
     "description": "Claude Code with full home directory access"
@@ -1319,9 +1319,9 @@ draft base hash does not match current profile. The profile changed after the dr
 
 Reread the current profile, recompute the hash, and update your draft.
 
-### Extending a built-in or pack profile
+### Extending a built-in or package profile
 
-`promote` refuses to replace a built-in or pack-installed profile. Instead, draft a derived profile that extends it:
+`promote` refuses to replace a built-in or package-installed profile. Instead, draft a derived profile that extends it:
 
 ```json
 {

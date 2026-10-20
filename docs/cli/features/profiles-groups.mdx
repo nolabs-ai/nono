@@ -70,15 +70,15 @@ This keeps the predefined profile stable and auditable while giving you full con
 
 ### Profile Sources
 
-Profiles can come from three sources, in order of precedence:
+Profiles can come from three sources:
 
 | Source | Location | Trust Level |
 |--------|----------|-------------|
-| CLI flags | Command line | Highest - explicit user intent |
-| User profiles | `~/.config/nono/profiles/*.json` or `*.jsonc` | Medium - user-defined |
-| Pack / preset profiles | Installed packs or compiled presets | Base - audited defaults |
+| Built-in profiles | Compiled into nono | Base - audited defaults |
+| Package profiles | Installed packs, addressed as `<namespace>/<package>` | Base - signed package defaults |
+| User profiles | `~/.config/nono/profiles/*.json` or `*.jsonc` | User-defined |
 
-CLI flags always override profile settings.
+Bare names resolve user profiles first and built-ins second, so a user profile can override a built-in with the same name. Package profiles occupy a separate fully-qualified namespace and cannot be shadowed by a bare user profile. CLI flags are applied after the selected profile and always take precedence.
 
 <Note>
   nono resolves config paths via `$XDG_CONFIG_HOME/nono/` on every platform. If
@@ -267,7 +267,7 @@ Block a specific path that a base profile would otherwise allow:
     "name": "claude-deny-git",
     "version": "1.0.0"
   },
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "filesystem": {
     "deny": ["$HOME/.gitconfig"]
   }
@@ -284,7 +284,7 @@ Use `filesystem.deny` as the enforcement mechanism. `commands.deny` remains depr
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": { "name": "no-docker", "version": "1.0.0" },
   "filesystem": {
     "deny": ["/var/run/docker.sock"]
@@ -371,7 +371,7 @@ you do not want nono to keep offering it as a profile addition:
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": { "name": "claude-local", "version": "1.0.0" },
   "filesystem": {
     "suppress_save_prompt": ["$HOME/.copilot/settings.json"]
@@ -554,10 +554,10 @@ nono run --profile ./profiles/my-agent.json -- my-command
 CLI flags always take precedence over profile settings:
 
 ```bash
-# Use claude-code profile but block network
+# Use the Claude package profile but block network
 nono run --profile nolabs-ai/claude --block-net -- claude
 
-# Use claude-code profile but add a custom domain
+# Use the Claude package profile but add a custom domain
 nono run --profile nolabs-ai/claude --allow-domain custom-api.example.com -- claude
 
 # Add extra directory access
@@ -569,12 +569,12 @@ To keep a base profile but clear an inherited network profile, set `network.netw
 ```json
 {
   "meta": { "name": "claude-code-netopen" },
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "network": { "network_profile": null }
 }
 ```
 
-You can also create a user profile with the same name to override a pack profile entirely.
+Package profiles occupy a separate, fully-qualified namespace. A bare user profile name cannot override one.
 
 ---
 
@@ -795,7 +795,7 @@ The base profile that all other profiles extend. Provides system path access, de
 
 **CWD:** None
 
-### claude-code
+### Claude Code (`nolabs-ai/claude`)
 
 ```bash
 nono run --profile nolabs-ai/claude -- claude
@@ -811,7 +811,7 @@ nono run --profile nolabs-ai/claude -- claude
 
 **Special:** Auto-installs Claude Code hooks. OAuth2 login support via `open_urls` (allows `https://claude.ai` and localhost). Profile opts into `allow_launch_services` for macOS browser opening.
 
-### codex
+### Codex (`nolabs-ai/codex`)
 
 ```bash
 nono run --profile nolabs-ai/codex -- codex
@@ -859,7 +859,7 @@ nono run --profile nolabs-ai/opencode-v1 -- opencode
 
 **Special:** Do not use `--standalone`; it is an OpenCode 2 flag. The v1 and v2 packs share plugin installation paths, so remove one before switching to the other.
 
-### openclaw
+### OpenClaw (`nolabs-ai/openclaw`)
 
 ```bash
 nono run --profile nolabs-ai/openclaw -- openclaw

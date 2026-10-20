@@ -1394,9 +1394,12 @@ mod cap_file_validation_tests {
         let path = write_cap_file(file_dir.path());
         let path_str = path.to_str().expect("utf8 path").to_string();
 
-        // Point $TMPDIR at a *different* existing directory.
-        let other_dir = tempfile::tempdir_in("/tmp").expect("other tempdir");
-        let other = other_dir.path().to_str().expect("utf8 other");
+        // Point $TMPDIR at a *different* existing directory. `keep()` so it
+        // is not auto-deleted: tests that call `tempdir()` concurrently
+        // (without the env lock) may create dirs inside it while TMPDIR
+        // points here, and deleting it from under them causes flaky failures.
+        let other_dir = tempfile::tempdir_in("/tmp").expect("other tempdir").keep();
+        let other = other_dir.to_str().expect("utf8 other");
         let _env = EnvVarGuard::set_all(&[("TMPDIR", other)]);
 
         // The cap file's canonical path is not under the overridden $TMPDIR, but

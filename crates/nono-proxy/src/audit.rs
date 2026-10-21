@@ -47,6 +47,23 @@ pub struct EventContext<'a> {
     pub spiffe_context: Option<nono::undo::SpiffeAuditContext>,
 }
 
+/// Log label for a denial category. Matches its serialized audit-event form.
+fn denial_category_label(category: &NetworkAuditDenialCategory) -> &'static str {
+    match category {
+        NetworkAuditDenialCategory::AuthenticationFailed => "authentication_failed",
+        NetworkAuditDenialCategory::EndpointPolicy => "endpoint_policy",
+        NetworkAuditDenialCategory::ManagedCredentialUnavailable => {
+            "managed_credential_unavailable"
+        }
+        NetworkAuditDenialCategory::HostDenied => "host_denied",
+        NetworkAuditDenialCategory::InterceptHandshakeFailed => "intercept_handshake_failed",
+        NetworkAuditDenialCategory::UpstreamConnectFailed => "upstream_connect_failed",
+        NetworkAuditDenialCategory::ConnectBypassesL7 => "connect_bypasses_l7",
+        NetworkAuditDenialCategory::ExternalProxyRejected => "external_proxy_rejected",
+        NetworkAuditDenialCategory::UnsupportedUpgrade => "unsupported_upgrade",
+    }
+}
+
 impl std::fmt::Display for ProxyMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -224,6 +241,7 @@ pub fn log_denied(
         port = port,
         decision = "deny",
         reason = reason,
+        denial_category = ctx.denial_category.as_ref().map(denial_category_label),
         "proxy request denied"
     );
 
@@ -352,6 +370,7 @@ pub fn log_l7_policy_decision(
         decision = ?decision,
         endpoint_policy_action = action,
         endpoint_policy_rule = rule_label,
+        denial_category = ctx.denial_category.as_ref().map(denial_category_label),
         "l7 endpoint policy decision"
     );
 
@@ -539,6 +558,56 @@ mod tests {
     }
 
     #[test]
+    fn denial_category_label_matches_audit_json() {
+        for category in [
+            NetworkAuditDenialCategory::AuthenticationFailed,
+            NetworkAuditDenialCategory::EndpointPolicy,
+            NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+            NetworkAuditDenialCategory::HostDenied,
+            NetworkAuditDenialCategory::InterceptHandshakeFailed,
+            NetworkAuditDenialCategory::UpstreamConnectFailed,
+            NetworkAuditDenialCategory::ConnectBypassesL7,
+            NetworkAuditDenialCategory::ExternalProxyRejected,
+            NetworkAuditDenialCategory::UnsupportedUpgrade,
+        ] {
+            let json = serde_json::to_string(&category).unwrap();
+            assert_eq!(json, format!("\"{}\"", denial_category_label(&category)));
+        }
+    }
+
+    #[test]
+    fn log_denied_emits_denial_category() {
+        let lines = capture_info_fields(|| {
+            log_denied(
+                None,
+                ProxyMode::ConnectIntercept,
+                &EventContext {
+                    denial_category: Some(NetworkAuditDenialCategory::UpstreamConnectFailed),
+                    ..EventContext::default()
+                },
+                "api.anthropic.com",
+                443,
+                "I/O error: Broken pipe (os error 32)",
+            );
+            log_denied(
+                None,
+                ProxyMode::Connect,
+                &EventContext::default(),
+                "example.com",
+                443,
+                "no category",
+            );
+        });
+
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("denial_category=upstream_connect_failed"),
+            "got {lines:?}"
+        );
+        assert!(!lines[1].contains("denial_category"), "got {lines:?}");
+    }
+
+    #[test]
     fn log_l7_policy_decision_records_endpoint_context() {
         let log = new_audit_log();
 
@@ -648,6 +717,59 @@ mod tests {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    fn capture_info_fields(f: impl FnOnce()) -> Vec<String> {
+        let subscriber = InfoFieldRecorder::default();
+        let lines = subscriber.lines.clone();
+        tracing::subscriber::with_default(subscriber, f);
+        lines.lock().map(|guard| guard.clone()).unwrap_or_default()
+    }
+
+    #[derive(Clone, Default)]
+    struct InfoFieldRecorder {
+        lines: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for InfoFieldRecorder {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::INFO
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            if let Ok(mut lines) = self.lines.lock() {
+                lines.push(visitor.fields.join(" "));
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: Vec<String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
     }
 
     #[derive(Clone, Default)]

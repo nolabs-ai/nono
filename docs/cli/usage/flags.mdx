@@ -51,6 +51,19 @@ NONO_THEME=latte nono run --allow-cwd -- codex
 
 If an unknown theme is supplied, nono falls back to `mocha`.
 
+### `NONO_SEATBELT_LOG_TAG` (macOS)
+
+Tag every deny rule in the generated Seatbelt profile with `(with message "<tag>")`, for the agent's sandbox and for every mediated command's sandbox. Each kernel denial line in the unified log then carries the tag, so a watcher can attribute denials to a nono session without relying on process ancestry.
+
+The value must be 1 to 64 characters from `[A-Za-z0-9_]`; anything else is rejected at startup.
+
+```bash
+NONO_SEATBELT_LOG_TAG=NONOGOV_35480 nono run --allow-cwd -- claude
+
+# Watch the denials of that session
+log stream --predicate 'eventMessage CONTAINS "NONOGOV_35480"'
+```
+
 ### Redaction Policy
 
 Command arguments persisted in sessions, audit logs, rollback metadata, and audit attestations are redacted with a secure default policy. You can extend the policy in `~/.config/nono/config.toml`:

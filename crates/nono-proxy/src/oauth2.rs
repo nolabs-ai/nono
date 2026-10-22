@@ -274,7 +274,7 @@ async fn exchange_token(
     // ── TCP + optional TLS ───────────────────────────────────────────────
     let addr = format!("{}:{}", host, port);
 
-    let response_bytes = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+    let response = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
         let tcp = TcpStream::connect(&addr)
             .await
             .map_err(|e| ProxyError::OAuth2Exchange(format!("TCP connect to {}: {}", addr, e)))?;
@@ -283,7 +283,7 @@ async fn exchange_token(
             stream: &mut S,
             request: &[u8],
             host: &str,
-        ) -> Result<Vec<u8>> {
+        ) -> Result<TokenHttpResponse> {
             stream
                 .write_all(request)
                 .await
@@ -314,67 +314,127 @@ async fn exchange_token(
     .await
     .map_err(|_| ProxyError::OAuth2Exchange(format!("token exchange with {} timed out", addr)))??;
 
-    // ── Parse HTTP response ──────────────────────────────────────────────
-    let response_str = String::from_utf8(response_bytes).map_err(|_| {
-        ProxyError::OAuth2Exchange("token endpoint returned non-UTF-8 response".to_string())
-    })?;
-
-    // Split headers from body
-    let body_start = response_str
-        .find("\r\n\r\n")
-        .map(|i| i + 4)
-        .or_else(|| response_str.find("\n\n").map(|i| i + 2))
-        .ok_or_else(|| {
-            ProxyError::OAuth2Exchange(
-                "malformed HTTP response: no header/body separator".to_string(),
-            )
-        })?;
-
-    // Check status code
-    let status_line = response_str.lines().next().unwrap_or("");
-    let status_code = parse_status_code(status_line);
-    if !(200..300).contains(&status_code) {
-        let body_preview: String = response_str[body_start..].chars().take(200).collect();
+    // ── Check status code ────────────────────────────────────────────────
+    if !(200..300).contains(&response.status) {
+        let body_preview: String = response.body.chars().take(200).collect();
         return Err(ProxyError::OAuth2Exchange(format!(
             "token endpoint returned HTTP {}: {}",
-            status_code, body_preview
+            response.status, body_preview
         )));
     }
 
-    let raw_body = &response_str[body_start..];
-    let is_chunked = response_str[..body_start].lines().any(|line| {
-        line.to_ascii_lowercase()
-            .contains("transfer-encoding: chunked")
-    });
-    if is_chunked {
-        let json_body = Zeroizing::new(decode_chunked(raw_body));
-        parse_token_response(&json_body)
-    } else {
-        parse_token_response(raw_body)
-    }
+    parse_token_response(&response.body)
 }
 
-/// Read a full HTTP response from a stream up to [`MAX_TOKEN_RESPONSE`] bytes.
-async fn read_http_response<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
-    loop {
-        let n = stream
-            .read(&mut tmp)
-            .await
-            .map_err(|e| ProxyError::OAuth2Exchange(format!("read response: {}", e)))?;
-        if n == 0 {
-            break;
+/// A token endpoint response with its body already de-framed.
+struct TokenHttpResponse {
+    status: u16,
+    body: Zeroizing<String>,
+}
+
+/// Read one HTTP/1.1 response from a stream, up to [`MAX_TOKEN_RESPONSE`] bytes.
+///
+/// A body framed by `Transfer-Encoding: chunked` or `Content-Length` is read
+/// only until that framing says it is complete. Many servers close a TLS
+/// connection without `close_notify`, which rustls reports as `UnexpectedEof`
+/// on the next read; for a framed response that read never happens. A body
+/// that ends before its framing does is an error. An unframed body is read to
+/// a clean EOF, and any read error fails, since it cannot be told apart from
+/// a truncated one.
+async fn read_http_response<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<TokenHttpResponse> {
+    let mut buf = Zeroizing::new(Vec::with_capacity(4096));
+
+    let body_start = loop {
+        if let Some(start) = find_body_start(&buf) {
+            break start;
         }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.len() > MAX_TOKEN_RESPONSE {
-            return Err(ProxyError::OAuth2Exchange(format!(
-                "token response exceeds {} bytes",
-                MAX_TOKEN_RESPONSE
-            )));
+        if read_more(stream, &mut buf).await? == 0 {
+            return Err(ProxyError::OAuth2Exchange(
+                "malformed HTTP response: no header/body separator".to_string(),
+            ));
         }
+    };
+
+    let headers = std::str::from_utf8(&buf[..body_start]).map_err(|_| {
+        ProxyError::OAuth2Exchange("token endpoint returned non-UTF-8 headers".to_string())
+    })?;
+    let status = parse_status_code(headers.lines().next().unwrap_or(""));
+    let is_chunked = crate::reverse::has_chunked_transfer_encoding(headers.as_bytes());
+    let content_length = crate::reverse::extract_content_length(headers.as_bytes());
+
+    // Transfer-Encoding takes precedence over Content-Length (RFC 9112 §6.3).
+    let body = if is_chunked {
+        loop {
+            if let Some(decoded) = decode_chunked(&buf[body_start..])? {
+                break decoded;
+            }
+            if read_more(stream, &mut buf).await? == 0 {
+                return Err(truncated_response());
+            }
+        }
+    } else if let Some(len) = content_length {
+        let end = body_start
+            .checked_add(len)
+            .filter(|end| *end <= MAX_TOKEN_RESPONSE)
+            .ok_or_else(response_too_large)?;
+        while buf.len() < end {
+            if read_more(stream, &mut buf).await? == 0 {
+                return Err(truncated_response());
+            }
+        }
+        buf[body_start..end].to_vec()
+    } else {
+        while read_more(stream, &mut buf).await? != 0 {}
+        buf[body_start..].to_vec()
+    };
+
+    let body = String::from_utf8(body).map_err(|_| {
+        ProxyError::OAuth2Exchange("token endpoint returned non-UTF-8 response".to_string())
+    })?;
+    Ok(TokenHttpResponse {
+        status,
+        body: Zeroizing::new(body),
+    })
+}
+
+/// Append the next read from `stream` to `buf`, enforcing [`MAX_TOKEN_RESPONSE`].
+///
+/// Returns the number of bytes read; `0` means a clean EOF.
+async fn read_more<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+) -> Result<usize> {
+    let mut tmp = Zeroizing::new([0u8; 4096]);
+    let n = stream
+        .read(tmp.as_mut_slice())
+        .await
+        .map_err(|e| ProxyError::OAuth2Exchange(format!("read response: {}", e)))?;
+    if buf.len().saturating_add(n) > MAX_TOKEN_RESPONSE {
+        return Err(response_too_large());
     }
-    Ok(buf)
+    buf.extend_from_slice(&tmp[..n]);
+    Ok(n)
+}
+
+/// Offset of the first body byte, once the header terminator has been read.
+fn find_body_start(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2))
+}
+
+fn truncated_response() -> ProxyError {
+    ProxyError::OAuth2Exchange("truncated token response".to_string())
+}
+
+fn response_too_large() -> ProxyError {
+    ProxyError::OAuth2Exchange(format!(
+        "token response exceeds {} bytes",
+        MAX_TOKEN_RESPONSE
+    ))
 }
 
 /// Parse the HTTP status code from the status line.
@@ -602,7 +662,7 @@ async fn exchange_jwt_assertion(
     ));
 
     let addr = format!("{}:{}", host, port);
-    let response_bytes = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+    let response = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
         let tcp = TcpStream::connect(&addr)
             .await
             .map_err(|e| ProxyError::OAuth2Exchange(format!("TCP connect to {addr}: {e}")))?;
@@ -611,7 +671,7 @@ async fn exchange_jwt_assertion(
             stream: &mut S,
             request: &[u8],
             host: &str,
-        ) -> Result<Vec<u8>> {
+        ) -> Result<TokenHttpResponse> {
             stream
                 .write_all(request)
                 .await
@@ -640,71 +700,69 @@ async fn exchange_jwt_assertion(
     .await
     .map_err(|_| ProxyError::OAuth2Exchange(format!("token exchange with {addr} timed out")))??;
 
-    let response_str = String::from_utf8(response_bytes)
-        .map_err(|_| ProxyError::OAuth2Exchange("non-UTF-8 token response".to_string()))?;
-    let body_start = response_str
-        .find("\r\n\r\n")
-        .map(|i| i + 4)
-        .or_else(|| response_str.find("\n\n").map(|i| i + 2))
-        .ok_or_else(|| ProxyError::OAuth2Exchange("malformed HTTP response".to_string()))?;
-    let status = parse_status_code(response_str.lines().next().unwrap_or(""));
-    let raw_body = &response_str[body_start..];
-    let is_chunked = response_str[..body_start].lines().any(|l| {
-        l.to_ascii_lowercase()
-            .contains("transfer-encoding: chunked")
-    });
-    let body = if is_chunked {
-        decode_chunked(raw_body)
-    } else {
-        raw_body.to_string()
-    };
-    if !(200..300).contains(&status) {
-        let preview: String = body.chars().take(200).collect();
+    if !(200..300).contains(&response.status) {
+        let preview: String = response.body.chars().take(200).collect();
         return Err(ProxyError::OAuth2Exchange(format!(
-            "token endpoint returned HTTP {status}: {preview}"
+            "token endpoint returned HTTP {}: {preview}",
+            response.status
         )));
     }
-    let (token, expires) = parse_token_response(&body)?;
+    let (token, expires) = parse_token_response(&response.body)?;
     Ok((token, expires, spiffe_id))
 }
 
-/// Decode an HTTP/1.1 chunked-encoded body into a plain string.
-fn decode_chunked(body: &str) -> String {
-    let mut out = String::new();
-    let mut rest = body;
+/// Decode an HTTP/1.1 chunked body.
+///
+/// Returns `Ok(None)` while the body is incomplete (no terminal chunk and
+/// empty trailer line yet), and an error for malformed framing.
+fn decode_chunked(body: &[u8]) -> Result<Option<Vec<u8>>> {
+    let malformed = || ProxyError::OAuth2Exchange("malformed chunked token response".to_string());
+    let find_crlf = |from: usize| {
+        body[from..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|i| from + i)
+    };
+
+    let mut out = Vec::with_capacity(body.len());
+    let mut pos = 0;
     loop {
-        // Each chunk: "<hex-size>\r\n<data>\r\n"
-        let end = rest
-            .find('\r')
-            .or_else(|| rest.find('\n'))
-            .unwrap_or(rest.len());
-        let size_str = rest[..end].trim();
-        if size_str.is_empty() {
-            break;
+        let Some(line_end) = find_crlf(pos) else {
+            return Ok(None);
+        };
+        let size_line = std::str::from_utf8(&body[pos..line_end]).map_err(|_| malformed())?;
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        if size_hex.is_empty() || !size_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(malformed());
         }
-        let size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+        let size = usize::from_str_radix(size_hex, 16).map_err(|_| malformed())?;
+        pos = line_end + 2;
         if size == 0 {
             break;
         }
-        let after_crlf = end
-            + if rest[end..].starts_with("\r\n") {
-                2
-            } else {
-                1
-            };
-        if after_crlf + size > rest.len() {
-            out.push_str(&rest[after_crlf..]);
-            break;
+        let data_end = pos.checked_add(size).ok_or_else(malformed)?;
+        let chunk_end = data_end.checked_add(2).ok_or_else(malformed)?;
+        if body.len() < chunk_end {
+            return Ok(None);
         }
-        out.push_str(&rest[after_crlf..after_crlf + size]);
-        rest = &rest[after_crlf + size..];
-        if rest.starts_with("\r\n") {
-            rest = &rest[2..];
-        } else if rest.starts_with('\n') {
-            rest = &rest[1..];
+        if &body[data_end..chunk_end] != b"\r\n" {
+            return Err(malformed());
+        }
+        out.extend_from_slice(&body[pos..data_end]);
+        pos = chunk_end;
+    }
+
+    // Trailer section: zero or more header lines, then an empty line.
+    loop {
+        let Some(line_end) = find_crlf(pos) else {
+            return Ok(None);
+        };
+        let is_empty = line_end == pos;
+        pos = line_end + 2;
+        if is_empty {
+            return Ok(Some(out));
         }
     }
-    out
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -752,6 +810,169 @@ mod tests {
         let (token, expires) = exchange_mock_token_response(response).await.unwrap();
         assert!(token.as_str() == "fake-token");
         assert_eq!(expires, Duration::from_secs(3600));
+    }
+
+    // ── read_http_response framing ───────────────────────────────────────
+
+    /// Yields `data`, then fails like rustls does when a peer closes without
+    /// sending `close_notify`.
+    struct NoCloseNotifyReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl NoCloseNotifyReader {
+        fn new(data: &str) -> Self {
+            Self {
+                data: data.as_bytes().to_vec(),
+                pos: 0,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for NoCloseNotifyReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.pos >= this.data.len() {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed connection without sending TLS close_notify",
+                )));
+            }
+            let n = buf.remaining().min(this.data.len() - this.pos);
+            buf.put_slice(&this.data[this.pos..this.pos + n]);
+            this.pos += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn content_length_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn chunked_response(body: &str) -> String {
+        let (first, second) = body.split_at(body.len() / 2);
+        format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+             {:x}\r\n{}\r\n{:x};ext=1\r\n{}\r\n0\r\n\r\n",
+            first.len(),
+            first,
+            second.len(),
+            second
+        )
+    }
+
+    #[tokio::test]
+    async fn read_http_response_content_length_without_close_notify() {
+        let mut stream = NoCloseNotifyReader::new(&content_length_response(FAKE_TOKEN_JSON));
+        let response = read_http_response(&mut stream).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert!(response.body.as_str() == FAKE_TOKEN_JSON);
+    }
+
+    #[tokio::test]
+    async fn read_http_response_chunked_without_close_notify() {
+        let mut stream = NoCloseNotifyReader::new(&chunked_response(FAKE_TOKEN_JSON));
+        let response = read_http_response(&mut stream).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert!(response.body.as_str() == FAKE_TOKEN_JSON);
+    }
+
+    #[tokio::test]
+    async fn read_http_response_chunked_with_trailers() {
+        let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                   2\r\n{}\r\n0\r\nX-Trailer: 1\r\n\r\n";
+        let mut stream = NoCloseNotifyReader::new(raw);
+        let response = read_http_response(&mut stream).await.unwrap();
+        assert!(response.body.as_str() == "{}");
+    }
+
+    #[tokio::test]
+    async fn read_http_response_short_content_length_errors() {
+        let full = content_length_response(FAKE_TOKEN_JSON);
+        let truncated = &full[..full.len() - 5];
+
+        let err = read_http_response(&mut truncated.as_bytes())
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("truncated token response"));
+
+        let err = read_http_response(&mut NoCloseNotifyReader::new(truncated))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("close_notify"));
+    }
+
+    #[tokio::test]
+    async fn read_http_response_missing_terminal_chunk_errors() {
+        let full = chunked_response(FAKE_TOKEN_JSON);
+        let truncated = full.strip_suffix("0\r\n\r\n").unwrap();
+
+        let err = read_http_response(&mut truncated.as_bytes())
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("truncated token response"));
+
+        let err = read_http_response(&mut NoCloseNotifyReader::new(truncated))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("close_notify"));
+    }
+
+    #[tokio::test]
+    async fn read_http_response_malformed_chunk_errors() {
+        let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                   zz\r\n{}\r\n0\r\n\r\n";
+        let err = read_http_response(&mut raw.as_bytes()).await.err().unwrap();
+        assert!(err.to_string().contains("malformed chunked"));
+    }
+
+    #[tokio::test]
+    async fn read_http_response_unframed_reads_to_clean_eof() {
+        let raw = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{FAKE_TOKEN_JSON}");
+        let response = read_http_response(&mut raw.as_bytes()).await.unwrap();
+        assert!(response.body.as_str() == FAKE_TOKEN_JSON);
+    }
+
+    #[tokio::test]
+    async fn read_http_response_unframed_without_close_notify_errors() {
+        let raw = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{FAKE_TOKEN_JSON}");
+        let err = read_http_response(&mut NoCloseNotifyReader::new(&raw))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("close_notify"));
+    }
+
+    #[tokio::test]
+    async fn read_http_response_oversized_errors() {
+        let declared = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_TOKEN_RESPONSE
+        );
+        let err = read_http_response(&mut declared.as_bytes())
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("exceeds"));
+
+        let body = "a".repeat(MAX_TOKEN_RESPONSE + 1);
+        let raw = format!("HTTP/1.1 200 OK\r\n\r\n{body}");
+        let err = read_http_response(&mut raw.as_bytes()).await.err().unwrap();
+        assert!(err.to_string().contains("exceeds"));
     }
 
     // ── parse_token_response ─────────────────────────────────────────────

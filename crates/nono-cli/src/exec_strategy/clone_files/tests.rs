@@ -70,6 +70,7 @@ fn config(caps: &CapabilitySet, filesystem: bool, proxy: bool) -> ExecConfig<'_>
             proc_comm_notify: filesystem,
         },
         sandbox_policy: LinuxSandboxPolicy::Auto,
+        namespaces: None,
         allowed_env_vars: None,
         denied_env_vars: None,
         case_insensitive_env_vars: false,
@@ -119,6 +120,7 @@ fn supervise(
     let scrub = nono::ScrubPolicy::secure_default();
     let config = SupervisorConfig {
         protected_roots: &[],
+        deny_paths: &[],
         approval_backend: &Deny,
         session_id: "clone-test",
         attach_initial_client: false,
@@ -791,6 +793,7 @@ fn full_cli_supervisor_combined_path() -> Result<()> {
         let scrub = nono::ScrubPolicy::secure_default();
         let supervisor = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &Deny,
             session_id: "clone-test",
             attach_initial_client: false,

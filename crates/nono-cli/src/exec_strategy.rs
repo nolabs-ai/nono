@@ -256,6 +256,14 @@ impl SeccompPolicy {
     }
 }
 
+/// Whether the child must be launched through the raw-clone bootstrap:
+/// network notifications need its listener handoff, and namespace isolation
+/// needs its synchronized parent/child id-map step.
+#[cfg(target_os = "linux")]
+fn uses_clone_bootstrap(config: &ExecConfig<'_>) -> bool {
+    config.seccomp_policy.needs_network_notify() || config.namespaces.is_some()
+}
+
 /// Configuration for command execution.
 pub struct ExecConfig<'a> {
     /// The command to execute (program + args).
@@ -304,6 +312,11 @@ pub struct ExecConfig<'a> {
     /// Linux network enforcement backend for this session.
     #[cfg(target_os = "linux")]
     pub sandbox_policy: crate::profile::LinuxSandboxPolicy,
+    /// Opt-in namespace isolation (NEP-0004). When set, the child is launched
+    /// through the raw-clone bootstrap, which enters these namespaces before
+    /// Landlock and seccomp apply. Partial application is fatal.
+    #[cfg(target_os = "linux")]
+    pub namespaces: Option<nono::NamespaceSpec>,
     /// Allow-list of environment variable names. When set, only variables
     /// matching a glob pattern (e.g. `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -344,6 +357,10 @@ pub struct StartupTimeoutConfig<'a> {
 pub struct SupervisorConfig<'a> {
     /// Protected nono state roots that must never be granted dynamically.
     pub protected_roots: &'a [std::path::PathBuf],
+    /// The session's resolved deny paths (deny groups and profile
+    /// `filesystem.deny`, after `bypass_protection`), each also in canonical
+    /// form. No approval may grant access at or beneath one of them.
+    pub deny_paths: &'a [std::path::PathBuf],
     /// Backend for approval decisions (terminal prompt, webhook, policy engine)
     pub approval_backend: &'a dyn ApprovalBackend,
     /// Session identifier used for audit correlation.
@@ -608,7 +625,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     let socket_pair = if needs_child_ipc {
         let pair = SupervisorSocket::pair()?;
         #[cfg(target_os = "linux")]
-        let pair = if config.seccomp_policy.needs_network_notify() {
+        let pair = if uses_clone_bootstrap(config) {
             (
                 clone_files::promote_supervisor_socket(pair.0)?,
                 clone_files::promote_supervisor_socket(pair.1)?,
@@ -938,14 +955,17 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // Serialize notification listener ownership, including destruction, across
     // shared-table bootstraps. Ordinary proxy I/O threads remain concurrent.
     #[cfg(target_os = "linux")]
-    let _listener_ownership_guard = if config.seccomp_policy.child_requires_dumpable() {
-        Some(clone_files::lock_listener_ownership()?)
-    } else {
-        None
-    };
+    let _listener_ownership_guard =
+        if config.seccomp_policy.child_requires_dumpable() || config.namespaces.is_some() {
+            Some(clone_files::lock_listener_ownership()?)
+        } else {
+            None
+        };
     #[cfg(target_os = "linux")]
-    let mut clone_bootstrap = if config.seccomp_policy.needs_network_notify() {
-        if !supervisor.is_some_and(|sup| sup.seccomp_policy == config.seccomp_policy) {
+    let mut clone_bootstrap = if uses_clone_bootstrap(config) {
+        if config.seccomp_policy.needs_network_notify()
+            && !supervisor.is_some_and(|sup| sup.seccomp_policy == config.seccomp_policy)
+        {
             return Err(NonoError::SandboxInit(
                 "Network notifications require a supervisor with matching notification policy"
                     .into(),
@@ -1446,6 +1466,38 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 .as_mut()
                 .and_then(|bootstrap| bootstrap.network.take());
 
+            // Namespace isolation proxy bridge: serve the listener the child
+            // created inside its network namespace with the session proxy.
+            // Failing to attach it is fatal; the child would have no egress
+            // path and the profile asked for proxied egress.
+            #[cfg(target_os = "linux")]
+            if let Some(bridge) = clone_bootstrap
+                .as_mut()
+                .and_then(|bootstrap| bootstrap.bridge.take())
+            {
+                let attached = supervisor
+                    .and_then(|sup| sup.proxy_handle)
+                    .ok_or_else(|| {
+                        NonoError::SandboxInit(
+                            "namespace isolation bridge requires a running proxy".to_string(),
+                        )
+                    })
+                    .and_then(|handle| {
+                        handle
+                            .add_listener(std::net::TcpListener::from(bridge))
+                            .map_err(|e| {
+                                NonoError::SandboxInit(format!(
+                                    "cannot attach namespace isolation bridge to proxy: {e}"
+                                ))
+                            })
+                    });
+                if let Err(error) = attached {
+                    let _ = signal::kill(child, Signal::SIGKILL);
+                    let _ = waitpid(child, None);
+                    return Err(error);
+                }
+            }
+
             // Set up signal forwarding.
             setup_signal_forwarding(child, pty_proxy.as_ref().map(|p| p.poll_fds().0));
             let _signal_forwarding_guard = SignalForwardingGuard;
@@ -1465,7 +1517,13 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .and_then(|c| std::path::Path::new(c).file_name())
                     .and_then(|n| n.to_str())
                     .map(str::to_string);
-                crate::sandbox_log::SandboxLogCollector::start(child.as_raw(), command_name)
+                crate::sandbox_log::SandboxLogCollector::start(
+                    child.as_raw(),
+                    command_name,
+                    config
+                        .tool_sandbox_runtime
+                        .map(crate::tool_sandbox::PreparedToolSandboxRuntime::mediated_pids),
+                )
             } else {
                 None
             };
@@ -1613,19 +1671,25 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             };
 
             #[cfg(target_os = "macos")]
-            let sandbox_violations = if supervisor.is_some() {
+            let collected_violations = if supervisor.is_some() {
                 let include_historical_sandbox_log =
                     exit_code != 0 || !denials.is_empty() || error_observation.has_findings();
                 match sandbox_log_collector {
                     Some(collector) if include_historical_sandbox_log => collector.finish(),
                     Some(collector) => collector.finish_realtime_only(),
-                    None => Vec::new(),
+                    None => crate::sandbox_log::CollectedViolations::default(),
                 }
             } else {
-                Vec::new()
+                crate::sandbox_log::CollectedViolations::default()
             };
+            #[cfg(target_os = "macos")]
+            let (sandbox_violations, mediated_violations) =
+                (collected_violations.agent, collected_violations.mediated);
             #[cfg(not(target_os = "macos"))]
-            let sandbox_violations = Vec::new();
+            let (sandbox_violations, mediated_violations): (
+                Vec<nono::SandboxViolation>,
+                Vec<crate::diagnostic::MediatedViolation>,
+            ) = (Vec::new(), Vec::new());
             let visible_sandbox_violations = filter_suppressed_system_service_violations(
                 &sandbox_violations,
                 config.suppressed_system_service_operations,
@@ -1700,6 +1764,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .with_denials(&denials)
                     .with_ipc_denials(&ipc_denials)
                     .with_sandbox_violations(&sandbox_violations)
+                    .with_mediated_violations(&mediated_violations)
                     .with_protected_paths(config.protected_paths)
                     .with_error_observation(error_observation)
                     .with_current_dir(config.current_dir)
@@ -1711,6 +1776,15 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     )
                     .with_canonical_denial_paths(canonical_denial_paths)
                     .with_network_denials(network_denials);
+                #[cfg(target_os = "linux")]
+                {
+                    base_formatter = base_formatter.with_network_isolated(
+                        config
+                            .namespaces
+                            .as_ref()
+                            .is_some_and(nono::NamespaceSpec::has_network),
+                    );
+                }
                 if let Some(program) = config.command.first() {
                     let argv_display: Vec<String> = config
                         .command
@@ -3440,6 +3514,24 @@ fn handle_supervisor_message(
                         request.path.display()
                     ),
                 }
+            } else if is_under_deny_path(&request.path, config.deny_paths)
+                || is_under_deny_path(&nono::try_canonicalize(&request.path), config.deny_paths)
+            {
+                debug!(
+                    "Supervisor: path {} is denied by policy; not sent for approval",
+                    request.path.display()
+                );
+                record_denial(
+                    &mut denials.fs,
+                    DenialRecord {
+                        path: request.path.clone(),
+                        access: request.access,
+                        reason: DenialReason::PolicyBlocked,
+                    },
+                );
+                ApprovalDecision::Denied {
+                    reason: format!("Path is denied by policy: {}", request.path.display()),
+                }
             } else if let Some(trust_result) = trust_interceptor
                 .as_mut()
                 .and_then(|ti| ti.check_path(&request.path))
@@ -3572,6 +3664,7 @@ fn handle_supervisor_message(
                     &request.path,
                     &request.access,
                     config.protected_roots,
+                    config.deny_paths,
                     verified_digest.as_deref(),
                     Some(ProcfsAccessContext::new(child.as_raw() as u32, None)),
                 ) {
@@ -4227,6 +4320,49 @@ fn validate_procfs_access(
     Ok(())
 }
 
+/// Whether `path` is at or beneath one of the session's deny paths. Deny rules
+/// win over approvals: a path they cover is never sent to an approval backend
+/// and never opened on a grant.
+fn is_under_deny_path(path: &Path, deny_paths: &[PathBuf]) -> bool {
+    deny_paths.iter().any(|deny| path.starts_with(deny))
+}
+
+/// Deny paths as configured plus their canonical forms, so a request through
+/// a symlink alias and a request for the symlink itself are both covered.
+pub(crate) fn supervisor_deny_paths(deny_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(deny_paths.len() * 2);
+    for deny in deny_paths {
+        paths.push(deny.clone());
+        if let Ok(canonical) = std::fs::canonicalize(deny)
+            && canonical != *deny
+        {
+            paths.push(canonical);
+        }
+    }
+    paths
+}
+
+/// Whether the procfs deny rules refuse `resolved_path` for this requester
+/// regardless of any grant: another process's `/proc/<pid>`, or one of the
+/// requester's own sensitive entries. An approval cannot change the outcome,
+/// so the supervisor denies these without asking the approval backend.
+///
+/// Both forms are checked, as [`open_path_for_access`] does: the resolved path
+/// keeps the provenance of procfs links such as `/proc/<pid>/cwd`, and the
+/// canonical path removes `..` and symlink aliases such as
+/// `/proc/<own-pid>/../<pid>/cmdline`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn procfs_access_never_grantable(
+    resolved_path: &Path,
+    canonical_path: &Path,
+    procfs_context: ProcfsAccessContext,
+) -> bool {
+    [resolved_path, canonical_path].into_iter().any(|path| {
+        validate_procfs_access(path, Some(procfs_context))
+            .is_err_and(|error| error.is_policy_blocked())
+    })
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug)]
 struct OpenPathError {
@@ -4297,6 +4433,7 @@ fn open_path_for_access(
     path: &Path,
     access: &nono::AccessMode,
     protected_roots: &[PathBuf],
+    deny_paths: &[PathBuf],
     trust_digest: Option<&str>,
     procfs_context: Option<ProcfsAccessContext>,
 ) -> std::result::Result<std::fs::File, OpenPathError> {
@@ -4317,6 +4454,9 @@ fn open_path_for_access(
             &e,
         )
     })?;
+    // `..` and symlink aliases can name another process's entry through the
+    // requester's own PID; validate what will actually be opened as well.
+    validate_procfs_access(&canonical, procfs_context)?;
 
     if let Some(protected_root) =
         crate::protected_paths::overlapping_protected_root(&canonical, false, protected_roots)
@@ -4326,6 +4466,19 @@ fn open_path_for_access(
             path.display(),
             canonical.display(),
             protected_root.display(),
+        )));
+    }
+
+    // Defense in depth: the approval paths refuse denied paths before asking,
+    // but a grant must never open one either.
+    if is_under_deny_path(path, deny_paths)
+        || is_under_deny_path(&resolved_path, deny_paths)
+        || is_under_deny_path(&canonical, deny_paths)
+    {
+        return Err(OpenPathError::policy_blocked(format!(
+            "Path {} resolves to {} which is denied by policy",
+            path.display(),
+            canonical.display(),
         )));
     }
 
@@ -4545,6 +4698,19 @@ mod tests {
         let set_vars = vec![("RUST_LOG".to_string(), "debug".to_string())];
         push_set_vars(&mut env_c, &set_vars, &[]);
         assert_eq!(env_strings(&env_c), vec!["HOME=/home/x", "RUST_LOG=debug"]);
+    }
+
+    #[test]
+    fn push_set_vars_keeps_empty_value() {
+        // Set-but-empty differs from unset: Claude Code's Keychain lookup
+        // depends on CLAUDE_SECURESTORAGE_CONFIG_DIR="" reaching the child.
+        let mut env_c = Vec::new();
+        let set_vars = vec![("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), String::new())];
+        push_set_vars(&mut env_c, &set_vars, &[]);
+        assert_eq!(
+            env_strings(&env_c),
+            vec!["CLAUDE_SECURESTORAGE_CONFIG_DIR="]
+        );
     }
 
     #[test]
@@ -5163,6 +5329,148 @@ mod tests {
     }
 
     #[test]
+    fn test_deny_paths_cover_the_path_and_its_descendants_only() {
+        let deny = vec![
+            PathBuf::from("/home/u/.zprofile"),
+            PathBuf::from("/home/u/.aws"),
+        ];
+        assert!(is_under_deny_path(Path::new("/home/u/.zprofile"), &deny));
+        assert!(is_under_deny_path(
+            Path::new("/home/u/.aws/credentials"),
+            &deny
+        ));
+        // Component-wise: a sibling sharing a prefix is not covered.
+        assert!(!is_under_deny_path(
+            Path::new("/home/u/.zprofile.bak"),
+            &deny
+        ));
+        assert!(!is_under_deny_path(Path::new("/home/u/.awsx"), &deny));
+        assert!(!is_under_deny_path(Path::new("/home/u/project"), &deny));
+    }
+
+    #[test]
+    fn test_granted_open_refuses_denied_paths_including_symlink_aliases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join(".zprofile");
+        std::fs::write(&secret, "secret").expect("write secret");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&secret, &alias).expect("symlink");
+        let allowed = dir.path().join("allowed");
+        std::fs::write(&allowed, "ok").expect("write allowed");
+
+        let deny = supervisor_deny_paths(std::slice::from_ref(&secret));
+        let open = |path: &Path| {
+            open_path_for_access(path, &nono::AccessMode::Read, &[], &deny, None, None)
+        };
+
+        let direct = open(&secret).expect_err("denied path must not open");
+        assert!(direct.is_policy_blocked());
+        let via_alias = open(&alias).expect_err("alias of a denied path must not open");
+        assert!(via_alias.is_policy_blocked());
+        assert!(
+            open(&allowed).is_ok(),
+            "paths outside the deny set still open on a grant"
+        );
+    }
+
+    #[test]
+    fn test_procfs_access_never_grantable_for_foreign_or_sensitive_entries() {
+        let context = ProcfsAccessContext::new(4242, Some(4343));
+        // Another process: process enumeration reads like these can never be granted.
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/1015"),
+            Path::new("/proc/1015"),
+            context
+        ));
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/1/cmdline"),
+            Path::new("/proc/1/cmdline"),
+            context
+        ));
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/1/task/2/stat"),
+            Path::new("/proc/1/task/2/stat"),
+            context
+        ));
+        // The requester's own sensitive entries stay blocked too.
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/4242/fd/3"),
+            Path::new("/proc/4242/fd/3"),
+            context
+        ));
+        // Everything else still follows the normal grant and approval path.
+        assert!(!procfs_access_never_grantable(
+            Path::new("/proc/4242/status"),
+            Path::new("/proc/4242/status"),
+            context
+        ));
+        assert!(!procfs_access_never_grantable(
+            Path::new("/proc/cpuinfo"),
+            Path::new("/proc/cpuinfo"),
+            context
+        ));
+        assert!(!procfs_access_never_grantable(
+            Path::new("/proc"),
+            Path::new("/proc"),
+            context
+        ));
+        assert!(!procfs_access_never_grantable(
+            Path::new("/home/user/file"),
+            Path::new("/home/user/file"),
+            context
+        ));
+    }
+
+    #[test]
+    fn test_procfs_access_never_grantable_through_parent_traversal() {
+        let context = ProcfsAccessContext::new(4242, Some(4343));
+        // The raw form names the requester's own PID; canonicalization reveals
+        // another process's entry.
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/4242/../1/cmdline"),
+            Path::new("/proc/1/cmdline"),
+            context
+        ));
+        // A link that canonicalizes outside /proc keeps its raw-form block.
+        assert!(procfs_access_never_grantable(
+            Path::new("/proc/1/cwd"),
+            Path::new("/home/user"),
+            context
+        ));
+        // Traversal that lands back on the requester's own entry is still allowed.
+        assert!(!procfs_access_never_grantable(
+            Path::new("/proc/4242/../4242/status"),
+            Path::new("/proc/4242/status"),
+            context
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_open_path_for_access_blocks_parent_traversal_to_foreign_proc_entry() {
+        let own_pid = std::process::id();
+        let context = ProcfsAccessContext::new(own_pid, None);
+        let traversal = PathBuf::from(format!("/proc/{own_pid}/../1/cmdline"));
+        let error = open_path_for_access(
+            &traversal,
+            &nono::AccessMode::Read,
+            &[],
+            &[],
+            None,
+            Some(context),
+        )
+        .expect_err("a foreign procfs entry must not open through traversal");
+        assert!(error.is_policy_blocked());
+
+        // The requester's own entries still open.
+        let own = PathBuf::from(format!("/proc/{own_pid}/status"));
+        assert!(
+            open_path_for_access(&own, &nono::AccessMode::Read, &[], &[], None, Some(context))
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn test_validate_procfs_access_blocks_child_proc_fd_path() {
         let result = validate_procfs_access(
             Path::new("/proc/4242/fd/3"),
@@ -5264,6 +5572,7 @@ mod tests {
         let backend = DenyAll;
         let sup_cfg = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test-session",
             attach_initial_client: false,
@@ -5395,6 +5704,7 @@ mod tests {
         // (simulating V4+ where Landlock handles networking).
         let sup_cfg = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test-proxy-v4",
             attach_initial_client: false,
@@ -5492,6 +5802,7 @@ mod tests {
         let origins = vec!["https://claude.ai".to_string()];
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5542,6 +5853,7 @@ mod tests {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5599,6 +5911,7 @@ mod tests {
         let origins = vec!["https://claude.ai".to_string()];
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5672,6 +5985,7 @@ mod tests {
         let backend = TestDenyBackend;
         let config_allow = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5706,6 +6020,7 @@ mod tests {
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5759,6 +6074,7 @@ mod tests {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5917,6 +6233,7 @@ mod tests {
         let backend = TestBackend;
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -5979,6 +6296,7 @@ mod tests {
         let origins = vec!["https://idp.example.com".to_string()];
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -6030,6 +6348,7 @@ mod tests {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,
@@ -6100,6 +6419,7 @@ mod tests {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
             protected_roots: &[],
+            deny_paths: &[],
             approval_backend: &backend,
             session_id: "test",
             attach_initial_client: false,

@@ -11,6 +11,8 @@ These options work with all commands.
 
 Suppress all nono output (banner, summary, status messages). Only the executed command's output will be shown.
 
+Logs still go to the file set by `--log-file` or `NONO_LOG_FILE`. Only terminal output is suppressed.
+
 ```bash
 nono -s run --allow-cwd -- my-agent
 nono --silent why --path ~/.ssh/id_rsa --op read
@@ -913,7 +915,7 @@ nono run --allow "$HOME/go/bin" --strict-broker-path -- my-agent
 Enable HTTP/2 multiplexing for upstream proxy connections. When set, the proxy negotiates h2 via ALPN with upstreams that support it, and the CONNECT intercept advertises both `h2` and `http/1.1`.
 
 ```bash
-nono run --profile claude-code --allow-http2 -- claude
+nono run --profile nolabs-ai/claude --allow-http2 -- claude
 ```
 
 Without this flag, the proxy uses HTTP/1.1 with keep-alive connection pooling. This is the conservative default since some upstream servers may not handle HTTP/2 correctly.
@@ -946,10 +948,10 @@ How long (in seconds) to wait for a detached session to become attachable before
 
 ```bash
 # Give a slow app 60 seconds to initialise
-nono run --detached --detach-timeout 60 --allow-cwd -- opencode
+nono run --detached --detach-timeout 60 --allow-cwd -- my-agent
 
 # Via environment variable
-NONO_DETACH_STARTUP_TIMEOUT=60 nono run --detached --allow-cwd -- opencode
+NONO_DETACH_STARTUP_TIMEOUT=60 nono run --detached --allow-cwd -- my-agent
 ```
 
 #### `--name`
@@ -1166,16 +1168,16 @@ Applies to `nono run` and `nono shell`. Not available on `nono wrap` (which uses
 
 ```bash
 # Kill the process if it hasn't become interactive after 10 seconds
-nono run --startup-timeout 10 --allow-cwd -- opencode
+nono run --startup-timeout 10 --allow-cwd -- my-agent
 
 # Disable the timeout entirely
-nono run --startup-timeout 0 --allow-cwd -- opencode
+nono run --startup-timeout 0 --allow-cwd -- my-agent
 
 # Via environment variable
-NONO_STARTUP_TIMEOUT=10 nono run --allow-cwd -- opencode
+NONO_STARTUP_TIMEOUT=10 nono run --allow-cwd -- my-agent
 ```
 
-No timeout is applied by default. When a known built-in profile exists for the binary (e.g. `opencode`, `claude`), the warning message also suggests the recommended profile.
+No timeout is applied by default. When a known registry pack exists for the binary (for example `claude`), the warning message also suggests the recommended profile.
 
 #### `--network-denial-audit-rate` and `--network-denial-audit-burst`
 
@@ -1244,6 +1246,25 @@ The policy can also be set in a profile under `linux.sandbox_policy`. The CLI fl
 <Note>
   `--sandbox-policy landlock` is useful for compliance contexts where you need a hard guarantee that seccomp BPF is not installed, or where you want to verify that the target kernel's Landlock ABI is sufficient before deploying to production.
 </Note>
+
+#### `--isolate`
+
+*Linux only.* Run the command in new namespaces, on top of the normal sandbox. A comma-separated list of:
+
+| Value | Namespace |
+|-------|-----------|
+| `net` | Network namespace containing only loopback. Egress is possible only through the nono proxy. |
+| `loopback` | TCP bind and connect on any port of that namespace's own loopback, for local dev servers and tests. Requires `net`. |
+| `ipc` | IPC namespace (SysV IPC and POSIX message queues). |
+| `uts` | UTS namespace (hostname). |
+
+A user namespace is always added. `--isolate net` requires `--block-net` or a proxied network policy, and cannot be combined with `--open-port`, `--listen-port`, `--allow-connect-port`, or `network.no_proxy`. If the host cannot create the namespaces, nono exits with an error instead of running without them.
+
+```bash
+nono run --isolate net,ipc,uts --allow-domain api.openai.com --allow-cwd -- my-agent
+```
+
+The flag adds to any `linux.isolate` set by the profile and cannot remove it. Supported by `nono run` and `nono shell`, not `nono wrap`. See [Namespace Isolation](/cli/features/namespace-isolation).
 
 <Warning>
   `--sandbox-policy external` provides no nono-managed TCP egress lockdown. Only use it when you have independently verified that the surrounding infrastructure forces outbound traffic through the intended proxy.

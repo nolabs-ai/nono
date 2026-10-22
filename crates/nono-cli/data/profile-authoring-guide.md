@@ -121,6 +121,33 @@ Controls startup-time command gating. These checks run only at launch time and a
 
 Command policies live under `command_policies`. Use `commands.<name>.executable` to bind a command name to one exact executable file instead of the first PATH match. By default, command mediation rejects pinned executables and direct parent directories that are writable through the session sandbox's capability set. If a low-assurance profile intentionally grants write access overlapping a pinned executable, `commands.<name>.allow_writable_executable` is available as a per-command trust downgrade. It is valid only with an absolute `executable` path; relative paths and bare command names fail validation. For local demos, `command_policies.allow_writable_executables` disables the writable executable and parent-directory trust check across policy, deny-only, and session executable allow-list paths. The agent still invokes the command name through the command-mediation shim. On macOS, command mediation verifies the file before sandboxing but must still exec by path, so sandbox-writable pinned executables are not suitable for high-assurance policies.
 
+Set `commands.<name>.sha256` to a 64-character SHA-256 digest to pin the resolved executable's content. A mismatch aborts the session. Hash the same path configured in `executable` and copy the first field of the output:
+
+```sh
+# Linux
+sha256sum /bin/sh
+
+# macOS
+shasum -a 256 /bin/sh
+```
+
+Then add that digest to the command policy. The field is optional; omit it when executable content pinning is not needed.
+
+```json
+{
+  "command_policies": {
+    "commands": {
+      "sh": {
+        "executable": "/bin/sh",
+        "sha256": "<64-character digest from the command above>"
+      }
+    }
+  }
+}
+```
+
+Update the digest after intentionally upgrading or replacing the executable.
+
 Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_file`) may use dynamic provider tokens. `@git:config-files` expands to trusted global/system Git config files, Git file settings (attributes, excludes, commit templates), and the declared target of every `include.path` and `includeIf.*.path` directive — including conditional includes that do not currently fire. `@git:hooks-path` expands to trusted global/system `core.hooksPath` directories. `@git:common-dir` expands to the git common directory (`.git` in a regular repo, or the absolute path to the main repo's `.git` in a worktree). `@git:worktree` expands to the main worktree root (empty in a regular repo). `@git:toplevel` expands to the current checkout root. `@git:toplevel-parent` expands to the parent of the current checkout root. These tokens are opt-in per profile and ignore repo-local/worktree Git config so a checkout cannot grant itself extra host filesystem access.
 
 #### Command-scoped proxy policy
@@ -164,6 +191,8 @@ The effective command sandbox is selected as follows:
 `commands.<name>.sandbox` and `commands.<name>.from.session` are alternative ways to define direct access and cannot both be present. Chained access also requires the caller's `can_use` entry; there is no fallback from a missing `from.<caller>` edge to the direct sandbox.
 
 Each direct, caller-specific, and intercept command sandbox policy with `network.allow_domain` receives a distinct scoped proxy. For example, direct `curl` may allow `github.com`, while `curl` launched by `git` is independently limited by `curl.from.git.sandbox` to `api.github.com`. `git.sandbox` controls Git itself. Domain allowlists are replaced, not merged: neither the caller's command sandbox nor the non-intercepted command sandbox contributes domains to the selected command sandbox's proxy policy.
+
+`keychain_access` (command sandbox, macOS only, `"read"` or `"readwrite"`) grants that command's child the user's login keychain (`login.keychain-db` and `metadata.keychain-db` under `~/Library/Keychains`) plus the keychain Mach services, through the agent's keychain deny; the agent keeps the deny. No separate filesystem grant is needed. The keychain is the only agent deny a command sandbox inherits, so no other path needs this. Prefer it over an agent-level `filesystem.bypass_protection` when only a mediated command (e.g. a credential helper) needs the keychain.
 
 `unix_socket_bind` (command sandbox only) grants `connect(2)`/`bind(2)` on named pathname AF_UNIX sockets, with the same implied filesystem coupling as the agent-level field of the same name. It also accepts the `@git:fsmonitor-socket` dynamic token, which expands to `fsmonitor--daemon.ipc` under the current worktree's private git-dir — resolved by a pure filesystem walk (no `git` process spawn), so an attacker-controlled working directory cannot influence resolution through `.git/config`.
 
@@ -1106,6 +1135,21 @@ direct-child-only and `unix_socket_subtree` remains recursive.
 Creating a new exact socket with `unix_socket_bind` requires write access to
 its parent directory. If that parent is denied, bypass the parent directory or,
 preferably, use `unix_socket_dir_bind` with a dedicated directory.
+
+#### Linux namespace isolation
+
+`linux.isolate` runs the command in new namespaces (opt-in, Linux only). `network` leaves only loopback, so egress must go through the proxy, and the profile cannot also grant `network.open_port`, `network.connect_port`, `network.listen_port`, or `network.no_proxy`. The fields merge by OR: an extending profile can add isolation but never remove it.
+
+```json
+{
+  "network": { "allow_domain": ["api.openai.com"] },
+  "linux": { "isolate": { "network": true, "ipc": true, "uts": true } }
+}
+```
+
+Add `"loopback": true` (requires `network`) to let the command use TCP on the namespace's own loopback, for local dev servers and tests. Egress stays proxy-only and the host's localhost stays unreachable.
+
+Network isolation does not block pathname Unix sockets (such as `/run/docker.sock`); use `linux.af_unix_mediation` for those.
 
 #### Linux
 

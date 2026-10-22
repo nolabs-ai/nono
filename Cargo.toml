@@ -31,9 +31,15 @@ tracing = "0.1"
 # Secure credential handling
 zeroize = { version = "1", features = ["alloc", "serde"] }
 
+# Sigstore signing and verification. Keep these on the same release line;
+# Dependabot groups sigstore-* updates so API and dependency-graph migrations
+# arrive together.
+sigstore-sign = "0.15.0"
+sigstore-verify = { version = "0.15.0", default-features = false }
+
 # Hashing
 sha2 = "0.11"
-sha1 = "0.10"
+sha1 = "0.11"
 uuid = { version = "1", features = ["serde", "v7"] }
 
 # Filesystem walking

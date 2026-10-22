@@ -1265,29 +1265,8 @@ fn parse_capture_headers_json(
     Ok(result)
 }
 
-fn is_http_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(
-            c,
-            '!' | '#'
-                | '$'
-                | '%'
-                | '&'
-                | '\''
-                | '*'
-                | '+'
-                | '-'
-                | '.'
-                | '^'
-                | '_'
-                | '`'
-                | '|'
-                | '~'
-        )
-}
-
 fn is_safe_capture_header_name(name: &str) -> bool {
-    if name.is_empty() || !name.chars().all(is_http_token_char) {
+    if !nono_proxy::config::is_http_header_token(name) {
         return false;
     }
     !matches!(
@@ -4148,6 +4127,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Default::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]
@@ -4225,6 +4206,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Default::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]
@@ -4297,6 +4280,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Default::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]

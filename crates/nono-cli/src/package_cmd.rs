@@ -44,6 +44,12 @@ pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
 
     let downloads = download_and_verify_artifacts(&client, &package_ref, &pull, Some(&printer))?;
     let manifest = load_manifest(&downloads.artifacts)?;
+    if manifest.name != package_ref.name {
+        return Err(NonoError::PackageInstall(format!(
+            "package manifest name '{}' does not match requested package '{}'",
+            manifest.name, package_ref.name
+        )));
+    }
     validate_manifest(&manifest)?;
 
     let signer_identity = signer_identity_uri(&downloads.signer_identity)?;
@@ -639,7 +645,7 @@ fn download_and_verify_artifacts(
     printer: Option<&crate::pull_ui::ProgressPrinter>,
 ) -> Result<VerifiedDownloads> {
     let trusted_root = nono::trust::load_production_trusted_root()?;
-    let policy = nono::trust::VerificationPolicy::default();
+    let policy = nono::trust::VerificationPolicy::any_identity();
     let bundle_path = Path::new(".nono-trust.bundle");
     let tempdir = TempDir::new().map_err(NonoError::Io)?;
 
@@ -732,6 +738,14 @@ fn load_manifest(downloads: &[DownloadedArtifact]) -> Result<PackageManifest> {
 }
 
 fn validate_manifest(manifest: &PackageManifest) -> Result<()> {
+    if manifest.has_profile_artifact() && manifest.public_profile_artifact().is_none() {
+        return Err(NonoError::PackageInstall(format!(
+            "package '{}' has profile artifacts but no public profile named '{}'; \
+             set a profile artifact's install_as to the package name",
+            manifest.name, manifest.name
+        )));
+    }
+
     if !manifest.platforms.is_empty()
         && !manifest
             .platforms
@@ -1290,6 +1304,25 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_profiles_without_package_named_public_entry() {
+        let manifest: PackageManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "name": "tools",
+            "artifacts": [
+                {"type": "profile", "path": "base.json", "install_as": "tools-base"}
+            ]
+        }))
+        .expect("manifest");
+
+        let error = validate_manifest(&manifest).expect_err("missing public entry must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("no public profile named 'tools'")
+        );
+    }
+
+    #[test]
     fn copy_instruction_to_project_refuses_dangling_symlink_at_dest() {
         use crate::test_env::ENV_LOCK;
         use std::os::unix::fs as unix_fs;
@@ -1320,7 +1353,6 @@ mod tests {
             install_as: None,
             placement: None,
             prefix: None,
-            aliases: Vec::new(),
         };
 
         let result = copy_instruction_to_project(&artifact, &source);

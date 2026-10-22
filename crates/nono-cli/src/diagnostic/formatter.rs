@@ -390,6 +390,15 @@ fn format_allow_net_help_line() -> String {
     "[nono]   --allow-net        unrestricted network for this session".to_string()
 }
 
+/// Network grant help for sessions in an isolated network namespace.
+///
+/// `--allow-net` is rejected alongside `linux.isolate.network`, so the only
+/// remedy that can work is proxied access to a named host.
+fn format_allow_domain_help_line() -> String {
+    "[nono]   --allow-domain <host>  proxied access to a host (network isolation has no direct route out)"
+        .to_string()
+}
+
 fn format_command_succeeded_with_stderr_line() -> String {
     "[nono] The command succeeded, but stderr showed a likely sandbox-related access issue."
         .to_string()
@@ -630,6 +639,14 @@ fn infer_access_from_error_line(line: &str, path: &Path) -> AccessMode {
     AccessMode::ReadWrite
 }
 
+/// A sandbox violation raised inside a mediated command's own sandbox, with
+/// the command-policy name that launched it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediatedViolation {
+    pub command: String,
+    pub violation: SandboxViolation,
+}
+
 /// Renders sandbox policy diagnostics for stderr output.
 pub struct DiagnosticFormatter<'a> {
     caps: &'a CapabilitySet,
@@ -637,6 +654,9 @@ pub struct DiagnosticFormatter<'a> {
     denials: &'a [DenialRecord],
     ipc_denials: &'a [IpcDenialRecord],
     sandbox_violations: &'a [SandboxViolation],
+    /// Violations from mediated commands' own sandboxes. Kept apart from
+    /// `sandbox_violations`: agent grants and save prompts don't apply there.
+    mediated_violations: &'a [MediatedViolation],
     /// Paths that are write-protected due to trust verification
     protected_paths: &'a [PathBuf],
     /// Primary verdict extracted from the command output.
@@ -679,6 +699,9 @@ pub struct DiagnosticFormatter<'a> {
     /// `network_blocked_hint`. Populated only in supervised mode with an
     /// active proxy.
     network_denials: Vec<nono::undo::NetworkAuditEvent>,
+    /// The session ran in an isolated network namespace (NEP-0004), where
+    /// `--allow-net` is a configuration error.
+    network_isolated: bool,
 }
 
 impl<'a> DiagnosticFormatter<'a> {
@@ -691,6 +714,7 @@ impl<'a> DiagnosticFormatter<'a> {
             denials: &[],
             ipc_denials: &[],
             sandbox_violations: &[],
+            mediated_violations: &[],
             protected_paths: &[],
             primary_verdict: None,
             blocked_protected_file: None,
@@ -707,6 +731,7 @@ impl<'a> DiagnosticFormatter<'a> {
             canonical_denial_paths: Vec::new(),
             session_diagnostics: &[],
             network_denials: Vec::new(),
+            network_isolated: false,
         }
     }
 
@@ -848,6 +873,12 @@ impl<'a> DiagnosticFormatter<'a> {
 
     /// Add OS-native sandbox violation records.
     #[must_use]
+    pub fn with_mediated_violations(mut self, violations: &'a [MediatedViolation]) -> Self {
+        self.mediated_violations = violations;
+        self
+    }
+
+    #[must_use]
     pub fn with_sandbox_violations(mut self, violations: &'a [SandboxViolation]) -> Self {
         self.sandbox_violations = violations;
         self
@@ -904,6 +935,15 @@ impl<'a> DiagnosticFormatter<'a> {
     #[must_use]
     pub fn with_network_denials(mut self, denials: Vec<nono::undo::NetworkAuditEvent>) -> Self {
         self.network_denials = denials;
+        self
+    }
+
+    /// Mark the session as running in an isolated network namespace, so
+    /// network grant help suggests `--allow-domain` instead of `--allow-net`.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn with_network_isolated(mut self, isolated: bool) -> Self {
+        self.network_isolated = isolated;
         self
     }
 
@@ -1273,6 +1313,7 @@ impl<'a> DiagnosticFormatter<'a> {
         if !has_path_findings
             && ipc_diagnostics.is_empty()
             && !has_network_denials
+            && self.mediated_violations.is_empty()
             && matches!(
                 primary_verdict.as_ref(),
                 Some(ErrorVerdict::MissingPath(_)) | Some(ErrorVerdict::NonSandboxFailure(_))
@@ -1317,7 +1358,7 @@ impl<'a> DiagnosticFormatter<'a> {
                     // the failure "may be unrelated to sandbox restrictions"
                     // when nono itself denied network traffic.
                     self.format_network_denial_guidance(&mut lines);
-                } else if !has_observed_path_evidence {
+                } else if !has_observed_path_evidence && self.mediated_violations.is_empty() {
                     lines.push(
                         "[nono] No path denials were observed during this session.".to_string(),
                     );
@@ -1363,7 +1404,60 @@ impl<'a> DiagnosticFormatter<'a> {
             self.format_network_denial_guidance(&mut lines);
         }
 
+        self.format_mediated_violations(&mut lines);
+
         lines.join("\n")
+    }
+
+    /// Denials from mediated commands' own sandboxes, grouped by command. Agent
+    /// flags and profile grants do not reach those sandboxes, so the guidance
+    /// points at the command policy instead.
+    fn format_mediated_violations(&self, lines: &mut Vec<String>) {
+        let mut by_command: std::collections::BTreeMap<&str, Vec<&SandboxViolation>> =
+            std::collections::BTreeMap::new();
+        for mediated in self.mediated_violations.iter().filter(|mediated| {
+            !self
+                .suppressed_system_service_operations
+                .contains(&mediated.violation.operation)
+        }) {
+            by_command
+                .entry(mediated.command.as_str())
+                .or_default()
+                .push(&mediated.violation);
+        }
+        for (command, mut violations) in by_command {
+            lines.push("[nono]".to_string());
+            lines.push(format!(
+                "[nono] Blocked inside the command sandbox for '{command}':"
+            ));
+            // A command sandbox starts from a minimal baseline, so routine
+            // runtime probes are denied there too. List the likely culprits
+            // first and cap the rest.
+            violations.sort_by_key(|violation| mediated_violation_rank(violation));
+            let shown = violations.len().min(MAX_MEDIATED_VIOLATIONS_SHOWN);
+            format_non_fs_violations(lines, &violations[..shown]);
+            if violations.len() > shown {
+                lines.push(format!(
+                    "[nono]   + {} more denied operation(s) in that sandbox",
+                    violations.len() - shown
+                ));
+            }
+            lines.push(format!(
+                "[nono] '{command}' runs in its own command sandbox; agent flags such as --read do not apply to it."
+            ));
+            lines.push(format!(
+                "[nono] Grant access in command_policies.commands.{command} (its sandbox or from.<caller> edge)."
+            ));
+            if violations
+                .iter()
+                .any(|violation| is_keychain_violation(violation))
+            {
+                lines.push(
+                    "[nono] For keychain access, set \"keychain_access\": \"read\" (or \"readwrite\") there."
+                        .to_string(),
+                );
+            }
+        }
     }
 
     fn actionable_observed_path_hints(&self) -> Vec<ObservedPathHint> {
@@ -2085,7 +2179,15 @@ impl<'a> DiagnosticFormatter<'a> {
         lines.push("[nono]   --write <path>     write-only access to directory".to_string());
 
         if self.caps.is_network_blocked() && stderr_network_diagnostic(diagnostics).is_some() {
-            lines.push(format_allow_net_help_line());
+            lines.push(self.network_grant_help_line());
+        }
+    }
+
+    fn network_grant_help_line(&self) -> String {
+        if self.network_isolated {
+            format_allow_domain_help_line()
+        } else {
+            format_allow_net_help_line()
         }
     }
 
@@ -2096,7 +2198,7 @@ impl<'a> DiagnosticFormatter<'a> {
     /// evidence this failure was network-related.
     fn format_network_grant_help(&self, lines: &mut Vec<String>) {
         lines.push("[nono] To grant additional access, re-run with:".to_string());
-        lines.push(format_allow_net_help_line());
+        lines.push(self.network_grant_help_line());
     }
 
     /// Render proxy-observed network denials with grant guidance.
@@ -2546,6 +2648,41 @@ fn sandbox_violation_owned_from_diagnostic(
     }
 }
 
+/// Mediated-command violations listed per command before the rest are counted.
+const MAX_MEDIATED_VIOLATIONS_SHOWN: usize = 5;
+
+/// Sort key for mediated-command violations: keychain first, then other known
+/// system services, then paths under `$HOME`, then everything else.
+fn mediated_violation_rank(violation: &SandboxViolation) -> u8 {
+    if is_keychain_violation(violation) {
+        return 0;
+    }
+    if system_service_diagnostic_for(violation).is_some() {
+        return 1;
+    }
+    let under_home = violation.target.as_deref().is_some_and(|target| {
+        std::env::var_os("HOME").is_some_and(|home| Path::new(target).starts_with(home))
+    });
+    if under_home { 2 } else { 3 }
+}
+
+/// Whether a violation is a keychain service lookup or a keychain file access.
+fn is_keychain_violation(violation: &SandboxViolation) -> bool {
+    if system_service_diagnostic_for(violation).and_then(|diagnostic| diagnostic.guidance)
+        == Some(SystemServiceGuidance::Keychain)
+    {
+        return true;
+    }
+    let Some(target) = violation.target.as_deref() else {
+        return false;
+    };
+    let target = Path::new(target);
+    let user_keychains =
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Keychains"));
+    target.starts_with("/Library/Keychains")
+        || user_keychains.is_some_and(|keychains| target.starts_with(keychains))
+}
+
 /// Format non-filesystem violations with human-readable service descriptions.
 fn format_non_fs_violations(lines: &mut Vec<String>, violations: &[&SandboxViolation]) {
     for v in violations {
@@ -2580,7 +2717,18 @@ fn format_non_fs_guidance(lines: &mut Vec<String>, violations: &[&SandboxViolati
     };
 
     if has_guidance(SystemServiceGuidance::Keychain) {
-        lines.push("[nono] Keychain access requires granting the login keychain path:".to_string());
+        lines.push(
+            "[nono] The keychain is denied by default (deny_keychains_macos); a file grant alone does not lift it."
+                .to_string(),
+        );
+        lines.push(
+            "[nono] If only a mediated command needs it, set \"keychain_access\": \"read\" in that command's sandbox."
+                .to_string(),
+        );
+        lines.push(
+            "[nono] To give the agent itself keychain access, grant the login keychain and bypass its protection:"
+                .to_string(),
+        );
         lines.push(keychain_login_grant_guidance());
     }
 
@@ -2614,7 +2762,7 @@ fn format_non_fs_guidance(lines: &mut Vec<String>, violations: &[&SandboxViolati
 fn keychain_login_grant_guidance() -> String {
     const DISPLAY_PATH: &str = "~/Library/Keychains/login.keychain-db";
     let Some(home) = std::env::var_os("HOME") else {
-        return format!("[nono]   --read-file {DISPLAY_PATH}");
+        return format!("[nono]   --read-file {DISPLAY_PATH} --bypass-protection {DISPLAY_PATH}");
     };
     let path = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
     keychain_grant_guidance_for_path(&path, DISPLAY_PATH)
@@ -2625,7 +2773,7 @@ fn keychain_grant_guidance_for_path(path: &Path, display_path: &str) -> String {
         Ok(file_type) if file_type.is_dir() => "--read",
         _ => "--read-file",
     };
-    format!("[nono]   {flag} {display_path}")
+    format!("[nono]   {flag} {display_path} --bypass-protection {display_path}")
 }
 
 fn access_str(access: AccessMode) -> &'static str {
@@ -3840,6 +3988,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn test_network_isolated_suggests_allow_domain_not_allow_net() {
+        // --allow-net is rejected alongside linux.isolate.network, so the hint
+        // must point at the only remedy that can work: proxied access.
+        let caps = make_test_caps();
+        let observation = || ErrorObservation {
+            primary_verdict: None,
+            blocked_protected_file: None,
+            path_hints: Vec::new(),
+            missing_paths: Vec::new(),
+            non_sandbox_failure: None,
+            network_blocked_hint: true,
+        };
+        let isolated = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_error_observation(observation())
+            .with_network_isolated(true)
+            .format_footer(1);
+        assert!(!isolated.contains("--allow-net"), "{isolated}");
+        assert!(isolated.contains("--allow-domain <host>"), "{isolated}");
+
+        let plain = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_error_observation(observation())
+            .format_footer(1);
+        assert!(plain.contains("--allow-net"), "{plain}");
+    }
+
+    #[test]
     fn test_next_steps_header_omitted_without_follow_up_remediations() {
         // Path evidence with no RunDiscovery/CheckPolicy remediation must not
         // leave a bare "Next steps:" header behind.
@@ -4023,6 +4200,115 @@ mod tests {
     }
 
     #[test]
+    fn test_supervised_reports_mediated_command_denials_with_command_policy_guidance() {
+        let caps = make_test_caps();
+        let mediated = vec![MediatedViolation {
+            command: "security".to_string(),
+            violation: SandboxViolation {
+                operation: "mach-lookup".to_string(),
+                target: Some("com.apple.SecurityServer".to_string()),
+            },
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_mediated_violations(&mediated);
+        let output = formatter.format_footer(44);
+
+        assert!(output.contains("Blocked inside the command sandbox for 'security':"));
+        assert!(output.contains("mach-lookup (com.apple.SecurityServer)"));
+        assert!(output.contains("command_policies.commands.security"));
+        assert!(output.contains("\"keychain_access\""));
+        assert!(
+            !output.contains("may be unrelated to sandbox restrictions"),
+            "a command sandbox denial is sandbox-related: {output}"
+        );
+        // Agent-level guidance must not be offered for a command sandbox denial.
+        assert!(!output.contains("--bypass-protection"), "got: {output}");
+    }
+
+    #[test]
+    fn test_supervised_mediated_denials_rank_keychain_first_and_cap_the_rest() {
+        let caps = make_test_caps();
+        let mut mediated: Vec<MediatedViolation> = (0..8)
+            .map(|i| MediatedViolation {
+                command: "security".to_string(),
+                violation: SandboxViolation {
+                    operation: "file-read-data".to_string(),
+                    target: Some(format!("/dev/probe{i}")),
+                },
+            })
+            .collect();
+        mediated.push(MediatedViolation {
+            command: "security".to_string(),
+            violation: SandboxViolation {
+                operation: "mach-lookup".to_string(),
+                target: Some("com.apple.SecurityServer".to_string()),
+            },
+        });
+        let output = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_mediated_violations(&mediated)
+            .format_footer(44);
+
+        let section: Vec<&str> = output
+            .lines()
+            .skip_while(|line| !line.contains("Blocked inside the command sandbox"))
+            .collect();
+        assert!(
+            section
+                .get(1)
+                .is_some_and(|line| line.contains("com.apple.SecurityServer")),
+            "keychain denial should be listed first: {output}"
+        );
+        assert!(
+            output.contains("+ 4 more denied operation(s)"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_supervised_mediated_non_keychain_denial_omits_keychain_hint() {
+        let caps = make_test_caps();
+        let mediated = vec![MediatedViolation {
+            command: "curl".to_string(),
+            violation: SandboxViolation {
+                operation: "file-read-data".to_string(),
+                target: Some("/Users/alice/.netrc".to_string()),
+            },
+        }];
+        let output = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_mediated_violations(&mediated)
+            .format_footer(1);
+
+        assert!(output.contains("Blocked inside the command sandbox for 'curl':"));
+        assert!(output.contains("file-read-data (/Users/alice/.netrc)"));
+        assert!(!output.contains("keychain_access"), "got: {output}");
+        // A command sandbox denial must not feed the agent's grant suggestions.
+        assert!(!output.contains("--read /Users/alice"), "got: {output}");
+    }
+
+    #[test]
+    fn test_agent_keychain_service_denial_points_at_bypass_and_command_option() {
+        let caps = make_test_caps();
+        let violations = vec![SandboxViolation {
+            operation: "mach-lookup".to_string(),
+            target: Some("com.apple.SecurityServer".to_string()),
+        }];
+        let output = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations)
+            .format_footer(44);
+
+        assert!(
+            output.contains("a file grant alone does not lift it"),
+            "got: {output}"
+        );
+        assert!(output.contains("\"keychain_access\""), "got: {output}");
+        assert!(output.contains("--bypass-protection"), "got: {output}");
+    }
+
+    #[test]
     fn test_violation_denial_keeps_file_read_target() {
         let requested = PathBuf::from("/Users/alice/workspace/readable.rs");
         let violations = vec![SandboxViolation {
@@ -4143,7 +4429,7 @@ mod tests {
 
         assert_eq!(
             guidance,
-            "[nono]   --read-file ~/Library/Keychains/login.keychain-db"
+            "[nono]   --read-file ~/Library/Keychains/login.keychain-db --bypass-protection ~/Library/Keychains/login.keychain-db"
         );
     }
 
@@ -4156,7 +4442,7 @@ mod tests {
 
         assert_eq!(
             guidance,
-            "[nono]   --read ~/Library/Keychains/login.keychain-db"
+            "[nono]   --read ~/Library/Keychains/login.keychain-db --bypass-protection ~/Library/Keychains/login.keychain-db"
         );
     }
 
@@ -4172,8 +4458,10 @@ mod tests {
             .with_sandbox_violations(&violations);
         let output = formatter.format_footer(1);
 
-        assert!(output.contains("Keychain access requires granting the login keychain path:"));
-        assert!(output.contains("--read-file ~/Library/Keychains/login.keychain-db"));
+        assert!(output.contains("The keychain is denied by default"));
+        assert!(output.contains(
+            "--read-file ~/Library/Keychains/login.keychain-db --bypass-protection ~/Library/Keychains/login.keychain-db"
+        ));
     }
 
     #[test]

@@ -348,7 +348,7 @@ Some deny groups (like `deny_credentials`) are marked as required and cannot be 
     "name": "docker-agent",
     "version": "1.0.0"
   },
-  "extends": "opencode",
+  "extends": "nolabs-ai/claude",
   "filesystem": {
     "allow": ["$HOME/.docker"],
     "bypass_protection": ["$HOME/.docker"]
@@ -361,7 +361,7 @@ This allows access to `~/.docker` even though `deny_credentials` blocks it by de
 This is equivalent to the CLI flag `--bypass-protection`:
 
 ```bash
-nono run --profile nolabs-ai/opencode --allow ~/.docker --bypass-protection ~/.docker -- opencode
+nono run --profile nolabs-ai/claude --allow ~/.docker --bypass-protection ~/.docker -- claude
 ```
 
 #### Suppressing Save Suggestions Without Granting Access
@@ -428,7 +428,9 @@ The `network` section controls network access and credential injection.
     "network_profile": "claude-code",
     "allow_domain": ["my-internal-api.example.com"],
     "open_port": [3000],
+    "open_port_range": [[3001, 3010]],
     "listen_port": [8080],
+    "listen_port_range": [[9000, 9010]],
     "no_proxy": ["redis"],
     "credentials": ["openai", "anthropic"],
     "upstream_proxy": "squid.corp:3128",
@@ -451,7 +453,9 @@ The `network` section controls network access and credential injection.
 | `network_profile` | Network profile name for host filtering (e.g., `minimal`, `claude-code`, `enterprise`). Set to `null` in a child profile to clear an inherited value. |
 | `allow_domain` | Additional domains to allow through the proxy |
 | `open_port` | Localhost TCP ports to allow bidirectional IPC (equivalent to `--open-port`) |
+| `open_port_range` | Inclusive localhost TCP port ranges to allow bidirectional IPC, e.g. `[[3001, 3010]]`. Multiple ranges are allowed; overlapping ranges are merged automatically |
 | `listen_port` | TCP ports the sandboxed child may listen on (equivalent to `--listen-port`) |
+| `listen_port_range` | Inclusive TCP port ranges the sandboxed child may listen on (bind only), e.g. `[[9000, 9010]]`. Multiple ranges are allowed; overlapping ranges are merged automatically |
 | `no_proxy` | Additional client-side `NO_PROXY` / `no_proxy` host patterns in proxy mode; supports safe single-label local aliases, canonical IPs, and explicit suffix patterns; does not grant network access, so direct connections still require matching sandbox permissions; entries overlapping route upstreams or `allow_domain` fail configuration so proxy-enforced routes cannot be bypassed |
 | `credentials` | Credential services to enable via reverse proxy (e.g., `openai`, `anthropic`) |
 | `custom_credentials` | Custom credential service definitions for APIs not in the built-in list |
@@ -709,7 +713,9 @@ Groups use a structured allow/deny taxonomy:
 
 - **`java_runtime`** — Java runtime and build tool paths (SDKMAN, Maven, Gradle) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L462))
 
-- **`nix_runtime`** — Nix package manager runtime paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L558))
+- **`nix_runtime`** — Nix package manager runtime paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L560))
+
+- **`nix_profile_state_write`** — Write access to `~/.local/state/nix/profiles` for `nix profile` mutations such as `nix profile add` ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L577))
 
 - **`user_tools`** — User-local executables, .desktop files, man pages, and shell completions ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L360))
 
@@ -732,6 +738,8 @@ Groups use a structured allow/deny taxonomy:
 - **`codex_macos`** — Codex macOS-specific state and credential paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L519))
 
 - **`opencode_linux`** — OpenCode binary directory (Landlock requires directory read to execute binaries) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L395))
+
+- **`rtk_state`** — rtk history database and persisted state under `~/.local/share/rtk` ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L407))
 
 - **`vscode_macos`** — Visual Studio Code configuration and extension directories for macOS ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L538))
 
@@ -819,19 +827,37 @@ nono run --profile nolabs-ai/codex -- codex
 
 **Special:** OAuth2 login support via `open_urls` (allows `https://auth.openai.com` and localhost). Profile opts into `allow_launch_services`.
 
-### opencode
+### OpenCode 2
 
 ```bash
-nono run --profile nolabs-ai/opencode -- opencode
+nono run --profile nolabs-ai/opencode -- opencode --standalone
 ```
 
 **Groups:** `user_caches_macos`, `user_caches_linux`, `node_runtime`, `opencode_linux`, `git_config`, `unlink_protection` (plus `default` groups)
 
-**Filesystem:** `~/.config/opencode`, `~/.cache/opencode`, `~/.local/share/opencode`, `~/.local/share/opentui` (all read+write), plus git config files from `git_config` group
+**Filesystem:** `~/.opencode` (read-only); OpenCode config, cache, data, state, and OpenTUI data (read+write); plus git config files from `git_config`
 
 **Network:** Allowed
 
 **CWD:** Read+write
+
+**Special:** Use `--standalone` to keep the OpenCode 2 server inside the sandbox. The pack disables project discovery and roots instruction initialization in the worktree to prevent denied parent-directory probes from breaking startup.
+
+### OpenCode 1
+
+```bash
+nono run --profile nolabs-ai/opencode-v1 -- opencode
+```
+
+**Groups:** Same runtime groups as the OpenCode 2 pack
+
+**Filesystem:** OpenCode installation, config, cache, data, state, and OpenTUI data (read+write), plus git config files
+
+**Network:** Allowed
+
+**CWD:** Read+write
+
+**Special:** Do not use `--standalone`; it is an OpenCode 2 flag. The v1 and v2 packs share plugin installation paths, so remove one before switching to the other.
 
 ### openclaw
 

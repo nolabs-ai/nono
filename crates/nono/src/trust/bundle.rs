@@ -35,7 +35,9 @@ pub use sigstore_verify::types::{Bundle, DerPublicKey, Sha256Hash};
 pub use sigstore_verify::{VerificationPolicy, VerificationResult as SigstoreVerificationResult};
 
 // Internal-only imports from sigstore
+use sigstore_verify::PublicKeyVerificationPolicy;
 use sigstore_verify::crypto::parse_certificate_info;
+use sigstore_verify::types::DerCertificate;
 use sigstore_verify::types::bundle::VerificationMaterialContent;
 
 // ---------------------------------------------------------------------------
@@ -219,12 +221,13 @@ pub fn verify_bundle_keyed(
     trusted_root: &TrustedRoot,
     artifact_path: &Path,
 ) -> Result<SigstoreVerificationResult> {
-    sigstore_verify::verify_with_key(artifact_bytes, bundle, public_key, trusted_root).map_err(
-        |e| NonoError::TrustVerification {
+    let policy = PublicKeyVerificationPolicy::new(public_key.clone());
+    sigstore_verify::verify(artifact_bytes, bundle, &policy, trusted_root).map_err(|e| {
+        NonoError::TrustVerification {
             path: artifact_path.display().to_string(),
             reason: format!("{e}"),
-        },
-    )
+        }
+    })
 }
 
 /// Verify a keyed bundle's ECDSA signature directly without a Sigstore TrustedRoot.
@@ -250,7 +253,6 @@ pub fn verify_keyed_signature(
     public_key_der: &[u8],
     artifact_path: &Path,
 ) -> Result<()> {
-    use sigstore_verify::crypto::signing::SigningScheme;
     use sigstore_verify::crypto::verification::VerificationKey;
     use sigstore_verify::types::SignatureBytes;
 
@@ -272,11 +274,9 @@ pub fn verify_keyed_signature(
 
     // Verify ECDSA P-256 signature over the PAE
     let pub_key = DerPublicKey::from(public_key_der.to_vec());
-    let vk = VerificationKey::from_spki(&pub_key, SigningScheme::EcdsaP256Sha256).map_err(|e| {
-        NonoError::TrustVerification {
-            path: artifact_path.display().to_string(),
-            reason: format!("invalid public key: {e}"),
-        }
+    let vk = VerificationKey::from_spki(&pub_key).map_err(|e| NonoError::TrustVerification {
+        path: artifact_path.display().to_string(),
+        reason: format!("invalid public key: {e}"),
     })?;
 
     vk.verify(&pae_bytes, &sig_bytes)
@@ -488,20 +488,20 @@ pub fn extract_predicate_type(bundle: &Bundle, bundle_path: &Path) -> Result<Str
 /// parsed or lacks required identity fields.
 pub fn extract_signer_identity(bundle: &Bundle, bundle_path: &Path) -> Result<SignerIdentity> {
     match &bundle.verification_material.content {
-        VerificationMaterialContent::PublicKey { hint } => {
+        VerificationMaterialContent::PublicKey(identifier) => {
             // Try to read the human key_id from the DSSE predicate
             match extract_keyed_identity_from_dsse(bundle, bundle_path) {
                 Ok(identity) => Ok(identity),
                 Err(_) => {
                     // Fall back to the public key hint (fingerprint)
                     Ok(SignerIdentity::Keyed {
-                        key_id: hint.clone(),
+                        key_id: identifier.hint.clone(),
                     })
                 }
             }
         }
         VerificationMaterialContent::Certificate(cert_content) => {
-            extract_identity_from_cert(cert_content.raw_bytes.as_bytes(), bundle_path)
+            extract_identity_from_cert(&cert_content.raw_bytes, bundle_path)
         }
         VerificationMaterialContent::X509CertificateChain { certificates } => {
             let leaf = certificates
@@ -510,8 +510,12 @@ pub fn extract_signer_identity(bundle: &Bundle, bundle_path: &Path) -> Result<Si
                     path: bundle_path.display().to_string(),
                     reason: "empty certificate chain".to_string(),
                 })?;
-            extract_identity_from_cert(leaf.raw_bytes.as_bytes(), bundle_path)
+            extract_identity_from_cert(&leaf.raw_bytes, bundle_path)
         }
+        _ => Err(NonoError::TrustVerification {
+            path: bundle_path.display().to_string(),
+            reason: "unsupported Sigstore verification material".to_string(),
+        }),
     }
 }
 
@@ -532,7 +536,10 @@ fn extract_keyed_identity_from_dsse(bundle: &Bundle, bundle_path: &Path) -> Resu
 }
 
 /// Extract signer identity fields from a DER-encoded Fulcio certificate.
-fn extract_identity_from_cert(cert_der: &[u8], bundle_path: &Path) -> Result<SignerIdentity> {
+fn extract_identity_from_cert(
+    cert_der: &DerCertificate,
+    bundle_path: &Path,
+) -> Result<SignerIdentity> {
     let cert_info = parse_certificate_info(cert_der).map_err(|e| NonoError::TrustVerification {
         path: bundle_path.display().to_string(),
         reason: format!("failed to parse signing certificate: {e}"),
@@ -546,7 +553,7 @@ fn extract_identity_from_cert(cert_der: &[u8], bundle_path: &Path) -> Result<Sig
         })?;
 
     // Extract extended Fulcio OIDs from the raw certificate
-    let extensions = extract_fulcio_extensions(cert_der, bundle_path)?;
+    let extensions = extract_fulcio_extensions(cert_der.as_bytes(), bundle_path)?;
 
     let build_signer_uri =
         extensions
@@ -809,7 +816,8 @@ pub fn extract_all_subjects(bundle: &Bundle, bundle_path: &Path) -> Result<Vec<(
 ///
 /// Returns `NonoError::TrustVerification` if the certificate cannot be parsed.
 pub fn parse_cert_info(cert_der: &[u8], bundle_path: &Path) -> Result<CertificateInfo> {
-    parse_certificate_info(cert_der).map_err(|e| NonoError::TrustVerification {
+    let certificate = DerCertificate::new(cert_der.to_vec());
+    parse_certificate_info(&certificate).map_err(|e| NonoError::TrustVerification {
         path: bundle_path.display().to_string(),
         reason: format!("failed to parse certificate: {e}"),
     })
@@ -937,7 +945,7 @@ mod tests {
         let json = make_public_key_bundle_json("key");
         let bundle = Bundle::from_json(&json).unwrap();
         let root = load_production_trusted_root().unwrap();
-        let policy = VerificationPolicy::default();
+        let policy = VerificationPolicy::any_identity();
         let result =
             verify_bundle_with_digest("not-hex!", &bundle, &root, &policy, Path::new("test"));
         assert!(result.is_err());
@@ -1059,8 +1067,9 @@ mod tests {
     fn extract_identity_from_real_fulcio_cert() {
         let cert_der = crate::trust::base64::base64_decode(REAL_FULCIO_CERT_B64).unwrap();
 
+        let certificate = DerCertificate::new(cert_der);
         let identity =
-            extract_identity_from_cert(&cert_der, Path::new("SKILLS.md.bundle")).unwrap();
+            extract_identity_from_cert(&certificate, Path::new("SKILLS.md.bundle")).unwrap();
 
         match identity {
             SignerIdentity::Keyless {
@@ -1092,8 +1101,9 @@ mod tests {
     fn real_fulcio_cert_matches_trust_policy() {
         let cert_der = crate::trust::base64::base64_decode(REAL_FULCIO_CERT_B64).unwrap();
 
+        let certificate = DerCertificate::new(cert_der);
         let identity =
-            extract_identity_from_cert(&cert_der, Path::new("SKILLS.md.bundle")).unwrap();
+            extract_identity_from_cert(&certificate, Path::new("SKILLS.md.bundle")).unwrap();
 
         // Simulate a trust-policy.json publisher entry
         let publisher = crate::trust::types::Publisher {

@@ -1,9 +1,11 @@
 #[cfg(target_os = "macos")]
+use crate::diagnostic::MediatedViolation;
+#[cfg(target_os = "macos")]
 use nono::SandboxViolation;
 #[cfg(target_os = "macos")]
 use serde_json::Value;
 #[cfg(target_os = "macos")]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader};
 #[cfg(target_os = "macos")]
@@ -19,12 +21,75 @@ use tracing::debug;
 const LOG_STREAM_PREDICATE: &str = "((processID == 0) AND (senderImagePath CONTAINS \"/Sandbox\")) OR (process == \"sandboxd\") OR (subsystem == \"com.apple.sandbox.reporting\")";
 #[cfg(target_os = "macos")]
 const MAX_VIOLATIONS: usize = 50;
+/// Upper bound on recorded mediated-command PIDs, so a long session that
+/// launches many commands cannot grow the registry without limit.
+#[cfg(target_os = "macos")]
+const MAX_MEDIATED_PIDS: usize = 4096;
+
+/// PIDs of mediated command children, mapped to the command-policy name that
+/// launched them. The command-mediation runtime records each child as it starts
+/// it; the log collector uses this to attribute denials from a command's own
+/// sandbox, which are not descendants of the agent and would otherwise be
+/// dropped. Diagnostics only: never consulted for an enforcement decision.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Default)]
+pub(crate) struct MediatedPids(Arc<Mutex<BTreeMap<i64, String>>>);
+
+#[cfg(target_os = "macos")]
+impl MediatedPids {
+    pub(crate) fn record(&self, pid: u32, command: &str) {
+        let Ok(mut map) = self.0.lock() else {
+            return;
+        };
+        if map.len() < MAX_MEDIATED_PIDS || map.contains_key(&i64::from(pid)) {
+            map.insert(i64::from(pid), command.to_string());
+        }
+    }
+
+    fn command_for(&self, pid: i64) -> Option<String> {
+        self.0.lock().ok()?.get(&pid).cloned()
+    }
+}
+
+/// Violations collected for one session, split by which sandbox raised them.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Default)]
+pub struct CollectedViolations {
+    /// Denials from the agent's own sandbox.
+    pub agent: Vec<SandboxViolation>,
+    /// Denials from mediated commands' sandboxes.
+    pub mediated: Vec<MediatedViolation>,
+}
 
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct SharedViolations {
-    seen: BTreeSet<(String, String)>,
-    violations: Vec<SandboxViolation>,
+    seen: BTreeSet<(String, String, String)>,
+    collected: CollectedViolations,
+}
+
+#[cfg(target_os = "macos")]
+impl SharedViolations {
+    /// Record a violation once per (sandbox, operation, target). Returns false
+    /// once the collection is full.
+    fn push(&mut self, filter: &ViolationFilter, pid: i64, violation: SandboxViolation) -> bool {
+        let command = filter.mediated_command(pid);
+        let key = (
+            command.clone().unwrap_or_default(),
+            violation.operation.clone(),
+            violation.target.clone().unwrap_or_default(),
+        );
+        if self.seen.insert(key) {
+            match command {
+                Some(command) => self
+                    .collected
+                    .mediated
+                    .push(MediatedViolation { command, violation }),
+                None => self.collected.agent.push(violation),
+            }
+        }
+        self.seen.len() < MAX_VIOLATIONS
+    }
 }
 
 /// Attribution filter for matching Seatbelt log entries to our sandboxed child.
@@ -39,15 +104,22 @@ struct SharedViolations {
 struct ViolationFilter {
     pid: Option<i32>,
     process_name: Option<String>,
+    mediated: Option<MediatedPids>,
 }
 
 #[cfg(target_os = "macos")]
 impl ViolationFilter {
     fn matches_pid(&self, pid: i64) -> bool {
-        match self.pid {
+        let agent = match self.pid {
             Some(expected) => pid == i64::from(expected),
             None => false,
-        }
+        };
+        agent || self.mediated_command(pid).is_some()
+    }
+
+    /// The mediated command that owns `pid`, if any.
+    fn mediated_command(&self, pid: i64) -> Option<String> {
+        self.mediated.as_ref()?.command_for(pid)
     }
 
     fn matches_process_name(&self, name: &str) -> bool {
@@ -67,6 +139,7 @@ pub struct SandboxLogCollector {
     child: Child,
     child_pid: i32,
     command_name: Option<String>,
+    mediated: Option<MediatedPids>,
     reader_thread: Option<JoinHandle<()>>,
     shared: Arc<Mutex<SharedViolations>>,
 }
@@ -74,7 +147,11 @@ pub struct SandboxLogCollector {
 #[cfg(target_os = "macos")]
 impl SandboxLogCollector {
     #[must_use]
-    pub fn start(child_pid: i32, command_name: Option<String>) -> Option<Self> {
+    pub fn start(
+        child_pid: i32,
+        command_name: Option<String>,
+        mediated: Option<MediatedPids>,
+    ) -> Option<Self> {
         let mut child = match Command::new("/usr/bin/log")
             .args([
                 "stream",
@@ -111,6 +188,7 @@ impl SandboxLogCollector {
         let thread_filter = ViolationFilter {
             pid: Some(child_pid),
             process_name: command_name.clone(),
+            mediated: mediated.clone(),
         };
         let reader_thread = thread::Builder::new()
             .name("nono-sandbox-log".to_string())
@@ -121,7 +199,8 @@ impl SandboxLogCollector {
                         break;
                     };
 
-                    let Some(violation) = parse_violation_line(&thread_filter, &line) else {
+                    let Some((pid, violation)) = parse_attributed_line(&thread_filter, &line)
+                    else {
                         continue;
                     };
 
@@ -129,15 +208,7 @@ impl SandboxLogCollector {
                         Ok(guard) => guard,
                         Err(_) => break,
                     };
-                    let key = (
-                        violation.operation.clone(),
-                        violation.target.clone().unwrap_or_default(),
-                    );
-                    if !guard.seen.insert(key) {
-                        continue;
-                    }
-                    guard.violations.push(violation);
-                    if guard.violations.len() >= MAX_VIOLATIONS {
+                    if !guard.push(&thread_filter, pid, violation) {
                         break;
                     }
                 }
@@ -148,22 +219,23 @@ impl SandboxLogCollector {
             child,
             child_pid,
             command_name,
+            mediated,
             reader_thread: Some(reader_thread),
             shared,
         })
     }
 
     #[must_use]
-    pub fn finish(self) -> Vec<SandboxViolation> {
+    pub fn finish(self) -> CollectedViolations {
         self.finish_inner(true)
     }
 
     #[must_use]
-    pub fn finish_realtime_only(self) -> Vec<SandboxViolation> {
+    pub fn finish_realtime_only(self) -> CollectedViolations {
         self.finish_inner(false)
     }
 
-    fn finish_inner(mut self, include_historical_fallback: bool) -> Vec<SandboxViolation> {
+    fn finish_inner(mut self, include_historical_fallback: bool) -> CollectedViolations {
         // Kill the real-time stream — it may or may not have captured
         // events depending on timing.
         let _ = self.child.kill();
@@ -173,14 +245,14 @@ impl SandboxLogCollector {
             let _ = reader_thread.join();
         }
 
-        let mut violations: Vec<SandboxViolation> = match Arc::try_unwrap(self.shared) {
+        let mut violations: CollectedViolations = match Arc::try_unwrap(self.shared) {
             Ok(shared) => match shared.into_inner() {
-                Ok(shared) => shared.violations,
-                Err(poisoned) => poisoned.into_inner().violations,
+                Ok(shared) => shared.collected,
+                Err(poisoned) => poisoned.into_inner().collected,
             },
             Err(shared) => match shared.lock() {
-                Ok(shared) => shared.violations.clone(),
-                Err(poisoned) => poisoned.into_inner().violations.clone(),
+                Ok(shared) => shared.collected.clone(),
+                Err(poisoned) => poisoned.into_inner().collected.clone(),
             },
         };
 
@@ -188,10 +260,14 @@ impl SandboxLogCollector {
         // (e.g. `cat`). The child can exit before the log system delivers
         // the denial event. Fall back to a historical log query which is
         // deterministic — events are already committed by this point.
-        if include_historical_fallback && violations.is_empty() {
+        if include_historical_fallback
+            && violations.agent.is_empty()
+            && violations.mediated.is_empty()
+        {
             let filter = ViolationFilter {
                 pid: Some(self.child_pid),
                 process_name: self.command_name.clone(),
+                mediated: self.mediated.clone(),
             };
             if let Some(historical) = collect_historical_violations(&filter) {
                 violations = historical;
@@ -217,7 +293,7 @@ pub struct SandboxLogCollector;
 /// pick up denials from unrelated sandboxed apps (Safari, Messages, etc.) that
 /// happened to deny a filesystem op in the same window.
 #[cfg(target_os = "macos")]
-fn collect_historical_violations(filter: &ViolationFilter) -> Option<Vec<SandboxViolation>> {
+fn collect_historical_violations(filter: &ViolationFilter) -> Option<CollectedViolations> {
     let predicate = LOG_STREAM_PREDICATE;
 
     let output = Command::new("/usr/bin/log")
@@ -241,11 +317,10 @@ fn collect_historical_violations(filter: &ViolationFilter) -> Option<Vec<Sandbox
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut seen = BTreeSet::<(String, String)>::new();
-    let mut violations = Vec::new();
+    let mut shared = SharedViolations::default();
 
     for line in text.lines() {
-        let Some(violation) = parse_violation_line(filter, line) else {
+        let Some((pid, violation)) = parse_attributed_line(filter, line) else {
             continue;
         };
         // Only include filesystem operations in historical results.
@@ -255,23 +330,15 @@ fn collect_historical_violations(filter: &ViolationFilter) -> Option<Vec<Sandbox
         if !violation.operation.starts_with("file-") {
             continue;
         }
-        let key = (
-            violation.operation.clone(),
-            violation.target.clone().unwrap_or_default(),
-        );
-        if !seen.insert(key) {
-            continue;
-        }
-        violations.push(violation);
-        if violations.len() >= MAX_VIOLATIONS {
+        if !shared.push(filter, pid, violation) {
             break;
         }
     }
 
-    if violations.is_empty() {
+    if shared.collected.agent.is_empty() && shared.collected.mediated.is_empty() {
         None
     } else {
-        Some(violations)
+        Some(shared.collected)
     }
 }
 
@@ -289,14 +356,23 @@ impl SandboxLogCollector {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn parse_violation_line(filter: &ViolationFilter, line: &str) -> Option<SandboxViolation> {
+    parse_attributed_line(filter, line).map(|(_, violation)| violation)
+}
+
+/// Parse a log line into the violating PID and the violation.
+#[cfg(target_os = "macos")]
+fn parse_attributed_line(filter: &ViolationFilter, line: &str) -> Option<(i64, SandboxViolation)> {
     let value: Value = serde_json::from_str(line).ok()?;
     parse_violation_value(filter, &value)
 }
 
 #[cfg(target_os = "macos")]
-fn parse_violation_value(filter: &ViolationFilter, value: &Value) -> Option<SandboxViolation> {
+fn parse_violation_value(
+    filter: &ViolationFilter,
+    value: &Value,
+) -> Option<(i64, SandboxViolation)> {
     let metadata = value
         .get("metadata")
         .or_else(|| value.get("MetaData"))
@@ -316,7 +392,7 @@ fn parse_violation_value(filter: &ViolationFilter, value: &Value) -> Option<Sand
         .and_then(|metadata| parse_metadata_violation(filter, metadata));
     if metadata_violation
         .as_ref()
-        .is_some_and(|violation| violation.target.is_some())
+        .is_some_and(|(_, violation)| violation.target.is_some())
     {
         return metadata_violation;
     }
@@ -331,7 +407,7 @@ fn parse_violation_value(filter: &ViolationFilter, value: &Value) -> Option<Sand
         .and_then(|metadata| parse_metadata_violation(filter, metadata));
     if event_metadata_violation
         .as_ref()
-        .is_some_and(|violation| violation.target.is_some())
+        .is_some_and(|(_, violation)| violation.target.is_some())
     {
         return event_metadata_violation;
     }
@@ -339,7 +415,7 @@ fn parse_violation_value(filter: &ViolationFilter, value: &Value) -> Option<Sand
     let event_violation = value
         .get("eventMessage")
         .and_then(Value::as_str)
-        .and_then(|message| parse_event_message(filter, message));
+        .and_then(|message| parse_attributed_event_message(filter, message));
 
     // None of the candidates exposed a structured target above. Prefer any
     // remaining candidate that still carries a target (e.g. an `eventMessage`
@@ -353,14 +429,14 @@ fn parse_violation_value(filter: &ViolationFilter, value: &Value) -> Option<Sand
     ]
     .into_iter()
     .flatten()
-    .min_by_key(|violation| violation.target.is_none())
+    .min_by_key(|(_, violation)| violation.target.is_none())
 }
 
 #[cfg(target_os = "macos")]
 fn parse_metadata_violation(
     filter: &ViolationFilter,
     metadata: &Value,
-) -> Option<SandboxViolation> {
+) -> Option<(i64, SandboxViolation)> {
     let pid = metadata
         .get("pid")
         .and_then(Value::as_i64)
@@ -382,11 +458,19 @@ fn parse_metadata_violation(
         .or_else(|| metadata.get("global-name").and_then(Value::as_str))
         .map(str::to_string);
 
-    Some(SandboxViolation { operation, target })
+    Some((pid, SandboxViolation { operation, target }))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn parse_event_message(filter: &ViolationFilter, message: &str) -> Option<SandboxViolation> {
+    parse_attributed_event_message(filter, message).map(|(_, violation)| violation)
 }
 
 #[cfg(target_os = "macos")]
-fn parse_event_message(filter: &ViolationFilter, message: &str) -> Option<SandboxViolation> {
+fn parse_attributed_event_message(
+    filter: &ViolationFilter,
+    message: &str,
+) -> Option<(i64, SandboxViolation)> {
     // Format: "Sandbox: processname(PID) deny(N) operation target"
     // or:     "N duplicate reports for Sandbox: processname(PID) deny(N) operation target"
     let first_line = message.lines().next()?.trim();
@@ -419,17 +503,66 @@ fn parse_event_message(filter: &ViolationFilter, message: &str) -> Option<Sandbo
         None => (detail.to_string(), None),
     };
 
-    Some(SandboxViolation { operation, target })
+    Some((pid, SandboxViolation { operation, target }))
 }
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{ViolationFilter, parse_event_message, parse_violation_line};
+    use super::{
+        MediatedPids, SharedViolations, ViolationFilter, parse_attributed_event_message,
+        parse_event_message, parse_violation_line,
+    };
+
+    #[test]
+    fn attributes_mediated_command_denials_to_their_command() {
+        let mediated = MediatedPids::default();
+        mediated.record(4242, "security");
+        let filter = ViolationFilter {
+            pid: Some(1234),
+            process_name: Some("env".to_string()),
+            mediated: Some(mediated),
+        };
+        let mut shared = SharedViolations::default();
+
+        let msg = "Sandbox: security(4242) deny(1) mach-lookup com.apple.SecurityServer";
+        let (pid, violation) =
+            parse_attributed_event_message(&filter, msg).expect("mediated pid accepted");
+        shared.push(&filter, pid, violation);
+        let msg = "Sandbox: env(1234) deny(1) file-read-data /Users/test/.ssh/id_rsa";
+        let (pid, violation) = parse_attributed_event_message(&filter, msg).expect("agent pid");
+        shared.push(&filter, pid, violation);
+
+        assert_eq!(shared.collected.mediated.len(), 1);
+        assert_eq!(shared.collected.mediated[0].command, "security");
+        assert_eq!(
+            shared.collected.mediated[0].violation.target.as_deref(),
+            Some("com.apple.SecurityServer")
+        );
+        assert_eq!(shared.collected.agent.len(), 1);
+        assert_eq!(
+            shared.collected.agent[0].target.as_deref(),
+            Some("/Users/test/.ssh/id_rsa")
+        );
+    }
+
+    #[test]
+    fn ignores_unregistered_pids_with_mediated_registry() {
+        let mediated = MediatedPids::default();
+        mediated.record(4242, "security");
+        let filter = ViolationFilter {
+            pid: Some(1234),
+            process_name: None,
+            mediated: Some(mediated),
+        };
+        let msg = "Sandbox: Safari(999) deny(1) file-read-data /Users/test/secret";
+        assert!(parse_event_message(&filter, msg).is_none());
+    }
 
     fn pid_filter(pid: i32) -> ViolationFilter {
         ViolationFilter {
             pid: Some(pid),
             process_name: None,
+            mediated: None,
         }
     }
 
@@ -437,6 +570,7 @@ mod tests {
         ViolationFilter {
             pid: None,
             process_name: Some(name.to_string()),
+            mediated: None,
         }
     }
 
@@ -444,6 +578,7 @@ mod tests {
         ViolationFilter {
             pid: Some(pid),
             process_name: Some(name.to_string()),
+            mediated: None,
         }
     }
 

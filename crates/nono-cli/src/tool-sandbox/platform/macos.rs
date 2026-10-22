@@ -3,8 +3,8 @@ use crate::audit_integrity::{
     CommandPolicyStdioStreamAudit,
 };
 use crate::command_policy::{
-    CommandPoliciesConfig, CommandSandboxConfig, InterceptActionConfig, ResolvedCommandBinaries,
-    ResolvedCommandBinary, has_explicit_self_invocation_entry,
+    CommandKeychainAccess, CommandPoliciesConfig, CommandSandboxConfig, InterceptActionConfig,
+    ResolvedCommandBinaries, ResolvedCommandBinary, has_explicit_self_invocation_entry,
 };
 use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
@@ -169,6 +169,11 @@ struct ToolSandboxState {
     deny_policy: crate::policy::EffectiveDenyPolicy,
     /// Snapshot of keychain filesystem denies, including mode-scoped bypasses.
     keychain_deny_rules: Vec<String>,
+    /// The user's keychain DBs a `keychain_access` command is granted, each in
+    /// its given and resolved forms, resolved once at runtime preparation. A
+    /// command's keychain access lifts the agent's keychain deny for its child
+    /// only.
+    keychain_db_forms: Vec<Vec<PathBuf>>,
     plan: ResolvedToolSandboxPlan,
     shims_by_command: BTreeMap<String, ShimIdentity>,
     shims_by_path: BTreeMap<PathBuf, String>,
@@ -177,6 +182,9 @@ struct ToolSandboxState {
     scoped_proxy_env_vars: BTreeMap<String, Vec<(String, String)>>,
     reserved_proxy_ports: BTreeSet<u16>,
     active_children: Mutex<HashMap<u32, ActiveChild>>,
+    /// Every child this runtime launched, kept after exit so the sandbox log
+    /// collector can attribute a command sandbox's denials to its command.
+    mediated_pids: crate::sandbox_log::MediatedPids,
     /// Attributes severed-ancestry callers to their spawning command. See the
     /// daemon-lineage section below.
     lineage: LineageMarker,
@@ -305,6 +313,7 @@ impl PreparedToolSandboxRuntime {
             outer_caps,
             resolved_command_binaries,
         )?;
+        let keychain_db_forms = resolve_keychain_db_forms();
 
         let runtime_dir = create_runtime_dir()?;
         let mut cleanup = RuntimeDirCleanup::new(runtime_dir.clone());
@@ -366,6 +375,7 @@ impl PreparedToolSandboxRuntime {
                 deny_paths: deny_paths.to_vec(),
                 deny_policy,
                 keychain_deny_rules,
+                keychain_db_forms,
                 plan,
                 shims_by_command,
                 shims_by_path,
@@ -374,6 +384,7 @@ impl PreparedToolSandboxRuntime {
                 scoped_proxy_env_vars: scoped_proxy_env_vars.clone(),
                 reserved_proxy_ports: reserved_proxy_ports.clone(),
                 active_children: Mutex::new(HashMap::new()),
+                mediated_pids: crate::sandbox_log::MediatedPids::default(),
                 lineage,
                 session_lineage: SessionLineage::default(),
                 active_count: AtomicUsize::new(0),
@@ -393,6 +404,11 @@ impl PreparedToolSandboxRuntime {
 
     pub(crate) fn emitted_error_response(&self) -> bool {
         self.inner.emitted_error_response.load(Ordering::SeqCst)
+    }
+
+    /// Registry of launched mediated-command PIDs, for diagnostics attribution.
+    pub(crate) fn mediated_pids(&self) -> crate::sandbox_log::MediatedPids {
+        self.inner.mediated_pids.clone()
     }
 
     pub(crate) fn cleanup_runtime_dir(&self) {
@@ -2716,6 +2732,7 @@ fn track_child(
         },
     );
     drop(map);
+    state.mediated_pids.record(child_pid, command_name);
     state
         .session_lineage
         .record(child_pid, command_name, launch_caller, identity);
@@ -3165,6 +3182,7 @@ fn build_child_caps(
         &state.outer_caps,
         &state.deny_paths,
     )?;
+    let command_bypasses = add_command_keychain_access(&mut caps, state, policy)?;
     add_policy_unix_sockets(
         &mut caps,
         policy,
@@ -3173,13 +3191,24 @@ fn build_child_caps(
         &state.outer_caps,
         &state.deny_paths,
     )?;
-    // SECURITY: authorized against the *agent's* deny/bypass policy, so a
-    // command policy granting login.keychain-db cannot reach a keychain the
-    // outer sandbox is denied.
+    // SECURITY: authorized against the agent's deny/bypass policy plus this
+    // command policy's own keychain bypasses, so a command policy granting
+    // login.keychain-db reaches the keychain only when the profile explicitly
+    // lifts the deny for the agent or for this command. A command bypass
+    // never changes the agent's own sandbox.
     for rule in &state.keychain_deny_rules {
         caps.add_platform_rule(rule.clone())?;
     }
-    crate::policy::apply_macos_keychain_db_exception(&mut caps, &state.deny_policy);
+    let command_deny_policy;
+    let deny_policy = if command_bypasses.is_empty() {
+        &state.deny_policy
+    } else {
+        command_deny_policy = state
+            .deny_policy
+            .with_additional_bypasses(&command_bypasses);
+        &command_deny_policy
+    };
+    crate::policy::apply_macos_keychain_db_exception(&mut caps, deny_policy);
     add_policy_network(&mut caps, policy)?;
     add_policy_proxy_network(&mut caps, state, request, policy, proxy_scope)?;
     add_proxy_trust_bundle_caps(&mut caps, state, policy)?;
@@ -3193,6 +3222,68 @@ fn build_child_caps(
     // overrides the exec gate's earlier `(deny process-exec*)`.
     add_unsafe_seatbelt_rules(&mut caps, policy)?;
     Ok(caps)
+}
+
+/// Resolve each user keychain DB to its given and resolved forms. Runs once at
+/// runtime preparation, before an untrusted child has had an opportunity to
+/// change symlinks.
+fn resolve_keychain_db_forms() -> Vec<Vec<PathBuf>> {
+    crate::policy::macos_user_keychain_dbs()
+        .into_iter()
+        .map(|given| {
+            let canonical = nono::try_canonicalize(&given);
+            if canonical == given {
+                vec![given]
+            } else {
+                vec![given, canonical]
+            }
+        })
+        .collect()
+}
+
+/// For `keychain_access`, grant the child each user keychain DB in the
+/// requested mode and return the bypasses that authorize exactly those grants
+/// against the agent's keychain deny. No access mode beyond the requested one
+/// is reopened, so a broader command grant cannot ride the bypass.
+fn add_command_keychain_access(
+    caps: &mut CapabilitySet,
+    state: &ToolSandboxState,
+    policy: &CommandSandboxConfig,
+) -> Result<Vec<crate::policy::AppliedBypass>> {
+    let access = match policy.keychain_access {
+        None => return Ok(Vec::new()),
+        Some(CommandKeychainAccess::Read) => AccessMode::Read,
+        Some(CommandKeychainAccess::ReadWrite) => AccessMode::ReadWrite,
+    };
+    let mut bypasses = Vec::new();
+    for forms in &state.keychain_db_forms {
+        let Some(given) = forms.first() else {
+            continue;
+        };
+        match FsCapability::new_file(given, access) {
+            Ok(capability) => caps.add_fs(capability),
+            Err(NonoError::PathNotFound(_)) => continue,
+            Err(err) => return Err(err),
+        }
+        for path in forms {
+            bypasses.push(crate::policy::AppliedBypass {
+                path: path.clone(),
+                access,
+                is_file: true,
+                removed_denies: Vec::new(),
+            });
+        }
+    }
+    // Fail closed and loud: keychain access was requested but there is no
+    // keychain to grant (e.g. `HOME` unset or no login keychain).
+    if bypasses.is_empty() {
+        return Err(NonoError::SandboxInit(
+            "keychain_access is set but no user keychain DB was found under \
+             ~/Library/Keychains"
+                .to_string(),
+        ));
+    }
+    Ok(bypasses)
 }
 
 /// Append a command sandbox's opt-in raw macOS Seatbelt rules to the child's
@@ -5708,6 +5799,7 @@ mod tests {
             deny_paths: Vec::new(),
             deny_policy: crate::policy::EffectiveDenyPolicy::new(&[], &[]),
             keychain_deny_rules: Vec::new(),
+            keychain_db_forms: Vec::new(),
             plan: ResolvedToolSandboxPlan {
                 config: CommandPoliciesConfig::default(),
                 resolved: ResolvedCommandBinaries {
@@ -5726,6 +5818,7 @@ mod tests {
             scoped_proxy_env_vars: BTreeMap::new(),
             reserved_proxy_ports: BTreeSet::new(),
             active_children: Mutex::new(HashMap::new()),
+            mediated_pids: crate::sandbox_log::MediatedPids::default(),
             lineage: LineageMarker::Disabled,
             session_lineage: SessionLineage::default(),
             active_count: AtomicUsize::new(0),
@@ -9386,5 +9479,170 @@ mod tests {
                 rule.contains("(allow mach-lookup") && rule.contains("com.apple.securityd")
             }));
         }
+    }
+
+    /// A child state whose agent is denied the fixture keychain with no
+    /// agent-level bypass, with keychain DB forms resolved the way `prepare`
+    /// resolves them.
+    fn command_bypass_state(
+        fixture: &crate::test_env::KeychainFixture,
+        sandbox: &serde_json::Value,
+    ) -> (ToolSandboxState, UnixListener, CommandSandboxConfig) {
+        let mut state = test_state();
+        state.shim_dir = fixture.home.join("shims");
+        fs::create_dir(&state.shim_dir).expect("shims");
+        state.socket_path = fixture.home.join("broker.sock");
+        let listener = UnixListener::bind(&state.socket_path).expect("socket");
+        state.deny_policy = crate::policy::EffectiveDenyPolicy::from_applied_bypasses(
+            &fixture.keychain_denies(),
+            &[],
+        );
+        state.keychain_deny_rules = state
+            .deny_policy
+            .keychain_child_deny_rules()
+            .expect("rules");
+        state.keychain_db_forms = resolve_keychain_db_forms();
+        let policy: CommandSandboxConfig = serde_json::from_value(sandbox.clone()).expect("policy");
+        (state, listener, policy)
+    }
+
+    fn child_caps_for(
+        state: &ToolSandboxState,
+        policy: &CommandSandboxConfig,
+    ) -> Result<CapabilitySet> {
+        let binary = test_binary("sh", Path::new("/bin/sh")).expect("binary");
+        let request = request_with_env(Vec::new());
+        build_child_caps(state, &binary, policy, &request, &state.shim_dir, "review")
+    }
+
+    #[test]
+    fn keychain_access_read_grants_login_keychain_without_outer_bypass() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let (state, _listener, policy) =
+            command_bypass_state(&fixture, &serde_json::json!({"keychain_access": "read"}));
+
+        let caps = child_caps_for(&state, &policy).expect("child caps");
+        let rules = caps.platform_rules().join("\n");
+
+        for db in [&fixture.login_db, &fixture.metadata_db] {
+            let db = db.canonicalize().expect("canonical db");
+            assert!(
+                rules.contains(&format!(
+                    "(allow file-read-data (literal \"{}\"))",
+                    db.display()
+                )),
+                "expected read access to {}, got: {rules}",
+                db.display()
+            );
+        }
+        assert!(
+            rules.contains("(allow mach-lookup (global-name \"com.apple.securityd\"))"),
+            "expected the keychain mach services to be unlocked, got: {rules}"
+        );
+        assert!(
+            !rules.contains("(allow file-write"),
+            "read keychain access must not gain write access, got: {rules}"
+        );
+        for rule in &state.keychain_deny_rules {
+            assert!(rules.contains(rule.as_str()), "missing restriction: {rule}");
+        }
+        // The agent's own deny policy is unchanged by a command's keychain access.
+        assert!(
+            state
+                .deny_policy
+                .matching_deny_for_access(&fixture.login_db, AccessMode::Read)
+                .is_some(),
+            "command keychain access must not lift the agent's keychain deny"
+        );
+    }
+
+    #[test]
+    fn keychain_access_readwrite_grants_write() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let (state, _listener, policy) = command_bypass_state(
+            &fixture,
+            &serde_json::json!({"keychain_access": "readwrite"}),
+        );
+
+        let caps = child_caps_for(&state, &policy).expect("child caps");
+        let rules = caps.platform_rules().join("\n");
+        let db = fixture.login_db.canonicalize().expect("canonical db");
+
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write-data (literal \"{}\"))",
+                db.display()
+            )),
+            "expected write access, got: {rules}"
+        );
+    }
+
+    #[test]
+    fn keychain_access_read_does_not_widen_a_broad_write_grant() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let (state, _listener, policy) = command_bypass_state(
+            &fixture,
+            &serde_json::json!({
+                "fs_write": [fixture.keychains],
+                "keychain_access": "read",
+            }),
+        );
+
+        let caps = child_caps_for(&state, &policy).expect("child caps");
+        let rules = caps.platform_rules().join("\n");
+        let db = fixture.login_db.canonicalize().expect("canonical db");
+
+        assert!(
+            !rules.contains(&format!(
+                "(allow file-write-data (literal \"{}\"))",
+                db.display()
+            )),
+            "a directory write grant must not ride read keychain access, got: {rules}"
+        );
+        for rule in &state.keychain_deny_rules {
+            assert!(rules.contains(rule.as_str()), "missing restriction: {rule}");
+        }
+    }
+
+    #[test]
+    fn keychain_access_without_a_keychain_is_refused() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        fs::remove_file(&fixture.login_db).expect("remove login db");
+        fs::remove_file(&fixture.metadata_db).expect("remove metadata db");
+        let (state, _listener, policy) =
+            command_bypass_state(&fixture, &serde_json::json!({"keychain_access": "read"}));
+
+        let err = child_caps_for(&state, &policy).expect_err("no keychain");
+        assert!(
+            err.to_string().contains("no user keychain DB"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn keychain_grant_without_keychain_access_stays_denied() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let (state, _listener, policy) = command_bypass_state(
+            &fixture,
+            &serde_json::json!({"fs_read_file": [fixture.login_db]}),
+        );
+
+        let caps = child_caps_for(&state, &policy).expect("child caps");
+        assert!(
+            !caps
+                .platform_rules()
+                .iter()
+                .any(|rule| rule.contains("(allow mach-lookup") && rule.contains("securityd")),
+            "a policy without keychain_access must stay denied"
+        );
+    }
+
+    #[test]
+    fn keychain_access_rejects_unknown_mode() {
+        let err = serde_json::from_value::<CommandSandboxConfig>(
+            serde_json::json!({"keychain_access": "write"}),
+        )
+        .expect_err("unknown mode");
+        assert!(err.to_string().contains("unknown variant"), "got: {err}");
     }
 }

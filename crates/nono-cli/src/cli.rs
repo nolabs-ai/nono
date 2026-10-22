@@ -517,8 +517,8 @@ SESSION PICKER:
                                                # Extend an existing profile
   nono profile init my-agent --full            # Generate a full skeleton
   nono profile list                            # List all profiles (built-in and user)
-  nono profile show claude-code                # Show a fully resolved profile
-  nono profile diff default claude-code        # Compare two profiles
+  nono profile show nolabs-ai/claude            # Show an installed package profile
+  nono profile diff default nolabs-ai/claude    # Compare two profiles
   nono profile validate my-agent               # Validate a profile by name
   nono profile validate ~/my-profile.json      # Validate a profile file
   nono profile validate --draft my-profile     # Validate a profile draft
@@ -888,14 +888,9 @@ pub struct CompletionsArgs {
 }
 
 #[derive(Parser, Debug)]
-#[command(disable_help_flag = true)]
 pub struct ProfileCmdArgs {
     #[command(subcommand)]
     pub command: ProfileCommands,
-
-    /// Print help
-    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
-    pub help: Option<bool>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1352,6 +1347,27 @@ pub struct SandboxArgs {
     #[cfg(target_os = "linux")]
     #[arg(long, help_heading = "OPTIONS", value_name = "POLICY")]
     pub sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
+
+    /// Run the command in new Linux namespaces (opt-in, NEP-0004).
+    ///
+    /// Comma-separated list of: net, loopback, ipc, uts. Always adds a user
+    /// namespace. `loopback` (requires `net`) allows TCP bind/connect on any
+    /// port of the namespace's own loopback, for local dev servers and tests.
+    /// `net` leaves only loopback; egress is possible only through the session
+    /// proxy, so it requires --block-net or a proxied network policy and cannot
+    /// be combined with direct-access grants (--open-port, --listen-port,
+    /// --allow-connect-port, network.no_proxy). Adds to any `linux.isolate`
+    /// set by the profile; it cannot remove it. Fails at startup if this host
+    /// cannot create the namespaces.
+    #[cfg(target_os = "linux")]
+    #[arg(
+        long,
+        help_heading = "OPTIONS",
+        value_name = "NAMESPACES",
+        value_enum,
+        value_delimiter = ','
+    )]
+    pub isolate: Vec<IsolateNamespace>,
 
     /// Allow HTTP/2 multiplexing for upstream proxy connections.
     ///
@@ -1843,6 +1859,34 @@ pub struct WrapSandboxArgs {
     pub dry_run: bool,
 }
 
+/// A namespace that `--isolate` can request.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum IsolateNamespace {
+    /// Network namespace containing only loopback.
+    Net,
+    /// TCP on the isolated network namespace's own loopback (requires `net`).
+    Loopback,
+    /// IPC namespace.
+    Ipc,
+    /// UTS namespace.
+    Uts,
+}
+
+#[cfg(target_os = "linux")]
+impl SandboxArgs {
+    /// The isolation set requested on the command line.
+    pub fn isolate_config(&self) -> crate::profile::LinuxIsolateConfig {
+        let has = |namespace| self.isolate.contains(&namespace);
+        crate::profile::LinuxIsolateConfig {
+            network: has(IsolateNamespace::Net),
+            loopback: has(IsolateNamespace::Loopback),
+            ipc: has(IsolateNamespace::Ipc),
+            uts: has(IsolateNamespace::Uts),
+        }
+    }
+}
+
 impl From<WrapSandboxArgs> for SandboxArgs {
     fn from(args: WrapSandboxArgs) -> Self {
         Self {
@@ -1900,6 +1944,8 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             dry_run: args.dry_run,
             #[cfg(target_os = "linux")]
             sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Vec::new(),
         }
     }
 }
@@ -4447,6 +4493,21 @@ mod tests {
     fn test_profile_no_subcommand() {
         let result = Cli::try_parse_from(["nono", "profile"]);
         assert!(result.is_err(), "profile without subcommand should fail");
+    }
+
+    #[test]
+    fn test_profile_subcommand_help_is_available() {
+        for subcommand in [
+            "init", "list", "show", "diff", "validate", "promote", "groups", "schema", "guide",
+        ] {
+            let error = Cli::try_parse_from(["nono", "profile", subcommand, "--help"])
+                .expect_err("--help should exit through clap");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "profile {subcommand} --help should display help"
+            );
+        }
     }
 
     #[test]

@@ -227,6 +227,25 @@ fn migrate_claude_json(legacy: &Path, canonical: &Path, claude_dir: &Path) {
     // Neither existed: nothing to migrate, Claude Code creates canonical fresh.
 }
 
+/// Env vars that point Claude Code at `claude_dir`.
+///
+/// Claude Code appends a hash of the config dir to its Keychain service name
+/// whenever CLAUDE_CONFIG_DIR is set, even to the default path, so a sandboxed
+/// session would miss the credentials `/login` stored outside nono (#1950).
+/// An empty CLAUDE_SECURESTORAGE_CONFIG_DIR selects the default service name
+/// again. A host value is left alone: the user chose that service on purpose.
+#[cfg(unix)]
+fn claude_config_dir_env(claude_dir: &Path) -> Vec<(String, String)> {
+    let mut vars = vec![(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        claude_dir.to_string_lossy().into_owned(),
+    )];
+    if std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR").is_none() {
+        vars.push(("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), String::new()));
+    }
+    vars
+}
+
 #[cfg(target_os = "macos")]
 fn claude_config_dir() -> std::result::Result<(PathBuf, bool), String> {
     if let Some(config_dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
@@ -259,7 +278,11 @@ fn claude_keychain_service_name(
     config_dir_explicit: bool,
     service_suffix: &str,
 ) -> String {
-    let dir_hash = if config_dir_explicit {
+    // An empty CLAUDE_SECURESTORAGE_CONFIG_DIR makes Claude Code use the
+    // default service name even when CLAUDE_CONFIG_DIR is set (#1950).
+    let default_service_forced =
+        std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR").is_some_and(|value| value.is_empty());
+    let dir_hash = if config_dir_explicit && !default_service_forced {
         let digest = Sha256::digest(config_dir.to_string_lossy().as_bytes());
         let prefix = digest[..4]
             .iter()
@@ -547,6 +570,9 @@ pub(crate) struct PreparedSandbox {
     pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) explicit_sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
+    /// Opt-in namespace isolation, merged (OR) from the profile and `--isolate`.
+    #[cfg(target_os = "linux")]
+    pub(crate) isolate: crate::profile::LinuxIsolateConfig,
     pub(crate) allow_launch_services_active: bool,
     pub(crate) allow_gpu_active: bool,
     /// True when NVIDIA GPU support needs supervisor-mediated writes to
@@ -762,6 +788,8 @@ fn finalize_prepared_sandbox(
     output::print_abi_info(silent);
     #[cfg(target_os = "linux")]
     output::print_landlock_scope_policy(&prepared.caps, args.verbose, silent);
+    #[cfg(target_os = "linux")]
+    output::print_isolation(prepared.isolate, silent);
 
     if !Sandbox::is_supported() {
         return Err(NonoError::SandboxInit(Sandbox::support_info().details));
@@ -881,7 +909,7 @@ fn reject_cgroup_writable_grants_under_resource_limit(caps: &CapabilitySet) -> R
 }
 
 /// Returns true if any CLI flag or profile field requires the proxy to run.
-fn has_proxy_intent(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
+pub(crate) fn has_proxy_intent(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
     args.has_proxy_flags()
         || !prepared.credentials.is_empty()
         || !prepared.custom_credentials.is_empty()
@@ -915,7 +943,10 @@ pub(crate) fn validate_proxy_conflicts(
     prepared: &PreparedSandbox,
 ) -> Result<()> {
     validate_block_net_conflicts(args, prepared)?;
-    validate_external_proxy_bypass(args, prepared)
+    validate_external_proxy_bypass(args, prepared)?;
+    #[cfg(target_os = "linux")]
+    crate::isolation::validate_config(args, prepared)?;
+    Ok(())
 }
 
 /// Validate that `--block-net` is not combined with flags that imply proxy
@@ -1542,6 +1573,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 sandbox_policy: crate::profile::LinuxSandboxPolicy::default(),
                 #[cfg(target_os = "linux")]
                 explicit_sandbox_policy: None,
+                // A manifest carries no isolation; `--isolate` still applies.
+                #[cfg(target_os = "linux")]
+                isolate: args.isolate_config(),
                 allow_launch_services_active: false,
                 allow_gpu_active: false,
                 #[cfg(target_os = "linux")]
@@ -1582,6 +1616,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         sandbox_policy,
         #[cfg(target_os = "linux")]
         explicit_sandbox_policy,
+        #[cfg(target_os = "linux")]
+        isolate,
         workdir_access: profile_workdir_access,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
@@ -1703,10 +1739,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 claude_dir.join(".claude.json"),
             );
             migrate_claude_json(&legacy_json, &redirected_json, &claude_dir);
-            profile_set_vars.get_or_insert_with(Vec::new).push((
-                "CLAUDE_CONFIG_DIR".to_string(),
-                claude_dir.to_string_lossy().into_owned(),
-            ));
+            profile_set_vars
+                .get_or_insert_with(Vec::new)
+                .extend(claude_config_dir_env(&claude_dir));
         }
     }
 
@@ -1764,6 +1799,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     let sandbox_policy = args.sandbox_policy.unwrap_or(sandbox_policy);
     #[cfg(target_os = "linux")]
     let explicit_sandbox_policy = args.sandbox_policy.or(explicit_sandbox_policy);
+    // CLI --isolate adds to the profile's isolation; it can never remove it.
+    #[cfg(target_os = "linux")]
+    let isolate = isolate.merge(args.isolate_config());
 
     // GPU access: macOS uses IOKit platform rules (tightened to AGXDeviceUserClient only),
     // Linux uses filesystem capabilities for render nodes and compute devices.
@@ -1944,6 +1982,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             sandbox_policy,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy,
+            #[cfg(target_os = "linux")]
+            isolate,
             allow_launch_services_active,
             allow_gpu_active,
             #[cfg(target_os = "linux")]
@@ -2367,6 +2407,45 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn claude_config_dir_env_keeps_default_keychain_service() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let env = crate::test_env::EnvVarGuard::set_all(&[("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")]);
+        env.remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
+
+        assert_eq!(
+            claude_config_dir_env(Path::new("/home/u/.claude")),
+            vec![
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/home/u/.claude".to_string()
+                ),
+                // Empty keeps Claude Code on the default Keychain service
+                // name instead of hashing CLAUDE_CONFIG_DIR into it (#1950).
+                ("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_config_dir_env_preserves_host_securestorage_dir() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            "/elsewhere",
+        )]);
+
+        assert_eq!(
+            claude_config_dir_env(Path::new("/home/u/.claude")),
+            vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/u/.claude".to_string()
+            )]
+        );
+    }
+
     /// Isolate every env var the Claude preflight decision reads. Callers must
     /// hold `test_env::ENV_LOCK`.
     ///
@@ -2405,6 +2484,7 @@ mod tests {
             ("CLAUDE_CODE_USE_FOUNDRY", "0"),
             ("ANTHROPIC_UNIX_SOCKET", "placeholder"),
             ("CLAUDE_CODE_SIMPLE", "0"),
+            ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "placeholder"),
         ]);
         for key in [
             "ANTHROPIC_API_KEY",
@@ -2417,10 +2497,42 @@ mod tests {
             "USER_TYPE",
             "ANTHROPIC_UNIX_SOCKET",
             "CLAUDE_CODE_SIMPLE",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
         ] {
             env.remove(key);
         }
         env
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_keychain_service_name_hashes_explicit_config_dir() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+        let config_dir = dir.path().join("claude-config");
+        let _env = claude_preflight_env(dir.path(), &config_dir);
+
+        let service = claude_keychain_service_name(&config_dir, true, "-credentials");
+        assert!(
+            service.starts_with("Claude Code-credentials-") && service.len() == 32,
+            "expected hashed service name, got {service}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_keychain_service_name_empty_securestorage_dir_selects_default() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+        let config_dir = dir.path().join("claude-config");
+        let _env = claude_preflight_env(dir.path(), &config_dir);
+        let _securestorage =
+            crate::test_env::EnvVarGuard::set_all(&[("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")]);
+
+        assert_eq!(
+            claude_keychain_service_name(&config_dir, true, "-credentials"),
+            "Claude Code-credentials"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2928,6 +3040,8 @@ mod tests {
             sandbox_policy: profile::LinuxSandboxPolicy::default(),
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Default::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]

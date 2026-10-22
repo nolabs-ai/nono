@@ -392,20 +392,27 @@ fn run_sign_keyless(args: TrustSignArgs) -> Result<()> {
 
     // Discover OIDC token from ambient environment (GitHub Actions, GitLab CI, etc.)
     let token = discover_oidc_token(&rt)?;
-    let jwt = token.raw().to_string();
+    // Extract the claims needed for nono's predicate before moving the
+    // zeroizing token into the signer. Do not retain a duplicate raw JWT.
+    let signer_predicate = build_keyless_predicate(token.expose_secret());
 
-    let context = sigstore_sign::SigningContext::production();
+    let context = rt
+        .block_on(sigstore_sign::SigningContext::production())
+        .map_err(|e| nono::NonoError::TrustSigning {
+            path: String::new(),
+            reason: format!("failed to load Sigstore production signing configuration: {e}"),
+        })?;
     let signer = context.signer(token);
 
     if multi_subject {
-        return rt.block_on(run_sign_multi_keyless(&files, &signer, &jwt));
+        return rt.block_on(run_sign_multi_keyless(&files, &signer, &signer_predicate));
     }
 
     let mut success_count = 0u32;
     let mut fail_count = 0u32;
 
     for file_path in &files {
-        match rt.block_on(sign_file_keyless(file_path, &signer, &jwt)) {
+        match rt.block_on(sign_file_keyless(file_path, &signer, &signer_predicate)) {
             Ok(()) => {
                 let bundle_path = trust::bundle_path_for(file_path);
                 eprintln!(
@@ -450,13 +457,14 @@ fn run_sign_keyless(args: TrustSignArgs) -> Result<()> {
 async fn run_sign_multi_keyless(
     files: &[PathBuf],
     signer: &sigstore_sign::Signer,
-    jwt: &str,
+    signer_predicate: &serde_json::Value,
 ) -> Result<()> {
     let cwd = std::env::current_dir().map_err(nono::NonoError::Io)?;
-    let signer_predicate = build_keyless_predicate(jwt);
 
-    let mut attestation =
-        sigstore_sign::Attestation::new(trust::NONO_MULTI_SUBJECT_PREDICATE_TYPE, signer_predicate);
+    let mut attestation = sigstore_sign::Attestation::new(
+        trust::NONO_MULTI_SUBJECT_PREDICATE_TYPE,
+        signer_predicate.clone(),
+    );
 
     for file_path in files {
         let content = std::fs::read(file_path).map_err(|e| nono::NonoError::TrustSigning {
@@ -525,7 +533,7 @@ async fn run_sign_multi_keyless(
 async fn sign_file_keyless(
     file_path: &Path,
     signer: &sigstore_sign::Signer,
-    jwt: &str,
+    signer_predicate: &serde_json::Value,
 ) -> std::result::Result<(), String> {
     let content = std::fs::read(file_path).map_err(|e| format!("failed to read file: {e}"))?;
 
@@ -539,11 +547,10 @@ async fn sign_file_keyless(
     let digest_hash = sigstore_sign::types::Sha256Hash::from_hex(&digest_hex)
         .map_err(|e| format!("failed to parse digest: {e}"))?;
 
-    let signer_predicate = build_keyless_predicate(jwt);
-
     // Build the attestation using sigstore-sign's Attestation type
-    let attestation = sigstore_sign::Attestation::new(trust::NONO_PREDICATE_TYPE, signer_predicate)
-        .add_subject(filename, digest_hash);
+    let attestation =
+        sigstore_sign::Attestation::new(trust::NONO_PREDICATE_TYPE, signer_predicate.clone())
+            .add_subject(filename, digest_hash);
 
     let bundle = signer
         .sign_attestation(attestation)
@@ -937,7 +944,7 @@ fn verify_multi_subject_file(
                 .ok_or("no subjects in bundle")?;
             let trusted_root = trust::load_production_trusted_root()
                 .map_err(|e| format!("failed to load Sigstore trusted root: {e}"))?;
-            let sigstore_policy = trust::VerificationPolicy::default();
+            let sigstore_policy = trust::VerificationPolicy::any_identity();
             trust::verify_bundle_with_digest(
                 first_digest,
                 &bundle,
@@ -1053,7 +1060,7 @@ fn verify_single_file(
         trust::SignerIdentity::Keyless { .. } => {
             let trusted_root = trust::load_production_trusted_root()
                 .map_err(|e| format!("failed to load Sigstore trusted root: {e}"))?;
-            let sigstore_policy = trust::VerificationPolicy::default();
+            let sigstore_policy = trust::VerificationPolicy::any_identity();
             trust::verify_bundle_with_digest(
                 &file_digest_hex,
                 &bundle,
@@ -1329,16 +1336,10 @@ fn pub_key_path_for_file(private_key_path: &Path) -> PathBuf {
 }
 
 pub(crate) fn reconstruct_key_pair(pkcs8_bytes: &[u8]) -> Result<trust::KeyPair> {
-    let ecdsa_kp =
-        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8_bytes).map_err(|e| {
-            nono::NonoError::TrustSigning {
-                path: String::new(),
-                reason: format!("invalid PKCS#8 key data: {e}"),
-            }
-        })?;
-
-    // KeyPair::EcdsaP256 has a public unnamed field, construct directly
-    Ok(trust::KeyPair::EcdsaP256(ecdsa_kp))
+    trust::KeyPair::from_pkcs8_der(pkcs8_bytes).map_err(|e| nono::NonoError::TrustSigning {
+        path: String::new(),
+        reason: format!("invalid PKCS#8 key data: {e}"),
+    })
 }
 
 // ---------------------------------------------------------------------------

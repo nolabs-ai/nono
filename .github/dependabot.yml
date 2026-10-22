@@ -9,6 +9,13 @@ updates:
       interval: "weekly"
     cooldown:
       default-days: 3
+    groups:
+      routine-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "cargo"
     directory: "/"
@@ -16,3 +23,13 @@ updates:
       interval: "weekly"
     cooldown:
       default-days: 3
+    groups:
+      sigstore:
+        patterns:
+          - "sigstore-*"
+      routine-rust:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

@@ -218,6 +218,7 @@
           "/etc/ssl",
           "/etc/pki",
           "/etc/ca-certificates",
+          "/var/lib/ca-certificates",
           "/etc/crypto-policies",
           "/etc/fonts",
           "/etc/ld.so.cache",
@@ -403,6 +404,14 @@
         ]
       }
     },
+    "rtk_state": {
+      "description": "rtk - history database and persisted state",
+      "allow": {
+        "readwrite": [
+          "~/.local/share/rtk"
+        ]
+      }
+    },
     "mise_manager": {
       "description": "Mise - dev tools, env vars, task runner",
       "allow": {
@@ -566,10 +575,19 @@
           "~/.local/state/nix/profiles",
           "~/.nix-defexpr",
           "~/.local/state/nix/defexpr",
+          "~/.local/share/nix",
           "/run/current-system/sw",
           "/etc/profiles/per-user",
           "/nix/var/nix/profiles",
           "/nix/store"
+        ]
+      }
+    },
+    "nix_profile_state_write": {
+      "description": "Nix profile mutation - write access to the user profiles state directory",
+      "allow": {
+        "write": [
+          "~/.local/state/nix/profiles"
         ]
       }
     },

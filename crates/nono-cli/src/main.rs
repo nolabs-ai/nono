@@ -30,6 +30,8 @@ mod execution_runtime;
 #[cfg(unix)]
 mod hook_runtime;
 mod instruction_deny;
+#[cfg(target_os = "linux")]
+mod isolation;
 mod jsonc;
 mod launch_runtime;
 #[cfg(target_os = "linux")]
@@ -318,6 +320,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Default::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]
@@ -397,6 +401,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Default::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]

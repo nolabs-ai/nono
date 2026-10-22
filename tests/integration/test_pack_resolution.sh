@@ -4,8 +4,9 @@
 # Hand-installs the synthetic test pack from tests/fixtures/synthetic-pack
 # into the local pack store, then verifies:
 #
-#   - `--profile <install_as>` resolves through the pack-store branch of
-#     load_profile (the same branch the pull/migration flow uses).
+#   - `--profile <namespace>/<package>` resolves through the pack-store
+#     branch of load_profile (the same branch the pull/migration flow uses).
+#   - A bare profile name never selects an installed package.
 #   - Sandbox enforcement honours the same pack-shipped profile contents.
 #   - Cleanup removes the pack-store entry without leaving lockfile state.
 #
@@ -18,7 +19,7 @@
 #   - end-to-end smoke tests in nono-packs CI
 #
 # This suite is specifically about: when a pack IS installed, does
-# `--profile <name>` find it through the user-facing CLI. Real execution
+# `--profile <namespace>/<package>` find it through the user-facing CLI. Real execution
 # verifies pack lockfile and Sigstore metadata, so enforcement below uses
 # the exact fixture profile file by path rather than treating the
 # hand-installed fixture as a trusted registry install.
@@ -71,20 +72,22 @@ echo ""
 
 echo "--- Pack-Store Resolution ---"
 
-# The resolver should find the synthetic pack's profile by `install_as`
-# name and load it without complaint. Dry-run is enough to exercise
-# the resolver path.
-expect_success "synthetic pack profile resolves by install_as name" \
-    "$NONO_BIN" run --profile synthetic --workdir "$TMPDIR/workdir" --dry-run -- echo "test"
+# The resolver should find the synthetic pack's public profile by its fully
+# qualified package identity. Dry-run is enough to exercise the resolver path.
+expect_success "synthetic pack profile resolves by fully qualified name" \
+    "$NONO_BIN" run --profile test-ns/synthetic --workdir "$TMPDIR/workdir" --dry-run -- echo "test"
 
 expect_output_contains "synthetic profile dry-run lists Capabilities" "Capabilities:" \
-    "$NONO_BIN" run --profile synthetic --workdir "$TMPDIR/workdir" --dry-run -- echo "test"
+    "$NONO_BIN" run --profile test-ns/synthetic --workdir "$TMPDIR/workdir" --dry-run -- echo "test"
 
-# A name not matching any pack OR embedded profile must fail cleanly,
+expect_failure "bare profile name does not select installed package" \
+    "$NONO_BIN" run --profile synthetic --dry-run -- echo "test"
+
+# A fully qualified name not matching an installed package must fail cleanly,
 # not silently fall through to default. (Migration prompt is bypassed
 # because XDG_CONFIG_HOME is isolated and there's no TTY in CI.)
-expect_failure "unknown pack-name profile fails to resolve" \
-    "$NONO_BIN" run --profile pack-name-that-doesnt-exist --dry-run -- echo "test"
+expect_failure "unknown fully qualified package profile fails to resolve" \
+    "$NONO_BIN" run --profile test-ns/pack-that-doesnt-exist --dry-run -- echo "test"
 
 # =============================================================================
 # Enforcement
@@ -94,7 +97,7 @@ echo ""
 echo "--- Pack-Profile Enforcement ---"
 
 # The synthetic profile grants $WORKDIR. Reading a file inside should work.
-# Use the profile file directly here: short-name pack-store execution is
+# Use the profile file directly here: real pack-store execution is
 # gated by lockfile + Sigstore verification, which this hand-installed
 # resolver fixture intentionally does not provide.
 expect_success "synthetic profile grants workdir read" \
@@ -116,7 +119,7 @@ echo "--- Post-Removal Resolution ---"
 rm -rf "$PACK_STORE"
 
 expect_failure "synthetic profile fails to resolve after pack removed" \
-    "$NONO_BIN" run --profile synthetic --dry-run -- echo "test"
+    "$NONO_BIN" run --profile test-ns/synthetic --dry-run -- echo "test"
 
 # =============================================================================
 # Summary

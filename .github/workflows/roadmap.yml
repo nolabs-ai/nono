@@ -1,0 +1,26 @@
+name: Roadmap
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "neps/**"
+      - "ROADMAP.md"
+      - "scripts/gen-roadmap.py"
+      - "crates/nono/Cargo.toml"
+      - ".github/workflows/roadmap.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  roadmap:
+    name: ROADMAP.md is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check generated roadmap and NEP index
+        run: python3 scripts/gen-roadmap.py --check

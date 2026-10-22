@@ -3236,10 +3236,19 @@ fn wrapper_exec_target(path: &Path) -> Result<Option<PathBuf>> {
     };
     for line in contents.lines().skip(1) {
         let mut tokens = line.split_whitespace();
-        let Some(first) = tokens.next() else {
-            continue;
-        };
-        if first != "exec" {
+        let mut command = tokens.next();
+        while let Some(token) = command {
+            let is_assignment = token.split_once('=').is_some_and(|(name, _)| {
+                let mut chars = name.chars();
+                matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+                    && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+            });
+            if !is_assignment {
+                break;
+            }
+            command = tokens.next();
+        }
+        if command != Some("exec") {
             continue;
         }
         for token in tokens {
@@ -7521,6 +7530,67 @@ mod tests {
         let phantom = format!("nono_{}", "a".repeat(64));
         let stdout = nonce_stdout(phantom.clone());
         assert_eq!(stdout, phantom.into_bytes());
+    }
+
+    #[test]
+    fn outer_exec_gate_includes_wrapper_target_after_env_assignment() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let script = tmp.path().join("env-assigned-wrapper");
+        fs::write(
+            &script,
+            b"#!/bin/sh\nHELIX_RUNTIME=/usr/lib/helix/runtime exec /bin/true \"$@\"\n",
+        )
+        .map_err(|source| NonoError::ConfigWrite {
+            path: script.clone(),
+            source,
+        })?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o500)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: script.clone(),
+                source,
+            }
+        })?;
+
+        reset_elf_resolution_cache();
+        let mut seen = HashSet::new();
+        let mut script_seen = HashSet::new();
+        let mut paths = Vec::new();
+        add_outer_exec_file_with_deps(
+            &script,
+            &CapabilitySet::new(),
+            &mut seen,
+            &mut script_seen,
+            &mut paths,
+        )?;
+
+        let target = Path::new("/bin/true").canonicalize().map_err(|source| {
+            NonoError::PathCanonicalization {
+                path: PathBuf::from("/bin/true"),
+                source,
+            }
+        })?;
+        assert!(
+            paths.contains(&target),
+            "outer gate must permit the wrapper's exec target: {paths:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wrapper_exec_target_ignores_env_assignments_without_exec() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let script = tmp.path().join("non-exec-wrapper");
+        fs::write(
+            &script,
+            b"#!/bin/sh\nHELIX_RUNTIME=/usr/lib/helix/runtime echo /usr/lib/helix/hx\n",
+        )
+        .map_err(|source| NonoError::ConfigWrite {
+            path: script.clone(),
+            source,
+        })?;
+
+        assert_eq!(wrapper_exec_target(&script)?, None);
+        Ok(())
     }
 
     #[test]

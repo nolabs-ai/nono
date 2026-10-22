@@ -707,11 +707,9 @@ fn profile_name_from_command(cmd_name: &str) -> Option<String> {
     }
 }
 
-/// Return true when writing `$XDG_CONFIG_HOME/nono/profiles/<name>.json` would shadow
-/// a built-in or installed pack profile of the same name. User files are loaded
-/// in preference to built-ins and pack-store profiles, so saving under an
-/// existing profile's name silently reroutes all future `--profile <name>`
-/// invocations to the user file and intercepts any `"extends": "<name>"` chains.
+/// Return true when writing `$XDG_CONFIG_HOME/nono/profiles/<name>.json` would
+/// shadow a built-in profile. Packages require fully-qualified names and cannot
+/// be shadowed by a bare user profile.
 pub(crate) fn would_shadow_existing_profile(profile_name: &str) -> bool {
     // If a user file already exists at this name, the user has already chosen
     // to override it — writing there is an explicit update, not a new shadow.
@@ -2536,7 +2534,7 @@ mod tests {
     }
 
     #[test]
-    fn suggested_run_profile_name_allows_short_name_matching_pack_install_as() {
+    fn suggested_run_profile_name_ignores_package_internal_profile_names() {
         let _env_lock = ENV_LOCK.lock().expect("env lock");
         let temp_home = TempDir::new().expect("temp home");
         let temp_config = TempDir::new().expect("temp config");
@@ -2570,8 +2568,7 @@ mod tests {
         )
         .expect("write pack profile");
 
-        // "hermes" matches a pack install_as but is not a built-in, so
-        // suggesting it directly as a profile name is valid.
+        // Package artifacts do not reserve global bare profile names.
         assert_eq!(
             suggested_run_profile_name(None, "hermes"),
             Some("hermes".to_string())
@@ -2841,7 +2838,7 @@ mod tests {
     }
 
     #[test]
-    fn would_shadow_existing_profile_allows_short_name_matching_pack_install_as() {
+    fn would_shadow_existing_profile_ignores_package_internal_profile_names() {
         let _env_lock = ENV_LOCK.lock().expect("env lock");
         let temp_home = TempDir::new().expect("temp home");
         let temp_config = TempDir::new().expect("temp config");

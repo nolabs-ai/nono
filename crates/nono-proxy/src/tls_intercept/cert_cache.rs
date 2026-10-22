@@ -22,9 +22,10 @@
 //! tunnel for a route that asked for L7 visibility.
 
 use crate::error::{ProxyError, Result};
-use crate::tls_intercept::ca::EphemeralCa;
+use crate::tls_intercept::ca::{EphemeralCa, certificate_not_before, system_time_to_offset};
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256, SanType,
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
+    PKCS_ECDSA_P256_SHA256, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -32,7 +33,6 @@ use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use time::OffsetDateTime;
 use tracing::{debug, warn};
 
 /// Per-hostname leaf certificate cache backed by the session's [`EphemeralCa`].
@@ -137,6 +137,15 @@ fn mint_leaf(
     hostname: &str,
     leaf_validity: Option<Duration>,
 ) -> Result<Arc<CertifiedKey>> {
+    mint_leaf_at(ca, hostname, leaf_validity, SystemTime::now())
+}
+
+fn mint_leaf_at(
+    ca: &EphemeralCa,
+    hostname: &str,
+    leaf_validity: Option<Duration>,
+    now: SystemTime,
+) -> Result<Arc<CertifiedKey>> {
     // Generate a new key pair for this leaf. Distinct from the CA key:
     // we never expose the CA's signing key in any TLS handshake.
     let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
@@ -151,18 +160,24 @@ fn mint_leaf(
     // "Missing Authority Key Identifier".
     params.use_authority_key_identifier_extension = true;
 
-    let now = SystemTime::now();
+    // Apple's TLS policy (macOS 10.15+, iOS 13+) rejects server certificates
+    // without an Extended Key Usage extension containing id-kp-serverAuth.
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+
     let ca_not_after = ca.not_after();
     if ca_not_after <= now {
         return Err(ProxyError::Config(format!(
             "CA certificate has expired; cannot mint leaf for '{hostname}'"
         )));
     }
-    let leaf_not_after = leaf_validity
-        .and_then(|validity| now.checked_add(validity))
-        .map(|requested| requested.min(ca_not_after))
-        .unwrap_or(ca_not_after);
-    params.not_before = system_time_to_offset(now)?;
+    let leaf_not_after = match leaf_validity {
+        Some(validity) => now
+            .checked_add(validity)
+            .ok_or_else(|| ProxyError::Config("leaf certificate expiry time overflow".to_string()))?
+            .min(ca_not_after),
+        None => ca_not_after,
+    };
+    params.not_before = certificate_not_before(now)?;
     params.not_after = system_time_to_offset(leaf_not_after)?;
 
     let mut dn = DistinguishedName::new();
@@ -212,17 +227,6 @@ fn is_plausible_dns_name(s: &str) -> bool {
         && s.contains(|c: char| c.is_ascii_alphabetic())
 }
 
-fn system_time_to_offset(t: SystemTime) -> Result<OffsetDateTime> {
-    OffsetDateTime::from_unix_timestamp(
-        t.duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| ProxyError::Config(format!("system time before unix epoch: {}", e)))?
-            .as_secs()
-            .try_into()
-            .map_err(|_| ProxyError::Config("system time exceeds i64::MAX".to_string()))?,
-    )
-    .map_err(|e| ProxyError::Config(format!("invalid system time for cert validity: {}", e)))
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -230,6 +234,77 @@ mod tests {
 
     fn fresh_cache() -> CertCache {
         CertCache::new(Arc::new(EphemeralCa::generate().unwrap()))
+    }
+
+    #[test]
+    fn leaf_validity_backdates_start_and_preserves_expiry_limits() {
+        use x509_parser::prelude::FromDer;
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ca =
+            EphemeralCa::generate_with_cn_at("test-ca", Duration::from_secs(600), now).unwrap();
+        for (requested, expected_expiry) in [
+            (None, 600),
+            (Some(Duration::from_secs(60)), 60),
+            (Some(Duration::from_secs(1200)), 600),
+        ] {
+            let leaf = mint_leaf_at(&ca, "api.example.com", requested, now).unwrap();
+            let (_, cert) =
+                x509_parser::certificate::X509Certificate::from_der(leaf.cert[0].as_ref()).unwrap();
+            assert_eq!(cert.validity().not_before.timestamp(), 1_800_000_000 - 3600);
+            assert_eq!(
+                cert.validity().not_after.timestamp(),
+                1_800_000_000 + expected_expiry
+            );
+        }
+        assert!(mint_leaf_at(&ca, "api.example.com", Some(Duration::MAX), now).is_err());
+        assert!(mint_leaf_at(&ca, "api.example.com", None, ca.not_after()).is_err());
+    }
+
+    #[test]
+    fn leaf_verifies_at_skew_boundary_but_not_outside_validity() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{ServerName, UnixTime};
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ca =
+            EphemeralCa::generate_with_cn_at("test-ca", Duration::from_secs(600), now).unwrap();
+        let leaf = mint_leaf_at(&ca, "api.example.com", None, now).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(ca.cert_der().to_vec()))
+            .unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        let name = ServerName::try_from("api.example.com").unwrap();
+        let verify = |timestamp| {
+            verifier.verify_server_cert(
+                &leaf.cert[0],
+                &[],
+                &name,
+                &[],
+                UnixTime::since_unix_epoch(Duration::from_secs(timestamp)),
+            )
+        };
+        assert!(verify(1_800_000_000 - 3600).is_ok());
+        assert!(verify(1_800_000_000).is_ok());
+        assert!(matches!(
+            verify(1_800_000_000 - 3601),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidYet
+                    | rustls::CertificateError::NotValidYetContext { .. }
+            ))
+        ));
+        assert!(matches!(
+            verify(1_800_000_000 + 601),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. }
+            ))
+        ));
     }
 
     #[test]
@@ -265,6 +340,28 @@ mod tests {
         assert!(
             der.windows(aki_oid.len()).any(|w| w == aki_oid),
             "minted leaf must include Authority Key Identifier (OID 2.5.29.35)"
+        );
+    }
+
+    #[test]
+    fn minted_leaf_carries_server_auth_eku() {
+        // Apple's TLS policy rejects server certificates without an Extended
+        // Key Usage extension containing id-kp-serverAuth. Verify the EKU
+        // extension OID 2.5.29.37 (DER bytes 06 03 55 1d 25) and the
+        // serverAuth purpose OID 1.3.6.1.5.5.7.3.1 are present in the leaf DER.
+        let cache = fresh_cache();
+        let ck = cache.get_or_mint("api.example.com").unwrap();
+        let der = ck.cert[0].as_ref();
+        let eku_oid = [0x06, 0x03, 0x55, 0x1d, 0x25];
+        let server_auth_oid = [0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        assert!(
+            der.windows(eku_oid.len()).any(|w| w == eku_oid),
+            "minted leaf must include Extended Key Usage (OID 2.5.29.37)"
+        );
+        assert!(
+            der.windows(server_auth_oid.len())
+                .any(|w| w == server_auth_oid),
+            "minted leaf EKU must include serverAuth (OID 1.3.6.1.5.5.7.3.1)"
         );
     }
 

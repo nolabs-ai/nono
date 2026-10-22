@@ -9,6 +9,18 @@ use std::collections::HashSet;
 use tracing::debug;
 
 impl OAuthCaptureStore {
+    /// Resolve an OAuth-capture phantom in a token endpoint request header
+    /// value (e.g. `Authorization: Bearer <phantom>`) back to the real token
+    /// for this endpoint's provider. `None` leaves the value unchanged.
+    pub fn rewrite_request_header_value(
+        &self,
+        endpoint: &LoadedOAuthEndpoint,
+        value: &str,
+    ) -> Option<String> {
+        let consumer = provider_consumer(&endpoint.provider);
+        self.rewrite_header_value(value, &consumer)
+    }
+
     pub fn rewrite_request_body(
         &self,
         endpoint: &LoadedOAuthEndpoint,

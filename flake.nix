@@ -58,10 +58,10 @@
     # Auto-updated by the `update-nix-hashes` job in release.yml
     # after each release — no manual maintenance needed.
     prebuiltHashes = {
-      "x86_64-linux" = "sha256-Nt/utujGowxD+AuiOeJGCvQwR8AIFTr1J/3Yk8HwI5I=";
-      "aarch64-linux" = "sha256-xKT0ua4xhXTTDTUhJ6NNzJGcTWaC7o+9MLuNK9Lg6F0=";
-      "x86_64-darwin" = "sha256-J29/avISWWVUqSR6SJAyVtkZz0PJd3He8TAKwzYAKRI=";
-      "aarch64-darwin" = "sha256-5GNlsIrs/wrMnHuG9dSxdFw4UDQYnVCCIVbkOIFHkWg=";
+      "x86_64-linux" = "sha256-baZlthmZVwwQ3/x9p4go/h+388rFMxnlBc6+yu8XA38=";
+      "aarch64-linux" = "sha256-0qJMjDdxT4XIKbVYb/2B/CrPM2yVNy2IG6YhQIhPIss=";
+      "x86_64-darwin" = "sha256-s1TmdOa0ZDrVxXLRSK42e7DFwQNBD7wikjxVk6b30LI=";
+      "aarch64-darwin" = "sha256-roJBZ7PZBTG4MEKbqSt3gTebHC15+bEf3Yiw/SZ+TjI=";
     };
 
     prebuiltFor = system: let pkgs = pkgsFor system; in pkgs.stdenv.mkDerivation {

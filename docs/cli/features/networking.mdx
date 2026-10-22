@@ -114,7 +114,7 @@ Each group maps to a set of allowed hostnames and wildcard suffixes:
 | Group | Hosts |
 |-------|-------|
 | `llm_apis` | api.openai.com, api.anthropic.com, generativelanguage.googleapis.com, ... |
-| `package_registries` | registry.npmjs.org, pypi.org, crates.io, ... |
+| `package_registries` | registry.npmjs.org, pypi.org, crates.io, cache.nixos.org, ... |
 | `github` | github.com, api.github.com, raw.githubusercontent.com, ... |
 | `sigstore` | fulcio.sigstore.dev, rekor.sigstore.dev, tuf-repo-cdn.sigstore.dev |
 | `documentation` | docs.python.org, developer.mozilla.org, doc.rust-lang.org, ... |
@@ -496,7 +496,7 @@ nono run -vv --network-profile claude-code --allow-cwd -- my-agent
 By default, the proxy uses HTTP/1.1 with keep-alive connection pooling for all upstream connections. The `--allow-http2` flag enables HTTP/2 multiplexing via ALPN negotiation:
 
 ```bash
-nono run --profile claude-code --allow-http2 -- claude
+nono run --profile nolabs-ai/claude --allow-http2 -- claude
 ```
 
 It can also be set in a profile with `network.allow_http2`, which both `nono run` and `nono proxy` honor.
@@ -505,6 +505,8 @@ When enabled:
 
 - **Reverse proxy**: Negotiates h2 with upstreams that support it, allowing multiple requests to be multiplexed over a single TCP connection. This eliminates per-request TLS handshake overhead (~50-100ms) for workloads with many concurrent requests to the same host (e.g., Maven/Gradle artifact downloads).
 - **CONNECT intercept**: Advertises both `h2` and `http/1.1` in ALPN, enabling gRPC and other HTTP/2 clients to negotiate h2 transparently through the proxy. Per-stream endpoint rules and credential injection are enforced at the HTTP/2 frame level.
+
+Intercepted targets with an `aws_auth` route use HTTP/1.1 even when HTTP/2 is enabled, because AWS SigV4 signing currently requires the HTTP/1.1 intercept path. This applies to all routes sharing that host and port; other targets can still negotiate HTTP/2. OAuth targets configured to force HTTP/1.1 also retain that fallback.
 
 ### Why Disabled by Default
 

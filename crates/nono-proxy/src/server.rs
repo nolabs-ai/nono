@@ -304,9 +304,59 @@ pub struct ProxyHandle {
     intercept_ca_env_vars: Vec<String>,
     /// Credential load warnings collected at startup.
     diagnostics: Vec<crate::diagnostic::ProxyDiagnostic>,
+    /// What [`Self::add_listener`] needs to serve another listener with this
+    /// proxy's state. `None` only for handles built directly in tests.
+    listener_attach: Option<ListenerAttach>,
+}
+
+/// Shared proxy state plus the runtime its accept loops run on.
+struct ListenerAttach {
+    state: Arc<ProxyState>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl ProxyHandle {
+    /// Serve an additional, already-listening socket with this proxy.
+    ///
+    /// Used for the namespace-isolation bridge (NEP-0004): a listener created
+    /// inside the sandbox's network namespace and handed to the supervisor.
+    /// Connections on it are handled exactly like connections on the primary
+    /// listener, including session-token authentication and the connection
+    /// limit. Its local port must equal the proxy port, so requests addressed
+    /// to the proxy itself are still recognised as such.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the port differs from the proxy port, the listener
+    /// cannot be registered with the runtime, or this handle has no runtime.
+    pub fn add_listener(&self, listener: std::net::TcpListener) -> Result<()> {
+        let attach = self.listener_attach.as_ref().ok_or_else(|| {
+            ProxyError::Config("proxy handle cannot accept additional listeners".to_string())
+        })?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| ProxyError::Config(format!("bridge listener address: {e}")))?
+            .port();
+        if port != self.port {
+            return Err(ProxyError::Config(format!(
+                "bridge listener port {port} does not match proxy port {}",
+                self.port
+            )));
+        }
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| ProxyError::Config(format!("bridge listener: {e}")))?;
+        let _entered = attach.runtime.enter();
+        let listener = TcpListener::from_std(listener)
+            .map_err(|e| ProxyError::Config(format!("bridge listener: {e}")))?;
+        attach.runtime.spawn(accept_loop(
+            listener,
+            Arc::clone(&attach.state),
+            self.shutdown_tx.subscribe(),
+        ));
+        Ok(())
+    }
+
     /// Signal the proxy to shut down gracefully.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
@@ -1367,7 +1417,7 @@ pub async fn start_with_nonce_resolver(
     // Spawn accept loop as a task within the current runtime.
     // The caller MUST ensure this runtime is being driven (e.g., via
     // a dedicated thread calling block_on or a multi-thread runtime).
-    tokio::spawn(accept_loop(listener, state, shutdown_rx));
+    tokio::spawn(accept_loop(listener, Arc::clone(&state), shutdown_rx));
 
     Ok(ProxyHandle {
         port,
@@ -1381,6 +1431,10 @@ pub async fn start_with_nonce_resolver(
         intercept_ca_path,
         intercept_ca_env_vars,
         diagnostics: proxy_diagnostics,
+        listener_attach: Some(ListenerAttach {
+            state,
+            runtime: tokio::runtime::Handle::current(),
+        }),
     })
 }
 
@@ -1726,11 +1780,19 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 None
                             };
 
+                        let requires_http1 = state.route_store.requires_http1(&host_port);
+                        if state.enable_h2 && requires_http1 {
+                            debug!(
+                                "tls_intercept: disabling h2 for {}:{}: AWS SigV4 requires HTTP/1.1",
+                                host, port
+                            );
+                        }
                         let mut h2_enabled_for_target = state.enable_h2
+                            && !requires_http1
                             && !oauth_host_policy
                                 .as_ref()
                                 .is_some_and(|policy| policy.force_http1);
-                        let (tls_connector_h2, h2_connector_cache_key) = if state.enable_h2 {
+                        let (tls_connector_h2, h2_connector_cache_key) = if h2_enabled_for_target {
                             match tls_intercept::handle::select_h2_tls_connector_for_target(
                                 &state.route_store,
                                 &host,
@@ -2265,6 +2327,195 @@ mod tests {
         }
     }
 
+    /// Exercise CONNECT dispatch, ALPN, and the existing HTTP/1.1 signing path
+    /// against an upstream that would otherwise permit h2.
+    #[test]
+    fn aws_intercept_falls_back_to_http1_and_signs_request() {
+        use base64::Engine;
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let empty_profile = dir.path().join("aws-empty");
+        std::fs::write(&empty_profile, "").unwrap();
+
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+            (
+                "AWS_SECRET_ACCESS_KEY",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            ),
+            ("AWS_SESSION_TOKEN", "fake-session-token"),
+            ("AWS_REGION", "us-east-1"),
+            ("AWS_CONFIG_FILE", empty_profile.to_str().unwrap()),
+            (
+                "AWS_SHARED_CREDENTIALS_FILE",
+                empty_profile.to_str().unwrap(),
+            ),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ]);
+
+        // Hold the environment lock until the runtime and guard are dropped.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                let ca = Arc::new(EphemeralCa::generate().unwrap());
+                let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+                let acceptor = tokio_rustls::TlsAcceptor::from(
+                    tls_intercept::acceptor::build_server_config(cache, true).unwrap(),
+                );
+
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream_port = listener.local_addr().unwrap().port();
+                let body = br#"{"messages":[{"text":"hi"}]}"#;
+
+                let upstream = tokio::spawn(async move {
+                    // A pre-flight h2 probe would consume this connection and
+                    // fail the HTTP/1.1 assertion, so this also checks probe suppression.
+                    let (sock, _) = listener.accept().await.unwrap();
+                    let mut tls = acceptor.accept(sock).await.unwrap();
+                    assert_ne!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+
+                    let mut request = Vec::new();
+                    let header_end = loop {
+                        let mut byte = [0];
+                        tls.read_exact(&mut byte).await.unwrap();
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break request.len();
+                        }
+                        assert!(request.len() < 16384);
+                    };
+
+                    let mut received_body = vec![0; body.len()];
+                    tls.read_exact(&mut received_body).await.unwrap();
+                    assert_eq!(received_body, body);
+
+                    let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+                    assert!(headers.starts_with("POST /model/test/converse HTTP/1.1\r\n"));
+                    assert!(headers.contains("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/"));
+                    assert!(headers.contains("/us-east-1/bedrock/aws4_request"));
+                    assert!(!headers.contains("agent-signature"));
+
+                    let lower = headers.to_ascii_lowercase();
+                    let body_hash: String = Sha256::digest(body)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                    assert!(lower.contains(&format!("x-amz-content-sha256: {body_hash}")));
+                    assert!(lower.contains("x-amz-security-token: fake-session-token"));
+                    assert!(!lower.contains("proxy-authorization"));
+
+                    tls.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+                    tls.shutdown().await.unwrap();
+                });
+
+                let ca_file = dir.path().join("upstream-ca.pem");
+                std::fs::write(&ca_file, ca.cert_pem()).unwrap();
+                let route = serde_json::from_value(serde_json::json!({
+                    "prefix": "aws",
+                    "upstream": format!("https://localhost:{upstream_port}"),
+                    "aws_auth": {"region": "us-east-1", "service": "bedrock"},
+                    "tls_ca": ca_file,
+                    "endpoint_rules": [{"method": "POST", "path": "/model/**"}]
+                }))
+                .unwrap();
+
+                let handle = start(ProxyConfig {
+                    routes: vec![route],
+                    enable_h2: true,
+                    intercept_ca_dir: Some(dir.path().to_path_buf()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+                let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+                    .await
+                    .unwrap();
+                let auth = base64::engine::general_purpose::STANDARD
+                    .encode(format!("nono:{}", handle.token.as_str()));
+                sock.write_all(
+                    format!(
+                        "CONNECT localhost:{upstream_port} HTTP/1.1\r\nHost: localhost:{upstream_port}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+                let mut response = Vec::new();
+                while !response.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    sock.read_exact(&mut byte).await.unwrap();
+                    response.push(byte[0]);
+                    assert!(response.len() < 16384);
+                }
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+
+                let bundle = std::fs::read(handle.intercept_ca_path().unwrap()).unwrap();
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in CertificateDer::pem_slice_iter(&bundle) {
+                    roots.add(cert.unwrap()).unwrap();
+                }
+
+                let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+                client.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+                    .connect(ServerName::try_from("localhost").unwrap(), sock)
+                    .await
+                    .unwrap();
+                assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"http/1.1".as_slice()));
+
+                tls.write_all(
+                    format!(
+                        "POST /model/test/converse HTTP/1.1\r\nHost: localhost:{upstream_port}\r\nAuthorization: agent-signature\r\nX-Amz-Date: agent-signature\r\nX-Amz-Content-Sha256: agent-signature\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+                tls.write_all(body).await.unwrap();
+
+                let mut response = Vec::new();
+                while !response.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    tls.read_exact(&mut byte).await.unwrap();
+                    response.push(byte[0]);
+                    assert!(response.len() < 16384);
+                }
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+
+                let mut response_body = [0; 2];
+                tls.read_exact(&mut response_body).await.unwrap();
+                assert_eq!(&response_body, b"ok");
+
+                upstream.await.unwrap();
+                handle.shutdown();
+            })
+            .await
+            .unwrap();
+        });
+    }
+
     #[test]
     fn normalize_authority_normalises_case_and_default_port() {
         assert_eq!(normalize_authority("API.OpenAI.com"), "api.openai.com:443");
@@ -2349,6 +2600,38 @@ mod tests {
         };
         let handle = start(config).await.unwrap();
         assert_eq!(*handle.token, "my-fixed-password");
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_add_listener_rejects_port_mismatch() {
+        let handle = start(ProxyConfig::default()).await.unwrap();
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let error = handle.add_listener(other).expect_err("port must match");
+        assert!(error.to_string().contains("does not match proxy port"));
+        handle.shutdown();
+    }
+
+    /// An added listener is served with the proxy's own state: an
+    /// unauthenticated forward request gets the same 407 as on the primary
+    /// listener. Uses 127.0.0.2 to share the proxy's port number in one netns.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_listener_serves_with_proxy_state() {
+        let handle = start(ProxyConfig::default()).await.unwrap();
+        let extra = std::net::TcpListener::bind(("127.0.0.2", handle.port)).unwrap();
+        handle.add_listener(extra).unwrap();
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.2", handle.port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = vec![0_u8; 64];
+        let read = stream.read(&mut response).await.unwrap();
+        let status = String::from_utf8_lossy(&response[..read]);
+        assert!(status.starts_with("HTTP/1.1 407"), "got: {status:?}");
         handle.shutdown();
     }
 
@@ -3018,6 +3301,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         {
             let _handle = ProxyHandle {
+                listener_attach: None,
                 port: 12345,
                 token: Zeroizing::new("test_token".to_string()),
                 audit_log: Some(audit::new_audit_log()),
@@ -3655,6 +3939,7 @@ mod tests {
     fn test_proxy_env_vars_include_canonical_nono_no_proxy() -> Result<()> {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("a".repeat(64)),
             audit_log: Some(audit::new_audit_log()),
@@ -3735,6 +4020,7 @@ mod tests {
         // backward-compatible path for keyring-backed credentials.
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -3800,6 +4086,7 @@ mod tests {
         // without starting a real proxy (which would try to load credentials).
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -3869,6 +4156,7 @@ mod tests {
         // like the system keyring. See: #234
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -3962,6 +4250,7 @@ mod tests {
     fn test_proxy_credential_env_vars_injects_spiffe_phantom_token() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("session_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4025,6 +4314,7 @@ mod tests {
         // "/ANTHROPIC_BASE_URL=http://127.0.0.1:PORT//anthropic".
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 58406,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4129,6 +4419,7 @@ mod tests {
         // => ANTHROPIC_API_KEY must NOT appear (demonstrates the bug).
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle_no_env_var = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("phantom".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4180,6 +4471,7 @@ mod tests {
         // => ANTHROPIC_API_KEY must be set to the phantom token.
         let (shutdown_tx2, _) = tokio::sync::watch::channel(false);
         let handle_fixed = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("phantom".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4232,6 +4524,7 @@ mod tests {
     fn test_no_proxy_excludes_credential_upstreams() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4271,6 +4564,7 @@ mod tests {
     fn test_no_proxy_empty_when_no_non_credential_hosts() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4296,6 +4590,7 @@ mod tests {
     fn test_no_proxy_omits_loopback_for_managed_loopback_upstream() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),

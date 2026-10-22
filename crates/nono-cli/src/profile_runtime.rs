@@ -24,6 +24,8 @@ pub(crate) struct PreparedProfile {
     pub(crate) sandbox_policy: profile::LinuxSandboxPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) explicit_sandbox_policy: Option<profile::LinuxSandboxPolicy>,
+    #[cfg(target_os = "linux")]
+    pub(crate) isolate: profile::LinuxIsolateConfig,
     pub(crate) workdir_access: Option<profile::WorkdirAccess>,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
@@ -273,7 +275,7 @@ fn verify_stored_bundles(
     })?;
 
     let trusted_root = nono::trust::load_production_trusted_root()?;
-    let policy = nono::trust::VerificationPolicy::default();
+    let policy = nono::trust::VerificationPolicy::any_identity();
 
     for entry in &entries {
         let artifact_name = entry
@@ -680,9 +682,8 @@ fn prepare_profile_with_options(
     }
 
     let (loaded_profile, resolved_command_binaries) = if let Some(ref profile_name) = args.profile {
-        // The claude-code → registry-pack migration is wired into
-        // `load_profile` itself so it fires from every call site (run,
-        // wrap, shell, profile show, why) without duplication.
+        // Missing fully-qualified package profiles may offer to install the
+        // exact registry package from every normal loading call site.
         let profile = profile::load_profile_with_extends(profile_name, &args.extends)?;
         crate::package_status::enforce_for_active_profile(
             Some(profile_name),
@@ -692,8 +693,7 @@ fn prepare_profile_with_options(
         // If the profile was addressed by pack ref (e.g. --profile nolabs-ai/hermes),
         // ensure that pack is verified even if the profile JSON doesn't list it in `packs`.
         // Pack refs are injected into profile.packs at load time for every
-        // pack-store resolution — both direct registry refs and name/alias
-        // paths — so no post-hoc lookup is needed here.
+        // fully-qualified package resolution, so no post-hoc lookup is needed.
         let mut packs_to_verify = profile.packs.clone();
         let resolved_command_binaries = validate_command_policy_runtime_support(&profile)?;
 
@@ -827,6 +827,11 @@ fn prepare_profile_with_options(
         explicit_sandbox_policy: loaded_profile
             .as_ref()
             .and_then(|profile| profile.linux.sandbox_policy),
+        #[cfg(target_os = "linux")]
+        isolate: loaded_profile
+            .as_ref()
+            .map(|profile| profile.linux.isolate)
+            .unwrap_or_default(),
         workdir_access: loaded_profile
             .as_ref()
             .map(|profile| profile.workdir.access.clone()),

@@ -145,11 +145,8 @@ fn yanked_message(key: &str, installed: &str, status: &PackageStatusResponse) ->
     message
 }
 
-/// Returns `true` when this run launches Claude Code: the `nolabs-ai/claude`
-/// pack ref, any name the installed pack answers to (its `install_as` plus the
-/// manifest's aliases), the names the pack is published under while it is not
-/// installed yet, a user profile file named after one of those, or any profile
-/// whose `extends` chain reaches one of those.
+/// Returns `true` when this run launches Claude Code: an official package ref,
+/// a known bare agent profile name, or an inheritance chain reaching either.
 ///
 /// `cli_extends` carries `--extends`, whose bases are resolved as if they
 /// were prepended to the selected profile's own `extends`.
@@ -166,10 +163,8 @@ pub(crate) fn profile_selects_claude_code(name_or_path: &str, cli_extends: &[Str
     )
 }
 
-/// Returns `true` when this run loads `target`'s own profile: the pack ref, a
-/// name the installed pack answers to, a name the pack is published under
-/// while it is not installed yet, or any profile whose `extends` chain reaches
-/// one of those.
+/// Returns `true` when this run loads `target`'s package profile: the exact
+/// package ref, or an inheritance chain reaching it.
 ///
 /// Unlike [`profile_selects_claude_code`] this mirrors the resolver exactly, so
 /// a user profile file shadowing a published name is not the pack: that run
@@ -180,24 +175,6 @@ fn run_loads_official_pack(
     cli_extends: &[String],
 ) -> bool {
     reaches_official_pack_profile(target, name_or_path, cli_extends, name_loads_official_pack)
-}
-
-/// The pack a bare `--profile <name>` would resolve to, if any — matching the
-/// canonical `install_as` names and the manifest aliases alike.
-///
-/// Delegates to the resolver's own lookup rather than re-deriving it from a
-/// separate scan, so this answer cannot drift from the pack `load_profile_inner`
-/// would load — including the tie-break when two installed packs publish the
-/// same profile name.
-///
-/// Each call rescans the pack store (a `read_dir` per namespace plus a
-/// `package.json` read and parse per pack). Detection asks this once per node of
-/// every `extends` chain it walks, but the walk already pays the same scan per
-/// node inside [`profile::load_profile_extends`], so this at most doubles a cost
-/// bounded by chain length. Cache it in `profile` — behind the one lookup both
-/// sides use — if that ever shows up in a profile.
-fn pack_store_provider(name: &str) -> Option<String> {
-    profile::find_pack_store_profile(name).map(|(_, pack_key)| pack_key)
 }
 
 /// Walk `name_or_path` and the `--extends` bases, asking `name_matches` about
@@ -242,17 +219,8 @@ fn walk_extends_chain(
 /// Returns `true` when this single name loads `target`'s own profile, ignoring
 /// `extends`.
 ///
-/// Mirrors the resolver's precedence (`load_profile_inner`): pack ref, then
-/// user override, then the pack store, then the published names.
 fn name_loads_official_pack(target: OfficialPackStatusTarget, name: &str) -> bool {
-    if is_official_package_ref(target, name) {
-        return true;
-    }
-    // A user file shadows the pack, so this name loads that file, not the pack.
-    if profile::is_user_override(name) {
-        return false;
-    }
-    name_resolves_to_official_pack(target, name)
+    is_official_package_ref(target, name)
 }
 
 /// Returns `true` when this single name launches `target`'s agent, ignoring
@@ -262,24 +230,7 @@ fn name_loads_official_pack(target: OfficialPackStatusTarget, name: &str) -> boo
 /// the pack: `~/.config/nono/profiles/claude-code.json` shadows the pack, but it
 /// still launches Claude Code and still needs the Claude Code preparation.
 fn name_launches_official_pack(target: OfficialPackStatusTarget, name: &str) -> bool {
-    if is_official_package_ref(target, name) {
-        return true;
-    }
-    if profile::is_user_override(name) {
-        return is_official_profile_name(target, name);
-    }
-    name_resolves_to_official_pack(target, name)
-}
-
-/// The tail both questions share: the pack store, then the published names.
-fn name_resolves_to_official_pack(target: OfficialPackStatusTarget, name: &str) -> bool {
-    if let Some(pack_key) = pack_store_provider(name) {
-        // An installed pack owns the name it installs, even when that name is
-        // one the official pack publishes — `--profile claude` resolves to
-        // that pack, so this run is not the official one.
-        return target.keys().any(|key| key == pack_key);
-    }
-    is_official_profile_name(target, name)
+    is_official_package_ref(target, name) || is_official_profile_name(target, name)
 }
 
 fn is_official_profile_name(target: OfficialPackStatusTarget, name: &str) -> bool {
@@ -312,8 +263,7 @@ mod tests {
         run_loads_official_pack(CLAUDE_PACK, name, NO_EXTENDS)
     }
 
-    /// Install a fake pack providing one profile artifact under `install_as`,
-    /// also answering to `aliases`.
+    /// Install a fake package profile.
     fn write_pack_profile(
         config_home: &Path,
         namespace: &str,
@@ -397,8 +347,8 @@ mod tests {
             write_pack_profile(config_home, "always-further", "claude", "claude", &["cc"]);
 
             assert!(selects_claude_code("claude"));
-            assert!(selects_claude_code("cc"));
-            assert!(loads_claude_pack("claude"));
+            assert!(!selects_claude_code("cc"));
+            assert!(!loads_claude_pack("claude"));
         });
     }
 
@@ -436,10 +386,8 @@ mod tests {
         });
     }
 
-    /// Aliases live in the pack manifest, not in `CLAUDE_PACK.profiles`, so
-    /// detection must ask the resolver instead of the hardcoded name list.
     #[test]
-    fn claude_code_detection_covers_pack_manifest_aliases() {
+    fn package_manifest_aliases_do_not_become_profile_names() {
         with_isolated_config_home(|config_home| {
             write_pack_profile(
                 config_home,
@@ -449,10 +397,7 @@ mod tests {
                 &["claude-code", "cc"],
             );
 
-            assert!(
-                selects_claude_code("cc"),
-                "an alias the installed claude pack answers to must be treated as Claude Code"
-            );
+            assert!(!selects_claude_code("cc"));
         });
     }
 
@@ -468,32 +413,25 @@ mod tests {
         });
     }
 
-    /// An installed pack owns the name it installs, even when that name is one
-    /// the official pack is published under: `--profile claude` resolves to
-    /// this third-party pack (user file -> pack store -> built-in), so treating
-    /// it as Claude Code would relocate `~/.claude.json` for an unrelated
-    /// profile.
     #[test]
-    fn third_party_pack_installing_the_claude_name_does_not_select_claude_code() {
+    fn third_party_package_cannot_claim_bare_profile_names() {
         with_isolated_config_home(|config_home| {
             write_pack_profile(config_home, "someone-else", "agent", "claude", &["cc"]);
 
-            assert!(
-                !selects_claude_code("claude"),
-                "a third-party pack installed as `claude` must not be treated as Claude Code"
-            );
-            assert!(!selects_claude_code("cc"), "nor must one of its aliases");
+            assert!(selects_claude_code("claude"));
+            assert!(!selects_claude_code("cc"));
+            assert!(!loads_claude_pack("claude"));
         });
     }
 
-    /// The published-name fallback still has to fire once the official pack is
-    /// the one installed under that name.
     #[test]
-    fn official_pack_installing_the_claude_name_selects_claude_code() {
+    fn official_pack_still_requires_its_fully_qualified_name() {
         with_isolated_config_home(|config_home| {
             write_pack_profile(config_home, "nolabs-ai", "claude", "claude", &[]);
 
             assert!(selects_claude_code("claude"));
+            assert!(!loads_claude_pack("claude"));
+            assert!(loads_claude_pack("nolabs-ai/claude"));
         });
     }
 

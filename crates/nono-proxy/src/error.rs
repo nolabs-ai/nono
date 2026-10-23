@@ -33,6 +33,9 @@ pub enum ProxyError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("OAuth capture keystore error: {0}")]
+    Keystore(String),
+
     #[error("HTTP parse error: {0}")]
     HttpParse(String),
 

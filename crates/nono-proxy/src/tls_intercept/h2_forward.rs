@@ -326,6 +326,10 @@ async fn handle_h2_stream(
             send_h2_error(&mut respond, status)?;
             return Ok(());
         }
+        handle::CredentialResolution::CaptureFailed => {
+            send_h2_credential_capture_error(&mut respond, method == http::Method::HEAD)?;
+            return Ok(());
+        }
         handle::CredentialResolution::Forward { credential } => credential,
     };
     let cred = resolved.as_ref().map(|c| c.as_ref());
@@ -678,6 +682,29 @@ async fn stream_body_to_client(mut recv: RecvStream, send: &mut SendStream<Bytes
     Ok(())
 }
 
+/// Send the same safe credential-capture diagnostic as the HTTP/1.1 paths.
+fn send_h2_credential_capture_error(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    is_head: bool,
+) -> Result<()> {
+    let body = Bytes::from_static(crate::capture::CAPTURE_FAILED_BODY.as_bytes());
+    let response = Response::builder()
+        .status(http::StatusCode::SERVICE_UNAVAILABLE)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CONTENT_LENGTH, body.len())
+        .body(())
+        .map_err(|e| ProxyError::HttpParse(format!("h2 error response build: {e}")))?;
+    let mut stream = respond
+        .send_response(response, is_head)
+        .map_err(|e| ProxyError::HttpParse(format!("h2 send error response: {e}")))?;
+    if !is_head {
+        stream
+            .send_data(body, true)
+            .map_err(|e| ProxyError::HttpParse(format!("h2 send error body: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Send a simple h2 error response (no body).
 fn send_h2_error(respond: &mut h2::server::SendResponse<Bytes>, status_code: u16) -> Result<()> {
     let status =
@@ -964,10 +991,10 @@ mod tests {
                     );
                     let headers = request.headers().clone();
 
+                    // Record receipt before responding so a send failure cannot hide a request.
+                    let _ = tx.send((method_path, headers));
                     let response = http::Response::builder().status(200).body(()).unwrap();
                     respond.send_response(response, true).unwrap();
-
-                    let _ = tx.send((method_path, headers));
                 }
             }
         });
@@ -1453,6 +1480,95 @@ mod tests {
         })
         .await;
         assert!(result.is_ok(), "test timed out — h2 forwarding hung");
+    }
+
+    #[tokio::test]
+    async fn h2_intercept_reports_credential_capture_failure() {
+        assert_h2_credential_capture_failure("POST").await;
+    }
+
+    #[tokio::test]
+    async fn h2_head_reports_credential_capture_failure_without_body() {
+        assert_h2_credential_capture_failure("HEAD").await;
+    }
+
+    async fn assert_h2_credential_capture_failure(method: &str) {
+        use crate::capture::tests::{FailingCaptureBackend, assert_failure_body};
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let ca = Arc::new(EphemeralCa::generate().unwrap());
+            let (port, upstream_requests) = spawn_mock_h2_upstream(&ca).await;
+            let connector = h2_tls_connector_trusting(ca.cert_pem());
+            let (route_store, credential_store) =
+                make_cmd_route_stores("localhost", port, &connector).await;
+            let session_token = Zeroizing::new("session-token".to_string());
+            let filter = ProxyFilter::allow_all();
+            let ctx = InterceptCtx {
+                route_id: Some("cmd-svc"),
+                host: "localhost",
+                port,
+                route_store: Arc::new(route_store),
+                credential_store: Arc::new(credential_store),
+                oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
+                session_token: &session_token,
+                cert_cache: Arc::new(CertCache::new(ca)),
+                tls_connector: &connector,
+                tls_connector_h2: &connector,
+                filter: &filter,
+                audit_log: None,
+                upstream_proxy: None,
+                approval_backends: None,
+                credential_capture_backend: Some(Arc::new(FailingCaptureBackend)),
+                nonce_resolver: None,
+                enable_h2: true,
+            };
+            let (client_io, server_io) = tokio::io::duplex(65536);
+            tokio::join!(
+                async {
+                    let _ = forward_h2_connection(server_io, &ctx).await;
+                },
+                async {
+                    let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+                    let driver = tokio::spawn(connection);
+                    let request = http::Request::builder()
+                        .method(method)
+                        .uri(format!("https://localhost:{port}/mcp"))
+                        .header("authorization", "Bearer session-token")
+                        .body(())
+                        .unwrap();
+                    let (response, _) = client.send_request(request, true).unwrap();
+                    let response = response.await.unwrap();
+                    assert_eq!(response.status(), 503);
+                    assert_eq!(response.headers()["content-type"], "application/json");
+                    assert!(!response.headers().contains_key("www-authenticate"));
+                    let content_length: usize = response.headers()["content-length"]
+                        .to_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let mut body = response.into_body();
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = body.data().await {
+                        bytes.extend_from_slice(&chunk.unwrap());
+                    }
+                    assert_eq!(content_length, crate::capture::CAPTURE_FAILED_BODY.len());
+                    if method == "HEAD" {
+                        assert!(bytes.is_empty());
+                    } else {
+                        assert_eq!(content_length, bytes.len());
+                        assert_failure_body(&bytes);
+                    }
+                    drop(client);
+                    driver.abort();
+                    let _ = driver.await;
+                }
+            );
+            // h2 connects eagerly. Await upstream shutdown, not just an empty queue,
+            // to prove that no request was forwarded before the connection closed.
+            assert!(upstream_requests.await.is_err());
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ zeroize.workspace = true
 sha2.workspace = true
 sha1.workspace = true
 getrandom.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 base64 = "0.23"
 regex = "1"
 subtle = "2"

@@ -4,7 +4,14 @@
 //! additional filesystem access. This is the default approval backend
 //! for `nono run`.
 
-use nono::{AccessMode, ApprovalBackend, ApprovalDecision, ApprovalRequest, Result};
+use nono::{AccessMode, ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result};
+use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
+
+/// Bound the complete attempt, including waiting for another prompt and the
+/// anti-type-ahead delay, before the proxy's timeout-plus-grace backstop.
+pub(crate) const TERMINAL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
+static APPROVAL_PROMPT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Interactive terminal approval backend.
 ///
@@ -16,6 +23,40 @@ pub struct TerminalApproval;
 
 impl ApprovalBackend for TerminalApproval {
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+        self.request_approval_with_timeout(request, TERMINAL_APPROVAL_TIMEOUT, None)
+    }
+
+    fn request_approval_with_deadline(
+        &self,
+        request: &ApprovalRequest,
+        deadline: Instant,
+    ) -> Result<ApprovalDecision> {
+        self.request_approval_with_timeout(request, TERMINAL_APPROVAL_TIMEOUT, Some(deadline))
+    }
+
+    fn backend_name(&self) -> &str {
+        "terminal"
+    }
+
+    fn approval_timeout(&self) -> Option<Duration> {
+        Some(TERMINAL_APPROVAL_TIMEOUT)
+    }
+}
+
+impl TerminalApproval {
+    pub(crate) fn request_approval_with_timeout(
+        &self,
+        request: &ApprovalRequest,
+        timeout: Duration,
+        caller_deadline: Option<Instant>,
+    ) -> Result<ApprovalDecision> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            NonoError::ConfigParse("Terminal approval timeout is too large".to_string())
+        })?;
+        let deadline = caller_deadline.map_or(deadline, |caller| deadline.min(caller));
+        if Instant::now() >= deadline {
+            return Ok(ApprovalDecision::Timeout);
+        }
         // Check the controlling terminal itself, in the same read/write mode
         // used to prompt, so we don't print a prompt we cannot safely answer.
         if !crate::terminal_prompt::consent_prompt_available() {
@@ -24,6 +65,23 @@ impl ApprovalBackend for TerminalApproval {
             });
         }
 
+        Self::prompt(
+            request,
+            deadline,
+            crate::terminal_prompt::read_consent_line_until,
+        )
+    }
+
+    fn prompt(
+        request: &ApprovalRequest,
+        deadline: Instant,
+        read_line: impl FnOnce(&str, Instant) -> Result<Option<String>>,
+    ) -> Result<ApprovalDecision> {
+        // Serialize the request text as well as the read, so concurrent hosts
+        // cannot print one request's context over another request's answer.
+        let Some(_prompt_guard) = acquire_prompt_slot(&APPROVAL_PROMPT_LOCK, deadline)? else {
+            return Ok(ApprovalDecision::Timeout);
+        };
         eprintln!();
         match request {
             ApprovalRequest::Capability {
@@ -105,9 +163,52 @@ impl ApprovalBackend for TerminalApproval {
             }
         }
         eprintln!("[nono]");
-        let input = crate::terminal_prompt::read_consent_line("[nono] Grant access? [y/N] ")?;
 
-        if is_affirmative_response(&input) {
+        // Network prompts offer session-scoped choices so an "always" answer
+        // suppresses re-prompting for the rest of the session. Every other
+        // request type keeps the one-shot [y/N] prompt.
+        let is_network = matches!(request, ApprovalRequest::Network { .. });
+        let prompt = if is_network {
+            eprintln!("[nono]   1) Allow once");
+            eprintln!("[nono]   2) Always allow (this session)");
+            eprintln!("[nono]   3) Deny once");
+            eprintln!("[nono]   4) Always deny (this session)");
+            "[nono] Choose [1-4, default 3]: "
+        } else {
+            "[nono] Grant access? [y/N] "
+        };
+        let Some(input) = read_line(prompt, deadline)? else {
+            eprintln!("\n[nono] Approval timed out; access denied.");
+            return Ok(ApprovalDecision::Timeout);
+        };
+        if Instant::now() >= deadline {
+            return Ok(ApprovalDecision::Timeout);
+        }
+
+        if is_network {
+            // Fail secure: an empty line (EOF), whitespace, or any unrecognized
+            // answer denies this one request without persisting the decision.
+            match input.trim().to_ascii_lowercase().as_str() {
+                "1" | "y" | "yes" => {
+                    eprintln!("[nono] Access granted.");
+                    Ok(ApprovalDecision::Granted)
+                }
+                "2" => {
+                    eprintln!("[nono] Access granted for this session.");
+                    Ok(ApprovalDecision::GrantedForSession)
+                }
+                "4" => {
+                    eprintln!("[nono] Access denied for this session.");
+                    Ok(ApprovalDecision::DeniedForSession)
+                }
+                _ => {
+                    eprintln!("[nono] Access denied.");
+                    Ok(ApprovalDecision::Denied {
+                        reason: "User denied the request".to_string(),
+                    })
+                }
+            }
+        } else if is_affirmative_response(&input) {
             eprintln!("[nono] Access granted.");
             Ok(ApprovalDecision::Granted)
         } else {
@@ -117,9 +218,25 @@ impl ApprovalBackend for TerminalApproval {
             })
         }
     }
+}
 
-    fn backend_name(&self) -> &str {
-        "terminal"
+fn acquire_prompt_slot(lock: &Mutex<()>, deadline: Instant) -> Result<Option<MutexGuard<'_, ()>>> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match lock.try_lock() {
+            Ok(guard) => return Ok(Some(guard)),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(NonoError::SandboxInit(
+                    "Terminal approval lock poisoned".to_string(),
+                ));
+            }
+            Err(TryLockError::WouldBlock) => {
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
     }
 }
 
@@ -261,6 +378,79 @@ mod tests {
         assert!(!is_affirmative_response(""));
         assert!(!is_affirmative_response("n"));
         assert!(!is_affirmative_response("anything else"));
+    }
+
+    #[test]
+    fn terminal_timeout_includes_waiting_for_the_prompt_slot() {
+        let lock = Mutex::new(());
+        let _held = lock.lock().expect("hold prompt slot");
+        let start = Instant::now();
+        assert!(
+            acquire_prompt_slot(&lock, start + Duration::from_millis(20))
+                .expect("wait for prompt slot")
+                .is_none()
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn timed_out_terminal_attempt_finishes_before_another_prompt_starts() {
+        use crate::terminal_prompt::read_consent_line_from;
+        use nix::pty::{OpenptyResult, openpty};
+        use std::sync::mpsc;
+
+        let OpenptyResult { master, slave } = openpty(None, None).expect("openpty");
+        let observer = nix::unistd::dup(&slave).expect("observe terminal");
+        let saved = nix::sys::termios::tcgetattr(&observer).expect("save terminal state");
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = TerminalApproval::prompt(
+                &network_request(),
+                Instant::now() + Duration::from_millis(50),
+                |prompt, deadline| {
+                    read_consent_line_from(
+                        std::fs::File::from(slave),
+                        prompt,
+                        Duration::ZERO,
+                        Some(deadline),
+                    )
+                },
+            );
+            finished_tx.send(result).expect("report completed prompt");
+        });
+        let decision = finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("terminal reader must finish without input")
+            .expect("prompt result");
+        assert!(matches!(decision, ApprovalDecision::Timeout));
+        worker.join().expect("no active prompt worker remains");
+        assert_eq!(
+            nix::sys::termios::tcgetattr(&observer).expect("restored terminal"),
+            saved
+        );
+        assert!(
+            APPROVAL_PROMPT_LOCK.try_lock().is_ok(),
+            "prompt slot released"
+        );
+
+        // A late affirmative answer must not authorize the next attempt. The
+        // next reader discards it, times out without fresh input, and releases
+        // the same prompt slot rather than competing with an abandoned reader.
+        nix::unistd::write(&master, b"1\n").expect("late answer");
+        let second = TerminalApproval::prompt(
+            &network_request(),
+            Instant::now() + Duration::from_millis(50),
+            |prompt, deadline| {
+                read_consent_line_from(
+                    std::fs::File::from(observer),
+                    prompt,
+                    Duration::ZERO,
+                    Some(deadline),
+                )
+            },
+        )
+        .expect("second prompt");
+        assert!(matches!(second, ApprovalDecision::Timeout));
     }
 
     // ── non-TTY auto-deny (all three variants) ────────────────────────────────

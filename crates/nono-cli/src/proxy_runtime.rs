@@ -1462,23 +1462,39 @@ pub(crate) fn prepare_proxy_launch_options(
         bypass
     };
 
+    // --allow-net clears profile network approval settings along with the
+    // static allowlist. Merely carrying the backends through would otherwise
+    // reactivate proxy filtering after the explicit unrestricted override.
+    let (network_approval_backends, network_approval_defaults) = if args.allow_net {
+        (BTreeMap::new(), None)
+    } else {
+        (
+            prepared.network_approval_backends.clone(),
+            prepared.network_approval_defaults.clone(),
+        )
+    };
+    let has_network_approval = !network_approval_backends.is_empty();
     let has_domain_filter =
         network_profile.is_some() || !allow_domain.is_empty() || !deny_domain.is_empty();
     let has_credentials = !credentials.is_empty();
-    let would_activate = has_domain_filter || has_credentials || upstream_proxy_addr.is_some();
+    let would_activate = has_domain_filter
+        || has_credentials
+        || upstream_proxy_addr.is_some()
+        || has_network_approval;
 
-    // Normal launch validation rejects hard-block plus proxy-mode inputs before
-    // this fallback can choose BlockAll or strict filtering.
-    let block_wins = args.block_net || (prepared.profile_network_block && !would_activate);
+    // Both block forms deny all outbound traffic. Normal launch validation
+    // rejects contradictory proxy/approval settings; retain this fail-closed
+    // fallback for callers that construct launch options directly.
+    let block_wins = args.block_net || (prepared.profile_network_block && !args.allow_net);
     if block_wins {
         if would_activate {
             warn!(
-                "--block-net is active; ignoring proxy configuration \
+                "network blocking is active; ignoring proxy configuration \
                  that would re-enable network access"
             );
             if !silent {
                 eprintln!(
-                    "  [nono] Warning: --block-net overrides proxy/credential settings. \
+                    "  [nono] Warning: network blocking overrides proxy/credential settings. \
                      Network remains fully blocked."
                 );
             }
@@ -1486,7 +1502,9 @@ pub(crate) fn prepare_proxy_launch_options(
         return Ok(NetworkIntent::BlockAll);
     }
 
-    let strict_filter = prepared.profile_network_block;
+    // Approval-only policies must produce allowlist misses, not the legacy
+    // empty-allowlist allow-all sentinel. Hard blocks have already returned.
+    let strict_filter = has_network_approval;
 
     let (plain_entries, endpoint_entries): (Vec<_>, Vec<_>) = allow_domain
         .into_iter()
@@ -1598,6 +1616,8 @@ pub(crate) fn prepare_proxy_launch_options(
         enable_h2: prepared.allow_http2_requested,
         no_proxy,
         audit_disabled: false,
+        network_approval_backends,
+        network_approval_defaults,
     };
 
     // Infra-only flags make no sense without an activating proxy feature.
@@ -2418,7 +2438,11 @@ pub(crate) fn build_proxy_config_from_flags(
     // proxy internals. An open policy is represented downstream by an empty
     // allowlist; adding a credential upstream to that empty list would
     // accidentally turn allow-all into allow-only-that-upstream (#1485).
-    let host_allowlist_active = proxy.strict_filter
+    // Enforce the approval-only invariant here as well as in launch planning:
+    // callers building ProxyLaunchOptions directly must not bypass approval via
+    // the empty-allowlist allow-all sentinel.
+    let strict_filter = proxy.strict_filter || !proxy.network_approval_backends.is_empty();
+    let host_allowlist_active = strict_filter
         || !resolved.hosts.is_empty()
         || !resolved.suffixes.is_empty()
         || !plain_hosts.is_empty()
@@ -2479,7 +2503,7 @@ pub(crate) fn build_proxy_config_from_flags(
 
     let mut proxy_config =
         network_policy::build_proxy_config(&resolved, &plain_hosts, &denied_hosts);
-    proxy_config.strict_filter = proxy.strict_filter;
+    proxy_config.strict_filter = strict_filter;
 
     if let Some(ref upstream) = proxy.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {
@@ -3003,6 +3027,18 @@ pub(crate) fn start_proxy_runtime(
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy runtime: {}", e)))?;
     let approval_registry =
         crate::approval_runtime::build_proxy_approval_registry(proxy.command_policies.as_ref())?;
+    // Interactive host-approval backend for CONNECT targets not on the
+    // allowlist. `None` when the profile's `network.approval_backends` is empty,
+    // preserving the immediate-403 behavior for not-allowed hosts. A configured
+    // backend that fails to build is a hard error — we never fall back to the
+    // weaker "no prompt" path.
+    let network_approval_backend = crate::approval_runtime::resolve_supervised_approval_backend(
+        &proxy.network_approval_backends,
+        proxy
+            .network_approval_defaults
+            .as_ref()
+            .and_then(|d| d.backend.clone()),
+    )?;
     let credential_capture_backend = build_credential_capture_backend(
         &proxy.credential_capture,
         proxy.session_id.clone(),
@@ -3016,11 +3052,13 @@ pub(crate) fn start_proxy_runtime(
 
     let handle = rt
         .block_on(async {
-            nono_proxy::server::start_with_nonce_resolver(
+            nono_proxy::server::start_with_network_approval(
                 session_proxy_config.clone(),
                 approval_registry.clone(),
                 credential_capture_backend.clone(),
                 nonce_resolver.clone(),
+                network_approval_backend,
+                proxy.session_id.clone(),
             )
             .await
         })
@@ -3859,6 +3897,142 @@ mod tests {
         );
     }
 
+    fn approval_only_proxy_options() -> ProxyLaunchOptions {
+        ProxyLaunchOptions {
+            network_approval_backends: BTreeMap::from([(
+                "terminal".to_string(),
+                serde_json::from_str(r#"{"type":"terminal"}"#).expect("terminal backend"),
+            )]),
+            ..ProxyLaunchOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_only_empty_allowlist_prompts_and_preserves_hard_denials() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct DenyBackend(AtomicUsize);
+
+        impl nono::ApprovalBackend for DenyBackend {
+            fn request_approval(
+                &self,
+                _: &nono::ApprovalRequest,
+            ) -> Result<nono::ApprovalDecision> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(nono::ApprovalDecision::Denied {
+                    reason: "test denial".to_string(),
+                })
+            }
+
+            fn backend_name(&self) -> &str {
+                "test-deny"
+            }
+        }
+
+        // Construct directly with strict_filter unset to exercise the config
+        // builder independently of prepare_proxy_launch_options.
+        let proxy = approval_only_proxy_options();
+        assert!(proxy.is_active());
+        let mut config = build_proxy_config_from_flags(&proxy).expect("approval-only config");
+        assert!(config.strict_filter);
+        assert!(config.allowed_hosts.is_empty());
+        config
+            .denied_hosts
+            .push("blocked.example.invalid".to_string());
+        let backend = Arc::new(DenyBackend(AtomicUsize::new(0)));
+        let handle = nono_proxy::server::start_with_network_approval(
+            config,
+            None,
+            None,
+            None,
+            Some(backend.clone()),
+            "approval-only".to_string(),
+        )
+        .await
+        .expect("start approval-only proxy");
+        let token = handle
+            .env_vars()
+            .into_iter()
+            .find_map(|(key, value)| (key == "NONO_PROXY_TOKEN").then_some(value))
+            .expect("proxy authentication token");
+
+        for authority in [
+            "unknown.example.invalid:443",
+            "blocked.example.invalid:443",
+            "metadata.google.internal:443",
+            "169.254.169.254:443",
+            "[fd00:ec2::254]:443",
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+                .await
+                .expect("connect to proxy");
+            let request = format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\
+                 Proxy-Authorization: Bearer {token}\r\n\r\n"
+            );
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("write CONNECT");
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+                .await
+                .expect("proxy response deadline")
+                .expect("read proxy response");
+            assert!(
+                response.starts_with(b"HTTP/1.1 403"),
+                "{authority} must be denied, got {}",
+                String::from_utf8_lossy(&response),
+            );
+            assert_eq!(
+                backend.0.load(Ordering::SeqCst),
+                1,
+                "only the plain allowlist miss may reach approval, not {authority}",
+            );
+        }
+        handle.shutdown();
+    }
+
+    #[test]
+    fn network_approvals_preserve_static_host_grants_and_denials() {
+        use nono::net_filter::FilterResult;
+
+        let proxy = ProxyLaunchOptions {
+            domain_filter: Some(DomainFilterIntent {
+                allow_domain: vec![crate::profile::AllowDomainEntry::Plain(
+                    "allowed.example.com".to_string(),
+                )],
+                deny_domain: vec!["blocked.example.com".to_string()],
+                ..Default::default()
+            }),
+            ..approval_only_proxy_options()
+        };
+        let config = build_proxy_config_from_flags(&proxy).expect("approval-backed allowlist");
+        assert!(config.strict_filter);
+        let filter = nono_proxy::filter::ProxyFilter::new_strict(&config.allowed_hosts)
+            .with_denied_hosts(&config.denied_hosts);
+        assert_eq!(
+            filter.check_host_with_ips("allowed.example.com", &[]),
+            FilterResult::Allow,
+        );
+        assert!(matches!(
+            filter.check_host_with_ips("unknown.example.com", &[]),
+            FilterResult::DenyNotAllowed { .. },
+        ));
+        assert!(matches!(
+            filter.check_host_with_ips("blocked.example.com", &[]),
+            FilterResult::DenyHost { .. },
+        ));
+        assert!(matches!(
+            filter.check_host_with_ips(
+                "allowed.example.com",
+                &["fe80::1".parse().expect("link-local address")],
+            ),
+            FilterResult::DenyLinkLocal { .. },
+        ));
+    }
+
     #[test]
     fn test_build_proxy_config_network_audit_on_by_default() {
         let proxy = ProxyLaunchOptions::default();
@@ -4117,6 +4291,8 @@ mod tests {
             upstream_proxy: None,
             no_proxy: Vec::new(),
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -4196,6 +4372,8 @@ mod tests {
             upstream_proxy: None,
             no_proxy: vec![".internal.corp".to_string()],
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -4270,6 +4448,8 @@ mod tests {
             upstream_proxy: Some("127.0.0.1:9".to_string()),
             no_proxy: vec!["redis".to_string(), "*.internal.example".to_string()],
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]

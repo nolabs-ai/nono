@@ -140,8 +140,8 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) allow_bind_ports: Vec<u16>,
     pub(crate) proxy_port: Option<u16>,
     /// When `true`, the proxy denies any host not explicitly allowed rather
-    /// than falling back to allow-all. Set when the user combined proxy
-    /// features with `--block-net` or profile `network.block`.
+    /// than falling back to allow-all. Set for network approval backends;
+    /// `--block-net` and profile `network.block` never start a proxy.
     pub(crate) strict_filter: bool,
     pub(crate) proxy_leaf_validity: Option<std::time::Duration>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
@@ -170,6 +170,14 @@ pub(crate) struct ProxyLaunchOptions {
     /// buffer. Set from `--no-audit`. Does not change filter, credentials,
     /// or fail-closed auth.
     pub(crate) audit_disabled: bool,
+    /// Named approval backends from the profile `network` section. When
+    /// non-empty, a CONNECT host that is not on the allowlist triggers a
+    /// runtime approval prompt instead of an immediate 403. This also activates
+    /// the proxy with strict filtering when no static allowlist is configured.
+    pub(crate) network_approval_backends:
+        std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
+    /// Default routing for `network_approval_backends`.
+    pub(crate) network_approval_defaults: Option<crate::command_policy::ApprovalDefaultsConfig>,
 }
 
 impl ProxyLaunchOptions {
@@ -182,6 +190,7 @@ impl ProxyLaunchOptions {
                 .is_some_and(|credentials| !credentials.credentials.is_empty())
             || !self.credential_routes.is_empty()
             || self.upstream_proxy.is_some()
+            || !self.network_approval_backends.is_empty()
     }
 }
 
@@ -198,7 +207,8 @@ pub(crate) enum NetworkIntent {
     /// `--allow-net` or default when no network flags are given: no restriction.
     #[default]
     Unrestricted,
-    /// `--block-net` or profile `network.block` with no active proxy override:
+    /// `--block-net` or effective profile `network.block` (unless explicitly
+    /// cleared by `--allow-net`):
     /// outbound connections are denied by the OS sandbox.
     BlockAll,
     /// Proxy-activating features are configured. Proxy starts only if

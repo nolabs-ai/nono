@@ -587,11 +587,24 @@ pub(crate) async fn select_intercept_route<'a>(
                     session_id: "proxy".to_string(),
                 };
                 let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(60));
-                let decision = tokio::time::timeout(
-                    timeout,
-                    tokio::task::spawn_blocking(move || backend.request_approval(&request)),
+                let deadline = std::time::Instant::now()
+                    .checked_add(timeout)
+                    .unwrap_or_else(std::time::Instant::now);
+                let decision = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    tokio::task::spawn_blocking(move || {
+                        backend.request_approval_with_deadline(&request, deadline)
+                    }),
                 )
                 .await;
+                // L7 endpoint approval has no per-connection session cache, so
+                // collapse the session-scoped decision variants to their
+                // one-shot equivalents and keep the match below total.
+                let decision = decision.map(|joined| {
+                    joined.map(|approved| {
+                        approved.map(nono::supervisor::ApprovalDecision::without_session_scope)
+                    })
+                });
                 match decision {
                     Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Granted))) => {
                         audit::log_l7_policy_decision(
@@ -640,6 +653,34 @@ pub(crate) async fn select_intercept_route<'a>(
                             "tls_intercept: {}",
                             crate::approval::sanitize_reason_for_log(&deny_reason)
                         );
+                        return RouteSelection::Rejected(403);
+                    }
+                    Ok(Ok(Ok(
+                        nono::supervisor::ApprovalDecision::GrantedForSession
+                        | nono::supervisor::ApprovalDecision::DeniedForSession,
+                    ))) => {
+                        // Unreachable: without_session_scope() above collapses
+                        // these to Granted/Denied before this match. Kept for
+                        // exhaustiveness and fail-secure if that normalization is
+                        // ever removed.
+                        let deny_reason = format!(
+                            "endpoint approval returned an unexpected session-scoped decision for {} {} on route '{}'",
+                            method, path, prefix
+                        );
+                        audit::log_l7_policy_decision(
+                            audit_log,
+                            audit::ProxyMode::ConnectIntercept,
+                            &approval_ctx,
+                            host,
+                            Some(port),
+                            method,
+                            path,
+                            nono::undo::NetworkAuditDecision::ApproveDenied,
+                            "approve",
+                            &rule_label,
+                            Some(&deny_reason),
+                        );
+                        warn!("tls_intercept: {}", deny_reason);
                         return RouteSelection::Rejected(403);
                     }
                     Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Timeout))) => {

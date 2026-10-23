@@ -51,6 +51,28 @@ NONO_THEME=latte nono run --allow-cwd -- codex
 
 If an unknown theme is supplied, nono falls back to `mocha`.
 
+### `--log-journald`
+
+Send logs to `systemd-journald` instead of stderr. It is an alternative to `--log-file`, not a companion: tracing output goes only to the journal, while direct terminal output (prompts, errors, warnings) still goes to stderr.
+
+```bash
+nono --log-journald run --profile untrusted-agent -- my-agent
+NONO_LOG_JOURNALD=1 nono run --profile untrusted-agent -- my-agent
+```
+
+Each proxied request or endpoint-policy decision becomes one entry carrying the detail inline: mode, host/target, method, path, status, decision, reason, plus route, auth, and credential metadata. Entries use the syslog identifier `nono-proxy`:
+
+```bash
+journalctl -t nono-proxy -f
+journalctl -t nono-proxy -o json | jq -r '.MESSAGE'
+```
+
+- Linux with systemd only. Elsewhere the flag has no effect and nono says so. On Linux without a reachable `/run/systemd/journal/socket`, nono warns and falls back to the usual sink (stderr, or the `--log-file` target when one is set).
+- Level follows `-v`/`-vv` and `RUST_LOG`, except the `nono_proxy` target tree: it is pinned at `INFO`, raised by `-v`/`-vv`, and a `RUST_LOG` directive for it is replaced, so audit entries reach the journal without `-v`. `-vv` adds connection diagnostics (`Accepted connection from <peer>`, `CONNECT request to <host>:<port>`) at `DEBUG`. Records outside the proxy tree keep the level they would have had on stderr, so the journal also carries the CLI's own warnings and `-v` diagnostics.
+- `--log-journald` replaces `--log-file`: the journald sink wins and no file is written, so a `NONO_LOG_FILE` exported by a launcher does not disable journald. Cannot be combined with `--silent`.
+- A socket that becomes unreachable after startup loses records silently: the journald layer ignores send errors, so a missing stream in `journalctl` is the only symptom. The startup check above is the only failure nono reports.
+- Journal trust domain. Entries are readable by root and members of the `systemd-journal` group. Credential values are never recorded. Request paths and denial reasons are redacted with the [secure default redaction policy](#redaction-policy): URL userinfo and sensitive query parameters such as `token` or `api_key` are replaced with `[REDACTED]`, and the same redacted values are stored in the session network audit log.
+
 ### Redaction Policy
 
 Command arguments persisted in sessions, audit logs, rollback metadata, and audit attestations are redacted with a secure default policy. You can extend the policy in `~/.config/nono/config.toml`:

@@ -99,6 +99,19 @@ pub struct Cli {
     )]
     pub log_file: Option<PathBuf>,
 
+    /// Send logs to systemd-journald instead of stderr or a log file (Linux only)
+    #[arg(
+        long,
+        global = true,
+        env = "NONO_LOG_JOURNALD",
+        conflicts_with = "silent",
+        // SetTrue only accepts `true`/`false` from NONO_LOG_JOURNALD; Boolish
+        // also takes 1/0/yes/no. The flag itself stays valueless.
+        value_parser = clap::builder::BoolishValueParser::new(),
+        help_heading = "OPTIONS"
+    )]
+    pub log_journald: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -4790,5 +4803,41 @@ mod tests {
     fn test_log_file_flag_absent() {
         let cli = Cli::parse_from(["nono", "run", "--allow", ".", "echo", "hi"]);
         assert!(cli.log_file.is_none());
+    }
+
+    #[test]
+    fn test_log_journald_flag() {
+        let cli = Cli::parse_from([
+            "nono",
+            "--log-journald",
+            "run",
+            "--allow",
+            ".",
+            "echo",
+            "hi",
+        ]);
+        assert!(cli.log_journald);
+    }
+
+    #[test]
+    fn test_log_journald_flag_absent() {
+        let cli = Cli::parse_from(["nono", "run", "--allow", ".", "echo", "hi"]);
+        assert!(!cli.log_journald);
+    }
+
+    #[test]
+    fn test_log_journald_conflicts_with_silent() {
+        let err = Cli::try_parse_from([
+            "nono",
+            "--silent",
+            "--log-journald",
+            "run",
+            "--allow",
+            ".",
+            "echo",
+            "hi",
+        ])
+        .expect_err("--silent and --log-journald are mutually exclusive");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

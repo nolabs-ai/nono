@@ -213,7 +213,12 @@ mod tests {
 
     #[test]
     fn deadline_restores_terminal_state_and_descriptor_flags() {
-        for delay in [Duration::ZERO, Duration::from_secs(1)] {
+        for (delay, initially_nonblocking) in [
+            (Duration::ZERO, false),
+            (Duration::from_secs(1), false),
+            (Duration::ZERO, true),
+            (Duration::from_secs(1), true),
+        ] {
             let OpenptyResult {
                 master: _master,
                 slave,
@@ -223,8 +228,21 @@ mod tests {
             nix::sys::termios::cfmakeraw(&mut saved);
             nix::sys::termios::tcsetattr(&observer, nix::sys::termios::SetArg::TCSANOW, &saved)
                 .expect("set distinct initial terminal state");
-            let flags = nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_GETFL)
-                .expect("read descriptor flags");
+            let mut flags = nix::fcntl::OFlag::from_bits_retain(
+                nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_GETFL)
+                    .expect("read descriptor flags"),
+            );
+            flags.set(nix::fcntl::OFlag::O_NONBLOCK, initially_nonblocking);
+            nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_SETFL(flags))
+                .expect("set initial descriptor flags");
+            let flags = nix::fcntl::OFlag::from_bits_truncate(
+                nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_GETFL)
+                    .expect("read initial descriptor flags"),
+            );
+            assert_eq!(
+                flags.contains(nix::fcntl::OFlag::O_NONBLOCK),
+                initially_nonblocking
+            );
             let start = Instant::now();
             let result = read_consent_line_from(
                 std::fs::File::from(slave),
@@ -242,9 +260,14 @@ mod tests {
                 nix::sys::termios::tcgetattr(&observer).expect("restored state"),
                 saved
             );
+            // Darwin exposes kernel bookkeeping such as FWASWRITTEN through
+            // F_GETFL after writing the prompt. Compare public status flags,
+            // including O_NONBLOCK, rather than that non-restorable history.
             assert_eq!(
-                nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_GETFL)
-                    .expect("restored flags"),
+                nix::fcntl::OFlag::from_bits_truncate(
+                    nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_GETFL)
+                        .expect("restored flags"),
+                ),
                 flags
             );
         }

@@ -2924,16 +2924,10 @@ pub(crate) fn apply_tls_intercept_config(
     }
 
     #[cfg(target_os = "macos")]
-    if proxy
-        .tls_intercept
-        .as_ref()
-        .is_some_and(|t| t.trust_proxy_ca)
-    {
+    if let Some(tls) = proxy.tls_intercept.as_ref().filter(|t| t.trust_proxy_ca) {
         if proxy_config.intercept_ca_dir.is_some() {
-            let validity = proxy
-                .tls_intercept
-                .as_ref()
-                .and_then(|t| t.ca_validity)
+            let validity = tls
+                .ca_validity
                 .unwrap_or(nono_proxy::tls_intercept::ca::CA_VALIDITY_DEFAULT);
             proxy_config.preloaded_ca = crate::macos_trust::load_or_generate_proxy_ca(validity);
         } else {
@@ -3069,6 +3063,17 @@ pub(crate) fn start_proxy_runtime(
     let proxy_diagnostics = handle.diagnostics();
     if !proxy_diagnostics.is_empty() {
         crate::output::print_proxy_diagnostics(proxy_diagnostics);
+    }
+
+    // A session-lifecycle CA is neither shared nor able to outlive its session.
+    #[cfg(target_os = "macos")]
+    if let Some(tls) = proxy.tls_intercept.as_ref().filter(|t| t.trust_proxy_ca)
+        && let Some(rotator) = handle.intercept_rotator()
+    {
+        let validity = tls
+            .ca_validity
+            .unwrap_or(nono_proxy::tls_intercept::ca::CA_VALIDITY_DEFAULT);
+        crate::macos_ca_renewal::spawn_supervisor(rotator, validity);
     }
     caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
         port,

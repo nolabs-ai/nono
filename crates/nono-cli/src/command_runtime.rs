@@ -439,6 +439,12 @@ mod tests {
 
     #[test]
     fn shell_dry_run_rejects_block_net_with_upstream_proxy() {
+        // Capability building resolves the nono state root from the
+        // environment, so a parallel test's XDG_STATE_HOME mutation must
+        // not leak into this dry run.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let args = ShellArgs {
             sandbox: SandboxArgs {
                 dry_run: true,

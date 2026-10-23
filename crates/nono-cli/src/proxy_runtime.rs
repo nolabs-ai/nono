@@ -1907,7 +1907,10 @@ fn collect_tool_sandbox_proxy_grants(
             path_replacement: None,
             query_param_name: None,
             proxy: None,
+            // The base URL override for per-command credentials flows through
+            // tool_sandbox_base_url_env_vars, not the route config.
             env_var,
+            base_url_env_var: None,
             endpoint_rules: Vec::new(),
             endpoint_policy: Some(endpoint_policy),
             tls_ca: credential
@@ -2589,6 +2592,7 @@ fn synthesize_credential_provider_proxy_config(
                 query_param_name: None,
                 proxy: None,
                 env_var: route.env_var.clone(),
+                base_url_env_var: None,
                 endpoint_rules: if endpoint_policy.is_none() {
                     vec![nono_proxy::config::EndpointRule {
                         method: "*".to_string(),
@@ -4082,6 +4086,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("MOCK_API_KEY".to_string()),
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4719,6 +4724,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: Some("GITHUB_TOKEN".to_string()),
+            base_url_env_var: None,
             endpoint_rules: Vec::new(),
             endpoint_policy: None,
             tls_ca: None,

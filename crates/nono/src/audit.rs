@@ -46,6 +46,18 @@ pub const AUDIT_ATTESTATION_BUNDLE_FILENAME: &str = "audit-attestation.bundle";
 pub const AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA: &str =
     "https://nono.sh/attestation/audit-session/alpha";
 
+/// Domain separator for beta event leaf hashes.
+///
+/// Beta leaf hash: `SHA-256(EVENT_DOMAIN_BETA || nonce || event_bytes)`.
+/// The 16-byte random nonce prevents inferring event content from the leaf
+/// hash alone and enables selective disclosure: a prover reveals `leaf_nonce`
+/// and `event_json` only for events they choose to disclose.
+pub const EVENT_DOMAIN_BETA: &[u8] = b"nono.audit.event.beta\n";
+/// Merkle scheme label emitted by beta verification.
+pub const MERKLE_SCHEME_BETA: &str = "beta";
+/// Filename used for per-session beta-scheme audit event logs.
+pub const AUDIT_EVENTS_BETA_FILENAME: &str = "audit-events-beta.ndjson";
+
 /// Event payloads written into the alpha audit log.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -223,6 +235,36 @@ pub struct AuditEventRecord {
     pub event_json: Option<String>,
     /// Parsed event payload.
     pub event: AuditEventPayload,
+}
+
+/// One line of `audit-events-beta.ndjson`.
+///
+/// Beta records include a per-leaf random nonce so that event content cannot
+/// be inferred from the leaf hash alone.  For selective disclosure, a prover
+/// reveals `leaf_nonce` and `event_json` only for events they choose to share;
+/// undisclosed records carry only `leaf_hash` and `chain_hash`, letting a
+/// verifier check chain continuity without learning event content.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BetaAuditEventRecord {
+    /// Monotonic sequence number, starting at 0.
+    pub sequence: u64,
+    /// Previous record's chain hash, or `None` for the first record.
+    pub prev_chain: Option<ContentHash>,
+    /// Hash of the beta leaf: `SHA-256(EVENT_DOMAIN_BETA || nonce || event_bytes)`.
+    pub leaf_hash: ContentHash,
+    /// Rolling chain hash over the previous chain hash and this leaf.
+    pub chain_hash: ContentHash,
+    /// Hex-encoded 16-byte random nonce used to derive `leaf_hash`.
+    /// Absent for undisclosed leaves; must be present together with `event_json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf_nonce: Option<String>,
+    /// Canonical event JSON bytes used to derive `leaf_hash`.
+    /// Absent for undisclosed leaves; must be present together with `leaf_nonce`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_json: Option<String>,
+    /// Parsed event payload; absent for undisclosed leaves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<AuditEventPayload>,
 }
 
 /// Result of verifying an alpha audit log.
@@ -667,6 +709,182 @@ impl CommandPolicySummaryBuilder {
 pub fn hash_event(event_bytes: &[u8]) -> ContentHash {
     let mut hasher = Sha256::new();
     hasher.update(EVENT_DOMAIN_ALPHA);
+    hasher.update(event_bytes);
+    ContentHash::from_bytes(hasher.finalize().into())
+}
+
+/// Stateful writer for beta-scheme audit records.
+pub struct BetaAuditRecorder {
+    file: File,
+    next_sequence: u64,
+    previous_chain: Option<ContentHash>,
+    leaf_hashes: Vec<ContentHash>,
+    redaction_policy: crate::ScrubPolicy,
+}
+
+impl BetaAuditRecorder {
+    /// Create a recorder with the secure default redaction policy.
+    pub fn new(session_dir: PathBuf) -> Result<Self> {
+        Self::new_with_policy(session_dir, crate::ScrubPolicy::secure_default())
+    }
+
+    /// Create a recorder using a caller-supplied redaction policy.
+    pub fn new_with_policy(
+        session_dir: PathBuf,
+        redaction_policy: crate::ScrubPolicy,
+    ) -> Result<Self> {
+        let path = session_dir.join(AUDIT_EVENTS_BETA_FILENAME);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| {
+                NonoError::Snapshot(format!(
+                    "Failed to open beta audit event log {}: {e}",
+                    path.display()
+                ))
+            })?;
+        Ok(Self {
+            file,
+            next_sequence: 0,
+            previous_chain: None,
+            leaf_hashes: Vec::new(),
+            redaction_policy,
+        })
+    }
+
+    /// Record a session start event.
+    pub fn record_session_started(&mut self, started: String, command: Vec<String>) -> Result<()> {
+        self.append_event(AuditEventPayload::SessionStarted {
+            started,
+            command: crate::scrub_argv_with_policy(&command, &self.redaction_policy),
+            redaction_policy: self
+                .redaction_policy
+                .diff_from_secure_default()
+                .into_option(),
+        })
+    }
+
+    /// Record a session end event.
+    pub fn record_session_ended(&mut self, ended: String, exit_code: i32) -> Result<()> {
+        self.append_event(AuditEventPayload::SessionEnded { ended, exit_code })
+    }
+
+    /// Record a capability approval decision.
+    pub fn record_capability_decision(&mut self, entry: AuditEntry) -> Result<()> {
+        self.append_event(AuditEventPayload::CapabilityDecision { entry })
+    }
+
+    /// Record a URL-open request result.
+    pub fn record_open_url(
+        &mut self,
+        request: UrlOpenRequest,
+        success: bool,
+        error: Option<String>,
+    ) -> Result<()> {
+        self.append_event(AuditEventPayload::UrlOpen {
+            request,
+            success,
+            error,
+        })
+    }
+
+    /// Record a network event.
+    pub fn record_network_event(&mut self, event: NetworkAuditEvent) -> Result<()> {
+        self.append_event(AuditEventPayload::Network {
+            event: Box::new(event),
+        })
+    }
+
+    /// Record sandbox runtime metadata.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn record_sandbox_runtime_event(&mut self, event: SandboxRuntimeAuditEvent) -> Result<()> {
+        self.append_event(AuditEventPayload::SandboxRuntime { event })
+    }
+
+    /// Record a tool sandbox command policy decision.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn record_command_policy_event(&mut self, event: CommandPolicyAuditEvent) -> Result<()> {
+        self.append_event(AuditEventPayload::CommandPolicy {
+            event: Box::new(event),
+        })
+    }
+
+    /// Number of events appended by this recorder.
+    #[must_use]
+    pub fn event_count(&self) -> u64 {
+        self.leaf_hashes.len() as u64
+    }
+
+    /// Final integrity summary for the current log, if at least one event exists.
+    #[must_use]
+    pub fn finalize(&self) -> Option<AuditIntegritySummary> {
+        let chain_head = self.previous_chain?;
+        let merkle_root_hash = merkle_root(&self.leaf_hashes);
+        Some(AuditIntegritySummary {
+            hash_algorithm: AUDIT_HASH_ALGORITHM.to_string(),
+            event_count: self.event_count(),
+            chain_head,
+            merkle_root: merkle_root_hash,
+        })
+    }
+
+    fn append_event(&mut self, event: AuditEventPayload) -> Result<()> {
+        let event_bytes = serde_json::to_vec(&event).map_err(|e| {
+            NonoError::Snapshot(format!("Failed to serialize beta audit event: {e}"))
+        })?;
+
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).map_err(|e| {
+            NonoError::Snapshot(format!("Failed to generate beta audit nonce: {e}"))
+        })?;
+
+        let leaf_hash = hash_event_beta(&nonce, &event_bytes);
+        let chain_hash = hash_chain(self.previous_chain.as_ref(), &leaf_hash);
+
+        let nonce_hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+
+        let event_json = String::from_utf8(event_bytes).map_err(|e| {
+            NonoError::Snapshot(format!(
+                "Failed to encode canonical beta audit event JSON as UTF-8: {e}"
+            ))
+        })?;
+
+        let record = BetaAuditEventRecord {
+            sequence: self.next_sequence,
+            prev_chain: self.previous_chain,
+            leaf_hash,
+            chain_hash,
+            leaf_nonce: Some(nonce_hex),
+            event_json: Some(event_json.clone()),
+            event: Some(event),
+        };
+        let line = serde_json::to_vec(&record).map_err(|e| {
+            NonoError::Snapshot(format!("Failed to serialize beta audit record: {e}"))
+        })?;
+        self.file
+            .write_all(&line)
+            .and_then(|_| self.file.write_all(b"\n"))
+            .and_then(|_| self.file.flush())
+            .map_err(|e| NonoError::Snapshot(format!("Failed to append beta audit record: {e}")))?;
+
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.previous_chain = Some(chain_hash);
+        self.leaf_hashes.push(leaf_hash);
+        Ok(())
+    }
+}
+
+/// Hash a beta event leaf.
+///
+/// Computes `SHA-256(EVENT_DOMAIN_BETA || nonce || event_bytes)`.
+/// The nonce must be 16 cryptographically random bytes generated at append
+/// time; callers must supply a distinct nonce for every record.
+#[must_use]
+pub fn hash_event_beta(nonce: &[u8; 16], event_bytes: &[u8]) -> ContentHash {
+    let mut hasher = Sha256::new();
+    hasher.update(EVENT_DOMAIN_BETA);
+    hasher.update(nonce.as_ref());
     hasher.update(event_bytes);
     ContentHash::from_bytes(hasher.finalize().into())
 }
@@ -1585,6 +1803,191 @@ pub fn verify_audit_log(
     })
 }
 
+/// Verify a beta audit log and optionally cross-check stored metadata.
+///
+/// Records with both `leaf_nonce` and `event_json` present have their leaf
+/// hash re-derived and verified.  Records with both absent are treated as
+/// undisclosed leaves: chain continuity is verified using the stored
+/// `leaf_hash`, but event content is not re-derived.  Any other combination
+/// (one present, one absent) is rejected as inconsistent.
+pub fn verify_beta_audit_log(
+    session_dir: &Path,
+    stored: Option<&AuditIntegritySummary>,
+) -> Result<AuditVerificationResult> {
+    let path = session_dir.join(AUDIT_EVENTS_BETA_FILENAME);
+    let file = File::open(&path).map_err(|e| {
+        NonoError::Snapshot(format!(
+            "Failed to open beta audit event log {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    let reader = BufReader::new(file);
+    let mut previous_chain: Option<ContentHash> = None;
+    let mut leaf_hashes = Vec::new();
+    let mut computed_chain_head: Option<ContentHash> = None;
+
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| {
+            NonoError::Snapshot(format!(
+                "Failed to read beta audit event log {}: {e}",
+                path.display()
+            ))
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let record: BetaAuditEventRecord = serde_json::from_str(&line).map_err(|e| {
+            NonoError::Snapshot(format!(
+                "Failed to parse beta audit event record {} line {}: {e}",
+                path.display(),
+                index.saturating_add(1)
+            ))
+        })?;
+
+        let expected_sequence = leaf_hashes.len() as u64;
+        if record.sequence != expected_sequence {
+            return Err(NonoError::Snapshot(format!(
+                "Beta audit event record sequence mismatch at line {}: expected {}, got {}",
+                index.saturating_add(1),
+                expected_sequence,
+                record.sequence
+            )));
+        }
+
+        if record.prev_chain != previous_chain {
+            return Err(NonoError::Snapshot(format!(
+                "Beta audit event record prev_chain mismatch at line {}",
+                index.saturating_add(1)
+            )));
+        }
+
+        match (&record.leaf_nonce, &record.event_json) {
+            (Some(nonce_hex), Some(event_json_str)) => {
+                if nonce_hex.len() != 32 {
+                    return Err(NonoError::Snapshot(format!(
+                        "Beta audit event leaf_nonce has wrong length at line {} \
+                         (expected 32 hex chars, got {})",
+                        index.saturating_add(1),
+                        nonce_hex.len()
+                    )));
+                }
+                let mut nonce = [0u8; 16];
+                for (i, chunk) in nonce_hex.as_bytes().chunks(2).enumerate() {
+                    let hex_str = std::str::from_utf8(chunk).map_err(|e| {
+                        NonoError::Snapshot(format!(
+                            "Invalid beta nonce hex at line {}: {e}",
+                            index.saturating_add(1)
+                        ))
+                    })?;
+                    nonce[i] = u8::from_str_radix(hex_str, 16).map_err(|e| {
+                        NonoError::Snapshot(format!(
+                            "Invalid beta nonce hex at line {}: {e}",
+                            index.saturating_add(1)
+                        ))
+                    })?;
+                }
+
+                serde_json::from_str::<AuditEventPayload>(event_json_str).map_err(|e| {
+                    NonoError::Snapshot(format!(
+                        "Failed to parse canonical beta audit event JSON at line {}: {e}",
+                        index.saturating_add(1)
+                    ))
+                })?;
+                if let Some(ref parsed_event) = record.event {
+                    let canonical_bytes = serde_json::to_vec(parsed_event).map_err(|e| {
+                        NonoError::Snapshot(format!(
+                            "Failed to serialize beta audit event payload at line {}: {e}",
+                            index.saturating_add(1)
+                        ))
+                    })?;
+                    if event_json_str.as_bytes() != canonical_bytes.as_slice() {
+                        return Err(NonoError::Snapshot(format!(
+                            "Beta audit event JSON mismatch at line {}",
+                            index.saturating_add(1)
+                        )));
+                    }
+                }
+
+                let leaf_hash = hash_event_beta(&nonce, event_json_str.as_bytes());
+                if record.leaf_hash != leaf_hash {
+                    return Err(NonoError::Snapshot(format!(
+                        "Beta audit event leaf hash mismatch at line {}",
+                        index.saturating_add(1)
+                    )));
+                }
+            }
+            (None, None) => {
+                // Undisclosed leaf: chain continuity is verified below using the
+                // stored leaf_hash; event content cannot be re-derived.
+            }
+            _ => {
+                return Err(NonoError::Snapshot(format!(
+                    "Beta audit event has inconsistent disclosure at line {}: \
+                     leaf_nonce and event_json must both be present or both absent",
+                    index.saturating_add(1)
+                )));
+            }
+        }
+
+        let chain_hash = hash_chain(previous_chain.as_ref(), &record.leaf_hash);
+        if record.chain_hash != chain_hash {
+            return Err(NonoError::Snapshot(format!(
+                "Beta audit event chain hash mismatch at line {}",
+                index.saturating_add(1)
+            )));
+        }
+
+        previous_chain = Some(chain_hash);
+        computed_chain_head = Some(chain_hash);
+        leaf_hashes.push(record.leaf_hash);
+    }
+
+    let computed_merkle_root = if leaf_hashes.is_empty() {
+        None
+    } else {
+        Some(merkle_root(&leaf_hashes))
+    };
+
+    let stored_event_count = stored.map(|s| s.event_count);
+    let stored_chain_head = stored.map(|s| s.chain_head);
+    let stored_merkle_root = stored.map(|s| s.merkle_root);
+    let event_count = leaf_hashes.len() as u64;
+    let event_count_matches = stored_event_count
+        .map(|count| count == event_count)
+        .unwrap_or(true);
+
+    if let Some(stored_head) = stored_chain_head
+        && Some(stored_head) != computed_chain_head
+    {
+        return Err(NonoError::Snapshot(
+            "Beta audit log chain head mismatch".to_string(),
+        ));
+    }
+
+    if let Some(stored_root) = stored_merkle_root
+        && Some(stored_root) != computed_merkle_root
+    {
+        return Err(NonoError::Snapshot(
+            "Beta audit log Merkle root mismatch".to_string(),
+        ));
+    }
+
+    Ok(AuditVerificationResult {
+        hash_algorithm: AUDIT_HASH_ALGORITHM.to_string(),
+        merkle_scheme: MERKLE_SCHEME_BETA.to_string(),
+        event_count,
+        computed_chain_head,
+        computed_merkle_root,
+        stored_event_count,
+        stored_chain_head,
+        stored_merkle_root,
+        event_count_matches,
+        records_verified: true,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -2486,6 +2889,371 @@ mod tests {
                 r#""argv_display":["git","status"],"env_names_display":[],"cwd_display":"/home/user","exit_code":0}}"#,
             ),
             "ae7caf84865bfd686729a67a04fc3fd6af72dbd700eb77403d9f338491c4815d",
+        );
+    }
+
+    #[test]
+    fn beta_recorder_produces_integrity_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = BetaAuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
+            .unwrap();
+
+        let summary = recorder.finalize().unwrap();
+        assert_eq!(summary.event_count, 2);
+        assert_eq!(summary.hash_algorithm, AUDIT_HASH_ALGORITHM);
+    }
+
+    #[test]
+    fn beta_verifier_round_trips_full_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = BetaAuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started(
+                "2026-04-21T00:00:00Z".to_string(),
+                vec!["claude".to_string(), "--debug".to_string()],
+            )
+            .unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
+            .unwrap();
+
+        let summary = recorder.finalize().unwrap();
+        let verified = verify_beta_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert_eq!(verified.event_count, 2);
+        assert_eq!(verified.merkle_scheme, MERKLE_SCHEME_BETA);
+        assert!(verified.records_verified);
+        assert!(verified.event_count_matches);
+    }
+
+    #[test]
+    fn beta_verifier_rejects_tampered_leaf_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = BetaAuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
+            .unwrap();
+
+        let path = dir.path().join(AUDIT_EVENTS_BETA_FILENAME);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let rewritten = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+            .map(|(i, line)| {
+                let mut record: BetaAuditEventRecord = serde_json::from_str(line).unwrap();
+                if i == 0 {
+                    // Flip one byte in the leaf hash to simulate tampering.
+                    let mut bytes = *record.leaf_hash.as_bytes();
+                    bytes[0] ^= 0xff;
+                    record.leaf_hash = ContentHash::from_bytes(bytes);
+                }
+                serde_json::to_string(&record).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{rewritten}\n")).unwrap();
+
+        let err = match verify_beta_audit_log(dir.path(), None) {
+            Ok(_) => panic!("beta verification should reject tampered leaf hash"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("leaf hash mismatch")
+                || err.to_string().contains("chain hash mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn beta_verifier_accepts_undisclosed_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = BetaAuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
+            .unwrap();
+
+        let path = dir.path().join(AUDIT_EVENTS_BETA_FILENAME);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        // Strip leaf_nonce, event_json, and event from the first record to
+        // simulate selective disclosure (only the second event is disclosed).
+        let rewritten = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+            .map(|(i, line)| {
+                let mut record: BetaAuditEventRecord = serde_json::from_str(line).unwrap();
+                if i == 0 {
+                    record.leaf_nonce = None;
+                    record.event_json = None;
+                    record.event = None;
+                }
+                serde_json::to_string(&record).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{rewritten}\n")).unwrap();
+
+        let verified = verify_beta_audit_log(dir.path(), None).unwrap();
+        assert_eq!(verified.event_count, 2);
+        assert_eq!(verified.merkle_scheme, MERKLE_SCHEME_BETA);
+        assert!(verified.records_verified);
+    }
+
+    #[test]
+    fn beta_verifier_rejects_inconsistent_disclosure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = BetaAuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+
+        let path = dir.path().join(AUDIT_EVENTS_BETA_FILENAME);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        // Remove leaf_nonce but keep event_json — inconsistent disclosure.
+        let rewritten = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let mut record: BetaAuditEventRecord = serde_json::from_str(line).unwrap();
+                record.leaf_nonce = None;
+                serde_json::to_string(&record).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{rewritten}\n")).unwrap();
+
+        let err = match verify_beta_audit_log(dir.path(), None) {
+            Ok(_) => panic!("beta verification should reject inconsistent disclosure"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("inconsistent disclosure"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Golden vectors for the beta event leaf hash, one per `AuditEventPayload`
+    /// variant, using a fixed all-zero nonce for reproducibility.
+    ///
+    /// Each case pins the exact JSON emitted by `serde_json::to_string` and the
+    /// corresponding beta leaf hash (nonce = `[0u8; 16]`).  If this test fails
+    /// the wire format diverged — fix the divergence, never the vector.
+    ///
+    /// Companion test in nono-py: `tests/test_audit.py::TestBetaAuditEventPayloadGoldenVectors`
+    #[test]
+    fn beta_audit_event_payload_golden_vectors() {
+        use crate::AccessMode;
+        use crate::supervisor::{ApprovalDecision, ApprovalRequest, UrlOpenRequest};
+        use crate::undo::{NetworkAuditDecision, NetworkAuditEvent, NetworkAuditMode};
+        use std::path::PathBuf;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // Fixed 16-byte all-zero nonce for deterministic golden output.
+        let nonce = [0u8; 16];
+
+        fn check_beta(
+            label: &str,
+            nonce: &[u8; 16],
+            payload: &AuditEventPayload,
+            expected_json: &str,
+            expected_leaf: &str,
+        ) {
+            let json = serde_json::to_string(payload).unwrap();
+            assert_eq!(json, expected_json, "{label}: JSON mismatch");
+            let leaf = hash_event_beta(nonce, json.as_bytes());
+            assert_eq!(
+                leaf.to_string(),
+                expected_leaf,
+                "{label}: beta leaf hash mismatch"
+            );
+        }
+
+        check_beta(
+            "SessionStarted",
+            &nonce,
+            &AuditEventPayload::SessionStarted {
+                started: "2026-04-21T20:00:00Z".to_string(),
+                command: vec!["claude".to_string()],
+                redaction_policy: None,
+            },
+            r#"{"type":"session_started","started":"2026-04-21T20:00:00Z","command":["claude"]}"#,
+            "4f235c08aec2888b4e955e1dc7ef9b781a0ce8a1db7216362c5348613b94b43f",
+        );
+
+        check_beta(
+            "SessionEnded",
+            &nonce,
+            &AuditEventPayload::SessionEnded {
+                ended: "2026-04-21T20:00:01Z".to_string(),
+                exit_code: 0,
+            },
+            r#"{"type":"session_ended","ended":"2026-04-21T20:00:01Z","exit_code":0}"#,
+            "1c88edae937a6b3d343b3ceaf6559a1b32a1835bb17d55821d0e3104352d456e",
+        );
+
+        check_beta(
+            "CapabilityDecision",
+            &nonce,
+            &AuditEventPayload::CapabilityDecision {
+                entry: crate::supervisor::AuditEntry {
+                    timestamp: UNIX_EPOCH + Duration::from_secs(5),
+                    request: ApprovalRequest::Capability {
+                        request_id: "req-1".to_string(),
+                        path: PathBuf::from("/tmp/example"),
+                        access: AccessMode::ReadWrite,
+                        reason: Some("need scratch space".to_string()),
+                        child_pid: 42,
+                        session_id: "sess-1".to_string(),
+                    },
+                    decision: ApprovalDecision::Denied {
+                        reason: "outside policy".to_string(),
+                    },
+                    backend: "terminal".to_string(),
+                    duration_ms: 12,
+                },
+            },
+            concat!(
+                r#"{"type":"capability_decision","entry":{"timestamp":{"secs_since_epoch":5,"nanos_since_epoch":0},"#,
+                r#""request":{"capability_type":"capability","request_id":"req-1","path":"/tmp/example","#,
+                r#""access":"ReadWrite","reason":"need scratch space","child_pid":42,"session_id":"sess-1"},"#,
+                r#""decision":{"Denied":{"reason":"outside policy"}},"backend":"terminal","duration_ms":12}}"#,
+            ),
+            "f513e29144bf2fa0694d309b0b6fd5e2f355f8dc46e7122b5618ee6ee6c82df2",
+        );
+
+        check_beta(
+            "UrlOpen",
+            &nonce,
+            &AuditEventPayload::UrlOpen {
+                request: UrlOpenRequest {
+                    request_id: "open-1".to_string(),
+                    url: "https://example.com/callback".to_string(),
+                    child_pid: 42,
+                    session_id: "sess-1".to_string(),
+                },
+                success: true,
+                error: None,
+            },
+            concat!(
+                r#"{"type":"url_open","request":{"request_id":"open-1","#,
+                r#""url":"https://example.com/callback","child_pid":42,"session_id":"sess-1"},"#,
+                r#""success":true,"error":null}"#,
+            ),
+            "1a5c73fa0cf91dec33f7a577d4f2449c2e9434e29b1a37c23aa6f8d566bb1268",
+        );
+
+        check_beta(
+            "Network",
+            &nonce,
+            &AuditEventPayload::Network {
+                event: Box::new(NetworkAuditEvent {
+                    timestamp_unix_ms: 5,
+                    mode: NetworkAuditMode::Reverse,
+                    decision: NetworkAuditDecision::Deny,
+                    route_id: None,
+                    auth_mechanism: None,
+                    auth_outcome: None,
+                    managed_credential_active: None,
+                    injection_mode: None,
+                    denial_category: None,
+                    endpoint_policy_action: None,
+                    endpoint_policy_rule: None,
+                    approval_backend: None,
+                    credential_capture_action: None,
+                    credential_capture_name: None,
+                    credential_capture_command: None,
+                    credential_capture_argv: None,
+                    credential_capture_exit_status: None,
+                    credential_capture_duration_ms: None,
+                    credential_capture_stdout_bytes: None,
+                    credential_capture_stderr: None,
+                    credential_capture_cache_scope: None,
+                    credential_capture_output_format: None,
+                    credential_capture_header_names: None,
+                    credential_capture_stdin_mode: None,
+                    credential_capture_interactive: None,
+                    spiffe_context: None,
+                    target: "api.example.com".to_string(),
+                    upstream: None,
+                    port: Some(443),
+                    method: Some("POST".to_string()),
+                    path: Some("/v1/chat".to_string()),
+                    status: Some(403),
+                    reason: Some("policy".to_string()),
+                }),
+            },
+            concat!(
+                r#"{"type":"network","event":{"timestamp_unix_ms":5,"mode":"reverse","decision":"deny","#,
+                r#""target":"api.example.com","port":443,"method":"POST","path":"/v1/chat","status":403,"reason":"policy"}}"#,
+            ),
+            "2438ddc67fc2759485421ee771296fa2908fe7fc69a420ba46bb52d48f1666a9",
+        );
+
+        check_beta(
+            "SandboxRuntime",
+            &nonce,
+            &AuditEventPayload::SandboxRuntime {
+                event: SandboxRuntimeAuditEvent {
+                    timestamp: "2026-04-21T20:00:00Z".to_string(),
+                    platform: "macOS".to_string(),
+                    landlock_abi: None,
+                    landlock_execute_enforced: None,
+                    tool_sandbox_active: false,
+                },
+            },
+            concat!(
+                r#"{"type":"sandbox_runtime","event":{"timestamp":"2026-04-21T20:00:00Z","#,
+                r#""platform":"macOS","tool_sandbox_active":false}}"#,
+            ),
+            "6c3ae67761102a34b79529dc04f7b9965aaa3f22331856778f7fe2b38394b62d",
+        );
+
+        check_beta(
+            "CommandPolicy",
+            &nonce,
+            &AuditEventPayload::CommandPolicy {
+                event: Box::new(CommandPolicyAuditEvent {
+                    timestamp: "2026-04-21T20:00:00Z".to_string(),
+                    session_id: Some("sess-1".to_string()),
+                    command: "git".to_string(),
+                    caller: "session".to_string(),
+                    caller_kind: None,
+                    caller_command: None,
+                    caller_pid: None,
+                    shim_pid: None,
+                    session_root_pid: None,
+                    decision: "allow".to_string(),
+                    reason: None,
+                    stdio_mode: "piped".to_string(),
+                    argv_hash: "aabbcc".to_string(),
+                    env_name_hash: "ddeeff".to_string(),
+                    cwd_hash: "001122".to_string(),
+                    argv_display: vec!["git".to_string(), "status".to_string()],
+                    env_names_display: vec![],
+                    env_display: vec![],
+                    cwd_display: "/home/user".to_string(),
+                    exit_code: Some(0),
+                    stdio: None,
+                }),
+            },
+            concat!(
+                r#"{"type":"command_policy","event":{"timestamp":"2026-04-21T20:00:00Z","session_id":"sess-1","#,
+                r#""command":"git","caller":"session","decision":"allow","reason":null,"stdio_mode":"piped","#,
+                r#""argv_hash":"aabbcc","env_name_hash":"ddeeff","cwd_hash":"001122","#,
+                r#""argv_display":["git","status"],"env_names_display":[],"cwd_display":"/home/user","exit_code":0}}"#,
+            ),
+            "5484d9af7c405633ccc407291a72d03435f655b4fdf5cf8cd30fac5d07e0f1cf",
         );
     }
 }

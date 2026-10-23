@@ -9,7 +9,7 @@
 
 use crate::audit;
 use crate::capture::CredentialCaptureBackend;
-use crate::config::ProxyConfig;
+use crate::config::{EndpointPolicyOutcome, ProxyConfig};
 use crate::connect;
 use crate::credential::CredentialStore;
 use crate::error::{ProxyError, Result};
@@ -2177,16 +2177,8 @@ async fn handle_forward_http(
         return Ok(());
     }
 
-    // 3. Read the request body before building upstream headers so chunked
-    //    framing can be decoded and re-written with Content-Length.
-    let body = match reverse::read_request_body(stream, header_bytes, buffered).await? {
-        Some(body) => body,
-        None => return Ok(()), // send_error already written (e.g. 413 / 400)
-    };
-
-    // Build the origin-form request bytes: rewritten request line +
-    // proxy-header-stripped header block + optional Content-Length +
-    // terminating CRLF.
+    // Build the origin-form request line and extract method + path so the
+    // endpoint-policy gate below can evaluate the L7 rules.
     let origin_line = rewrite_absolute_to_origin_form(first_line)?;
     let inbound_path = origin_line
         .split_whitespace()
@@ -2198,6 +2190,24 @@ async fn handle_forward_http(
         .next()
         .unwrap_or("GET")
         .to_string();
+
+    // 2b. Endpoint-policy gate. The host filter authorizes the HOST; endpoint
+    //     rules configured on routes for that host restrict which method+path
+    //     combinations may pass. The CONNECT-intercept path enforces them via
+    //     `select_intercept_route`; without the same gate here every
+    //     plain-HTTP request to an allowed host would bypass the rules
+    //     entirely (issue #2174).
+    if enforce_forward_http_endpoint_rules(state, &host, port, &method, &inbound_path).await {
+        reverse::send_error_generic(stream, 403, "Forbidden").await?;
+        return Ok(());
+    }
+
+    // 3. Read the request body before building upstream headers so chunked
+    //    framing can be decoded and re-written with Content-Length.
+    let body = match reverse::read_request_body(stream, header_bytes, buffered).await? {
+        Some(body) => body,
+        None => return Ok(()), // send_error already written (e.g. 413 / 400)
+    };
 
     // Target matches a route's upstream (not nono's own port, handled above) —
     // redeem any phantom nonce before forwarding, as CONNECT already does.
@@ -2329,6 +2339,112 @@ async fn handle_forward_http(
             Ok(())
         }
     }
+}
+
+/// Audit an endpoint-policy denial on the plain-HTTP forward path.
+async fn log_forward_endpoint_denial(
+    state: &ProxyState,
+    host: &str,
+    port: u16,
+    route_id: Option<&str>,
+    reason: &str,
+) {
+    warn!("forward-http: {}", reason);
+    audit::log_denied(
+        state.audit_log.as_ref(),
+        audit::ProxyMode::Reverse,
+        &audit::EventContext {
+            route_id,
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
+            ..audit::EventContext::default()
+        },
+        host,
+        port,
+        reason,
+    );
+}
+
+/// Evaluate the endpoint rules configured on routes matching an absolute-form
+/// forward target, mirroring `select_intercept_route`'s authorization
+/// semantics (without credential selection, approval workflows, or rate
+/// limiting — the forward path is a transparent proxy that never injects a
+/// managed credential).
+///
+/// Returns `true` when the request must be denied (the caller responds 403);
+/// `false` when it may proceed.
+async fn enforce_forward_http_endpoint_rules(
+    state: &ProxyState,
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+) -> bool {
+    let candidates = state
+        .route_store
+        .lookup_forward_endpoint_candidates(host, port);
+    if candidates.is_empty() {
+        return false;
+    }
+
+    let mut has_endpoint_only_route = false;
+    let mut endpoint_authorized = false;
+    for (prefix, route) in &candidates {
+        if route.endpoint_policy.allows_all_without_l7() {
+            // Catch-all route for this host: no L7 constraint.
+            continue;
+        }
+        match route.endpoint_policy.evaluate(method, path) {
+            EndpointPolicyOutcome::Allow { .. } => {
+                endpoint_authorized = true;
+            }
+            EndpointPolicyOutcome::Approve { rule_label, .. } => {
+                // Approval workflows have no client surface on the
+                // plain-HTTP forward path; fail closed.
+                let reason = format!(
+                    "endpoint rule {} requires approval, which is not supported \
+                     on the plain-HTTP forward path: {} {} on {}:{}",
+                    rule_label, method, path, host, port
+                );
+                log_forward_endpoint_denial(state, host, port, Some(prefix), &reason).await;
+                return true;
+            }
+            EndpointPolicyOutcome::Deny { reason, rule_label } => {
+                // Legacy `endpoint_rules` allow-lists compile to a
+                // non-explicit default-deny policy: a non-matching route
+                // simply does not authorize the request. It must not
+                // hard-deny on its own — mirror `select_intercept_route` by
+                // letting credential-less (`_ep_`) routes gate the request
+                // via the post-loop check, and dropping managed-credential
+                // routes (another candidate may still authorize).
+                if !route.endpoint_policy.is_explicit() {
+                    if !route.requires_managed_credential {
+                        has_endpoint_only_route = true;
+                    }
+                    continue;
+                }
+                let reason = reason.map_or_else(
+                    || format!("endpoint denied by policy ({})", rule_label),
+                    std::string::ToString::to_string,
+                );
+                log_forward_endpoint_denial(state, host, port, Some(prefix), &reason).await;
+                return true;
+            }
+        }
+    }
+
+    // A credential catch-all must not be shadowed by an endpoint-only route
+    // that gates this host but did not authorize the request (mirrors
+    // `select_intercept_route`).
+    if has_endpoint_only_route && !endpoint_authorized {
+        let reason = format!(
+            "endpoint rules denied {} {}: no rule matched on {}:{}",
+            method, path, host, port
+        );
+        log_forward_endpoint_denial(state, host, port, None, &reason).await;
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -6473,6 +6589,246 @@ mod tests {
                     && e.denial_category
                         == Some(nono::undo::NetworkAuditDenialCategory::HostDenied)),
             "expected a HostDenied audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    // ========================================================================
+    // Forward-proxy endpoint-rule enforcement — issue #2174
+    // ========================================================================
+
+    /// A route whose legacy `endpoint_rules` allow only `GET /get`, as
+    /// produced by `allow_domain` entries with `endpoints` (or URL-form
+    /// `--allow-domain 'https://host/get'`).
+    fn get_only_route_config(upstream: String) -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
+            prefix: "get-only".to_string(),
+            upstream,
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/get".to_string(),
+            }],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+            upgrades: vec![],
+            rate_limit: None,
+        }
+    }
+
+    /// Wrong METHOD on an allowed host must be denied by the route's
+    /// endpoint rules: plain-HTTP forward requests are the cleartext twin of
+    /// intercepted CONNECT traffic and must obey the same L7 policy.
+    #[tokio::test]
+    async fn forward_http_wrong_method_denied_by_endpoint_rules() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, _origin_rx) = spawn_echo_origin().await;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            routes: vec![get_only_route_config(format!(
+                "http://127.0.0.1:{}",
+                origin_addr.port()
+            ))],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        let request = format!(
+            "DELETE http://127.0.0.1:{}/get HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port(),
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 403"),
+            "expected 403 for DELETE against a GET-only endpoint rule, got: {}",
+            response_str
+        );
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.decision == nono::undo::NetworkAuditDecision::Deny
+                    && e.target == "127.0.0.1"
+                    && e.denial_category
+                        == Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy)),
+            "expected an EndpointPolicy deny audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Wrong PATH on an allowed host must be denied by the route's endpoint
+    /// rules.
+    #[tokio::test]
+    async fn forward_http_wrong_path_denied_by_endpoint_rules() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, _origin_rx) = spawn_echo_origin().await;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            routes: vec![get_only_route_config(format!(
+                "http://127.0.0.1:{}",
+                origin_addr.port()
+            ))],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        let request = format!(
+            "GET http://127.0.0.1:{}/headers HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port(),
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 403"),
+            "expected 403 for /headers against a GET-only /get rule, got: {}",
+            response_str
+        );
+
+        handle.shutdown();
+    }
+
+    /// A request matching the endpoint rules is still forwarded: the gate
+    /// must not over-block.
+    #[tokio::test]
+    async fn forward_http_matching_endpoint_rule_is_forwarded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, origin_rx) = spawn_echo_origin().await;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            routes: vec![get_only_route_config(format!(
+                "http://127.0.0.1:{}",
+                origin_addr.port()
+            ))],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        let request = format!(
+            "GET http://127.0.0.1:{}/get HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port(),
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 200"),
+            "expected upstream 200 for GET /get matching the rule, got: {}",
+            response_str
+        );
+
+        let received = origin_rx.await.unwrap();
+        assert!(
+            received.starts_with("GET /get HTTP/1.1"),
+            "upstream should see origin-form request line, got: {received:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// The exact issue #2174 scenario: `allow_domain` endpoint rules compile
+    /// to `https://` upstreams (port 443) while HTTP_PROXY sends plain
+    /// `http://` requests to the default port 80. The rules must still gate
+    /// the plain-HTTP request.
+    #[tokio::test]
+    async fn forward_http_enforces_https_route_rules_on_default_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            routes: vec![get_only_route_config("https://127.0.0.1".to_string())],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        // Port 80 (plain-HTTP default) against a route registered at port
+        // 443 — previously bypassed the rules entirely.
+        let request = format!(
+            "DELETE http://127.0.0.1:80/get HTTP/1.1\r\nHost: 127.0.0.1\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 403"),
+            "expected 403 for DELETE http://host:80/get against a GET-only https route, got: {}",
+            response_str
         );
 
         handle.shutdown();

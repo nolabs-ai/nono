@@ -984,6 +984,21 @@ fn prepare_with_abi_inner(
                 }
             }
         }
+
+        let has_bind_rules = match caps.network_mode() {
+            NetworkMode::ProxyOnly { bind_ports, .. } => !bind_ports.is_empty(),
+            _ => false,
+        } || !caps.tcp_bind_ports().is_empty()
+            || (!matches!(caps.network_mode(), NetworkMode::AllowAll)
+                && (!caps.localhost_ports().is_empty()
+                    || !caps.localhost_port_ranges().is_empty()));
+
+        if has_bind_rules {
+            net_rules.push(PreparedNetRule {
+                port: 0,
+                allowed_access: bind,
+            });
+        }
     }
 
     let mut path_rules = Vec::with_capacity(caps.fs_capabilities().len());
@@ -1188,6 +1203,23 @@ fn apply_with_abi_inner(
     // When a seccomp fallback is active (BlockAll or ProxyOnly), the ruleset was
     // created without handle_access(AccessNet), so adding NetPort rules would fail.
     if landlock_network_active {
+        let has_bind_rules = match caps.network_mode() {
+            NetworkMode::ProxyOnly { bind_ports, .. } => !bind_ports.is_empty(),
+            _ => false,
+        } || !caps.tcp_bind_ports().is_empty()
+            || (!matches!(caps.network_mode(), NetworkMode::AllowAll)
+                && (!caps.localhost_ports().is_empty()
+                    || !caps.localhost_port_ranges().is_empty()));
+
+        if has_bind_rules {
+            debug!("Adding TCP bind rule for port 0 (ephemeral ports)");
+            ruleset = ruleset
+                .add_rule(NetPort::new(0, AccessNet::BindTcp))
+                .map_err(|e| {
+                    NonoError::SandboxInit(format!("Cannot add TCP bind rule for port 0: {}", e))
+                })?;
+        }
+
         // Add per-port TCP connect rules (ProxyOnly port + explicit tcp_connect_ports)
         if let NetworkMode::ProxyOnly { port, bind_ports } = caps.network_mode() {
             debug!("Adding ProxyOnly TCP connect rule for port {}", port);

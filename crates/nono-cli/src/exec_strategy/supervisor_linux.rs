@@ -902,8 +902,16 @@ pub(super) fn decide_network_notification(
         }
         SYS_BIND => {
             let port = sockaddr.port;
-            let allowed = config.proxy_bind_ports.contains(&port)
+            let has_bind_grants = !config.proxy_bind_ports.is_empty()
+                || !config.caps.localhost_ports().is_empty()
+                || !config.caps.localhost_port_ranges().is_empty()
+                || !config.proxy_bind_port_ranges.is_empty()
+                || !config.caps.tcp_bind_ports().is_empty();
+
+            let allowed = (port == 0 && has_bind_grants)
+                || config.proxy_bind_ports.contains(&port)
                 || config.caps.localhost_ports().contains(&port)
+                || config.caps.tcp_bind_ports().contains(&port)
                 || config
                     .caps
                     .localhost_port_ranges()
@@ -2800,6 +2808,39 @@ mod tests {
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49160), &config),
                 NetworkDecision::Allow
+            );
+        }
+
+        #[test]
+        fn bind_to_port_zero_is_allowed_when_bind_ports_configured() {
+            let backend = DenyAllBackend;
+            let config = make_config(&backend, 0, vec![3000], &[]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(0), &config),
+                NetworkDecision::Allow,
+                "bind to port 0 (ephemeral port allocation) must be allowed when bind ports are configured"
+            );
+        }
+
+        #[test]
+        fn bind_to_port_zero_is_allowed_when_port_ranges_configured() {
+            let backend = DenyAllBackend;
+            let config = make_config_with_ranges(&backend, 0, vec![], vec![(49152, 49200)], &[]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(0), &config),
+                NetworkDecision::Allow,
+                "bind to port 0 (ephemeral port allocation) must be allowed when port ranges are configured"
+            );
+        }
+
+        #[test]
+        fn bind_to_port_zero_is_denied_when_no_bind_ports_or_ranges_configured() {
+            let backend = DenyAllBackend;
+            let config = make_config(&backend, 0, vec![], &[]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(0), &config),
+                NetworkDecision::Deny,
+                "bind to port 0 must be denied when no bind ports or ranges are permitted"
             );
         }
     }

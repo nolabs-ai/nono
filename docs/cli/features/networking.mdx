@@ -26,11 +26,11 @@ The proxy supports three modes that can be combined in a single session:
 
 | Mode | What it does | Activated by |
 |------|-------------|--------------|
-| **CONNECT tunnel** | Domain-filtered HTTPS tunneling. Validates the target host against an allowlist, then relays raw TCP bytes. TLS is end-to-end — the proxy never sees plaintext. | `--allow-domain`, `--network-profile` |
+| **CONNECT tunnel** | Domain-filtered HTTPS tunneling. Validates the target host against an allowlist, then relays raw TCP bytes. TLS is end-to-end — the proxy never sees plaintext. | `--allow-domain`, `--network-profile`, profile `network.approval_backends` |
 | **Reverse proxy** | Credential injection for API calls. Requests arrive at `http://localhost:<port>/<service>/...`, the proxy injects the real API key and forwards to the upstream over TLS. | `--credential` |
 | **External proxy** | Enterprise proxy passthrough. CONNECT requests are chained through a corporate proxy. Cloud metadata endpoints are still denied. | `--upstream-proxy` |
 
-When domain filtering or credential injection is active, the proxy starts automatically. `HTTP_PROXY` and `HTTPS_PROXY` are set in the child environment. For Node.js 26+, nono also sets `NODE_USE_ENV_PROXY=1` so built-in `fetch()` reads `HTTPS_PROXY`.
+When domain filtering, credential injection, or a network approval backend is active, the proxy starts automatically for `nono run` and `nono shell`. `HTTP_PROXY` and `HTTPS_PROXY` are set in the child environment. For Node.js 26+, nono also sets `NODE_USE_ENV_PROXY=1` so built-in `fetch()` reads `HTTPS_PROXY`.
 
 A 256-bit session token is generated for each proxy session. The child must include it in every request (`Proxy-Authorization` header for CONNECT, `X-Nono-Token` for reverse proxy), preventing other localhost processes from using the proxy.
 
@@ -51,6 +51,15 @@ In a profile, set `network.block` to `true`:
   "network": { "block": true }
 }
 ```
+
+Neither `--block-net` nor `network.block: true` can be lifted by a runtime
+approval. Configuring `network.approval_backends` together with either effective
+hard block is rejected before launch. For approval-only networking with an empty
+`allow_domain`, omit the hard block (or set `network.block: false`); the configured
+backend activates a strict proxy and otherwise eligible, directly handled
+CONNECT targets need approval. Inherited profile blocks remain hard blocks. The explicit `--allow-net`
+CLI override instead clears the profile block and approval settings and grants
+unrestricted networking.
 
 ## CONNECT Tunnel (Domain Filtering)
 
@@ -77,6 +86,64 @@ When `--allow-domain` is given a URL with a path (e.g., `https://github.com/org/
 Use `nono why --self --host https://github.com/some/path` inside the sandbox to check whether a specific URL is permitted and see the configured endpoint rules.
 
 ![Proxy architecture flow](/assets/proxy-flow.png)
+
+### Runtime Host Approval
+
+For `nono run` and `nono shell`, configure `network.approval_backends` to ask
+before connecting to hosts outside the static allowlist. Backends can be
+`terminal`, `webhook`, or `chain`. An approval-only profile needs no static
+allowlist entry or other proxy feature:
+
+```json
+{
+  "network": {
+    "block": false,
+    "allow_domain": [],
+    "approval_backends": {
+      "review": { "type": "terminal", "timeout_secs": 60 }
+    },
+    "approval_defaults": { "backend": "review" }
+  }
+}
+```
+
+Save this as `approval-only.json` and launch it with:
+
+```bash
+nono run --profile ./approval-only.json --allow-cwd -- my-agent
+```
+
+A non-empty backend map activates a strict proxy:
+an empty allowlist means eligible CONNECT destinations require approval, not
+unrestricted networking. Direct outbound traffic remains blocked. Static
+allowlist grants do not prompt; explicit host denies and metadata/link-local
+SSRF protections cannot be approved. Approved destinations are resolved and
+checked again before each connection. Without a backend map, static-policy
+behavior is unchanged; `approval_defaults` alone does not activate the proxy.
+
+`--block-net` and `network.block: true` are hard blocks, not approval triggers.
+They cannot be combined with approval backends, including when a block is
+inherited. Remove the hard block to use approval-only networking, or remove the
+backends to keep all networking blocked. The explicit `--allow-net` override
+clears the profile's block, allowlist, and approval settings instead.
+
+Terminal prompts offer *Deny once*, *Allow once*, *Always allow*, and *Always
+deny*. Once decisions apply only to the current attempt. Always decisions are
+cached for the same host and port until the proxy session ends. An empty or
+unrecognized answer denies the request. Terminal `timeout_secs` defaults to
+600 seconds and includes prompt-queue waiting, anti-typeahead delay, and reading
+the answer. Expiry denies, restores terminal state, and releases the prompt
+reader; expired queued work cannot open a later prompt. Set this timeout on the
+backend itself. A terminal backend without an available terminal denies.
+
+Host approvals apply to direct CONNECT tunnels, including destinations that
+bypass an enterprise upstream proxy. CONNECTs forwarded to the enterprise
+proxy do not consult these backends and need static allowlist grants. The
+standalone `nono proxy` does not load network approval backends, and `nono wrap`
+rejects them because it cannot host an approval proxy.
+
+See the [approval webhook protocol](https://github.com/nolabs-ai/nono/blob/main/docs/protocols/approval-webhook-v1.md)
+for webhook configuration, chain behavior, and grant scope.
 
 ### DNS Rebinding Protection
 
@@ -200,7 +267,7 @@ nono run --allow-cwd --network-profile enterprise \
   --upstream-proxy squid.corp:3128 -- my-agent
 ```
 
-CONNECT requests are chained through the corporate proxy. Cloud metadata endpoints are still denied regardless.
+CONNECT requests are chained through the corporate proxy. Cloud metadata endpoints are still denied regardless. Forwarded CONNECTs use static host policy, not runtime host approvals. When network approval backends are configured, forwarded destinations therefore need static allowlist grants; only direct/upstream-bypass CONNECTs can consult `network.approval_backends`.
 
 ### Bypassing the External Proxy
 
@@ -238,7 +305,7 @@ nono run --allow-cwd --network-profile enterprise -- my-agent
 
 ## Standalone Proxy (`nono proxy`)
 
-`nono run` / `shell` / `wrap` start the proxy as a side effect of launching a sandboxed child, wiring `HTTP_PROXY`/`HTTPS_PROXY` and the session token into that child. `nono proxy` instead runs the same network-filtering / credential-injection proxy as a **foreground server with no sandboxed child**, prints the connection details, and blocks until you press Ctrl-C.
+`nono run` / `shell` start the proxy as a side effect of launching a sandboxed child, wiring `HTTP_PROXY`/`HTTPS_PROXY` and the session token into that child. `nono proxy` instead runs the same network-filtering / credential-injection proxy as a **foreground server with no sandboxed child**, prints the connection details, and blocks until you press Ctrl-C.
 
 This lets you point your own tools at nono's domain filtering and credential injection, useful for workloads that provide their own OS-level isolation, such as Docker containers, Kata Containers, Kubernetes pods, Firecracker, and gVisor. The workload routes its egress through the proxy via `HTTP(S)_PROXY` while isolation comes from the container/microVM runtime.
 
@@ -269,7 +336,7 @@ On startup it prints the proxy URL (with the embedded credential), the raw token
   Press Ctrl-C to stop.
 ```
 
-Settings are loaded from `--profile` and extended/overridden by explicit flags, reusing the same configuration machinery as the sandboxed path. Allow-domains and credentials are merged on top of the profile; the network profile and upstream proxy are overridden by flags. Credential injection for known services and `cmd://` credential-capture routes carry through the profile exactly as they do under `nono run`.
+Static network and credential settings are loaded from `--profile` and extended/overridden by explicit flags. Unlike `run` and `shell`, standalone `nono proxy` does not load `network.approval_backends`; do not use an approval-only profile to restrict it. Allow-domains and credentials are merged on top of the profile; the network profile and upstream proxy are overridden by flags. Credential injection for known services and `cmd://` credential-capture routes carry through the profile exactly as they do under `nono run`.
 
 ### Flags
 

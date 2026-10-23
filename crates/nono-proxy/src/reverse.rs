@@ -1223,9 +1223,14 @@ async fn enforce_endpoint_policy(
                 session_id: "proxy".to_string(),
             };
             let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(60));
-            let decision = tokio::time::timeout(
-                timeout,
-                tokio::task::spawn_blocking(move || backend.request_approval(&request)),
+            let deadline = std::time::Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(std::time::Instant::now);
+            let decision = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                tokio::task::spawn_blocking(move || {
+                    backend.request_approval_with_deadline(&request, deadline)
+                }),
             )
             .await;
             // L7 endpoint approval has no per-connection session cache, so

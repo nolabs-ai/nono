@@ -36,10 +36,10 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const NETWORK_APPROVAL_BACKSTOP_GRACE: Duration = Duration::from_secs(30);
 
 /// Backstop wall-clock cap applied only to a backend that reports no timeout of
-/// its own ([`nono::ApprovalBackend::approval_timeout`] returns `None`, e.g. a
-/// `terminal` backend blocking on `/dev/tty`). Without this, such a backend
-/// could pin a blocking-pool thread indefinitely. On expiry the request is
-/// denied. A backend that reports a timeout is instead bounded by that timeout
+/// its own ([`nono::ApprovalBackend::approval_timeout`] returns `None`). On
+/// expiry the request is denied, but arbitrary third-party blocking calls
+/// cannot be forcibly cancelled. Built-in terminal backends enforce their own
+/// read deadline and report it, returning before the backstop expires. A backend that reports a timeout is instead bounded by that timeout
 /// plus [`NETWORK_APPROVAL_BACKSTOP_GRACE`].
 const NETWORK_APPROVAL_UNBOUNDED_BACKSTOP: Duration = Duration::from_secs(600);
 
@@ -485,19 +485,24 @@ async fn run_prompt(
         child_pid: 0,
         session_id: approval.session_id.to_string(),
     };
-    let backstop = approval
-        .backend
-        .approval_timeout()
-        .map(|t| t.saturating_add(NETWORK_APPROVAL_BACKSTOP_GRACE))
+    let configured_timeout = approval.backend.approval_timeout();
+    let budget = configured_timeout.unwrap_or(NETWORK_APPROVAL_UNBOUNDED_BACKSTOP);
+    let Some(deadline) = std::time::Instant::now().checked_add(budget) else {
+        return ApprovalDecision::Denied {
+            reason: "network approval timeout is too large".to_string(),
+        };
+    };
+    let backstop = configured_timeout
+        .map(|timeout| timeout.saturating_add(NETWORK_APPROVAL_BACKSTOP_GRACE))
         .unwrap_or(NETWORK_APPROVAL_UNBOUNDED_BACKSTOP);
 
     let backend = Arc::clone(approval.backend);
-    let decision = match tokio::time::timeout(
-        backstop,
-        tokio::task::spawn_blocking(move || backend.request_approval(&request)),
-    )
-    .await
-    {
+    // Compute the deadline before entering the blocking pool: queued work and
+    // later members of a chain must not start a stale terminal prompt.
+    let mut prompt = tokio::task::spawn_blocking(move || {
+        backend.request_approval_with_deadline(&request, deadline)
+    });
+    let decision = match tokio::time::timeout(backstop, &mut prompt).await {
         Ok(Ok(Ok(decision))) => decision,
         Ok(Ok(Err(e))) => {
             warn!("network approval backend '{backend_name}' error for {host}:{port}: {e}");
@@ -512,11 +517,17 @@ async fn run_prompt(
             };
         }
         Err(_) => {
+            // This also cancels a task still queued in the blocking pool. A
+            // running built-in terminal read uses the earlier absolute deadline.
+            prompt.abort();
             warn!("network approval timed out for {host}:{port}");
             return ApprovalDecision::Timeout;
         }
     };
 
+    if std::time::Instant::now() >= deadline {
+        return ApprovalDecision::Timeout;
+    }
     match &decision {
         ApprovalDecision::GrantedForSession => {
             approval.remember(key.clone(), true);
@@ -1151,6 +1162,72 @@ mod tests {
             None,
             "a one-shot Denied must not populate the session cache"
         );
+    }
+
+    #[test]
+    fn queued_approval_cannot_start_a_prompt_after_its_deadline() {
+        struct DeadlineBackend(AtomicUsize);
+        impl nono::ApprovalBackend for DeadlineBackend {
+            fn request_approval(&self, _: &ApprovalRequest) -> nono::Result<ApprovalDecision> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ApprovalDecision::Denied {
+                    reason: "test denial".to_string(),
+                })
+            }
+            fn backend_name(&self) -> &str {
+                "deadline-test"
+            }
+            fn approval_timeout(&self) -> Option<Duration> {
+                Some(Duration::from_millis(20))
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let concrete = Arc::new(DeadlineBackend(AtomicUsize::new(0)));
+            let backend: Arc<dyn nono::ApprovalBackend> = concrete.clone();
+            let decisions = Mutex::new(HashMap::new());
+            let in_flight = empty_in_flight();
+            let approval = NetworkApproval {
+                backend: &backend,
+                session_decisions: &decisions,
+                in_flight: &in_flight,
+                session_id: "queued",
+            };
+            let key = ("blocked.example.com".to_string(), 443);
+            let (decision, ()) = tokio::join!(
+                run_prompt(&approval, "deadline-test", &key.0, key.1, &key),
+                async {
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    release_tx.send(()).unwrap();
+                },
+            );
+            occupied.await.unwrap();
+            assert!(matches!(decision, ApprovalDecision::Timeout));
+            assert_eq!(
+                concrete.0.load(Ordering::SeqCst),
+                0,
+                "expired queued attempt must not prompt"
+            );
+            assert!(decisions.lock().unwrap().is_empty());
+            let next = run_prompt(&approval, "deadline-test", &key.0, key.1, &key).await;
+            assert!(matches!(next, ApprovalDecision::Denied { .. }));
+            assert_eq!(
+                concrete.0.load(Ordering::SeqCst),
+                1,
+                "new attempt gets a fresh deadline"
+            );
+        });
     }
 
     /// An approval backend that blocks briefly before answering, so a burst of

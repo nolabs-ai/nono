@@ -1514,10 +1514,13 @@ fn handle_shim_stream_inner(
                     child_pid: auth.peer_pid,
                     session_id: session_id.to_string(),
                 };
-                let decision = run_with_timeout(
-                    std::time::Duration::from_secs(approval_route.timeout_secs),
-                    move || backend.request_approval(&approval_request),
-                )?;
+                let timeout = std::time::Duration::from_secs(approval_route.timeout_secs);
+                let deadline = std::time::Instant::now()
+                    .checked_add(timeout)
+                    .unwrap_or_else(std::time::Instant::now);
+                let decision = run_with_timeout(timeout, move || {
+                    backend.request_approval_with_deadline(&approval_request, deadline)
+                })?;
                 let (audit_decision, deny_reason) = if decision.is_granted() {
                     (CommandPolicyDecision::InvocationApproveGranted, None)
                 } else {
@@ -1651,8 +1654,12 @@ fn handle_shim_stream_inner(
                 reason: err.to_string(),
             })?;
         let timeout = std::time::Duration::from_secs(approval_route.timeout_secs);
-        let decision =
-            run_with_timeout(timeout, move || backend.request_approval(&approval_request))?;
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(std::time::Instant::now);
+        let decision = run_with_timeout(timeout, move || {
+            backend.request_approval_with_deadline(&approval_request, deadline)
+        })?;
 
         let (audit_decision, deny_reason) = if decision.is_granted() {
             (CommandPolicyDecision::ApproveGranted, None)

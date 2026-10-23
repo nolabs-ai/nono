@@ -1,7 +1,7 @@
 use crate::command_policy::{
     ApprovalBackendConfig, ApprovalBackendType, ApprovalChainMode, CommandPoliciesConfig,
 };
-use crate::terminal_approval::TerminalApproval;
+use crate::terminal_approval::{TERMINAL_APPROVAL_TIMEOUT, TerminalApproval};
 use nono::{ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -101,6 +101,10 @@ fn build_approval_backend(
     let backend: Arc<dyn ApprovalBackend> = match backend_config.backend_type {
         ApprovalBackendType::Terminal => Arc::new(NamedTerminalApproval {
             name: name.to_string(),
+            timeout: backend_config
+                .timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(TERMINAL_APPROVAL_TIMEOUT),
         }),
         ApprovalBackendType::Webhook => Arc::new(WebhookApproval::new(name, backend_config)?),
         ApprovalBackendType::Chain => {
@@ -126,15 +130,28 @@ fn build_approval_backend(
 
 struct NamedTerminalApproval {
     name: String,
+    timeout: Duration,
 }
 
 impl ApprovalBackend for NamedTerminalApproval {
+    fn request_approval_with_deadline(
+        &self,
+        request: &ApprovalRequest,
+        deadline: Instant,
+    ) -> Result<ApprovalDecision> {
+        TerminalApproval.request_approval_with_timeout(request, self.timeout, Some(deadline))
+    }
+
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
-        TerminalApproval.request_approval(request)
+        TerminalApproval.request_approval_with_timeout(request, self.timeout, None)
     }
 
     fn backend_name(&self) -> &str {
         &self.name
+    }
+
+    fn approval_timeout(&self) -> Option<Duration> {
+        Some(self.timeout)
     }
 }
 
@@ -557,10 +574,24 @@ struct ChainApproval {
 }
 
 impl ApprovalBackend for ChainApproval {
+    fn request_approval_with_deadline(
+        &self,
+        request: &ApprovalRequest,
+        deadline: Instant,
+    ) -> Result<ApprovalDecision> {
+        if Instant::now() >= deadline {
+            return Ok(ApprovalDecision::Timeout);
+        }
+        match self.mode {
+            ApprovalChainMode::All => self.request_all(request, Some(deadline)),
+            ApprovalChainMode::Any => Ok(self.request_any(request, Some(deadline))),
+        }
+    }
+
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
         match self.mode {
-            ApprovalChainMode::All => self.request_all(request),
-            ApprovalChainMode::Any => Ok(self.request_any(request)),
+            ApprovalChainMode::All => self.request_all(request, None),
+            ApprovalChainMode::Any => Ok(self.request_any(request, None)),
         }
     }
 
@@ -570,8 +601,9 @@ impl ApprovalBackend for ChainApproval {
 
     fn approval_timeout(&self) -> Option<Duration> {
         // Backends are consulted sequentially in both modes, so the worst-case
-        // wall-clock is the sum of their timeouts. If any child is unbounded
-        // (e.g. a terminal prompt), so is the chain — the caller applies its
+        // wall-clock is the sum of their timeouts. Terminal prompts include
+        // their queue wait in this bound. If any child is unbounded, so is
+        // the chain — the caller applies its
         // own floor. Saturating on overflow keeps the hint total.
         let mut total = Duration::ZERO;
         for backend in &self.backends {
@@ -582,13 +614,29 @@ impl ApprovalBackend for ChainApproval {
 }
 
 impl ChainApproval {
-    fn request_all(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+    fn request_child(
+        backend: &Arc<dyn ApprovalBackend>,
+        request: &ApprovalRequest,
+        deadline: Option<Instant>,
+    ) -> Result<ApprovalDecision> {
+        match deadline {
+            Some(end) if Instant::now() >= end => Ok(ApprovalDecision::Timeout),
+            Some(end) => backend.request_approval_with_deadline(request, end),
+            None => backend.request_approval(request),
+        }
+    }
+
+    fn request_all(
+        &self,
+        request: &ApprovalRequest,
+        deadline: Option<Instant>,
+    ) -> Result<ApprovalDecision> {
         // A unanimous grant carries session scope only if every backend grants
         // for the session. A single-use grant must never be widened. A session
         // denial short-circuits and propagates so the denial is cached too.
         let mut grant_for_session = !self.backends.is_empty();
         for backend in &self.backends {
-            match backend.request_approval(request)? {
+            match Self::request_child(backend, request, deadline)? {
                 ApprovalDecision::Granted => grant_for_session = false,
                 ApprovalDecision::GrantedForSession => {}
                 ApprovalDecision::Denied { reason } => {
@@ -617,10 +665,14 @@ impl ChainApproval {
         })
     }
 
-    fn request_any(&self, request: &ApprovalRequest) -> ApprovalDecision {
+    fn request_any(
+        &self,
+        request: &ApprovalRequest,
+        deadline: Option<Instant>,
+    ) -> ApprovalDecision {
         let mut reasons = Vec::new();
         for backend in &self.backends {
-            match backend.request_approval(request) {
+            match Self::request_child(backend, request, deadline) {
                 Ok(ApprovalDecision::Granted) => return ApprovalDecision::Granted,
                 Ok(ApprovalDecision::GrantedForSession) => {
                     return ApprovalDecision::GrantedForSession;
@@ -682,6 +734,110 @@ mod tests {
             child_pid: 0,
             session_id: "proxy".to_string(),
         }
+    }
+
+    #[test]
+    fn chain_preserves_the_callers_absolute_deadline() {
+        struct DeadlineBackend {
+            seen: Arc<std::sync::Mutex<Vec<Instant>>>,
+            decision: ApprovalDecision,
+        }
+        impl ApprovalBackend for DeadlineBackend {
+            fn request_approval(&self, _: &ApprovalRequest) -> Result<ApprovalDecision> {
+                panic!("chain must forward caller deadline")
+            }
+            fn request_approval_with_deadline(
+                &self,
+                _: &ApprovalRequest,
+                deadline: Instant,
+            ) -> Result<ApprovalDecision> {
+                self.seen.lock().unwrap().push(deadline);
+                Ok(self.decision.clone())
+            }
+            fn backend_name(&self) -> &str {
+                "deadline-child"
+            }
+        }
+        for mode in [ApprovalChainMode::All, ApprovalChainMode::Any] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let first = match mode {
+                ApprovalChainMode::All => ApprovalDecision::GrantedForSession,
+                ApprovalChainMode::Any => ApprovalDecision::Denied {
+                    reason: "next".to_string(),
+                },
+            };
+            let chain = ChainApproval {
+                name: "deadline-chain".to_string(),
+                mode,
+                backends: vec![
+                    Arc::new(DeadlineBackend {
+                        seen: seen.clone(),
+                        decision: first,
+                    }),
+                    Arc::new(DeadlineBackend {
+                        seen: seen.clone(),
+                        decision: ApprovalDecision::GrantedForSession,
+                    }),
+                ],
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            assert!(
+                chain
+                    .request_approval_with_deadline(&request(), deadline)
+                    .unwrap()
+                    .is_granted()
+            );
+            assert_eq!(*seen.lock().unwrap(), [deadline, deadline]);
+            assert!(matches!(
+                chain
+                    .request_approval_with_deadline(&request(), Instant::now())
+                    .unwrap(),
+                ApprovalDecision::Timeout
+            ));
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                2,
+                "expired chain starts no child prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_named_terminal_does_not_open_a_prompt() {
+        let backend = NamedTerminalApproval {
+            name: "terminal".to_string(),
+            timeout: Duration::from_secs(600),
+        };
+        assert!(matches!(
+            backend
+                .request_approval_with_deadline(&request(), Instant::now())
+                .unwrap(),
+            ApprovalDecision::Timeout
+        ));
+    }
+
+    #[test]
+    fn terminal_and_chain_advertise_their_enforced_timeouts() {
+        let backends: BTreeMap<String, ApprovalBackendConfig> = serde_json::from_value(
+            serde_json::json!({
+                "default-terminal": {"type": "terminal"},
+                "short-terminal": {"type": "terminal", "timeout_secs": 2},
+                "chain": {"type": "chain", "mode": "all", "backends": ["default-terminal", "short-terminal"]}
+            }),
+        ).unwrap();
+        let built = build_approval_backends_from(&backends).unwrap();
+        assert_eq!(
+            built["default-terminal"].approval_timeout(),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            built["short-terminal"].approval_timeout(),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            built["chain"].approval_timeout(),
+            Some(Duration::from_secs(602))
+        );
     }
 
     #[test]

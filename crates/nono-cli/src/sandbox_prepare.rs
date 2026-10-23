@@ -767,7 +767,7 @@ fn finalize_prepared_sandbox(
 
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
     let proxy_intent = has_proxy_intent(args, &prepared);
-    let block_wins = args.block_net || (prepared.profile_network_block && !proxy_intent);
+    let block_wins = args.block_net || (prepared.profile_network_block && !args.allow_net);
     let proxy_pending = !block_wins && !args.allow_net && proxy_intent;
     output::print_capabilities(
         &prepared.caps,
@@ -918,6 +918,7 @@ fn has_proxy_intent(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
         || prepared.network_profile.is_some()
         || !prepared.allow_domain.is_empty()
         || prepared.upstream_proxy.is_some()
+        || (!args.allow_net && !prepared.network_approval_backends.is_empty())
 }
 
 fn has_upstream_proxy(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
@@ -957,9 +958,19 @@ pub(crate) fn validate_block_net_conflicts(
     args: &SandboxArgs,
     prepared: &PreparedSandbox,
 ) -> Result<()> {
-    let block_net = args.block_net || prepared.profile_network_block;
+    let block_net = args.block_net || (prepared.profile_network_block && !args.allow_net);
 
     if block_net {
+        if !args.allow_net && !prepared.network_approval_backends.is_empty() {
+            return Err(NonoError::ConfigParse(
+                "--block-net or network.block: true cannot be combined with \
+                 network.approval_backends: a hard network block cannot be approved. \
+                 For approval-only networking, omit --block-net and set network.block \
+                 to false (or omit it); otherwise remove the approval backends."
+                    .to_string(),
+            ));
+        }
+
         // Credential injection requires the proxy to be reachable.
         let has_credentials = !args.proxy_credential.is_empty() || !prepared.credentials.is_empty();
         if has_credentials {
@@ -3055,6 +3066,163 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+        }
+    }
+
+    fn approval_only_prepared() -> PreparedSandbox {
+        let mut prepared = empty_prepared();
+        prepared.network_approval_backends.insert(
+            "terminal".to_string(),
+            serde_json::from_str(r#"{"type":"terminal"}"#).expect("terminal backend"),
+        );
+        prepared.network_approval_defaults = Some(crate::command_policy::ApprovalDefaultsConfig {
+            backend: Some("terminal".to_string()),
+            ..Default::default()
+        });
+        prepared
+    }
+
+    #[test]
+    fn approval_only_profile_activates_strict_proxy_with_empty_allowlist() {
+        for proxy_port in [None, Some(0)] {
+            let prepared = approval_only_prepared();
+            assert!(!prepared.profile_network_block);
+            let args = SandboxArgs {
+                proxy_port,
+                ..Default::default()
+            };
+
+            assert!(has_proxy_intent(&args, &prepared));
+            validate_proxy_conflicts(&args, &prepared).expect("approval-only profile is valid");
+            let intent = crate::proxy_runtime::prepare_proxy_launch_options(
+                &args,
+                &prepared,
+                true,
+                "approval-only".to_string(),
+            )
+            .expect("approval-only launch options");
+            assert!(intent.is_proxy_active());
+            let proxy = intent.proxy_options().expect("active proxy options");
+            assert!(proxy.domain_filter.is_none());
+            assert!(proxy.endpoint_filter.is_none());
+            assert!(proxy.credentials.is_none());
+            assert!(proxy.upstream_proxy.is_none());
+            assert!(proxy.strict_filter);
+            assert_eq!(proxy.proxy_port, proxy_port);
+            assert_eq!(
+                proxy.network_approval_backends,
+                prepared.network_approval_backends
+            );
+            assert_eq!(
+                proxy.network_approval_defaults,
+                prepared.network_approval_defaults
+            );
+            let config = crate::proxy_runtime::build_proxy_config_from_flags(proxy)
+                .expect("approval-only proxy config");
+            assert!(config.allowed_hosts.is_empty());
+            assert!(
+                config.strict_filter,
+                "empty allowlist must not allow all hosts"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_network_blocks_reject_approval_backends() {
+        for (cli_block, profile_block) in [(true, false), (false, true), (true, true)] {
+            let mut prepared = approval_only_prepared();
+            prepared.profile_network_block = profile_block;
+            let args = SandboxArgs {
+                block_net: cli_block,
+                ..Default::default()
+            };
+            let error = validate_proxy_conflicts(&args, &prepared)
+                .expect_err("approval must never override either hard-block form");
+            let message = error.to_string();
+            assert!(message.contains("network.approval_backends"));
+            assert!(message.contains("network.block: true"));
+            assert!(message.contains("--block-net"));
+            assert!(message.contains("cannot be approved"));
+        }
+    }
+
+    #[test]
+    fn hard_network_blocks_stay_blocked_if_validation_is_bypassed() {
+        for (cli_block, profile_block) in [(true, false), (false, true), (true, true)] {
+            let mut prepared = approval_only_prepared();
+            prepared.profile_network_block = profile_block;
+            let args = SandboxArgs {
+                block_net: cli_block,
+                ..Default::default()
+            };
+            let intent = crate::proxy_runtime::prepare_proxy_launch_options(
+                &args,
+                &prepared,
+                true,
+                String::new(),
+            )
+            .expect("hard-block fallback");
+            assert!(matches!(
+                intent,
+                crate::launch_runtime::NetworkIntent::BlockAll
+            ));
+            assert!(!intent.is_proxy_active());
+        }
+    }
+
+    #[test]
+    fn allow_net_clears_profile_network_approval_settings() {
+        for profile_network_block in [false, true] {
+            let mut prepared = approval_only_prepared();
+            prepared.profile_network_block = profile_network_block;
+            let args = SandboxArgs {
+                allow_net: true,
+                ..Default::default()
+            };
+
+            assert!(!has_proxy_intent(&args, &prepared));
+            validate_proxy_conflicts(&args, &prepared)
+                .expect("explicit --allow-net clears profile block and approvals");
+            let intent = crate::proxy_runtime::prepare_proxy_launch_options(
+                &args,
+                &prepared,
+                true,
+                String::new(),
+            )
+            .expect("unrestricted launch options");
+            assert!(!intent.is_proxy_active());
+            assert!(!matches!(
+                intent,
+                crate::launch_runtime::NetworkIntent::BlockAll
+            ));
+            let proxy = intent.proxy_options().expect("inactive proxy options");
+            assert!(proxy.network_approval_backends.is_empty());
+            assert!(proxy.network_approval_defaults.is_none());
+            assert!(!proxy.strict_filter);
+        }
+    }
+
+    #[test]
+    fn empty_network_approval_backends_do_not_activate_proxy() {
+        for profile_network_block in [false, true] {
+            let mut prepared = empty_prepared();
+            prepared.profile_network_block = profile_network_block;
+            prepared.network_approval_defaults = Some(Default::default());
+            let args = SandboxArgs::default();
+
+            assert!(!has_proxy_intent(&args, &prepared));
+            let intent = crate::proxy_runtime::prepare_proxy_launch_options(
+                &args,
+                &prepared,
+                true,
+                String::new(),
+            )
+            .expect("launch options without approval backends");
+            assert!(!intent.is_proxy_active());
+            assert_eq!(
+                matches!(intent, crate::launch_runtime::NetworkIntent::BlockAll),
+                profile_network_block,
+            );
         }
     }
 

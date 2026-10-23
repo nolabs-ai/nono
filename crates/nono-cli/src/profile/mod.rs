@@ -1870,8 +1870,15 @@ pub struct NetworkConfig {
     ///
     /// A named backend here (e.g. `terminal`, `webhook`, or a `chain`)
     /// answers the prompt; an approved host is tunnelled, a denied one gets a
-    /// 403. Empty (default) keeps the existing behavior: a not-allowed host is
-    /// denied immediately with no prompt. Uses the same
+    /// 403. For `run` and `shell`, a non-empty map activates the proxy even
+    /// with an empty allowlist, provided `network.block` is false or omitted
+    /// and `--block-net` is absent. The empty allowlist then requires approval
+    /// rather than allowing all hosts. Both hard-block forms conflict with
+    /// configured approval backends and are rejected; approvals cannot lift
+    /// a block. `--allow-net` clears these profile approval settings. Explicit host denies and metadata /
+    /// link-local SSRF protection cannot be overridden by approval.
+    /// Empty (default) keeps the existing static-policy behavior: a not-allowed
+    /// host is denied immediately with no prompt. Uses the same
     /// [`ApprovalBackendConfig`] shape as `security.approval_backends`.
     /// Session-scoped "Always allow"/"Always deny" answers suppress re-prompting
     /// for the rest of the session.
@@ -7446,6 +7453,25 @@ mod tests {
 
         let merged = merge_profiles(base, child);
         assert!(merged.network.block, "base block=true must be inherited");
+    }
+
+    #[test]
+    fn test_merge_profiles_network_approvals_cannot_clear_inherited_block() {
+        let mut base = base_profile();
+        base.network.block = true;
+        let mut child = child_profile();
+        child.network.approval_backends.insert(
+            "terminal".to_string(),
+            serde_json::from_str(r#"{"type":"terminal"}"#).expect("terminal backend"),
+        );
+        let merged = merge_profiles(base, child);
+        assert!(
+            merged.network.block,
+            "approval config cannot loosen an inherited hard block"
+        );
+        assert!(merged.network.approval_backends.contains_key("terminal"));
+        // Launch validation rejects this combination instead of starting an
+        // approval proxy that could override the inherited network block.
     }
 
     #[test]

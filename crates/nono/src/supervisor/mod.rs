@@ -92,6 +92,33 @@ pub trait ApprovalBackend: Send + Sync {
     /// or internal error. The supervisor treats errors as denials.
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision>;
 
+    /// Decide before an absolute caller deadline, including time spent queued
+    /// before this call. Interactive backends should override this method and
+    /// bound their reads by the earlier of this deadline and their own timeout.
+    /// Composite backends must forward the same deadline to each child.
+    ///
+    /// The compatibility implementation rejects expired attempts and late
+    /// results, but cannot interrupt an already-running legacy backend. Callers
+    /// must retain their outer timeout as a fail-closed backstop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying backend error, as with `request_approval`.
+    fn request_approval_with_deadline(
+        &self,
+        request: &ApprovalRequest,
+        deadline: std::time::Instant,
+    ) -> Result<ApprovalDecision> {
+        if std::time::Instant::now() >= deadline {
+            return Ok(ApprovalDecision::Timeout);
+        }
+        let decision = self.request_approval(request);
+        if std::time::Instant::now() >= deadline {
+            return Ok(ApprovalDecision::Timeout);
+        }
+        decision
+    }
+
     /// Human-readable name for this backend (used in audit logs).
     fn backend_name(&self) -> &str;
 
@@ -102,8 +129,9 @@ pub trait ApprovalBackend: Send + Sync {
     /// network-approval path, which runs the blocking `request_approval` on a
     /// worker pool under a `timeout`) use this to size that backstop so it never
     /// preempts a legitimately longer-configured timeout. `None` means the
-    /// backend is effectively unbounded (for example an interactive terminal
-    /// prompt with no timeout), and the caller should apply its own floor.
+    /// backend is effectively unbounded, and the caller should apply its own
+    /// floor. Interactive backends should enforce a finite timeout and honor
+    /// `request_approval_with_deadline` so expired prompts release their reader.
     fn approval_timeout(&self) -> Option<std::time::Duration> {
         None
     }

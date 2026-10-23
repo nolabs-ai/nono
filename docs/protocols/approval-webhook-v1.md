@@ -35,6 +35,64 @@ There are two variants of the contract:
 | `auth` | Omit for unsigned. `"platform"` selects the signed variant and fails closed if the client is not enrolled. |
 | `timeout_secs` | Total time this backend waits for a decision (default 60). It is also sent to the server as the hold hint. |
 
+### Approval-only network configuration
+
+For sandboxed `run` and `shell` launches, `network.approval_backends`
+also activates the proxy: no static `allow_domain` entry, credential route, or
+upstream proxy is required. `network.block` must be false or omitted, and
+`--block-net` must be absent. For example:
+
+```json
+{
+  "network": {
+    "block": false,
+    "allow_domain": [],
+    "approval_backends": {
+      "review": { "type": "terminal" }
+    },
+    "approval_defaults": { "backend": "review" }
+  }
+}
+```
+
+A non-empty backend map selects strict host filtering. An empty allowlist
+therefore sends every otherwise eligible CONNECT target for approval instead of using the legacy empty-list allow-all
+behavior. Static allowlist grants still work without a prompt; explicit host
+denies and metadata/link-local SSRF protection remain hard denials and cannot
+be approved. Approved destinations are resolved and checked again before use.
+Without network approval backends, the existing static-policy behavior is
+unchanged; `approval_defaults` alone does not activate a proxy.
+
+Both `--block-net` and profile `network.block: true` are hard network blocks,
+not default-deny settings that an approval can override. Combining either with
+`network.approval_backends` is rejected as contradictory before launch. To use
+approval-only mode, remove the hard block; to keep networking blocked, remove
+the approval backends. An inherited block also remains a hard block; adding
+approvals in a child profile cannot loosen it. The explicit `--allow-net`
+override clears a profile block and its approval backends along with its static
+proxy settings; this is an explicit unrestricted grant, not an approval. The standalone `nono proxy` command does not currently load network approval backends.
+`nono wrap` cannot host an approval proxy and rejects active network approval
+backends rather than silently ignoring them; use `nono run` instead.
+Runtime network approvals currently apply to CONNECT tunnels handled directly
+by nono, including upstream-bypass destinations. CONNECTs forwarded to an
+enterprise upstream proxy do not consult these backends: unlisted destinations
+remain denied, so forwarded destinations need static allowlist grants.
+
+### Terminal approval deadline
+
+Terminal approval has a total deadline set by the terminal backend's
+`timeout_secs` (ten minutes by default). That budget includes waiting
+for another approval prompt to release the terminal and the anti-typeahead
+delay, not just time spent reading an answer. Expiry denies the request,
+restores terminal state, and leaves no active prompt reader behind. Named and
+chained backends advertise their bounded timeout to callers so a proxy backstop
+does not prematurely abandon a legitimate terminal prompt. The proxy passes its
+absolute deadline through queued approval work and chains; a worker that starts
+after expiry cannot open a fresh terminal prompt. For network approvals, set
+`timeout_secs` on the terminal or webhook backend entry: only `backend` is read
+from `network.approval_defaults`. A chain derives its bound from its children;
+a chain-level `timeout_secs` does not override their deadlines.
+
 ## Request
 
 Both variants `POST` the same JSON body:

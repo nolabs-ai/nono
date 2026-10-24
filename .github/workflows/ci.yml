@@ -24,6 +24,62 @@ jobs:
       - name: Run actionlint
         uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
 
+  verify-release-workflow:
+    name: Verify Release Workflow Structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check publish-oci job structure
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+          import yaml
+
+          with open('.github/workflows/release.yml') as f:
+              wf = yaml.safe_load(f)
+
+          jobs = wf['jobs']
+          errors = []
+
+          job = jobs.get('publish-oci')
+          if not job:
+              errors.append('publish-oci job is missing')
+          else:
+              if job.get('needs') != 'release':
+                  errors.append(f"publish-oci needs={job.get('needs')!r}, want 'release'")
+
+              expected = {'contents': 'read', 'packages': 'write', 'id-token': 'write'}
+              if job.get('permissions') != expected:
+                  errors.append(f"publish-oci permissions={job.get('permissions')!r}, want {expected!r}")
+
+              # Verify latest-binary tagging step exists and is not gated on exists check
+              steps = job.get('steps', [])
+              tag_step = next(
+                  (s for s in steps
+                   if 'oras tag' in (s.get('run') or '') and 'latest-binary' in (s.get('run') or '')),
+                  None
+              )
+              if not tag_step:
+                  errors.append('publish-oci is missing a step that runs "oras tag ... latest-binary"')
+              elif 'steps.existing.outputs.exists' in str(tag_step.get('if', '')):
+                  errors.append('latest-binary tag step must not be gated on steps.existing.outputs.exists')
+
+          for name, j in jobs.items():
+              needs = j.get('needs', [])
+              if isinstance(needs, str):
+                  needs = [needs]
+              if 'publish-oci' in needs:
+                  errors.append(f"job '{name}' depends on publish-oci (must not)")
+
+          if errors:
+              for e in errors:
+                  print(f'FAIL: {e}', file=sys.stderr)
+              sys.exit(1)
+
+          print('OK')
+          PYEOF
+
   shellcheck:
     name: ShellCheck
     runs-on: ubuntu-latest

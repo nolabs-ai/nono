@@ -90,6 +90,39 @@ makepkg -si
 
 Other distributions are in the process of being packaged. In the meantime, you can use the prebuilt binaries or build from source.
 
+## OCI Registry (GHCR)
+
+nono binaries are published as OCI artifacts to the GitHub Container Registry, making them consumable with [`oras`](https://oras.land) in CI pipelines and air-gapped environments without custom scripting.
+
+```bash
+# Pull the binary for your platform (auto-resolves to the right tarball)
+oras pull --platform linux/amd64 ghcr.io/nolabs-ai/nono:latest-binary -o .
+tar xzf nono-*.tar.gz
+sudo mv nono /usr/local/bin/
+nono --version
+```
+
+Replace `linux/amd64` with your platform. Supported values: `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`.
+
+### Verify the signature
+
+Each release is signed with [Cosign](https://docs.sigstore.dev/cosign/overview/) keyless signatures (Sigstore). To verify before installing:
+
+```bash
+TAG=v0.81.0          # git release tag (with "v")
+VERSION="${TAG#v}"   # OCI tags omit the "v"
+cosign verify \
+  --certificate-identity "https://github.com/nolabs-ai/nono/.github/workflows/release.yml@refs/tags/${TAG}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "ghcr.io/nolabs-ai/nono@$(oras resolve ghcr.io/nolabs-ai/nono:${VERSION}-binary)"
+```
+
+### Pin to a specific version
+
+```bash
+oras pull --platform linux/amd64 ghcr.io/nolabs-ai/nono:0.81.0-binary -o .
+```
+
 ## Building from Source
 
 See the [Development Guide](/cli/development/index) for instructions on building nono from source.

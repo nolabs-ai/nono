@@ -302,6 +302,309 @@ jobs:
             artifacts/*.rpm
             artifacts/SHA256SUMS.txt
 
+  publish-oci:
+    name: Publish OCI artifacts to GHCR
+    needs: release
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ github.repository == 'nolabs-ai/nono' &&
+      !contains(github.event.inputs.tag || github.ref_name, 'alpha') &&
+      !contains(github.event.inputs.tag || github.ref_name, 'beta') &&
+      !contains(github.event.inputs.tag || github.ref_name, 'rc') }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      OCI_REPO: ghcr.io/nolabs-ai/nono
+      ARTIFACT_TYPE: application/vnd.nono.binary.v1
+      LAYER_MEDIA_TYPE: application/vnd.nono.binary.layer.v1.tar+gzip
+    steps:
+      - name: Validate tag
+        run: |
+          set -euo pipefail
+          if ! echo "$RELEASE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::RELEASE_TAG '${RELEASE_TAG}' is not a stable semver tag"
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          pattern: nono-*
+          merge-multiple: true
+
+      - name: Verify checksums against published SHA256SUMS.txt
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const crypto = require('crypto');
+            const path = require('path');
+
+            const tag = process.env.RELEASE_TAG;
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+
+            const { data: release } = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+            const asset = release.assets.find(a => a.name === 'SHA256SUMS.txt');
+            if (!asset) {
+              core.setFailed(`SHA256SUMS.txt not found in release ${tag}`);
+              return;
+            }
+
+            const response = await github.request(
+              'GET /repos/{owner}/{repo}/releases/assets/{asset_id}',
+              { owner, repo, asset_id: asset.id, headers: { accept: 'application/octet-stream' } }
+            );
+            const sums = Object.fromEntries(
+              Buffer.from(response.data).toString('utf8').trim().split('\n')
+                .map(l => l.trim().split(/\s+/))
+                .filter(p => p.length === 2)
+                .map(([hash, name]) => [name, hash])
+            );
+
+            const targets = [
+              'x86_64-unknown-linux-gnu',
+              'aarch64-unknown-linux-gnu',
+              'x86_64-apple-darwin',
+              'aarch64-apple-darwin',
+            ];
+
+            let failed = false;
+            for (const target of targets) {
+              const filename = `nono-${tag}-${target}.tar.gz`;
+              const filepath = path.join('artifacts', filename);
+              if (!fs.existsSync(filepath)) {
+                core.error(`Expected artifact not found: ${filepath}`);
+                failed = true;
+                continue;
+              }
+              const expected = sums[filename];
+              if (!expected) {
+                core.error(`No entry for ${filename} in SHA256SUMS.txt`);
+                failed = true;
+                continue;
+              }
+              const actual = crypto.createHash('sha256').update(fs.readFileSync(filepath)).digest('hex');
+              if (actual !== expected) {
+                core.error(`Checksum mismatch for ${filename}: expected ${expected}, got ${actual}`);
+                failed = true;
+                continue;
+              }
+              core.info(`✓ ${filename}`);
+            }
+
+            if (failed) core.setFailed('One or more checksum verifications failed');
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@005458ad77f1c8facd38a094e4af2e69e5607ff4 # v2.0.2
+        with:
+          version: 1.3.4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for existing OCI index
+        id: existing
+        run: |
+          set -euo pipefail
+          if resolve_output=$(oras resolve "$OCI_REPO:${VERSION}-binary" 2>&1); then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::OCI index ${VERSION}-binary already exists; skipping push"
+          else
+            exit_code=$?
+            if echo "$resolve_output" | grep -qiE 'not found|does not exist|404'; then
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::oras resolve failed (exit ${exit_code}): ${resolve_output}"
+              exit "$exit_code"
+            fi
+          fi
+
+      - name: Push per-platform artifacts
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          CHILD_DIGESTS=""
+          cd artifacts
+          for target in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin; do
+            case "$target" in
+              x86_64-unknown-linux-gnu)  os=linux;  arch=amd64 ;;
+              aarch64-unknown-linux-gnu) os=linux;  arch=arm64 ;;
+              x86_64-apple-darwin)       os=darwin; arch=amd64 ;;
+              aarch64-apple-darwin)      os=darwin; arch=arm64 ;;
+            esac
+            tag="${VERSION}-binary-${os}-${arch}"
+            file="nono-${RELEASE_TAG}-${target}.tar.gz"
+            # Write the platform config blob; oras manifest index create reads this
+            # to populate the platform descriptor in the index.
+            printf '{"os":"%s","architecture":"%s"}' "$os" "$arch" \
+              > "${RUNNER_TEMP}/config-${os}-${arch}.json"
+            digest=$(oras push "$OCI_REPO:${tag}" \
+              --artifact-type "$ARTIFACT_TYPE" \
+              --config "${RUNNER_TEMP}/config-${os}-${arch}.json:application/vnd.oci.image.config.v1+json" \
+              --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+              --annotation "org.opencontainers.image.version=${VERSION}" \
+              --annotation "org.opencontainers.image.ref.name=${tag}" \
+              --annotation "org.opencontainers.image.description=nono CLI ${target}" \
+              --annotation "ai.nolabs.nono.target=${target}" \
+              --format go-template='{{.digest}}' \
+              "${file}:${LAYER_MEDIA_TYPE}")
+            if ! echo "$digest" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+              echo "::error::Unexpected digest format for ${target}: ${digest}"
+              exit 1
+            fi
+            echo "Pushed ${target} → ${digest}"
+            CHILD_DIGESTS="${CHILD_DIGESTS} $OCI_REPO@${digest}"
+          done
+          echo "CHILD_DIGESTS=${CHILD_DIGESTS}" >> "$GITHUB_ENV"
+
+      - name: Create OCI index
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          oras manifest index create "$OCI_REPO:${VERSION}-binary" \
+            --artifact-type "$ARTIFACT_TYPE" \
+            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --annotation "org.opencontainers.image.version=${VERSION}" \
+            $CHILD_DIGESTS
+
+      - name: Verify OCI index structure
+        run: |
+          set -euo pipefail
+          INDEX_DIGEST=$(oras resolve "$OCI_REPO:${VERSION}-binary")
+          if ! echo "$INDEX_DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::Unexpected index digest format: ${INDEX_DIGEST}"
+            exit 1
+          fi
+          echo "INDEX_DIGEST=${INDEX_DIGEST}" >> "$GITHUB_ENV"
+          manifest=$(oras manifest fetch "$OCI_REPO@${INDEX_DIGEST}")
+          echo "$manifest" | jq -e \
+            --arg at "$ARTIFACT_TYPE" \
+            '
+              .mediaType == "application/vnd.oci.image.index.v1+json" and
+              .artifactType == $at and
+              (.manifests | length) == 4 and
+              ([ .manifests[].platform | "\(.os)/\(.architecture)" ] | sort) ==
+                ["darwin/amd64","darwin/arm64","linux/amd64","linux/arm64"]
+            ' > /dev/null || {
+            echo "::error::OCI index structure check failed"
+            echo "$manifest" | jq .
+            exit 1
+          }
+          CHILD_DIGESTS=""
+          for target in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin; do
+            file="artifacts/nono-${RELEASE_TAG}-${target}.tar.gz"
+            expected_digest="sha256:$(sha256sum "$file" | cut -d' ' -f1)"
+            case "$target" in
+              x86_64-unknown-linux-gnu)  plat="linux/amd64" ;;
+              aarch64-unknown-linux-gnu) plat="linux/arm64" ;;
+              x86_64-apple-darwin)       plat="darwin/amd64" ;;
+              aarch64-apple-darwin)      plat="darwin/arm64" ;;
+            esac
+            child_digest=$(echo "$manifest" | jq -r \
+              --arg p "$plat" \
+              '.manifests[] | select(.platform.os + "/" + .platform.architecture == $p) | .digest')
+            if ! echo "$child_digest" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+              echo "::error::Unexpected child digest format for ${target}: ${child_digest}"
+              exit 1
+            fi
+            child_manifest=$(oras manifest fetch "$OCI_REPO@${child_digest}")
+            echo "$child_manifest" | jq -e \
+              --arg at "$ARTIFACT_TYPE" \
+              --arg ed "$expected_digest" \
+              '.artifactType == $at and (.layers | length) == 1 and .layers[0].digest == $ed' \
+              > /dev/null || {
+              echo "::error::Child manifest check failed for ${target}"
+              echo "$child_manifest" | jq .
+              exit 1
+            }
+            CHILD_DIGESTS="${CHILD_DIGESTS} $OCI_REPO@${child_digest}"
+          done
+          echo "CHILD_DIGESTS=${CHILD_DIGESTS}" >> "$GITHUB_ENV"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign OCI artifacts with Cosign
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$OCI_REPO@${INDEX_DIGEST}"
+          # shellcheck disable=SC2086
+          for child in $CHILD_DIGESTS; do
+            cosign sign --yes "$child"
+          done
+
+      - name: Tag latest-binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LATEST_TAG=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
+          if ! echo "$LATEST_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Latest release tag '${LATEST_TAG}' is not a stable semver tag"
+            exit 1
+          fi
+          if [ "$LATEST_TAG" != "$RELEASE_TAG" ]; then
+            echo "::notice::latest-binary not advanced: ${RELEASE_TAG} is not the latest release (${LATEST_TAG} is)"
+            exit 0
+          fi
+          oras tag "$OCI_REPO@${INDEX_DIGEST}" latest-binary
+          actual=$(oras resolve "$OCI_REPO:latest-binary")
+          if [ "$actual" != "$INDEX_DIGEST" ]; then
+            echo "::error::latest-binary points to ${actual}, expected ${INDEX_DIGEST}"
+            exit 1
+          fi
+          echo "LATEST_BINARY=true" >> "$GITHUB_ENV"
+          echo "Tagged ${OCI_REPO}:latest-binary → ${INDEX_DIGEST}"
+
+      - name: Write step summary
+        if: always()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const repo   = process.env.OCI_REPO;
+            const ver    = process.env.VERSION    || '<unset>';
+            const digest = process.env.INDEX_DIGEST || 'unknown';
+            const tag    = process.env.RELEASE_TAG;
+            const ghRepo = process.env.GITHUB_REPOSITORY;
+
+            await core.summary
+              .addHeading('OCI Artifacts published')
+              .addRaw(`**Index:** \`${repo}:${ver}-binary\`\n`)
+              .addRaw(`**Digest:** \`${digest}\`\n`)
+              .addHeading('Pull examples', 3)
+              .addCodeBlock(
+                `oras pull --platform linux/amd64 ${repo}:${ver}-binary -o .\n` +
+                `oras pull --platform darwin/arm64 ${repo}:${ver}-binary -o .`,
+                'bash'
+              )
+              .addHeading('Verify signature', 3)
+              .addCodeBlock(
+                `cosign verify \\\n` +
+                `  --certificate-identity "https://github.com/${ghRepo}/.github/workflows/release.yml@refs/tags/${tag}" \\\n` +
+                `  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\\n` +
+                `  "${repo}@${digest}"`,
+                'bash'
+              )
+              .write();
+
   update-nix-hashes:
     name: Update Nix prebuilt hashes
     needs: release

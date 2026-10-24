@@ -45,7 +45,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -5562,9 +5562,9 @@ thread_local! {
     /// determine the result.
     static ELF_LIB_CACHE: RefCell<HashMap<ElfLibCacheKey, PathBuf>> =
         RefCell::new(HashMap::new());
-    /// Memoizes `parse_elf` (which reads the whole file) keyed by canonical path,
-    /// so each shared object is read+parsed once per pass rather than once per
-    /// dependency closure that references it.
+    /// Memoizes `parse_elf` keyed by canonical path, so each shared object is
+    /// read+parsed once per pass rather than once per dependency closure that
+    /// references it.
     static ELF_PARSE_CACHE: RefCell<HashMap<PathBuf, ParsedElf>> = RefCell::new(HashMap::new());
     /// Memoizes file identity (dev+ino) keyed by canonical path, so the per-edge
     /// `statx` used for closure dedup runs once per file per pass.
@@ -5684,7 +5684,7 @@ fn resolve_elf_recursive(
     Ok(())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 struct ParsedElf {
     interpreter: Option<PathBuf>,
     needed: Vec<String>,
@@ -5713,27 +5713,46 @@ struct LoadSegment {
     filesz: u64,
 }
 
+/// Upper bounds on each region [`parse_elf`] reads. A region over its bound is a
+/// parse error, so the file is skipped (or the launch fails) rather than read
+/// without limit.
+///
+/// The program header table: the kernel refuses an executable whose table is
+/// over 64 KiB (`load_elf_phdrs`); real tables are under 1 KiB.
+const ELF_MAX_PHDRS_BYTES: usize = 64 * 1024;
+/// The interpreter path: the kernel refuses a `PT_INTERP` longer than `PATH_MAX`.
+const ELF_MAX_INTERP_BYTES: usize = libc::PATH_MAX as usize;
+/// `PT_DYNAMIC`: 65,536 64-bit entries; real objects have well under a hundred.
+const ELF_MAX_DYNAMIC_BYTES: usize = 1024 * 1024;
+/// The dynamic string table: large C++ libraries reach a few MiB
+/// (`libclang-cpp.so`: 3.7 MiB).
+const ELF_MAX_DYNSTR_BYTES: usize = 64 * 1024 * 1024;
+
+/// Reads the ELF header, program headers, `PT_INTERP`, `PT_DYNAMIC` and the
+/// dynamic string table of `path`, and no other part of the file: executables on
+/// `PATH` reach hundreds of MiB, and the session gate parses every one of them.
 fn parse_elf(path: &Path) -> Result<ParsedElf> {
-    let data = fs::read(path).map_err(|source| NonoError::ConfigRead {
+    let file = File::open(path).map_err(|source| NonoError::ConfigRead {
         path: path.to_path_buf(),
         source,
     })?;
-    if data.len() < 64 || &data[0..4] != b"\x7fELF" {
+    let header = read_elf_region(&file, path, 0, 64, 64)?;
+    if header.len() < 64 || &header[0..4] != b"\x7fELF" {
         return Ok(ParsedElf {
             interpreter: None,
             needed: Vec::new(),
             search_dirs: Vec::new(),
         });
     }
-    if data[5] != 1 {
+    if header[5] != 1 {
         return Err(NonoError::SandboxInit(format!(
             "command-mediation supports little-endian ELF only: {}",
             path.display()
         )));
     }
-    match data[4] {
-        1 => parse_elf32(path, &data),
-        2 => parse_elf64(path, &data),
+    match header[4] {
+        1 => parse_elf32(path, &file, &header),
+        2 => parse_elf64(path, &file, &header),
         _ => Err(NonoError::SandboxInit(format!(
             "unknown ELF class for {}",
             path.display()
@@ -5741,46 +5760,60 @@ fn parse_elf(path: &Path) -> Result<ParsedElf> {
     }
 }
 
-fn parse_elf64(path: &Path, data: &[u8]) -> Result<ParsedElf> {
-    let phoff = le_u64(data, 32)? as usize;
-    let phentsize = le_u16(data, 54)? as usize;
-    let phnum = le_u16(data, 56)? as usize;
-    let mut interpreter = None;
-    let mut dynamic = None;
-    let mut loads = Vec::new();
-    for idx in 0..phnum {
-        let off = phoff.saturating_add(idx.saturating_mul(phentsize));
-        let p_type = le_u32(data, off)?;
-        let p_offset = le_u64(data, off + 8)?;
-        let p_vaddr = le_u64(data, off + 16)?;
-        let p_filesz = le_u64(data, off + 32)?;
-        match p_type {
-            1 => loads.push(LoadSegment {
-                vaddr: p_vaddr,
-                offset: p_offset,
-                filesz: p_filesz,
-            }),
-            2 => dynamic = Some((p_offset as usize, p_filesz as usize)),
-            3 => interpreter = Some(read_cstr_path(data, p_offset as usize, p_filesz as usize)?),
-            _ => {}
+/// Reads `len` bytes of `file` at `offset`, or fewer at end of file. A short
+/// region makes the parsers' bounds checks fail exactly where they would on the
+/// whole file; `len` over `max_len` is an error.
+fn read_elf_region(
+    file: &File,
+    path: &Path,
+    offset: u64,
+    len: usize,
+    max_len: usize,
+) -> Result<Vec<u8>> {
+    if len > max_len {
+        return Err(NonoError::SandboxInit(format!(
+            "ELF region of {len} bytes exceeds the {max_len}-byte limit: {}",
+            path.display()
+        )));
+    }
+    let mut buf = vec![0; len];
+    let mut filled = 0;
+    while filled < len {
+        match file.read_at(&mut buf[filled..], offset.saturating_add(filled as u64)) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(source) => {
+                return Err(NonoError::ConfigRead {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
         }
     }
-    parse_dynamic(path, data, dynamic, &loads, interpreter, 16)
+    buf.truncate(filled);
+    Ok(buf)
 }
 
-fn parse_elf32(path: &Path, data: &[u8]) -> Result<ParsedElf> {
-    let phoff = le_u32(data, 28)? as usize;
-    let phentsize = le_u16(data, 42)? as usize;
-    let phnum = le_u16(data, 44)? as usize;
+fn parse_elf64(path: &Path, file: &File, header: &[u8]) -> Result<ParsedElf> {
+    let phoff = le_u64(header, 32)?;
+    let phentsize = le_u16(header, 54)? as usize;
+    let phnum = le_u16(header, 56)? as usize;
+    // Offsets below are relative to `phoff`. The region ends at the last entry's
+    // `p_filesz`, the last field read.
+    let phdrs_len = phnum
+        .checked_sub(1)
+        .map_or(0, |last| last.saturating_mul(phentsize).saturating_add(40));
+    let data = read_elf_region(file, path, phoff, phdrs_len, ELF_MAX_PHDRS_BYTES)?;
     let mut interpreter = None;
     let mut dynamic = None;
     let mut loads = Vec::new();
     for idx in 0..phnum {
-        let off = phoff.saturating_add(idx.saturating_mul(phentsize));
-        let p_type = le_u32(data, off)?;
-        let p_offset = le_u32(data, off + 4)? as u64;
-        let p_vaddr = le_u32(data, off + 8)? as u64;
-        let p_filesz = le_u32(data, off + 16)? as u64;
+        let off = idx.saturating_mul(phentsize);
+        let p_type = le_u32(&data, off)?;
+        let p_offset = le_u64(&data, off + 8)?;
+        let p_vaddr = le_u64(&data, off + 16)?;
+        let p_filesz = le_u64(&data, off + 32)?;
         match p_type {
             1 => loads.push(LoadSegment {
                 vaddr: p_vaddr,
@@ -5788,16 +5821,62 @@ fn parse_elf32(path: &Path, data: &[u8]) -> Result<ParsedElf> {
                 filesz: p_filesz,
             }),
             2 => dynamic = Some((p_offset as usize, p_filesz as usize)),
-            3 => interpreter = Some(read_cstr_path(data, p_offset as usize, p_filesz as usize)?),
+            3 => interpreter = Some(read_elf_interpreter(path, file, p_offset, p_filesz)?),
             _ => {}
         }
     }
-    parse_dynamic(path, data, dynamic, &loads, interpreter, 8)
+    parse_dynamic(path, file, dynamic, &loads, interpreter, 16)
+}
+
+fn parse_elf32(path: &Path, file: &File, header: &[u8]) -> Result<ParsedElf> {
+    let phoff = le_u32(header, 28)? as u64;
+    let phentsize = le_u16(header, 42)? as usize;
+    let phnum = le_u16(header, 44)? as usize;
+    // Offsets below are relative to `phoff`. The region ends at the last entry's
+    // `p_filesz`, the last field read.
+    let phdrs_len = phnum
+        .checked_sub(1)
+        .map_or(0, |last| last.saturating_mul(phentsize).saturating_add(20));
+    let data = read_elf_region(file, path, phoff, phdrs_len, ELF_MAX_PHDRS_BYTES)?;
+    let mut interpreter = None;
+    let mut dynamic = None;
+    let mut loads = Vec::new();
+    for idx in 0..phnum {
+        let off = idx.saturating_mul(phentsize);
+        let p_type = le_u32(&data, off)?;
+        let p_offset = le_u32(&data, off + 4)? as u64;
+        let p_vaddr = le_u32(&data, off + 8)? as u64;
+        let p_filesz = le_u32(&data, off + 16)? as u64;
+        match p_type {
+            1 => loads.push(LoadSegment {
+                vaddr: p_vaddr,
+                offset: p_offset,
+                filesz: p_filesz,
+            }),
+            2 => dynamic = Some((p_offset as usize, p_filesz as usize)),
+            3 => interpreter = Some(read_elf_interpreter(path, file, p_offset, p_filesz)?),
+            _ => {}
+        }
+    }
+    parse_dynamic(path, file, dynamic, &loads, interpreter, 8)
+}
+
+/// The `PT_INTERP` path: the string at `p_offset`, which (as the kernel requires)
+/// ends within `PATH_MAX` bytes.
+fn read_elf_interpreter(path: &Path, file: &File, p_offset: u64, p_filesz: u64) -> Result<PathBuf> {
+    let data = read_elf_region(
+        file,
+        path,
+        p_offset,
+        ELF_MAX_INTERP_BYTES,
+        ELF_MAX_INTERP_BYTES,
+    )?;
+    read_cstr_path(&data, 0, p_filesz as usize)
 }
 
 fn parse_dynamic(
     path: &Path,
-    data: &[u8],
+    file: &File,
     dynamic: Option<(usize, usize)>,
     loads: &[LoadSegment],
     interpreter: Option<PathBuf>,
@@ -5810,18 +5889,20 @@ fn parse_dynamic(
             search_dirs: Vec::new(),
         });
     };
+    // `cursor` is relative to `dyn_off`.
+    let data = read_elf_region(file, path, dyn_off as u64, dyn_size, ELF_MAX_DYNAMIC_BYTES)?;
     let mut needed_offsets = Vec::new();
     let mut rpath_offsets = Vec::new();
     let mut strtab = None;
     let mut strsz = None;
-    let mut cursor = dyn_off;
-    while cursor.saturating_add(entry_size) <= dyn_off.saturating_add(dyn_size) {
+    let mut cursor: usize = 0;
+    while cursor.saturating_add(entry_size) <= dyn_size {
         let (tag, value) = if entry_size == 16 {
-            (le_u64(data, cursor)? as i64, le_u64(data, cursor + 8)?)
+            (le_u64(&data, cursor)? as i64, le_u64(&data, cursor + 8)?)
         } else {
             (
-                le_u32(data, cursor)? as i32 as i64,
-                le_u32(data, cursor + 4)? as u64,
+                le_u32(&data, cursor)? as i32 as i64,
+                le_u32(&data, cursor + 4)? as u64,
             )
         };
         match tag {
@@ -5840,16 +5921,37 @@ fn parse_dynamic(
             path.display()
         ))
     })?;
-    let strsz = strsz.unwrap_or(data.len().saturating_sub(strtab));
-    let str_end = strtab.saturating_add(strsz).min(data.len());
-    let strings = &data[strtab..str_end];
+    // No string to look up: leave the table unread (and its size unchecked).
+    if needed_offsets.is_empty() && rpath_offsets.is_empty() {
+        return Ok(ParsedElf {
+            interpreter,
+            needed: Vec::new(),
+            search_dirs: Vec::new(),
+        });
+    }
+    let strsz = match strsz {
+        Some(strsz) => strsz,
+        None => {
+            let len = file
+                .metadata()
+                .map_err(|source| NonoError::ConfigRead {
+                    path: path.to_path_buf(),
+                    source,
+                })?
+                .len();
+            usize::try_from(len)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(strtab)
+        }
+    };
+    let strings = read_elf_region(file, path, strtab as u64, strsz, ELF_MAX_DYNSTR_BYTES)?;
     let mut needed = Vec::new();
     for offset in needed_offsets {
-        needed.push(read_cstr_string(strings, offset)?);
+        needed.push(read_cstr_string(&strings, offset)?);
     }
     let mut search_dirs = Vec::new();
     for offset in rpath_offsets {
-        let value = read_cstr_string(strings, offset)?;
+        let value = read_cstr_string(&strings, offset)?;
         for entry in value.split(':') {
             if entry.is_empty() {
                 continue;
@@ -7786,6 +7888,492 @@ mod tests {
             closure.len() > 1,
             "a real binary's dependency closure must include more than itself: {closure:?}"
         );
+        Ok(())
+    }
+
+    /// The whole-file parser that `parse_elf` replaced, unchanged but for its
+    /// names: the oracle `parse_elf`'s bounded reads must agree with.
+    fn whole_file_parse_elf(path: &Path) -> Result<ParsedElf> {
+        let data = fs::read(path).map_err(|source| NonoError::ConfigRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if data.len() < 64 || &data[0..4] != b"\x7fELF" {
+            return Ok(ParsedElf {
+                interpreter: None,
+                needed: Vec::new(),
+                search_dirs: Vec::new(),
+            });
+        }
+        if data[5] != 1 {
+            return Err(NonoError::SandboxInit(format!(
+                "command-mediation supports little-endian ELF only: {}",
+                path.display()
+            )));
+        }
+        match data[4] {
+            1 => whole_file_parse_elf32(path, &data),
+            2 => whole_file_parse_elf64(path, &data),
+            _ => Err(NonoError::SandboxInit(format!(
+                "unknown ELF class for {}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn whole_file_parse_elf64(path: &Path, data: &[u8]) -> Result<ParsedElf> {
+        let phoff = le_u64(data, 32)? as usize;
+        let phentsize = le_u16(data, 54)? as usize;
+        let phnum = le_u16(data, 56)? as usize;
+        let mut interpreter = None;
+        let mut dynamic = None;
+        let mut loads = Vec::new();
+        for idx in 0..phnum {
+            let off = phoff.saturating_add(idx.saturating_mul(phentsize));
+            let p_type = le_u32(data, off)?;
+            let p_offset = le_u64(data, off + 8)?;
+            let p_vaddr = le_u64(data, off + 16)?;
+            let p_filesz = le_u64(data, off + 32)?;
+            match p_type {
+                1 => loads.push(LoadSegment {
+                    vaddr: p_vaddr,
+                    offset: p_offset,
+                    filesz: p_filesz,
+                }),
+                2 => dynamic = Some((p_offset as usize, p_filesz as usize)),
+                3 => {
+                    interpreter = Some(read_cstr_path(data, p_offset as usize, p_filesz as usize)?)
+                }
+                _ => {}
+            }
+        }
+        whole_file_parse_dynamic(path, data, dynamic, &loads, interpreter, 16)
+    }
+
+    fn whole_file_parse_elf32(path: &Path, data: &[u8]) -> Result<ParsedElf> {
+        let phoff = le_u32(data, 28)? as usize;
+        let phentsize = le_u16(data, 42)? as usize;
+        let phnum = le_u16(data, 44)? as usize;
+        let mut interpreter = None;
+        let mut dynamic = None;
+        let mut loads = Vec::new();
+        for idx in 0..phnum {
+            let off = phoff.saturating_add(idx.saturating_mul(phentsize));
+            let p_type = le_u32(data, off)?;
+            let p_offset = le_u32(data, off + 4)? as u64;
+            let p_vaddr = le_u32(data, off + 8)? as u64;
+            let p_filesz = le_u32(data, off + 16)? as u64;
+            match p_type {
+                1 => loads.push(LoadSegment {
+                    vaddr: p_vaddr,
+                    offset: p_offset,
+                    filesz: p_filesz,
+                }),
+                2 => dynamic = Some((p_offset as usize, p_filesz as usize)),
+                3 => {
+                    interpreter = Some(read_cstr_path(data, p_offset as usize, p_filesz as usize)?)
+                }
+                _ => {}
+            }
+        }
+        whole_file_parse_dynamic(path, data, dynamic, &loads, interpreter, 8)
+    }
+
+    fn whole_file_parse_dynamic(
+        path: &Path,
+        data: &[u8],
+        dynamic: Option<(usize, usize)>,
+        loads: &[LoadSegment],
+        interpreter: Option<PathBuf>,
+        entry_size: usize,
+    ) -> Result<ParsedElf> {
+        let Some((dyn_off, dyn_size)) = dynamic else {
+            return Ok(ParsedElf {
+                interpreter,
+                needed: Vec::new(),
+                search_dirs: Vec::new(),
+            });
+        };
+        let mut needed_offsets = Vec::new();
+        let mut rpath_offsets = Vec::new();
+        let mut strtab = None;
+        let mut strsz = None;
+        let mut cursor = dyn_off;
+        while cursor.saturating_add(entry_size) <= dyn_off.saturating_add(dyn_size) {
+            let (tag, value) = if entry_size == 16 {
+                (le_u64(data, cursor)? as i64, le_u64(data, cursor + 8)?)
+            } else {
+                (
+                    le_u32(data, cursor)? as i32 as i64,
+                    le_u32(data, cursor + 4)? as u64,
+                )
+            };
+            match tag {
+                0 => break,
+                1 => needed_offsets.push(value as usize),
+                5 => strtab = vaddr_to_offset(value, loads),
+                10 => strsz = Some(value as usize),
+                15 | 29 => rpath_offsets.push(value as usize),
+                _ => {}
+            }
+            cursor = cursor.saturating_add(entry_size);
+        }
+        let strtab = strtab.ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "ELF dynamic string table missing for {}",
+                path.display()
+            ))
+        })?;
+        let strsz = strsz.unwrap_or(data.len().saturating_sub(strtab));
+        let str_end = strtab.saturating_add(strsz).min(data.len());
+        let strings = &data[strtab..str_end];
+        let mut needed = Vec::new();
+        for offset in needed_offsets {
+            needed.push(read_cstr_string(strings, offset)?);
+        }
+        let mut search_dirs = Vec::new();
+        for offset in rpath_offsets {
+            let value = read_cstr_string(strings, offset)?;
+            for entry in value.split(':') {
+                if entry.is_empty() {
+                    continue;
+                }
+                let origin = path.parent().unwrap_or_else(|| Path::new("/"));
+                let expanded = entry.replace("$ORIGIN", &origin.display().to_string());
+                search_dirs.push(expanded);
+            }
+        }
+        Ok(ParsedElf {
+            interpreter,
+            needed,
+            search_dirs,
+        })
+    }
+
+    /// A minimal little-endian ELF: a `PT_LOAD` mapping the whole file at
+    /// `TEST_ELF_BASE`, then `PT_INTERP` and `PT_DYNAMIC` when asked for. The
+    /// dynamic string table comes before the dynamic section, so no truncation of
+    /// the file leaves `DT_STRTAB` readable but past its end.
+    #[derive(Clone, Copy)]
+    struct TestElf<'a> {
+        is64: bool,
+        interpreter: Option<&'a [u8]>,
+        dynamic: bool,
+        needed: &'a [&'a str],
+        rpath: Option<&'a str>,
+        runpath: Option<&'a str>,
+    }
+
+    const TEST_ELF_BASE: u64 = 0x10000;
+
+    fn put_le(bytes: &mut [u8], offset: usize, width: usize, value: u64) {
+        bytes[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+    }
+
+    fn build_test_elf(elf: &TestElf<'_>) -> Vec<u8> {
+        // (header size, program header size, dynamic entry size, word size)
+        let (ehsize, phentsize, dynent, word) = if elf.is64 {
+            (64, 56, 16, 8)
+        } else {
+            (52, 32, 8, 4)
+        };
+        let phnum = 1 + usize::from(elf.interpreter.is_some()) + usize::from(elf.dynamic);
+        let mut interp = elf.interpreter.map(<[u8]>::to_vec).unwrap_or_default();
+        if elf.interpreter.is_some() {
+            interp.push(0);
+        }
+        let mut dynstr = vec![0u8];
+        let mut entries = Vec::new();
+        let strings = elf
+            .needed
+            .iter()
+            .map(|name| (1, *name))
+            .chain(elf.rpath.map(|value| (15, value)))
+            .chain(elf.runpath.map(|value| (29, value)));
+        for (tag, value) in strings {
+            entries.push((tag, dynstr.len() as u64));
+            dynstr.extend_from_slice(value.as_bytes());
+            dynstr.push(0);
+        }
+        let interp_off = ehsize + phnum * phentsize;
+        let dynstr_off = interp_off + interp.len();
+        let dynamic_off = dynstr_off + dynstr.len();
+        entries.push((5, TEST_ELF_BASE + dynstr_off as u64));
+        entries.push((10, dynstr.len() as u64));
+        entries.push((0, 0));
+        let dynamic_len = if elf.dynamic {
+            entries.len() * dynent
+        } else {
+            0
+        };
+        let total = dynamic_off + dynamic_len;
+
+        let mut out = vec![0u8; total];
+        out[0..4].copy_from_slice(b"\x7fELF");
+        out[4] = if elf.is64 { 2 } else { 1 };
+        out[5] = 1;
+        out[6] = 1;
+        put_le(&mut out, 16, 2, 3); // ET_DYN
+        let (phoff_at, phentsize_at) = if elf.is64 { (32, 54) } else { (28, 42) };
+        put_le(&mut out, phoff_at, word, ehsize as u64);
+        put_le(&mut out, phentsize_at, 2, phentsize as u64);
+        put_le(&mut out, phentsize_at + 2, 2, phnum as u64);
+
+        let mut phdrs = vec![(1, 0, total)];
+        if elf.interpreter.is_some() {
+            phdrs.push((3, interp_off, interp.len()));
+        }
+        if elf.dynamic {
+            phdrs.push((2, dynamic_off, dynamic_len));
+        }
+        for (idx, (p_type, offset, filesz)) in phdrs.into_iter().enumerate() {
+            let at = ehsize + idx * phentsize;
+            // (p_offset, p_vaddr, p_filesz) field offsets
+            let (off_at, vaddr_at, filesz_at) = if elf.is64 { (8, 16, 32) } else { (4, 8, 16) };
+            put_le(&mut out, at, 4, p_type);
+            put_le(&mut out, at + off_at, word, offset as u64);
+            put_le(&mut out, at + vaddr_at, word, TEST_ELF_BASE + offset as u64);
+            put_le(&mut out, at + filesz_at, word, filesz as u64);
+        }
+        out[interp_off..dynstr_off].copy_from_slice(&interp);
+        out[dynstr_off..dynamic_off].copy_from_slice(&dynstr);
+        if elf.dynamic {
+            for (idx, (tag, value)) in entries.into_iter().enumerate() {
+                let at = dynamic_off + idx * dynent;
+                put_le(&mut out, at, word, tag);
+                put_le(&mut out, at + word, word, value);
+            }
+        }
+        out
+    }
+
+    fn write_test_file(path: &Path, bytes: &[u8]) -> Result<()> {
+        fs::write(path, bytes).map_err(|source| NonoError::ConfigWrite {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn assert_parse_matches_whole_file(path: &Path) {
+        match (whole_file_parse_elf(path), parse_elf(path)) {
+            (Ok(whole), Ok(bounded)) => assert_eq!(whole, bounded, "{}", path.display()),
+            (Err(_), Err(_)) => {}
+            (whole, bounded) => panic!(
+                "parse_elf disagrees with the whole-file parse for {}: {whole:?} vs {bounded:?}",
+                path.display()
+            ),
+        }
+    }
+
+    #[test]
+    fn parse_elf_matches_the_whole_file_parse() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let interpreter = tmp.path().join("ld-test.so");
+        write_test_file(&interpreter, b"stand-in interpreter")?;
+        let interpreter_bytes = interpreter.as_os_str().as_bytes();
+        let fixture = tmp.path().join("fixture");
+        let origin = tmp.path().display().to_string();
+
+        // `is64` and `interpreter` vary below.
+        let base = TestElf {
+            is64: true,
+            interpreter: None,
+            dynamic: true,
+            needed: &[],
+            rpath: None,
+            runpath: None,
+        };
+        let one = &["libone.so.1"];
+        let shapes = [
+            TestElf {
+                dynamic: false,
+                ..base
+            },
+            base,
+            TestElf {
+                needed: &["libone.so.1", "libtwo.so.2"],
+                ..base
+            },
+            TestElf {
+                needed: one,
+                rpath: Some("$ORIGIN/../lib:/opt/rpath"),
+                ..base
+            },
+            TestElf {
+                needed: one,
+                runpath: Some("/opt/runpath::$ORIGIN"),
+                ..base
+            },
+            TestElf {
+                needed: one,
+                rpath: Some("/opt/rpath"),
+                runpath: Some("/opt/runpath"),
+                ..base
+            },
+        ];
+        for is64 in [true, false] {
+            for with_interpreter in [false, true] {
+                for shape in &shapes {
+                    let elf = TestElf {
+                        is64,
+                        interpreter: with_interpreter.then_some(interpreter_bytes),
+                        ..*shape
+                    };
+                    let bytes = build_test_elf(&elf);
+                    write_test_file(&fixture, &bytes)?;
+                    // The fixture parses to what it was built from, so the
+                    // agreement below is not two parsers failing alike.
+                    let parsed = parse_elf(&fixture)?;
+                    let expected_dirs: Vec<String> = elf
+                        .rpath
+                        .into_iter()
+                        .chain(elf.runpath)
+                        .flat_map(|value| value.split(':'))
+                        .filter(|entry| !entry.is_empty())
+                        .map(|entry| entry.replace("$ORIGIN", &origin))
+                        .collect();
+                    assert_eq!(
+                        parsed,
+                        ParsedElf {
+                            interpreter: with_interpreter
+                                .then(|| interpreter.canonicalize())
+                                .transpose()
+                                .map_err(|source| NonoError::PathCanonicalization {
+                                    path: interpreter.clone(),
+                                    source,
+                                })?,
+                            needed: elf.needed.iter().map(|name| name.to_string()).collect(),
+                            search_dirs: expected_dirs,
+                        }
+                    );
+                    // The whole file and every truncation of it.
+                    for len in (0..=bytes.len()).rev() {
+                        write_test_file(&fixture, &bytes[..len])?;
+                        assert_parse_matches_whole_file(&fixture);
+                    }
+                }
+            }
+        }
+
+        // Without DT_STRSZ the table runs to the end of the file.
+        for is64 in [true, false] {
+            let mut bytes = build_test_elf(&TestElf {
+                is64,
+                interpreter: None,
+                dynamic: true,
+                needed: &["libone.so.1"],
+                rpath: None,
+                runpath: Some("/opt/runpath"),
+            });
+            // DT_STRSZ is the entry before the closing DT_NULL; make it DT_DEBUG.
+            let dynent = if is64 { 16 } else { 8 };
+            let strsz_at = bytes.len() - 2 * dynent;
+            put_le(&mut bytes, strsz_at, dynent / 2, 21);
+            write_test_file(&fixture, &bytes)?;
+            let parsed = parse_elf(&fixture)?;
+            assert_eq!(parsed.needed, ["libone.so.1"]);
+            assert_eq!(parsed.search_dirs, ["/opt/runpath"]);
+            for len in (0..=bytes.len()).rev() {
+                write_test_file(&fixture, &bytes[..len])?;
+                assert_parse_matches_whole_file(&fixture);
+            }
+        }
+
+        write_test_file(&fixture, b"#!/bin/sh\nexit 0\n")?;
+        assert_parse_matches_whole_file(&fixture);
+
+        // A real binary, this test executable, and its dependency closure.
+        reset_elf_resolution_cache();
+        let exe = std::env::current_exe().map_err(|source| NonoError::ConfigRead {
+            path: PathBuf::from("/proc/self/exe"),
+            source,
+        })?;
+        for dep in elf_dependency_closure(&exe)? {
+            assert_parse_matches_whole_file(&dep);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_elf_refuses_a_truncated_region() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let interpreter = tmp.path().join("ld-test.so");
+        write_test_file(&interpreter, b"stand-in interpreter")?;
+        let fixture = tmp.path().join("fixture");
+        let bytes = build_test_elf(&TestElf {
+            is64: true,
+            interpreter: Some(interpreter.as_os_str().as_bytes()),
+            dynamic: true,
+            needed: &["libone.so.1"],
+            rpath: None,
+            runpath: Some("/opt/runpath"),
+        });
+        let interp_at = 64 + 3 * 56;
+        // Inside the program headers, the interpreter path, and the last
+        // dynamic entry (`DT_NULL`).
+        for len in [64 + 56, interp_at + 4, bytes.len() - 1] {
+            write_test_file(&fixture, &bytes[..len])?;
+            assert!(
+                parse_elf(&fixture).is_err(),
+                "a file cut at byte {len} must not parse"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_elf_refuses_a_region_over_its_limit() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let fixture = tmp.path().join("fixture");
+        let elf = TestElf {
+            is64: true,
+            interpreter: None,
+            dynamic: true,
+            needed: &["libone.so.1"],
+            rpath: None,
+            runpath: None,
+        };
+        let bytes = build_test_elf(&elf);
+        // The second program header is PT_DYNAMIC; DT_STRSZ is the entry
+        // before the closing DT_NULL.
+        let dynamic_filesz_at = 64 + 56 + 32;
+        let strsz_at = bytes.len() - 2 * 16 + 8;
+        let mut oversized = Vec::new();
+        let mut dynamic = bytes.clone();
+        put_le(
+            &mut dynamic,
+            dynamic_filesz_at,
+            8,
+            ELF_MAX_DYNAMIC_BYTES as u64 + 16,
+        );
+        oversized.push(dynamic);
+        let mut strings = bytes.clone();
+        put_le(&mut strings, strsz_at, 8, ELF_MAX_DYNSTR_BYTES as u64 + 1);
+        oversized.push(strings);
+        for bytes in oversized {
+            write_test_file(&fixture, &bytes)?;
+            // The whole-file parse accepts it: the limit alone refuses it.
+            whole_file_parse_elf(&fixture)?;
+            let err = parse_elf(&fixture).expect_err("a region over its limit must not parse");
+            assert!(err.to_string().contains("limit"), "unexpected error: {err}");
+        }
+
+        let mut phdrs = bytes.clone();
+        put_le(&mut phdrs, 56, 2, u64::from(u16::MAX));
+        write_test_file(&fixture, &phdrs)?;
+        let err = parse_elf(&fixture).expect_err("a program header table over its limit");
+        assert!(err.to_string().contains("limit"), "unexpected error: {err}");
+
+        // An interpreter path with no end within PATH_MAX bytes.
+        let long_interpreter = vec![b'/'; ELF_MAX_INTERP_BYTES + 1];
+        write_test_file(
+            &fixture,
+            &build_test_elf(&TestElf {
+                interpreter: Some(&long_interpreter),
+                ..elf
+            }),
+        )?;
+        assert!(parse_elf(&fixture).is_err());
         Ok(())
     }
 

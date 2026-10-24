@@ -473,7 +473,7 @@ pub async fn handle_reverse_proxy(
                     0,
                     &err.to_string(),
                 );
-                send_error(stream, 503, "Service Unavailable").await?;
+                send_credential_capture_error(stream).await?;
                 return Ok(());
             }
         }
@@ -1797,6 +1797,28 @@ where
     S: tokio::io::AsyncWrite + Unpin,
 {
     let body = format!("{{\"error\":\"{}\"}}", reason);
+    send_json_error(stream, status, reason, &body).await
+}
+
+/// Reject a host credential-capture failure without exposing helper diagnostics.
+/// Keep 503: this is not a challenge for the client's upstream credentials.
+pub(crate) async fn send_credential_capture_error<S>(stream: &mut S) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    send_json_error(
+        stream,
+        503,
+        "Service Unavailable",
+        crate::capture::CAPTURE_FAILED_BODY,
+    )
+    .await
+}
+
+async fn send_json_error<S>(stream: &mut S, status: u16, reason: &str, body: &str) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
     let response = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         status,
@@ -2868,6 +2890,52 @@ pub(crate) fn injected_credential_header_names(cred: Option<&LoadedCredential>) 
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reverse_proxy_reports_credential_capture_failure() {
+        use crate::capture::tests::{FailingCaptureBackend, FailureFixture, assert_http1_failure};
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let fixture = FailureFixture::new().await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (client, server) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept(),
+            );
+            let mut client = client.unwrap();
+            let (mut server, _) = server.unwrap();
+            let session_token = Zeroizing::new("session-token".to_string());
+            let filter = ProxyFilter::allow_all();
+            let pool = crate::pool::UpstreamPool::new(
+                Arc::clone(&fixture.tls_config), false,
+            );
+            let ctx = ReverseProxyCtx {
+                route_store: &fixture.route_store,
+                credential_store: &fixture.credential_store,
+                session_token: &session_token,
+                require_auth: true,
+                filter: &filter,
+                tls_connector: &fixture.connector,
+                default_tls_config: &fixture.tls_config,
+                upstream_pool: &pool,
+                audit_log: None,
+                approval_backends: None,
+                credential_capture_backend: Some(Arc::new(FailingCaptureBackend)),
+            };
+            handle_reverse_proxy(
+                "POST /capture/mcp HTTP/1.1",
+                &mut server,
+                b"Host: localhost\r\nAuthorization: Bearer session-token\r\nContent-Length: 0\r\n\r\n",
+                &ctx,
+                &[],
+            ).await.unwrap();
+            drop(server);
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert_http1_failure(&response);
+            fixture.assert_no_upstream_connection();
+        }).await.unwrap();
+    }
 
     #[test]
     fn test_endpoint_approval_request_id_is_unique() {

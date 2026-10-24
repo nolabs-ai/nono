@@ -915,6 +915,8 @@ pub(crate) enum CredentialResolution<'a> {
     /// The request must be rejected with this HTTP status; the denial has
     /// already been audited.
     Rejected(u16),
+    /// Host credential capture failed; return a safe diagnostic, not backend output.
+    CaptureFailed,
     /// Forward the request, optionally injecting `credential`.
     Forward {
         credential: Option<ResolvedCredential<'a>>,
@@ -1038,7 +1040,7 @@ pub(crate) async fn resolve_managed_credential<'a>(
                     port,
                     &reason,
                 );
-                return CredentialResolution::Rejected(503);
+                return CredentialResolution::CaptureFailed;
             }
         }
     }
@@ -1196,6 +1198,10 @@ where
                 _ => "Service Unavailable",
             };
             reverse::send_error_generic(tls_stream, status, msg).await?;
+            return Ok(());
+        }
+        CredentialResolution::CaptureFailed => {
+            reverse::send_credential_capture_error(tls_stream).await?;
             return Ok(());
         }
         CredentialResolution::Forward { credential } => credential,
@@ -3504,6 +3510,37 @@ mod tests {
         )
         .await;
         assert!(matches!(selection, RouteSelection::Rejected(403)));
+    }
+
+    #[tokio::test]
+    async fn http1_intercept_reports_credential_capture_failure() {
+        use crate::capture::tests::{FailingCaptureBackend, FailureFixture, assert_http1_failure};
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let fixture = FailureFixture::new().await;
+            let session_token = Zeroizing::new("session-token".to_string());
+            let filter = ProxyFilter::allow_all();
+            let mut ctx = test_intercept_ctx(&session_token, &fixture.connector, &filter);
+            ctx.host = "127.0.0.1";
+            ctx.port = fixture.port();
+            ctx.route_id = Some("capture");
+            ctx.route_store = Arc::clone(&fixture.route_store);
+            ctx.credential_store = Arc::clone(&fixture.credential_store);
+            ctx.credential_capture_backend = Some(Arc::new(FailingCaptureBackend));
+
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            client.write_all(format!(
+                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer session-token\r\nContent-Length: 0\r\n\r\n",
+                fixture.port(),
+            ).as_bytes()).await.unwrap();
+            handle_inner_request(&mut server, &ctx).await.unwrap();
+            drop(server);
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert_http1_failure(&response);
+            fixture.assert_no_upstream_connection();
+        }).await.unwrap();
     }
 
     fn test_intercept_ctx<'a>(

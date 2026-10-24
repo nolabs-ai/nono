@@ -1145,7 +1145,11 @@ pub async fn start_with_nonce_resolver(
     })?;
     let port = local_addr.port();
 
-    info!("Proxy server listening on {}", local_addr);
+    info!(
+        "Proxy server {} listening on {}",
+        nono::build_info::VERSION_WITH_REVISION,
+        local_addr
+    );
 
     let oauth_capture_store = OAuthCaptureStore::load_with_persistence(
         &config.oauth_capture,

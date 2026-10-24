@@ -112,6 +112,11 @@ pub(crate) struct ChildCapsSpec {
     pub(crate) proxy_bind_port_ranges: Vec<(u16, u16)>,
     pub(crate) tcp_connect_ports: Vec<u16>,
     pub(crate) tcp_bind_ports: Vec<u16>,
+    /// Seatbelt log tag of the agent's sandbox, re-applied to the command's
+    /// own sandbox so its denials carry the same session tag.
+    #[cfg(target_os = "macos")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) seatbelt_log_tag: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

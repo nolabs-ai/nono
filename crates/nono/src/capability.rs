@@ -601,6 +601,21 @@ impl std::fmt::Display for UnixSocketCapability {
     }
 }
 
+/// A Seatbelt log tag is interpolated into a quoted SBPL string, so it is
+/// limited to 1 to 64 characters from `[A-Za-z0-9_]`: no quote, backslash,
+/// or whitespace can reach the profile.
+fn validate_seatbelt_log_tag(tag: &str) -> Result<()> {
+    if tag.is_empty()
+        || tag.len() > 64
+        || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(NonoError::SandboxInit(format!(
+            "seatbelt log tag must be 1 to 64 characters from [A-Za-z0-9_], got {tag:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a platform-specific rule for obvious security issues.
 ///
 /// Rejects rules that:
@@ -1002,6 +1017,10 @@ pub struct CapabilitySet {
     /// When set, the generated Seatbelt profile emits `(debug deny)` so
     /// sandboxd records denial events in the unified log.
     seatbelt_debug_deny: bool,
+    /// Tag carried by every deny rule in the macOS Seatbelt profile as
+    /// `(with message "<tag>")`, so each kernel denial line in the unified
+    /// log names the session that raised it. `None` leaves the rules bare.
+    seatbelt_log_tag: Option<String>,
     /// Resource ceilings (memory and max processes) for the sandboxed tree.
     /// Plumbed through here so they ride the serialization layer like other
     /// policy; enforced by the supervisor via cgroup v2 on Linux.
@@ -1462,6 +1481,19 @@ impl CapabilitySet {
         self.seatbelt_debug_deny = enabled;
     }
 
+    /// Tag every deny rule in the macOS Seatbelt profile with
+    /// `(with message "<tag>")`, so the kernel's denial lines in the unified
+    /// log carry the tag. Ignored on Linux.
+    ///
+    /// The tag is interpolated into the profile, so it must be 1 to 64
+    /// characters from `[A-Za-z0-9_]`.
+    pub fn set_seatbelt_log_tag(&mut self, tag: impl Into<String>) -> Result<()> {
+        let tag = tag.into();
+        validate_seatbelt_log_tag(&tag)?;
+        self.seatbelt_log_tag = Some(tag);
+        Ok(())
+    }
+
     /// Add to allowed commands list
     pub fn add_allowed_command(&mut self, cmd: impl Into<String>) {
         self.allowed_commands.push(cmd.into());
@@ -1722,6 +1754,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn seatbelt_debug_deny(&self) -> bool {
         self.seatbelt_debug_deny
+    }
+
+    /// The tag macOS Seatbelt deny rules report with, if one is set.
+    #[must_use]
+    pub fn seatbelt_log_tag(&self) -> Option<&str> {
+        self.seatbelt_log_tag.as_deref()
     }
 
     /// Get allowed commands
@@ -2899,6 +2937,23 @@ mod tests {
         let mut caps = CapabilitySet::new();
         assert!(caps.add_platform_rule("not an s-expression").is_err());
         assert!(caps.add_platform_rule("").is_err());
+    }
+
+    #[test]
+    fn test_seatbelt_log_tag_rejects_profile_breaking_input() {
+        let mut caps = CapabilitySet::new();
+        for bad in [
+            "",
+            "tag\"))(allow default)(deny default (with message \"",
+            "tag with space",
+            "täg",
+            &"x".repeat(65),
+        ] {
+            assert!(caps.set_seatbelt_log_tag(bad).is_err(), "{bad:?}");
+            assert_eq!(caps.seatbelt_log_tag(), None);
+        }
+        caps.set_seatbelt_log_tag("NONOGOV_35480").unwrap();
+        assert_eq!(caps.seatbelt_log_tag(), Some("NONOGOV_35480"));
     }
 
     #[test]

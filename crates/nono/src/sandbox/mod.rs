@@ -49,8 +49,8 @@ pub use linux::{
     install_seccomp_proxy_filter, notif_id_valid, prepare_landlock_with_abi,
     prepare_seccomp_af_unix_filter, prepare_seccomp_openat_filter, prepare_seccomp_proxy_filter,
     prepare_seccomp_with_abi, probe_seccomp_block_network_support, read_mmsghdr_dests,
-    read_msghdr_dest, read_notif_path, read_notif_sockaddr, read_open_how, recv_notif,
-    resolve_notif_path, respond_notif_errno, validate_openat2_size,
+    read_msghdr_dest, read_notif_sockaddr, read_open_how, read_open_path,
+    recv_notif, resolve_notif_path, respond_notif_errno, validate_openat2_size,
 };
 
 /// Information about sandbox support on this platform

@@ -84,7 +84,7 @@ impl TerminalApproval {
         };
         eprintln!();
         match request {
-            ApprovalRequest::Capability {
+            ApprovalRequest::FileCapability {
                 path,
                 access,
                 reason,
@@ -96,6 +96,16 @@ impl TerminalApproval {
                     sanitize_for_terminal(&path.display().to_string())
                 );
                 eprintln!("[nono]   Access: {}", format_access_mode(access));
+                if let Some(r) = reason {
+                    eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
+                }
+            }
+            ApprovalRequest::SocketCapability { uds, reason, .. } => {
+                eprintln!("[nono] The sandboxed process is requesting to bind a unix socket:");
+                eprintln!(
+                    "[nono]   Socket: {}",
+                    sanitize_for_terminal(&uds.to_string())
+                );
                 if let Some(r) = reason {
                     eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
@@ -313,7 +323,7 @@ mod tests {
     // ── helpers ──────────────────────────────────────────────────────────────
 
     fn capability_request() -> ApprovalRequest {
-        ApprovalRequest::Capability {
+        ApprovalRequest::FileCapability {
             request_id: "cap-001".to_string(),
             path: "/tmp/test".into(),
             access: AccessMode::ReadWrite,

@@ -528,8 +528,12 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
 fn print_capability_decision(entry: &nono::supervisor::AuditEntry) {
     use nono::supervisor::{ApprovalDecision, ApprovalRequest};
 
-    let ApprovalRequest::Capability { path, access, .. } = &entry.request else {
-        return;
+    let (access, target) = match &entry.request {
+        ApprovalRequest::FileCapability { path, access, .. } => {
+            (access.to_string(), path.display().to_string())
+        }
+        ApprovalRequest::SocketCapability { uds, .. } => ("bind".to_string(), uds.to_string()),
+        _ => return,
     };
     let decision = match &entry.decision {
         ApprovalDecision::Granted => "granted".green(),
@@ -552,7 +556,7 @@ fn print_capability_decision(entry: &nono::supervisor::AuditEntry) {
         "    {} {} {} backend={} duration={}ms{}",
         decision,
         access,
-        sanitize_for_terminal(&path.display().to_string()),
+        sanitize_for_terminal(&target),
         sanitize_for_terminal(&entry.backend),
         entry.duration_ms,
         reason,

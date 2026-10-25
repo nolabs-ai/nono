@@ -12,10 +12,28 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// Address of a Unix domain socket.
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub enum SocketAddress {
+    /// Filesystem-backed (pathname) socket.
+    Path(PathBuf),
+    /// Abstract-namespace socket (name without the leading NUL byte).
+    Abstract(String),
+}
+
+impl std::fmt::Display for SocketAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SocketAddress::Path(path) => write!(f, "{}", path.display()),
+            SocketAddress::Abstract(name) => write!(f, "unix:@{name}"),
+        }
+    }
+}
+
 /// A request from the sandboxed child for additional filesystem access.
 ///
 /// This is the IPC wire type sent over the supervisor Unix socket. The
-/// supervisor converts it to [`ApprovalRequest::Capability`] before calling
+/// supervisor converts it to [`ApprovalRequest::FileCapability`] before calling
 /// the approval backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityRequest {
@@ -37,14 +55,15 @@ pub struct CapabilityRequest {
 /// [`crate::supervisor::ApprovalBackend`].
 ///
 /// The supervisor IPC wire type [`CapabilityRequest`] maps to the
-/// [`ApprovalRequest::Capability`] variant. Command-policy launch uses the
+/// [`ApprovalRequest::FileCapability`] variant. Tool Sandbox  command launch uses the
 /// [`ApprovalRequest::Command`] variant, built directly in the command-mediation shim
 /// handler without going over the IPC socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "capability_type", rename_all = "snake_case")]
 pub enum ApprovalRequest {
     /// A filesystem capability expansion request (from `nono grant` IPC).
-    Capability {
+    #[serde(rename = "capability")]
+    FileCapability {
         /// Unique identifier for this request (for replay protection and audit)
         request_id: String,
         /// The filesystem path being requested
@@ -52,6 +71,19 @@ pub enum ApprovalRequest {
         /// The access mode requested (read, write, or read+write)
         access: AccessMode,
         /// Human-readable reason for the request (provided by the agent)
+        reason: Option<String>,
+        /// PID of the requesting child process
+        child_pid: u32,
+        /// Session identifier for correlating requests within a single run
+        session_id: String,
+    },
+    /// A Unix domain socket bind request intercepted by the supervisor.
+    SocketCapability {
+        /// Unique identifier for this request (for replay protection and audit)
+        request_id: String,
+        /// The socket address the child is trying to bind
+        uds: SocketAddress,
+        /// Human-readable reason for the request
         reason: Option<String>,
         /// PID of the requesting child process
         child_pid: u32,
@@ -124,7 +156,8 @@ impl ApprovalRequest {
     #[must_use]
     pub fn request_id(&self) -> &str {
         match self {
-            ApprovalRequest::Capability { request_id, .. }
+            ApprovalRequest::FileCapability { request_id, .. }
+            | ApprovalRequest::SocketCapability { request_id, .. }
             | ApprovalRequest::Network { request_id, .. }
             | ApprovalRequest::Endpoint { request_id, .. }
             | ApprovalRequest::Command { request_id, .. } => request_id,
@@ -135,7 +168,8 @@ impl ApprovalRequest {
     #[must_use]
     pub fn session_id(&self) -> &str {
         match self {
-            ApprovalRequest::Capability { session_id, .. }
+            ApprovalRequest::FileCapability { session_id, .. }
+            | ApprovalRequest::SocketCapability { session_id, .. }
             | ApprovalRequest::Network { session_id, .. }
             | ApprovalRequest::Endpoint { session_id, .. }
             | ApprovalRequest::Command { session_id, .. } => session_id,
@@ -145,7 +179,7 @@ impl ApprovalRequest {
 
 impl From<CapabilityRequest> for ApprovalRequest {
     fn from(r: CapabilityRequest) -> Self {
-        ApprovalRequest::Capability {
+        ApprovalRequest::FileCapability {
             request_id: r.request_id,
             path: r.path,
             access: r.access,

@@ -9,9 +9,21 @@
 //! - Instruction files undergo trust verification with TOCTOU protection via
 //!   digest re-check at fd open time.
 
+use std::str::FromStr;
+
 use super::*;
 use crate::trust_intercept::TrustInterceptor;
-use nono::{AccessMode, NonoRemediation, UnixSocketCapability, UnixSocketOp, try_canonicalize};
+use nono::{
+    AccessMode, NonoRemediation, UnixSocketCapability, UnixSocketOp,
+    sandbox::{
+        SYS_BIND, SYS_OPENAT, SYS_OPENAT2, SeccompNotif, UnixSocketKind,
+        classify_access_from_flags, continue_notif, deny_notif, inject_fd, notif_id_valid,
+        read_notif_sockaddr, read_open_how, read_open_path, recv_notif, resolve_notif_path,
+        respond_notif_errno, validate_openat2_size,
+    },
+    supervisor::SocketAddress,
+    try_canonicalize,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct InitialCapability {
@@ -226,24 +238,35 @@ pub(super) fn handle_seccomp_notification(
     config: &SupervisorConfig<'_>,
     initial_caps: &[InitialCapability],
     state: SeccompNotificationState<'_>,
+    ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) -> Result<()> {
-    let notif = nono::sandbox::recv_notif(notify_fd)?;
-    handle_received_filesystem_notification(notify_fd, child, config, initial_caps, state, notif)
+    // Receive the notification
+    let notif = recv_notif(notify_fd)?;
+
+    match notif.data.nr {
+        SYS_OPENAT | SYS_OPENAT2 => {
+            handle_open_notification(notify_fd, child, notif, config, initial_caps, state)
+        }
+        SYS_BIND => {
+            handle_uds_bind_notifcation(notify_fd, child, notif, config, state, ipc_denials)
+        }
+        other => {
+            // Unexpected syscall (shouldn't happen with our BPF filter)
+            warn!("Unexpected syscall {} in seccomp handler, denying", other);
+            let _ = deny_notif(notify_fd, notif.id);
+            Ok(())
+        }
+    }
 }
 
-fn handle_received_filesystem_notification(
+fn handle_open_notification(
     notify_fd: std::os::fd::RawFd,
     child: Pid,
+    notif: SeccompNotif,
     config: &SupervisorConfig<'_>,
     initial_caps: &[InitialCapability],
     state: SeccompNotificationState<'_>,
-    notif: nono::sandbox::SeccompNotif,
 ) -> Result<()> {
-    use nono::sandbox::{
-        SYS_OPENAT, SYS_OPENAT2, classify_access_from_flags, continue_notif, deny_notif, inject_fd,
-        notif_id_valid, read_notif_path, read_open_how, resolve_notif_path, respond_notif_errno,
-        validate_openat2_size,
-    };
     let SeccompNotificationState {
         rate_limiter,
         denials,
@@ -251,11 +274,9 @@ fn handle_received_filesystem_notification(
         pty,
     } = state;
 
-    // 1. Receive the notification
-
-    // 2. Read the path from the child's memory (args[1] = pathname for openat/openat2)
-    //    Then resolve dirfd-relative paths using /proc/PID/fd/DIRFD or /proc/PID/cwd.
-    let path = match read_notif_path(notif.pid, notif.data.args[1]) {
+    // Read the path from the child's memory (args[1] = pathname for openat/openat2)
+    // Then resolve dirfd-relative paths using /proc/PID/fd/DIRFD or /proc/PID/cwd.
+    let path = match read_open_path(notif.pid, notif.data.args[1]) {
         Ok(raw_path) => {
             // args[0] is dirfd for both openat and openat2
             match resolve_notif_path(notif.pid, notif.data.args[0], &raw_path) {
@@ -278,9 +299,9 @@ fn handle_received_filesystem_notification(
         }
     };
 
-    // 3. First TOCTOU check: verify notification still valid
+    // first toctou check: verify notification still valid
     if !notif_id_valid(notify_fd, notif.id)? {
-        debug!("Seccomp notification expired (first TOCTOU check)");
+        debug!("seccomp notification expired (first toctou check)");
         return Ok(());
     }
 
@@ -333,16 +354,15 @@ fn handle_received_filesystem_notification(
         read_tgid(notif.pid)
     };
     let procfs_context = ProcfsAccessContext::new(notifying_tgid, Some(notif.pid));
-    let resolved_path = match resolve_procfs_path_for_child(&path, Some(procfs_context)) {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            debug!("Failed to resolve procfs path '{}': {}", path.display(), e);
-            let _ = deny_notif(notify_fd, notif.id);
-            return Ok(());
-        }
-    };
+    let resolved_path =
+        resolve_procfs_path_for_child(&path, Some(procfs_context)).map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Failed to resolve procfs path '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
     let canonicalized = try_canonicalize(&resolved_path);
-
     // For the initial capability match, map a grandchild's /proc/<tgid> path back to the
     // direct child's /proc/<child_pid>, because initial_caps are built from the direct
     // child's /proc/self remapping (remap_procfs_self_references uses child.as_raw()).
@@ -352,33 +372,25 @@ fn handle_received_filesystem_notification(
     // opened by open_path_for_access continues to use `procfs_context` with notifying_tgid,
     // so the correct /proc/<notifying_tgid>/... file is opened. validate_procfs_access also
     // uses notifying_tgid as allowed_pid, blocking cross-process procfs reads.
-    let cap_check_path: std::borrow::Cow<std::path::Path> = if notifying_tgid != child_pid {
+    let cap_check_path: PathBuf = if notifying_tgid != child_pid {
         let notifying_prefix = format!("/proc/{}", notifying_tgid);
         if let Ok(rel) = canonicalized.strip_prefix(&notifying_prefix) {
             let mut p = std::path::PathBuf::from(format!("/proc/{}", child_pid));
             p.push(rel);
-            std::borrow::Cow::Owned(p)
+            p
         } else {
-            std::borrow::Cow::Borrowed(canonicalized.as_path())
+            canonicalized.clone()
         }
     } else {
-        std::borrow::Cow::Borrowed(canonicalized.as_path())
+        canonicalized.clone()
     };
 
-    // 4. Check protected roots BEFORE initial-set fast-path.
-    let protected_root = crate::protected_paths::overlapping_protected_root(
+    // Check protected roots BEFORE initial-set fast-path.
+    if let Some(protected_root) = crate::protected_paths::overlapping_protected_root(
         &canonicalized,
         false,
         config.protected_roots,
-    )
-    .or_else(|| {
-        crate::protected_paths::overlapping_protected_root(
-            &resolved_path,
-            false,
-            config.protected_roots,
-        )
-    });
-    if let Some(protected_root) = protected_root {
+    ) {
         debug!(
             "Seccomp: path {} blocked by protected root {}",
             canonicalized.display(),
@@ -402,7 +414,7 @@ fn handle_received_filesystem_notification(
     // procfs target and injects the writable fd.
     if config.seccomp_policy.proc_comm_notify
         && proc_comm_notify_allows_access(access)
-        && is_proc_task_comm_for_tgid(&canonicalized, notifying_tgid)
+        && is_proc_task_comm_for_tgid(&canonicalized, procfs_context.process_pid)
     {
         match open_proc_comm_for_access(&canonicalized, access) {
             Ok(file) => {
@@ -651,7 +663,7 @@ fn handle_received_filesystem_notification(
     };
 
     // 8. Delegate to approval backend (for both instruction and non-instruction files)
-    let request = nono::supervisor::ApprovalRequest::Capability {
+    let request = nono::supervisor::ApprovalRequest::FileCapability {
         request_id: format!("seccomp-{}", unique_request_id()),
         path: path.clone(),
         access,
@@ -741,6 +753,250 @@ fn handle_received_filesystem_notification(
                     let _ = respond_notif_errno(notify_fd, notif.id, e.errno());
                 }
             }
+        }
+    } else {
+        let _ = deny_notif(notify_fd, notif.id);
+    }
+
+    Ok(())
+}
+
+fn handle_uds_bind_notifcation(
+    notify_fd: std::os::fd::RawFd,
+    child: Pid,
+    notif: SeccompNotif,
+    config: &SupervisorConfig<'_>,
+    state: SeccompNotificationState<'_>,
+    ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+) -> Result<()> {
+    let SeccompNotificationState {
+        rate_limiter,
+        denials: _,
+        trust_interceptor: _,
+        pty,
+    } = state;
+
+    let sockaddr = match read_notif_sockaddr(notif.pid, notif.data.args[1], notif.data.args[2]) {
+        Ok(sockaddr) => sockaddr,
+        Err(e) => {
+            debug!(
+                "Failed to read socket address from seccomp notification: {}",
+                e
+            );
+            let _ = deny_notif(notify_fd, notif.id);
+            return Ok(());
+        }
+    };
+
+    // We don't enforce rules on any non AF_UNIX socket bind
+    if sockaddr.family != libc::AF_UNIX as u16 {
+        let _ = continue_notif(notify_fd, notif.id);
+        return Ok(());
+    }
+
+    let mut socket_address = match (
+        sockaddr.unix_kind,
+        sockaddr.unix_path,
+        sockaddr.unix_abstract_name,
+    ) {
+        (Some(UnixSocketKind::Pathname), Some(path), _) => SocketAddress::Path(path),
+        (Some(UnixSocketKind::Abstract), _, Some(name)) => match String::from_utf8(name) {
+            Ok(name) => SocketAddress::Abstract(name),
+            Err(_) => {
+                debug!("Seccomp: denying AF_UNIX bind: abstract name is not valid UTF-8");
+                let _ = deny_notif(notify_fd, notif.id);
+                return Ok(());
+            }
+        },
+        // Unnamed (autobind) or malformed sockaddr: fail closed.
+        (kind, _, _) => {
+            debug!("Seccomp: denying AF_UNIX bind of kind {:?}", kind);
+            let _ = deny_notif(notify_fd, notif.id);
+            return Ok(());
+        }
+    };
+
+    if let SocketAddress::Path(p) = &socket_address {
+        // 1. If the path being opened is relative, resolve it to an absolute one
+        // based on the child's view.
+        let resolved = match resolve_af_unix_sockaddr_path(notif.pid, p) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                debug!(
+                    "Seccomp: denying AF_UNIX bind to {}: resolution failed: {}",
+                    p.display(),
+                    e
+                );
+                let _ = deny_notif(notify_fd, notif.id);
+                return Ok(());
+            }
+        };
+
+        // 2. Resolve entries under /proc to the child's view
+        let child_pid = child.as_raw() as u32;
+        let notifying_tgid = if notif.pid == child_pid {
+            child_pid
+        } else {
+            read_tgid(notif.pid)
+        };
+        let procfs_context = ProcfsAccessContext::new(notifying_tgid, Some(notif.pid));
+        let resolved_procfs = resolve_procfs_path_for_child(&resolved, Some(procfs_context))
+            .map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Failed to resolve procfs path '{}': {}",
+                    resolved.display(),
+                    e
+                ))
+            })?;
+
+        // 3. Resolve symlinks for the parent, not the full bind path. Because in `bind`
+        // the path may not exist beforehand.
+        let canonicalized = match canonicalize_unix_socket_bind_path(&resolved_procfs.as_path()) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("{}", e);
+                let _ = deny_notif(notify_fd, notif.id);
+                return Ok(());
+            }
+        };
+
+        // Don't allow `bind` for any path under /proc
+        let mut protected_roots: Vec<PathBuf> = config.protected_roots.to_vec().clone();
+        protected_roots.push(PathBuf::from_str("/proc").unwrap());
+
+        if let Some(protected_root) = crate::protected_paths::overlapping_protected_root(
+            &canonicalized,
+            false,
+            &protected_roots,
+        ) {
+            debug!(
+                "Seccomp: socket bind {} blocked by protected root {}",
+                canonicalized.display(),
+                protected_root.display()
+            );
+            record_ipc_denial(
+                ipc_denials,
+                nono::diagnostic::IpcDenialRecord::new(
+                    canonicalized.display().to_string(),
+                    UnixSocketOp::Bind.to_string(),
+                    format!("blocked by protected root {}", protected_root.display()),
+                    None,
+                ),
+            );
+            let _ = deny_notif(notify_fd, notif.id);
+            return Ok(());
+        }
+        socket_address = SocketAddress::Path(canonicalized);
+    }
+
+    // first toctou check: verify notification still valid
+    if !notif_id_valid(notify_fd, notif.id)? {
+        debug!("seccomp notification expired (first toctou check)");
+        return Ok(());
+    }
+
+    // Fast-path: pathname sockets covered by a unix_socket capability that
+    // permits bind proceed immediately.
+    if let SocketAddress::Path(p) = &socket_address
+        && unix_socket_allowlist_allows(config.unix_socket_allowlist, p, UnixSocketOp::Bind)
+    {
+        if let Err(e) = continue_notif(notify_fd, notif.id) {
+            debug!("continue_notif failed for initial-set socket: {}", e);
+            let _ = deny_notif(notify_fd, notif.id);
+        }
+        return Ok(());
+    }
+
+    let socket_target = socket_address.to_string();
+    let remediation = match &socket_address {
+        SocketAddress::Path(p) => Some(NonoRemediation::GrantUnixSocket {
+            path: p.clone(),
+            bind: true,
+        }),
+        SocketAddress::Abstract(_) => None,
+    };
+    let mut record_socket_denial = |reason: &str| {
+        record_ipc_denial(
+            ipc_denials,
+            nono::diagnostic::IpcDenialRecord::new(
+                socket_target.clone(),
+                UnixSocketOp::Bind.to_string(),
+                reason.to_string(),
+                remediation.clone(),
+            ),
+        );
+    };
+
+    if !config.seccomp_policy.capability_elevation {
+        debug!(
+            "Seccomp: socket bind {} denied because runtime capability elevation is disabled",
+            socket_target
+        );
+        record_socket_denial("no matching unix_socket capability");
+        let _ = deny_notif(notify_fd, notif.id);
+        return Ok(());
+    }
+
+    // Rate limit check
+    if !rate_limiter.try_acquire() {
+        debug!("Rate limited seccomp socket bind for {}", socket_target);
+        record_socket_denial("rate limited");
+        let _ = deny_notif(notify_fd, notif.id);
+        return Ok(());
+    }
+
+    // Send an approval request
+    let request = nono::supervisor::ApprovalRequest::SocketCapability {
+        request_id: format!("seccomp-{}", unique_request_id()),
+        uds: socket_address.clone(),
+        reason: Some("Sandbox intercepted socket bind (seccomp-notify)".to_string()),
+        child_pid: child.as_raw() as u32,
+        session_id: config.session_id.to_string(),
+    };
+    let decision_started: Instant = Instant::now();
+
+    let decision = match super::request_approval_with_relay_paused(config, &request, pty) {
+        Ok(d) => {
+            if d.is_denied() {
+                record_socket_denial("denied by user");
+            }
+            d
+        }
+        Err(e) => {
+            warn!("Approval backend error for seccomp notification: {}", e);
+            record_socket_denial("approval backend error");
+            let decision = ApprovalDecision::Denied {
+                reason: format!("Approval backend error: {e}"),
+            };
+            let deny_result = deny_notif(notify_fd, notif.id);
+            let audit_result = record_capability_audit(config, request, decision_started, decision);
+            deny_result?;
+            audit_result?;
+            return Ok(());
+        }
+    };
+    if let Err(audit_error) =
+        record_capability_audit(config, request, decision_started, decision.clone())
+    {
+        let _ = deny_notif(notify_fd, notif.id);
+        return Err(audit_error);
+    }
+
+    // Second TOCTOU check before acting on the decision
+    if !notif_id_valid(notify_fd, notif.id)? {
+        debug!("Seccomp notification expired (second TOCTOU check)");
+        return Ok(());
+    }
+
+    // TOCTOU limitation: SECCOMP_USER_NOTIF_FLAG_CONTINUE makes the kernel re-read
+    // the sockaddr from the child's memory, so a racing thread can swap the path
+    // between approval and the actual bind. Landlock's MAKE_SOCK right still
+    // constrains where a pathname socket can be created, so this cannot escape
+    // the filesystem sandbox, but the approved path is not strictly binding.
+    if decision.is_granted() {
+        if let Err(e) = continue_notif(notify_fd, notif.id) {
+            debug!("continue_notif failed for approved socket bind: {}", e);
+            let _ = deny_notif(notify_fd, notif.id);
         }
     } else {
         let _ = deny_notif(notify_fd, notif.id);
@@ -1106,14 +1362,7 @@ pub(super) fn handle_combined_notification(
         if !config.seccomp_policy.needs_openat_notify() {
             return nono::sandbox::deny_notif(notify_fd, notif.id);
         }
-        handle_received_filesystem_notification(
-            notify_fd,
-            child,
-            config,
-            initial_caps,
-            state,
-            notif,
-        )
+        handle_open_notification(notify_fd, child, notif, config, initial_caps, state)
     } else {
         handle_received_network_notification(
             notify_fd,
@@ -1370,12 +1619,10 @@ fn record_af_unix_ipc_denial(
         .unwrap_or_else(|| format!("syscall {syscall}"));
     let (target, reason, remediation, path_record) = ipc_denial_details(sockaddr, child_pid, op);
 
-    ipc_denials.push(nono::diagnostic::IpcDenialRecord::new(
-        target,
-        operation,
-        reason,
-        remediation,
-    ));
+    record_ipc_denial(
+        ipc_denials,
+        nono::diagnostic::IpcDenialRecord::new(target, operation, reason, remediation),
+    );
 
     let Some((display_path, op)) = path_record else {
         return;
@@ -1647,17 +1894,20 @@ fn match_initial_capability<'a>(
     let mut best_sufficient_score = 0usize;
 
     for cap in initial_caps {
+        // if the capability in the intiial caps is a file (not dir)
+        // check if its euqal the requested path. otherwise, check if if the path has a prefix for that cap
         let covers = if cap.is_file {
             path == cap.path
         } else {
             path.starts_with(&cap.path)
         };
 
+        // none of these condition is true, skip it. doesn't match
         if !covers {
             continue;
         }
 
-        let score = cap.path.as_os_str().len();
+        let score = cap.path.as_os_str().len(); // the capability has matched the path prefix or the full path
         if score >= best_covering_score {
             best_covering = Some(cap);
             best_covering_score = score;
@@ -2044,6 +2294,7 @@ mod tests {
                 is_loopback: true,
                 unix_kind: Some(UnixSocketKind::Pathname),
                 unix_path: Some(path.to_path_buf()),
+                unix_abstract_name: None,
             }
         }
 
@@ -2054,6 +2305,7 @@ mod tests {
                 is_loopback: true,
                 unix_kind: Some(UnixSocketKind::Abstract),
                 unix_path: None,
+                unix_abstract_name: None,
             }
         }
 
@@ -2064,6 +2316,7 @@ mod tests {
                 is_loopback: true,
                 unix_kind: Some(UnixSocketKind::Unnamed),
                 unix_path: None,
+                unix_abstract_name: None,
             }
         }
 
@@ -2074,6 +2327,7 @@ mod tests {
                 is_loopback: true,
                 unix_kind: None,
                 unix_path: None,
+                unix_abstract_name: None,
             }
         }
 
@@ -2084,6 +2338,7 @@ mod tests {
                 is_loopback: false,
                 unix_kind: None,
                 unix_path: None,
+                unix_abstract_name: None,
             }
         }
 

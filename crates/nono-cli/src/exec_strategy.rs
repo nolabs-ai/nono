@@ -3192,6 +3192,7 @@ fn run_supervisor_loop_inner(
                             trust_interceptor: trust_interceptor.as_mut(),
                             pty: pty.as_deref_mut(),
                         },
+                        &mut ipc_denials,
                     )
                 {
                     debug!("Error handling seccomp notification: {}", e);
@@ -4034,6 +4035,15 @@ fn clear_close_on_exec(fd: i32) -> Result<()> {
 }
 
 pub(super) fn record_denial(denials: &mut Vec<DenialRecord>, record: DenialRecord) {
+    if denials.len() < MAX_DENIAL_RECORDS {
+        denials.push(record);
+    }
+}
+
+pub(super) fn record_ipc_denial(
+    denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+    record: nono::diagnostic::IpcDenialRecord,
+) {
     if denials.len() < MAX_DENIAL_RECORDS {
         denials.push(record);
     }

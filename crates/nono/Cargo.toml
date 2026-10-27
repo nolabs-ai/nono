@@ -61,7 +61,7 @@ prettyplease = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true
-jsonschema = "0.58"
+jsonschema = "0.60"
 
 [lints]
 workspace = true

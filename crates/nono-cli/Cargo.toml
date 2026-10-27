@@ -115,7 +115,7 @@ serde.workspace = true
 # dev-dependency, so publishing nono-cli does not require this crate on
 # crates.io.
 nono-test-support = { path = "../nono-test-support" }
-jsonschema = "0.58"
+jsonschema = "0.60"
 proptest = "1"
 
 [lints]

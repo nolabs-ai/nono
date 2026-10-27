@@ -4041,9 +4041,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-bundle"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ec07aba431df2345a4f703218e442f1f80ac192bf64f19777d9fb4ad1259851"
+checksum = "442bc4f672eef040397e65d4ae34ca1b1dc8140b1a35b1246e0b219ce5f4e571"
 dependencies = [
  "jiff",
  "sigstore-types",
@@ -4052,9 +4052,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-crypto"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cf3186b87f0bfbe7e2968e844d5e8053d36e9106601a0fe988aa5be928c314a"
+checksum = "045039ae523e86a8b856470a6fc8e9a4567bb61e723ec08a4d23fa8ce40167e9"
 dependencies = [
  "aws-lc-rs",
  "const-oid 0.9.6",
@@ -4070,9 +4070,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-fulcio"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "879f2005719c82c063a8fc83d5e97ca4c4bff35b04645bf7ab497d959a1016e5"
+checksum = "1bd4f6a3e1419dcceeac5f24e4601d7a0b5cac639a96b52029bef92070872cb3"
 dependencies = [
  "reqwest",
  "serde",
@@ -4085,9 +4085,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-merkle"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a73aee6f9218b08736804d848d70971297d8a1842860bb2db3c16ca1c53c98b"
+checksum = "22923d7f1a03e21a3313a4a2e6a6485959327a2a084df09b4fff45810e46f08a"
 dependencies = [
  "sigstore-crypto",
  "sigstore-types",
@@ -4096,9 +4096,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-oidc"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf57758e72b921877242a86e7cd37ce6cf06c58c539a52a1ff4065833cefb14c"
+checksum = "0ab524c65ae617b89a9252e53aec91104a9ddbb28de11f47800c241d7ae5397f"
 dependencies = [
  "ambient-id",
  "base64 0.23.1",
@@ -4118,9 +4118,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-rekor"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7944b186fea86436f865540901f0afbd7fa48568ff5f2f4e8b9e27ae758771fc"
+checksum = "a46ca1954e5e92b8a35eeefb745f55a1eff2d82c6b80f946e733671b33508540"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -4135,9 +4135,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-sign"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b48e53426834d72ac55d2cba9b3978d6a72af32cdb8ddae932d473b898993631"
+checksum = "8252e823efe7552ffb47fde9b593aea9d5f00bd624e522db2b428990b2260c59"
 dependencies = [
  "futures-io",
  "serde_json",
@@ -4154,9 +4154,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-trust-root"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28c383bc3d087db8c7bad0fbc04b4e6744f9c08adabb233eb7c8166caa6a9fb2"
+checksum = "d9a49e390a5f52e0b05f1a17820be5ac747a3890bb9f54156d8a1147508420a7"
 dependencies = [
  "directories",
  "jiff",
@@ -4171,9 +4171,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-tsa"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c51d5bafa5abd35c60e99249a954d7092376114b02d9b9acaa355e130a87c24e"
+checksum = "36aa9c47f3480420ccb90753c5f3aae07823c489ab20762f0c96070ba35cd5cb"
 dependencies = [
  "cms",
  "const-oid 0.9.6",
@@ -4193,9 +4193,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-tuf"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eccbde8af5f8f613444a0c9d83a9ff8df2bd0c180215f69d9d40169344d1dca3"
+checksum = "fb4ea7f5d83c3d2d06397d153de059ff5b6f594fb04c3d8dc1912d127cf105db"
 dependencies = [
  "glob",
  "hex",
@@ -4213,9 +4213,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-types"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24f58ba2ce9de6e912d5e4043eeb8baa1aeee7ddf9ea19c950a20ee6e0973979"
+checksum = "eec330f1cdb4c7ec6628ef43165c42978480d4213af70567e67e2891ec9072d8"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -4228,9 +4228,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-verify"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d81887abe3161d7f0d04f224236e14390f782ce6f3b5e2717819ef2d7b452cb"
+checksum = "465f37d73c80fc6a2fa519d1337befab2026fce47f490181f72842aa56d401e1"
 dependencies = [
  "base64 0.23.1",
  "const-oid 0.9.6",

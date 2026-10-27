@@ -309,11 +309,13 @@ The invariant matches the filesystem model: **if anything goes wrong, the child 
 
 ### Audit Durability Boundary
 
-Network proxy events are captured during the session, but the durable append-only audit log is finalized after the session ends rather than updated on every proxied request.
+Network proxy events are captured during a session, but `session.json` and the global ledger entry are written only at finalization. The event file may therefore exist before the session is discoverable through `nono audit list` or `nono audit show`.
 
-This is an intentional performance tradeoff: the live request path only pays the cost of lightweight event capture, while the append-only hash chain and Merkleized audit summary are written during session finalization. The result is good post-run audit integrity, but not per-request durability.
+Completed sessions have post-run audit integrity. Incomplete sessions do not yet have a durable, discoverable start record.
 
-The security implication is narrow but real: if the supervisor or proxy is forcibly terminated mid-session, recent network events may be lost before they are committed into the append-only audit record. This does not weaken sandbox enforcement or credential isolation, but it does leave a temporary gap in forensic durability. Tightening that window is future work.
+If the supervisor or proxy terminates before finalization, recent events may be lost and surviving event files can remain unreferenced. The session may be absent from normal audit discovery, and rollback metadata may remain incomplete. This does not weaken sandbox enforcement or credential isolation, but it can leave a permanent gap in the audit trail.
+
+Crash-resistant audit durability remains planned future work. It will require recording session start before untrusted execution and recovering orphaned event logs and rollback state after abnormal termination. Until then, operators requiring this guarantee should export audit evidence to an independently supervised system.
 
 ## macOS Model
 

@@ -1653,7 +1653,9 @@ pub(crate) fn resolve_nonce_in_header_value(
     if end > value.len() {
         return None;
     }
-    let nonce = &value[start..end];
+    // The fixed byte window may end inside a UTF-8 codepoint. Treat malformed
+    // candidates as non-matches instead of panicking.
+    let nonce = value.get(start..end)?;
     if !nonce[NONCE_PREFIX.len()..]
         .bytes()
         .all(|b| b.is_ascii_hexdigit())
@@ -3285,6 +3287,32 @@ mod tests {
         let result =
             resolve_nonce_in_header_value(&value, "proxy.anthropic", CONSUMER_PATH, &resolver);
         assert_eq!(result, Some(format!("é{filler}REAL")));
+    }
+
+    #[test]
+    fn multibyte_nonce_candidate_does_not_panic() {
+        // The 69-byte nonce window ends inside the final euro sign.
+        let value = format!("nono_{}", "€".repeat(22));
+        assert_eq!(value.len(), 71);
+        let resolver = test_resolver(&make_nonce(), b"REAL");
+
+        assert!(
+            resolve_nonce_in_header_value(&value, "proxy.anthropic", CONSUMER_PATH, &resolver)
+                .is_none(),
+            "a non-ASCII nonce candidate must fail closed"
+        );
+    }
+
+    #[test]
+    fn valid_nonce_surrounded_by_multibyte_text_resolves() {
+        let nonce = make_nonce();
+        let resolver = test_resolver(&nonce, b"REAL");
+        let value = format!("préfix-{nonce}-süffix");
+
+        assert_eq!(
+            resolve_nonce_in_header_value(&value, "proxy.anthropic", CONSUMER_PATH, &resolver),
+            Some("préfix-REAL-süffix".to_string())
+        );
     }
 
     #[test]

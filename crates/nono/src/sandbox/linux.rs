@@ -506,8 +506,9 @@ const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 /// Return the raw Landlock ABI version reported by the kernel.
 ///
 /// Unlike [`detect_abi`], this is not limited to ABIs the `landlock` crate
-/// knows, so it identifies kernels newer than nono recognises. It is for
-/// diagnostics only and must never select enforced access rights.
+/// knows, so it identifies kernels newer than nono recognises. Detection uses
+/// it only as an upper bound on probed candidates; it never selects enforced
+/// access rights, which stay capped at [`MAX_ENFORCED_ABI`].
 ///
 /// Returns `None` if Landlock is unavailable.
 #[must_use]
@@ -551,10 +552,31 @@ pub fn detect_abi() -> Result<DetectedAbi> {
 }
 
 fn detect_abi_uncached() -> Result<DetectedAbi> {
+    detect_abi_with(kernel_abi_version(), probe_abi_candidate)
+}
+
+/// Select the highest ABI that the kernel reports and a probe confirms.
+///
+/// Probing alone cannot tell V6, V7, and V8 apart: they handle the same access
+/// rights and scopes and differ only in `landlock_restrict_self` flags, which
+/// cannot be probed without restricting the caller. The kernel-reported
+/// version bounds the candidates and the probe confirms each one.
+fn detect_abi_with(
+    kernel_version: Option<u32>,
+    probe: impl Fn(ABI) -> std::result::Result<(), String>,
+) -> Result<DetectedAbi> {
+    let Some(kernel_version) = kernel_version else {
+        return Err(NonoError::SandboxInit(
+            "No supported Landlock ABI detected (kernel ABI version query failed)".to_string(),
+        ));
+    };
     let mut last_error = None;
 
-    for &abi in &ABI_PROBE_ORDER {
-        match probe_abi_candidate(abi) {
+    for &abi in ABI_PROBE_ORDER
+        .iter()
+        .filter(|abi| **abi as u32 <= kernel_version)
+    {
+        match probe(abi) {
             Ok(()) => return Ok(DetectedAbi::new(abi)),
             Err(err) => {
                 debug!("ABI {:?} probe failed: {}", abi, err);
@@ -4776,7 +4798,53 @@ mod tests {
             return;
         };
         let kernel = kernel_abi_version().expect("Landlock detected but version query failed");
-        assert!(kernel >= detected.abi as u32);
+        let newest_known = ABI_PROBE_ORDER[0] as u32;
+        assert_eq!(detected.abi as u32, kernel.min(newest_known));
+    }
+
+    fn probe_always_succeeds(_: ABI) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
+    #[test]
+    fn test_detect_abi_bounded_by_kernel_version() {
+        // V6-V8 accept identical probe rulesets, so a probe-only detector
+        // would report V8 on these kernels.
+        let v6 = detect_abi_with(Some(6), probe_always_succeeds).expect("simulated V6");
+        assert_eq!(v6.abi, ABI::V6);
+        assert!(!v6.has_audit_log_flags() && !v6.has_tsync());
+
+        let v7 = detect_abi_with(Some(7), probe_always_succeeds).expect("simulated V7");
+        assert_eq!(v7.abi, ABI::V7);
+        assert!(v7.has_audit_log_flags() && !v7.has_tsync());
+
+        let v8 = detect_abi_with(Some(8), probe_always_succeeds).expect("simulated V8");
+        assert_eq!(v8.abi, ABI::V8);
+        assert!(v8.has_tsync() && !v8.has_resolve_unix());
+    }
+
+    #[test]
+    fn test_detect_abi_kernel_newer_than_crate_saturates() {
+        let detected = detect_abi_with(Some(10), probe_always_succeeds).expect("simulated V10");
+        assert_eq!(detected.abi, ABI_PROBE_ORDER[0]);
+    }
+
+    #[test]
+    fn test_detect_abi_still_requires_probe() {
+        let detected = detect_abi_with(Some(9), |abi| {
+            if abi <= ABI::V5 {
+                Ok(())
+            } else {
+                Err("unsupported".to_string())
+            }
+        })
+        .expect("simulated probe failures above V5");
+        assert_eq!(detected.abi, ABI::V5);
+    }
+
+    #[test]
+    fn test_detect_abi_fails_without_kernel_version() {
+        assert!(detect_abi_with(None, probe_always_succeeds).is_err());
     }
 
     /// Detection above [`MAX_ENFORCED_ABI`] must not handle newer access

@@ -1,12 +1,12 @@
 # nono - Makefile for library and CLI
 #
 # Usage:
-#   make              Build everything
+#   make              Build the workspace
 #   make test         Run all tests
 #   make check        Run clippy and format check
-#   make release      Build release binaries
+#   make build-release Build release binaries
 
-.PHONY: all build build-lib build-cli build-ffi build-arm64 test test-workspace test-lib test-cli test-ffi test-doc test-one test-repeat test-spiffe check clippy fmt clean install audit help roadmap roadmap-check
+.PHONY: all build build-lib build-cli build-ffi build-release build-release-lib build-release-cli build-arm64 test test-workspace test-lib test-cli test-ffi test-doc test-one test-repeat test-spiffe check clippy clippy-fix fmt fmt-check roadmap roadmap-check clean install run run-setup run-dry watch watch-test doc doc-lib audit lint-docs ci help
 
 # Keep Rust panic locations available in both local and CI test output. A
 # caller can still override this (for example, RUST_BACKTRACE=full make test).
@@ -16,7 +16,8 @@ RUST_BACKTRACE ?= 1
 all: build
 
 # Build targets
-build: build-lib build-cli
+build:
+	cargo build --workspace
 
 build-lib:
 	cargo build -p nono
@@ -146,11 +147,10 @@ audit:
 
 # Lint: forbid legacy #594 schema tokens in docs and rustdoc outside the
 # allowlist (see scripts/lint-docs.sh).
-.PHONY: lint-docs
 lint-docs:
 	bash scripts/lint-docs.sh
 
-# CI simulation (what CI would run)
+# Core local checks. GitHub CI additionally runs platform and workflow jobs.
 ci: check test test-doc audit lint-docs
 	@echo "CI checks passed"
 
@@ -159,11 +159,13 @@ help:
 	@echo "nono Makefile targets:"
 	@echo ""
 	@echo "Build:"
-	@echo "  make build          Build library and CLI (debug)"
+	@echo "  make build          Build the workspace (debug)"
 	@echo "  make build-lib      Build library only"
 	@echo "  make build-cli      Build CLI only"
 	@echo "  make build-ffi      Build C FFI bindings"
 	@echo "  make build-release  Build release binaries"
+	@echo "  make build-release-lib Build release library"
+	@echo "  make build-release-cli Build release CLI"
 	@echo "  make build-arm64    Build CLI for Linux ARM64 (cargo on Linux ARM64; cross elsewhere)"
 	@echo ""
 	@echo "Test:"
@@ -180,6 +182,7 @@ help:
 	@echo "Check:"
 	@echo "  make check          Run clippy and format check"
 	@echo "  make clippy         Run clippy linter"
+	@echo "  make clippy-fix     Apply automatic Clippy fixes"
 	@echo "  make fmt            Format code"
 	@echo "  make fmt-check      Check formatting"
 	@echo ""
@@ -193,5 +196,11 @@ help:
 	@echo "  make install        Install CLI to ~/.cargo/bin"
 	@echo "  make clean          Clean build artifacts"
 	@echo "  make doc            Generate and open documentation"
-	@echo "  make ci             Simulate CI checks"
+	@echo "  make doc-lib        Generate library documentation"
+	@echo "  make run            Run CLI help"
+	@echo "  make run-setup      Check setup requirements"
+	@echo "  make run-dry        Preview a sandboxed command"
+	@echo "  make watch          Rebuild the CLI on changes"
+	@echo "  make watch-test     Rerun tests on changes"
+	@echo "  make ci             Run core local CI checks"
 	@echo "  make help           Show this help"

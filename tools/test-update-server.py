@@ -63,7 +63,7 @@ class UpdateHandler(BaseHTTPRequestHandler):
             "latest_version": self.latest_version,
             "update_available": update_available,
             "message": None,
-            "release_url": f"https://github.com/always-further/nono/releases/tag/v{self.latest_version}"
+            "release_url": f"https://github.com/nolabs-ai/nono/releases/tag/v{self.latest_version}"
             if update_available
             else None,
         }

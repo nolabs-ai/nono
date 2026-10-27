@@ -31,7 +31,7 @@ zeroize.workspace = true
 sha2.workspace = true
 sha1.workspace = true
 getrandom.workspace = true
-base64 = "0.23"
+base64.workspace = true
 regex = "1"
 subtle = "2"
 url.workspace = true
@@ -65,8 +65,8 @@ webpki-roots = "1.0.10"
 
 # TLS interception (CONNECT-mode L7 filtering and credential injection):
 # ephemeral session CA + per-host leaf certificate generation. `ring` matches
-# the rustls crypto provider used elsewhere; `aws_lc_rs` is disabled to avoid
-# a second, redundant crypto stack in the dependency tree.
+# the provider explicitly selected for proxy TLS. The AWS SDK separately uses
+# AWS-LC for its own HTTPS client.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
 x509-parser = "0.18"
 # Read the host's system trust store (used to compose the trust bundle that

@@ -24,7 +24,6 @@ assets = [
     ["../../README.md", "usr/share/doc/nono/README", "644"],
     ["../../LICENSE", "usr/share/doc/nono/LICENSE", "644"],
 ]
-conf-files = ["/etc/nono/profiles/"]
 
 [[bin]]
 name = "nono"
@@ -65,11 +64,10 @@ itoa = "1"
 # Signing key PKCS#8 serialization (already transitive via sigstore-verify)
 aws-lc-rs = "1.17.3"
 
-# Keystore access for trust signing keys (optional). Linux uses the pure-Rust
-# zbus Secret Service backend (see linux target deps), so no libdbus is linked.
-# default-features = false on every keyring declaration ensures only the
-# explicitly-listed backend is compiled, even if keyring later adds a default.
-keyring = { version = "3", optional = true, default-features = false }
+# Keystore access for trust signing keys (optional). Keyring's v1 compatibility
+# feature selects the native Keychain backend on macOS and the pure-Rust zbus
+# Secret Service backend on Linux, with no libdbus runtime dependency.
+keyring = { version = "4", features = ["v1"], optional = true, default-features = false }
 
 # Keyless (Sigstore/Fulcio/Rekor) signing for instruction file attestation
 sigstore-sign.workspace = true
@@ -82,14 +80,13 @@ semver = "1"
 
 zeroize.workspace = true
 sha2.workspace = true
-thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng = "0.10.0"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url.workspace = true
-globset = "0.4"
+globset.workspace = true
 regex = "1"
 urlencoding = "2"
 tempfile.workspace = true
@@ -100,15 +97,9 @@ jsonc-parser = { version = "0.34", features = ["serde"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }
 landlock.workspace = true
-dns-lookup = "4"
-# Pure-Rust Secret Service backend (zbus) — no libdbus link. Keep in sync with
-# the keyring features in crates/nono/Cargo.toml.
-keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"], optional = true, default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }
-dns-lookup = "4"
-keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
 security-framework = "3"
 security-framework-sys = "2"
 core-foundation = "0.10"
@@ -126,7 +117,6 @@ serde.workspace = true
 nono-test-support = { path = "../nono-test-support" }
 jsonschema = "0.58"
 proptest = "1"
-criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [lints]
 workspace = true

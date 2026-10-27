@@ -1615,6 +1615,7 @@ const BPF_RET: u16 = 0x06;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_RET_IO_URING_DENIED: u32 = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
 
 const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
@@ -1642,6 +1643,10 @@ const SYS_SOCKET: i32 = libc::SYS_socket as i32;
 const SYS_SOCKETPAIR: i32 = libc::SYS_socketpair as i32;
 #[cfg(target_os = "linux")]
 const SYS_IO_URING_SETUP: i32 = libc::SYS_io_uring_setup as i32;
+#[cfg(target_os = "linux")]
+const SYS_IO_URING_ENTER: i32 = libc::SYS_io_uring_enter as i32;
+#[cfg(target_os = "linux")]
+const SYS_IO_URING_REGISTER: i32 = libc::SYS_io_uring_register as i32;
 
 // Syscall numbers for connect/bind (public for CLI supervisor handler)
 #[cfg(target_os = "linux")]
@@ -3044,7 +3049,10 @@ fn selected_static_network_filter(
 /// `socket()` allows all `AF_UNIX` types and only TCP streams for
 /// `AF_INET`/`AF_INET6`.
 /// `socketpair()` is allowed only for `AF_UNIX`.
-/// `io_uring_setup()` is denied.
+///
+/// The three io_uring syscalls return `EPERM`, preventing queued socket
+/// operations from bypassing mediation through new or inherited rings.
+/// `EPERM` allows compatible runtimes to fall back to synchronous I/O.
 fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> ArchGuarded<Vec<SockFilterInsn>> {
     let errno_ret = SECCOMP_RET_ERRNO | (libc::EACCES as u32);
 
@@ -3069,36 +3077,38 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> ArchGuarded<Vec<SockFilt
     // A six-instruction architecture guard is prepended after this tail is
     // built; every target shifts equally, so these relative jumps stay valid:
     //  0: ld [nr]
-    //  1: jeq SOCKET     jt=9  -> insn 11
-    //  2: jeq CONNECT    jt=16 -> insn 19
-    //  3: jeq BIND       jt=16 -> insn 20
-    //  4: jeq SOCKETPAIR jt=11 -> insn 16
-    //  5: jeq SENDTO     jt=15 -> insn 21
-    //  6: jeq SENDMSG    jt=14 -> insn 21
-    //  7: jeq SENDMMSG   jt=13 -> insn 21
-    //  8: jeq IO_URING   jt=1  -> insn 10
-    //  9: ret ALLOW
-    // 10: ret ERRNO
-    // 11: ld [args[0]]
-    // 12: jeq AF_UNIX    jt=17 -> insn 30
-    // 13: jeq AF_INET    jt=8  -> insn 22
-    // 14: jeq AF_INET6   jt=7  -> insn 22
-    // 15: ret ERRNO            (bad socket family)
-    // 16: ld [args[0]]
-    // 17: jeq AF_UNIX    jt=12 -> insn 30
-    // 18: ret ERRNO            (bad socketpair family)
-    // 19: ret USER_NOTIF       (connect)
-    // 20: ret bind_action      (bind)
-    // 21: ret USER_NOTIF       (sendto/sendmsg/sendmmsg)
-    // 22: ld [args[1]]         (Internet socket type)
-    // 23: and SOCK_TYPE_MASK
-    // 24: jeq SOCK_STREAM -> insn 26
-    // 25: ret ERRNO            (UDP/raw/non-stream Internet socket)
-    // 26: ld [args[2]]         (Internet socket protocol)
-    // 27: jeq 0 -> insn 30
-    // 28: jeq IPPROTO_TCP -> insn 30
-    // 29: ret ERRNO            (non-TCP stream protocol)
-    // 30: ret ALLOW            (validated socket/socketpair)
+    //  1: jeq SOCKET          jt=11 -> insn 13
+    //  2: jeq CONNECT         jt=18 -> insn 21
+    //  3: jeq BIND            jt=18 -> insn 22
+    //  4: jeq SOCKETPAIR      jt=13 -> insn 18
+    //  5: jeq SENDTO          jt=17 -> insn 23
+    //  6: jeq SENDMSG         jt=16 -> insn 23
+    //  7: jeq SENDMMSG        jt=15 -> insn 23
+    //  8: jeq IO_URING_SETUP  jt=3  -> insn 12
+    //  9: jeq IO_URING_ENTER  jt=2  -> insn 12
+    // 10: jeq IO_URING_REGISTER jt=1 -> insn 12
+    // 11: ret ALLOW
+    // 12: ret ERRNO(EPERM)
+    // 13: ld [args[0]]
+    // 14: jeq AF_UNIX         jt=17 -> insn 32
+    // 15: jeq AF_INET         jt=8  -> insn 24
+    // 16: jeq AF_INET6        jt=7  -> insn 24
+    // 17: ret ERRNO                 (bad socket family)
+    // 18: ld [args[0]]
+    // 19: jeq AF_UNIX         jt=12 -> insn 32
+    // 20: ret ERRNO                 (bad socketpair family)
+    // 21: ret USER_NOTIF            (connect)
+    // 22: ret bind_action           (bind)
+    // 23: ret USER_NOTIF            (sendto/sendmsg/sendmmsg)
+    // 24: ld [args[1]]              (Internet socket type)
+    // 25: and SOCK_TYPE_MASK
+    // 26: jeq SOCK_STREAM -> insn 28
+    // 27: ret ERRNO                 (UDP/raw/non-stream Internet socket)
+    // 28: ld [args[2]]              (Internet socket protocol)
+    // 29: jeq 0 -> insn 32
+    // 30: jeq IPPROTO_TCP -> insn 32
+    // 31: ret ERRNO                 (non-TCP stream protocol)
+    // 32: ret ALLOW                 (validated socket/socketpair)
 
     let filter = vec![
         // 0: ld [nr]
@@ -3108,210 +3118,224 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> ArchGuarded<Vec<SockFilt
             jf: 0,
             k: SECCOMP_DATA_NR_OFFSET,
         },
-        // 1: jeq SYS_SOCKET -> 11 (jt = 11-1-1 = 9)
-        SockFilterInsn {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 9,
-            jf: 0,
-            k: SYS_SOCKET as u32,
-        },
-        // 2: jeq SYS_CONNECT -> 19 (jt = 19-2-1 = 16)
-        SockFilterInsn {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 16,
-            jf: 0,
-            k: SYS_CONNECT as u32,
-        },
-        // 3: jeq SYS_BIND -> 20 (jt = 20-3-1 = 16)
-        SockFilterInsn {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 16,
-            jf: 0,
-            k: SYS_BIND as u32,
-        },
-        // 4: jeq SYS_SOCKETPAIR -> 16 (jt = 16-4-1 = 11)
+        // 1: jeq SYS_SOCKET -> 13 (jt = 13-1-1 = 11)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 11,
             jf: 0,
-            k: SYS_SOCKETPAIR as u32,
+            k: SYS_SOCKET as u32,
         },
-        // 5: jeq SYS_SENDTO -> 21 (jt = 21-5-1 = 15)
+        // 2: jeq SYS_CONNECT -> 21 (jt = 21-2-1 = 18)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 15,
+            jt: 18,
             jf: 0,
-            k: SYS_SENDTO as u32,
+            k: SYS_CONNECT as u32,
         },
-        // 6: jeq SYS_SENDMSG -> 21 (jt = 21-6-1 = 14)
+        // 3: jeq SYS_BIND -> 22 (jt = 22-3-1 = 18)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 14,
+            jt: 18,
             jf: 0,
-            k: SYS_SENDMSG as u32,
+            k: SYS_BIND as u32,
         },
-        // 7: jeq SYS_SENDMMSG -> 21 (jt = 21-7-1 = 13)
+        // 4: jeq SYS_SOCKETPAIR -> 18 (jt = 18-4-1 = 13)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 13,
             jf: 0,
+            k: SYS_SOCKETPAIR as u32,
+        },
+        // 5: jeq SYS_SENDTO -> 23 (jt = 23-5-1 = 17)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 17,
+            jf: 0,
+            k: SYS_SENDTO as u32,
+        },
+        // 6: jeq SYS_SENDMSG -> 23 (jt = 23-6-1 = 16)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 16,
+            jf: 0,
+            k: SYS_SENDMSG as u32,
+        },
+        // 7: jeq SYS_SENDMMSG -> 23 (jt = 23-7-1 = 15)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 15,
+            jf: 0,
             k: SYS_SENDMMSG as u32,
         },
-        // 8: jeq SYS_IO_URING_SETUP -> 10 (jt = 10-8-1 = 1)
+        // 8: jeq SYS_IO_URING_SETUP -> 12 (jt = 12-8-1 = 3)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 3,
+            jf: 0,
+            k: SYS_IO_URING_SETUP as u32,
+        },
+        // 9: jeq SYS_IO_URING_ENTER -> 12 (jt = 12-9-1 = 2)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 2,
+            jf: 0,
+            k: SYS_IO_URING_ENTER as u32,
+        },
+        // 10: jeq SYS_IO_URING_REGISTER -> 12 (jt = 12-10-1 = 1)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 1,
             jf: 0,
-            k: SYS_IO_URING_SETUP as u32,
+            k: SYS_IO_URING_REGISTER as u32,
         },
-        // 9: ret ALLOW
+        // 11: ret ALLOW
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_ALLOW,
         },
-        // 10: ret ERRNO(EACCES)
+        // 12: ret ERRNO(EPERM)
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
-            k: errno_ret,
+            k: SECCOMP_RET_IO_URING_DENIED,
         },
-        // 11: ld [args[0]] -- socket() family
+        // 13: ld [args[0]] -- socket() family
         SockFilterInsn {
             code: BPF_LD | BPF_W | BPF_ABS,
             jt: 0,
             jf: 0,
             k: SECCOMP_DATA_ARG0_OFFSET,
         },
-        // 12: jeq AF_UNIX -> 30 (jt = 30-12-1 = 17)
+        // 14: jeq AF_UNIX -> 32 (jt = 32-14-1 = 17)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 17,
             jf: 0,
             k: libc::AF_UNIX as u32,
         },
-        // 13: jeq AF_INET -> 22 (jt = 22-13-1 = 8)
+        // 15: jeq AF_INET -> 24 (jt = 24-15-1 = 8)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 8,
             jf: 0,
             k: libc::AF_INET as u32,
         },
-        // 14: jeq AF_INET6 -> 22 (jt = 22-14-1 = 7)
+        // 16: jeq AF_INET6 -> 24 (jt = 24-16-1 = 7)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 7,
             jf: 0,
             k: libc::AF_INET6 as u32,
         },
-        // 15: ret ERRNO(EACCES) -- bad socket family
+        // 17: ret ERRNO(EACCES) -- bad socket family
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: errno_ret,
         },
-        // 16: ld [args[0]] -- socketpair() family
+        // 18: ld [args[0]] -- socketpair() family
         SockFilterInsn {
             code: BPF_LD | BPF_W | BPF_ABS,
             jt: 0,
             jf: 0,
             k: SECCOMP_DATA_ARG0_OFFSET,
         },
-        // 17: jeq AF_UNIX -> 30 (jt = 30-17-1 = 12)
+        // 19: jeq AF_UNIX -> 32 (jt = 32-19-1 = 12)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 12,
             jf: 0,
             k: libc::AF_UNIX as u32,
         },
-        // 18: ret ERRNO(EACCES) -- bad socketpair family
+        // 20: ret ERRNO(EACCES) -- bad socketpair family
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: errno_ret,
         },
-        // 19: ret USER_NOTIF -- connect()
+        // 21: ret USER_NOTIF -- connect()
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_USER_NOTIF,
         },
-        // 20: ret bind_action -- bind()
+        // 22: ret bind_action -- bind()
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: bind_action,
         },
-        // 21: ret USER_NOTIF -- sendto/sendmsg/sendmmsg
+        // 23: ret USER_NOTIF -- sendto/sendmsg/sendmmsg
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_USER_NOTIF,
         },
-        // 22: ld [args[1]] -- Internet socket type
+        // 24: ld [args[1]] -- Internet socket type
         SockFilterInsn {
             code: BPF_LD | BPF_W | BPF_ABS,
             jt: 0,
             jf: 0,
             k: SECCOMP_DATA_ARG1_OFFSET,
         },
-        // 23: retain the base socket type
+        // 25: retain the base socket type
         SockFilterInsn {
             code: BPF_ALU | BPF_AND | BPF_K,
             jt: 0,
             jf: 0,
             k: SOCK_TYPE_MASK,
         },
-        // 24: SOCK_STREAM -> protocol check at 26
+        // 26: SOCK_STREAM -> protocol check at 28
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 1,
             jf: 0,
             k: libc::SOCK_STREAM as u32,
         },
-        // 25: UDP/raw/non-stream Internet socket -> deny
+        // 27: UDP/raw/non-stream Internet socket -> deny
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: errno_ret,
         },
-        // 26: ld [args[2]] -- Internet socket protocol
+        // 28: ld [args[2]] -- Internet socket protocol
         SockFilterInsn {
             code: BPF_LD | BPF_W | BPF_ABS,
             jt: 0,
             jf: 0,
             k: SECCOMP_DATA_ARG2_OFFSET,
         },
-        // 27: protocol 0 -> allow at 30
+        // 29: protocol 0 -> allow at 32
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 2,
             jf: 0,
             k: 0,
         },
-        // 28: explicit TCP -> allow at 30
+        // 30: explicit TCP -> allow at 32
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 1,
             jf: 0,
             k: libc::IPPROTO_TCP as u32,
         },
-        // 29: non-TCP stream protocol -> deny
+        // 31: non-TCP stream protocol -> deny
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: errno_ret,
         },
-        // 30: ret ALLOW -- validated socket/socketpair
+        // 32: ret ALLOW -- validated socket/socketpair
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
@@ -3326,8 +3350,15 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> ArchGuarded<Vec<SockFilt
 ///
 /// Routes `connect()`, `bind()`, `sendto()`, `sendmsg()`, and `sendmmsg()`
 /// to `USER_NOTIF` so the supervisor can inspect `sockaddr_un` paths.
-/// Everything else is allowed: TCP policy is Landlock's responsibility on
-/// V4+ kernels; this filter only handles AF_UNIX.
+///
+/// Denies `io_uring_setup()`, `io_uring_enter()`, and
+/// `io_uring_register()` with `EPERM`. io_uring socket operations bypass
+/// syscall-level pathname mediation, so existing rings must be unusable as
+/// well as preventing new rings from being created. `EPERM` allows compatible
+/// runtimes to fall back to synchronous I/O.
+///
+/// All other syscalls are allowed. TCP policy remains Landlock's
+/// responsibility on V4+ kernels.
 ///
 /// The IPC handshake (child→parent SCM_RIGHTS transfer of the notify fd)
 /// must complete *before* this filter is installed. That ordering removes
@@ -3340,13 +3371,17 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> ArchGuarded<Vec<SockFilt
 /// Instruction layout:
 /// ```text
 ///  0: ld  [nr]
-///  1: jeq SYS_CONNECT  jt=+5 (->  7: notify)
-///  2: jeq SYS_BIND     jt=+4 (->  7: notify)
-///  3: jeq SYS_SENDTO   jt=+3 (->  7: notify)
-///  4: jeq SYS_SENDMSG  jt=+2 (->  7: notify)
-///  5: jeq SYS_SENDMMSG jt=+1 (->  7: notify)
-///  6: ret ALLOW
-///  7: ret USER_NOTIF
+///  1: jeq SYS_CONNECT           jt=+9 (-> 11: notify)
+///  2: jeq SYS_BIND              jt=+8 (-> 11: notify)
+///  3: jeq SYS_SENDTO            jt=+7 (-> 11: notify)
+///  4: jeq SYS_SENDMSG           jt=+6 (-> 11: notify)
+///  5: jeq SYS_SENDMMSG          jt=+5 (-> 11: notify)
+///  6: jeq SYS_IO_URING_SETUP    jt=+3 (-> 10: EPERM)
+///  7: jeq SYS_IO_URING_ENTER    jt=+2 (-> 10: EPERM)
+///  8: jeq SYS_IO_URING_REGISTER jt=+1 (-> 10: EPERM)
+///  9: ret ALLOW
+/// 10: ret ERRNO(EPERM)
+/// 11: ret USER_NOTIF
 /// ```
 fn build_seccomp_af_unix_filter() -> ArchGuarded<Vec<SockFilterInsn>> {
     // Non-native ABIs are denied outright. The i386 socket syscalls are
@@ -3365,49 +3400,77 @@ fn build_seccomp_af_unix_filter() -> ArchGuarded<Vec<SockFilterInsn>> {
             jf: 0,
             k: SECCOMP_DATA_NR_OFFSET,
         },
-        // 1: jeq SYS_CONNECT -> 7 (jt = 7-1-1 = 5)
+        // 1: jeq SYS_CONNECT -> 11 (jt = 11-1-1 = 9)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 9,
+            jf: 0,
+            k: SYS_CONNECT as u32,
+        },
+        // 2: jeq SYS_BIND -> 11 (jt = 11-2-1 = 8)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 8,
+            jf: 0,
+            k: SYS_BIND as u32,
+        },
+        // 3: jeq SYS_SENDTO -> 11 (jt = 11-3-1 = 7)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 7,
+            jf: 0,
+            k: SYS_SENDTO as u32,
+        },
+        // 4: jeq SYS_SENDMSG -> 11 (jt = 11-4-1 = 6)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 6,
+            jf: 0,
+            k: SYS_SENDMSG as u32,
+        },
+        // 5: jeq SYS_SENDMMSG -> 11 (jt = 11-5-1 = 5)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 5,
             jf: 0,
-            k: SYS_CONNECT as u32,
+            k: SYS_SENDMMSG as u32,
         },
-        // 2: jeq SYS_BIND -> 7 (jt = 7-2-1 = 4)
-        SockFilterInsn {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 4,
-            jf: 0,
-            k: SYS_BIND as u32,
-        },
-        // 3: jeq SYS_SENDTO -> 7 (jt = 7-3-1 = 3)
+        // 6: jeq SYS_IO_URING_SETUP -> 10 (jt = 10-6-1 = 3)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 3,
             jf: 0,
-            k: SYS_SENDTO as u32,
+            k: SYS_IO_URING_SETUP as u32,
         },
-        // 4: jeq SYS_SENDMSG -> 7 (jt = 7-4-1 = 2)
+        // 7: jeq SYS_IO_URING_ENTER -> 10 (jt = 10-7-1 = 2)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 2,
             jf: 0,
-            k: SYS_SENDMSG as u32,
+            k: SYS_IO_URING_ENTER as u32,
         },
-        // 5: jeq SYS_SENDMMSG -> 7 (jt = 7-5-1 = 1)
+        // 8: jeq SYS_IO_URING_REGISTER -> 10 (jt = 10-8-1 = 1)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 1,
             jf: 0,
-            k: SYS_SENDMMSG as u32,
+            k: SYS_IO_URING_REGISTER as u32,
         },
-        // 6: ret ALLOW
+        // 9: ret ALLOW
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_ALLOW,
         },
-        // 7: ret USER_NOTIF
+        // 10: ret ERRNO(EPERM)
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_IO_URING_DENIED,
+        },
+        // 11: ret USER_NOTIF
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
@@ -5407,9 +5470,9 @@ mod tests {
     #[test]
     fn prepared_notify_filters_own_their_bpf_storage() {
         let proxy = prepare_seccomp_proxy_filter(true);
-        assert_eq!(proxy.filter.len(), 37);
+        assert_eq!(proxy.filter.len(), 39);
         let unix = prepare_seccomp_af_unix_filter();
-        assert_eq!(unix.filter.len(), 14);
+        assert_eq!(unix.filter.len(), 18);
     }
 
     #[test]
@@ -5439,6 +5502,8 @@ mod tests {
                 libc::SYS_write as i32,
                 libc::SYS_execve as i32,
                 SYS_IO_URING_SETUP,
+                SYS_IO_URING_ENTER,
+                SYS_IO_URING_REGISTER,
             ] {
                 for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
                     for kind in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_RAW] {
@@ -5482,27 +5547,39 @@ mod tests {
     #[test]
     fn test_build_seccomp_proxy_filter_with_bind() {
         let filter = build_seccomp_proxy_filter(true);
-        assert_eq!(filter.len(), 37);
+        assert_eq!(filter.len(), 39);
 
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(filter[0].k, SECCOMP_DATA_ARCH_OFFSET);
         assert_eq!(filter[6].k, SECCOMP_DATA_NR_OFFSET);
 
-        // Tail insn 6 (actual 12): jeq SENDMSG -> tail 21.
+        // Tail insn 6 (actual 12): jeq SENDMSG -> tail 23.
         assert_eq!(filter[12].k, SYS_SENDMSG as u32);
-        assert_eq!(filter[12].jt, 14);
+        assert_eq!(filter[12].jt, 16);
 
-        // Tail insn 19 (actual 25): USER_NOTIF (connect)
-        assert_eq!(filter[25].code, BPF_RET | BPF_K);
-        assert_eq!(filter[25].k, SECCOMP_RET_USER_NOTIF);
-
-        // Tail insn 20 (actual 26): USER_NOTIF (bind)
-        assert_eq!(filter[26].code, BPF_RET | BPF_K);
-        assert_eq!(filter[26].k, SECCOMP_RET_USER_NOTIF);
-
-        // Tail insn 21 (actual 27): USER_NOTIF (sendto/sendmsg/sendmmsg)
+        // Tail insn 21 (actual 27): USER_NOTIF (connect)
         assert_eq!(filter[27].code, BPF_RET | BPF_K);
         assert_eq!(filter[27].k, SECCOMP_RET_USER_NOTIF);
+
+        // Tail insn 22 (actual 28): USER_NOTIF (bind)
+        assert_eq!(filter[28].code, BPF_RET | BPF_K);
+        assert_eq!(filter[28].k, SECCOMP_RET_USER_NOTIF);
+
+        // Tail insn 23 (actual 29): USER_NOTIF (sendto/sendmsg/sendmmsg)
+        assert_eq!(filter[29].code, BPF_RET | BPF_K);
+        assert_eq!(filter[29].k, SECCOMP_RET_USER_NOTIF);
+
+        for syscall in [
+            SYS_IO_URING_SETUP,
+            SYS_IO_URING_ENTER,
+            SYS_IO_URING_REGISTER,
+        ] {
+            assert_eq!(
+                evaluate_static_bpf(&filter, syscall, [0; 6]),
+                SECCOMP_RET_IO_URING_DENIED,
+                "io_uring syscall {syscall} must fail with EPERM"
+            );
+        }
 
         // Internet sockets are restricted to TCP before destination
         // operations reach the supervisor.
@@ -5523,9 +5600,9 @@ mod tests {
             SECCOMP_RET_ERRNO | (libc::EACCES as u32)
         );
 
-        // Tail insn 30 (actual 36): ALLOW (validated socket/socketpair)
-        assert_eq!(filter[36].code, BPF_RET | BPF_K);
-        assert_eq!(filter[36].k, SECCOMP_RET_ALLOW);
+        // Tail insn 32 (actual 38): ALLOW (validated socket/socketpair)
+        assert_eq!(filter[38].code, BPF_RET | BPF_K);
+        assert_eq!(filter[38].k, SECCOMP_RET_ALLOW);
     }
 
     /// Regression test for the Landlock V2 + `has_bind_ports=false`
@@ -5535,24 +5612,24 @@ mod tests {
     #[test]
     fn test_build_seccomp_proxy_filter_without_bind() {
         let filter = build_seccomp_proxy_filter(false);
-        assert_eq!(filter.len(), 37);
+        assert_eq!(filter.len(), 39);
 
-        assert_eq!(filter[26].code, BPF_RET | BPF_K);
+        assert_eq!(filter[28].code, BPF_RET | BPF_K);
         assert_eq!(
-            filter[26].k, SECCOMP_RET_USER_NOTIF,
+            filter[28].k, SECCOMP_RET_USER_NOTIF,
             "bind must route to USER_NOTIF regardless of has_bind_ports so \
              the supervisor can permit AF_UNIX pathname bind (#685)"
         );
     }
 
     #[test]
-    fn test_build_seccomp_af_unix_filter_notifies_all_syscalls() {
+    fn test_build_seccomp_af_unix_filter_mediates_sockets_and_blocks_io_uring() {
         let filter = build_seccomp_af_unix_filter();
-        // 14 instructions: 0-5 arch guard, then the 8-instruction tail
-        // (6 ld-nr, 7-11 jeq dispatch, 12 ALLOW, 13 USER_NOTIF).
+        // 18 instructions: 0-5 arch guard, then the 12-instruction tail
+        // (6 ld-nr, 7-14 jeq dispatch, 15 ALLOW, 16 EPERM, 17 USER_NOTIF).
         // No check_fd block — the IPC handshake completes before the filter
         // is installed, so no fd-based exemption is needed.
-        assert_eq!(filter.len(), 14);
+        assert_eq!(filter.len(), 18);
 
         // Architecture guard: compat ABIs are denied before any dispatch, since
         // i386 multiplexes these calls through socketcall(2) and BPF cannot
@@ -5569,18 +5646,31 @@ mod tests {
         assert_eq!(filter[6].k, SECCOMP_DATA_NR_OFFSET);
 
         assert_eq!(filter[7].k, SYS_CONNECT as u32);
-        assert_eq!(filter[7].jt, 5); // -> insn 13 (USER_NOTIF)
+        assert_eq!(filter[7].jt, 9); // -> insn 17 (USER_NOTIF)
         assert_eq!(filter[8].k, SYS_BIND as u32);
-        assert_eq!(filter[8].jt, 4); // -> insn 13
+        assert_eq!(filter[8].jt, 8); // -> insn 17
         assert_eq!(filter[9].k, SYS_SENDTO as u32);
-        assert_eq!(filter[9].jt, 3); // -> insn 13
+        assert_eq!(filter[9].jt, 7); // -> insn 17
         assert_eq!(filter[10].k, SYS_SENDMSG as u32);
-        assert_eq!(filter[10].jt, 2); // -> insn 13 (no special exemption)
+        assert_eq!(filter[10].jt, 6); // -> insn 17 (no special exemption)
         assert_eq!(filter[11].k, SYS_SENDMMSG as u32);
-        assert_eq!(filter[11].jt, 1); // -> insn 13
+        assert_eq!(filter[11].jt, 5); // -> insn 17
 
-        assert_eq!(filter[12].k, SECCOMP_RET_ALLOW);
-        assert_eq!(filter[13].k, SECCOMP_RET_USER_NOTIF);
+        assert_eq!(filter[15].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[16].k, SECCOMP_RET_IO_URING_DENIED);
+        assert_eq!(filter[17].k, SECCOMP_RET_USER_NOTIF);
+
+        for syscall in [
+            SYS_IO_URING_SETUP,
+            SYS_IO_URING_ENTER,
+            SYS_IO_URING_REGISTER,
+        ] {
+            assert_eq!(
+                evaluate_static_bpf(&filter, syscall, [0; 6]),
+                SECCOMP_RET_IO_URING_DENIED,
+                "io_uring syscall {syscall} must fail with EPERM"
+            );
+        }
 
         // Regression: an i386-ABI caller must not slip past mediation. Before
         // the guard, these syscall numbers matched nothing in the dispatch and

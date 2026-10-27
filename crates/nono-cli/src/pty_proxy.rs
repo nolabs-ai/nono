@@ -23,6 +23,7 @@ use nix::unistd::{Pid, tcgetpgrp};
 use nono::{NonoError, Result};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::num::NonZeroU16;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -219,19 +220,27 @@ struct ScreenState {
     parser: vt100::Parser,
 }
 
+fn nonzero_screen_dimension(value: usize) -> NonZeroU16 {
+    let bounded = value.clamp(1, u16::MAX as usize) as u16;
+    NonZeroU16::new(bounded).unwrap_or(NonZeroU16::MIN)
+}
+
 impl ScreenState {
     fn new(rows: usize, cols: usize) -> Self {
-        let rows = rows.max(1).min(u16::MAX as usize) as u16;
-        let cols = cols.max(1).min(u16::MAX as usize) as u16;
         Self {
-            parser: vt100::Parser::new(rows, cols, VT_SCROLLBACK_ROWS),
+            parser: vt100::Parser::new(
+                nonzero_screen_dimension(rows),
+                nonzero_screen_dimension(cols),
+                VT_SCROLLBACK_ROWS,
+            ),
         }
     }
 
     fn resize(&mut self, rows: usize, cols: usize) {
-        let rows = rows.max(1).min(u16::MAX as usize) as u16;
-        let cols = cols.max(1).min(u16::MAX as usize) as u16;
-        self.parser.screen_mut().set_size(rows, cols);
+        self.parser.screen_mut().set_size(
+            nonzero_screen_dimension(rows),
+            nonzero_screen_dimension(cols),
+        );
     }
 
     fn apply_bytes(&mut self, bytes: &[u8]) {
@@ -239,7 +248,7 @@ impl ScreenState {
     }
 
     fn render(&self) -> Vec<u8> {
-        self.parser.screen().state_formatted()
+        self.parser.screen().state_formatted().into_bytes()
     }
 
     fn render_plaintext(&self) -> String {
@@ -247,7 +256,8 @@ impl ScreenState {
     }
 
     fn size(&self) -> (u16, u16) {
-        self.parser.screen().size()
+        let (rows, cols) = self.parser.screen().size();
+        (rows.get(), cols.get())
     }
 
     fn cursor_position(&self) -> (u16, u16) {
@@ -1589,6 +1599,13 @@ fn select_attach_replay_bytes(
     rendered_snapshot: Vec<u8>,
     rendered_plaintext: &str,
 ) -> Vec<u8> {
+    let raw_replay_restores_alternate_screen = if alternate_screen_active {
+        let mut tracker = AltScreenTracker::default();
+        tracker.observe(&raw_scrollback);
+        tracker.in_alt_screen
+    } else {
+        false
+    };
     let body = compose_replay_body(
         alternate_screen_active,
         raw_scrollback,
@@ -1596,16 +1613,21 @@ fn select_attach_replay_bytes(
         rendered_plaintext,
     );
     if alternate_screen_active {
-        // Only force the outer terminal into the alternate screen when the
-        // child is currently using it (vim, htop, etc.). For normal-mode
-        // sessions (shells, Claude Code) we stay in normal screen so the
-        // user's terminal-emulator scrollback and mouse-wheel behavior are
-        // preserved.
-        let mut out =
-            Vec::with_capacity(ATTACH_SCREEN_ENTER_ESCAPE.len().saturating_add(body.len()));
-        out.extend_from_slice(ATTACH_SCREEN_ENTER_ESCAPE);
-        out.extend_from_slice(&body);
-        out
+        if raw_replay_restores_alternate_screen {
+            body
+        } else {
+            // Force the outer terminal into the alternate screen only when the
+            // retained raw history was truncated past the child's active
+            // alternate-screen entry. When the history still contains that entry,
+            // replay it from the normal screen so the terminal saves the rebuilt
+            // child shell buffer. Otherwise leaving the TUI later would restore
+            // the host's pre-attach buffer instead of the child's normal screen.
+            let mut out =
+                Vec::with_capacity(ATTACH_SCREEN_ENTER_ESCAPE.len().saturating_add(body.len()));
+            out.extend_from_slice(ATTACH_SCREEN_ENTER_ESCAPE);
+            out.extend_from_slice(&body);
+            out
+        }
     } else if raw_scrollback_present {
         // Normal-screen, session has produced output: wipe the outer
         // terminal's native scrollback before replaying so the user doesn't
@@ -2764,7 +2786,8 @@ mod tests {
         AltScreenTracker, AttachedClient, CprReplyParse, DEFAULT_DETACH_SEQUENCE,
         ERASE_NATIVE_SCROLLBACK, PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_NORMAL,
         decode_attach_handshake, discard_late_terminal_input, encode_attach_request_frame,
-        read_fd_once, select_attach_replay_bytes, terminal_restore_escape, write_all_fd,
+        nonzero_screen_dimension, read_fd_once, select_attach_replay_bytes,
+        terminal_restore_escape, write_all_fd,
     };
     use nix::libc;
     use nix::pty::{OpenptyResult, Winsize, openpty};
@@ -2978,7 +3001,11 @@ mod tests {
 
     #[test]
     fn remote_restore_clears_normal_viewport_and_retains_scrollback() {
-        let mut parser = vt100::Parser::new(6, 30, 30);
+        let mut parser = vt100::Parser::new(
+            nonzero_screen_dimension(6),
+            nonzero_screen_dimension(30),
+            30,
+        );
         parser.process(b"foo\r\nbar\x1b[41m\x1b[2;4r\x1b[?6h");
         parser.process(&remote_terminal_restore_escape(false, 6));
         assert_eq!(parser.screen().contents(), "");
@@ -2993,7 +3020,11 @@ mod tests {
 
     #[test]
     fn remote_restore_moves_saved_banner_out_of_the_prompt_area() {
-        let mut parser = vt100::Parser::new(6, 30, 30);
+        let mut parser = vt100::Parser::new(
+            nonzero_screen_dimension(6),
+            nonzero_screen_dimension(30),
+            30,
+        );
         parser.process(b"$ nono connect\r\nconnected\r\ndetach keys\r\n");
         // Reproduce a saved cursor above the connection banner. Restoring only
         // the alternate buffer would put the next prompt over that banner.
@@ -3178,6 +3209,23 @@ mod tests {
         );
         assert_eq!(replay, with_alt_prefix(b"rawrendered"));
         assert!(!replay.starts_with(ERASE_NATIVE_SCROLLBACK));
+    }
+
+    #[test]
+    fn attach_replay_uses_retained_alt_entry_to_save_the_child_normal_screen() {
+        let raw = b"shell prompt\r\n\x1b[?1049hless contents";
+        let replay = select_attach_replay_bytes(
+            true,
+            true,
+            raw.to_vec(),
+            b"rendered less".to_vec(),
+            "less contents",
+        );
+
+        let mut expected = raw.to_vec();
+        expected.extend_from_slice(b"rendered less");
+        assert_eq!(replay, expected);
+        assert!(!replay.starts_with(ATTACH_SCREEN_ENTER_ESCAPE));
     }
 
     #[test]

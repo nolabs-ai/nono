@@ -323,7 +323,7 @@ impl DetectedAbi {
     /// Whether execute access control is supported strongly enough for command sandbox execution.
     #[must_use]
     pub fn has_execute(&self) -> bool {
-        matches!(self.abi, ABI::V3 | ABI::V4 | ABI::V5 | ABI::V6)
+        self.abi >= ABI::V3
     }
 
     /// Whether TCP network filtering is supported (V4+).
@@ -344,18 +344,44 @@ impl DetectedAbi {
         !Scope::from_all(self.abi).is_empty()
     }
 
+    /// Whether audit logging control flags for `landlock_restrict_self` are supported (V7+).
+    #[must_use]
+    pub fn has_audit_log_flags(&self) -> bool {
+        self.abi >= ABI::V7
+    }
+
+    /// Whether enforcing a ruleset on all threads at once (TSYNC) is supported (V8+).
+    #[must_use]
+    pub fn has_tsync(&self) -> bool {
+        self.abi >= ABI::V8
+    }
+
+    /// Whether pathname UNIX socket connect control is supported (V9+).
+    #[must_use]
+    pub fn has_resolve_unix(&self) -> bool {
+        AccessFs::from_all(self.abi).contains(AccessFs::ResolveUnix)
+    }
+
+    /// The ABI whose access rights and scopes nono enforces on this kernel.
+    ///
+    /// This is the detected ABI clamped to [`MAX_ENFORCED_ABI`]. Detection may
+    /// report a newer ABI, but its features are not handled until nono
+    /// integrates them.
+    #[must_use]
+    pub fn enforced_abi(&self) -> ABI {
+        self.abi.min(MAX_ENFORCED_ABI)
+    }
+
     /// Return a human-readable version string (e.g., "V4").
     #[must_use]
     pub fn version_string(&self) -> &'static str {
-        match self.abi {
-            ABI::V1 => "V1",
-            ABI::V2 => "V2",
-            ABI::V3 => "V3",
-            ABI::V4 => "V4",
-            ABI::V5 => "V5",
-            ABI::V6 => "V6",
-            _ => "unknown",
-        }
+        abi_version_string(self.abi)
+    }
+
+    /// Return the version string of [`DetectedAbi::enforced_abi`].
+    #[must_use]
+    pub fn enforced_version_string(&self) -> &'static str {
+        abi_version_string(self.enforced_abi())
     }
 
     /// Return a list of available feature names at this ABI level.
@@ -380,7 +406,36 @@ impl DetectedAbi {
         if self.has_scoping() {
             features.push("Signal and abstract UNIX socket scoping".to_string());
         }
+        if self.has_audit_log_flags() {
+            features.push(format!("Audit logging flags {NOT_YET_ENFORCED}"));
+        }
+        if self.has_tsync() {
+            features.push(format!("All-thread enforcement (TSYNC) {NOT_YET_ENFORCED}"));
+        }
+        if self.has_resolve_unix() {
+            features.push(format!(
+                "Pathname UNIX socket control (ResolveUnix) {NOT_YET_ENFORCED}"
+            ));
+        }
         features
+    }
+}
+
+/// Suffix for detected kernel features above [`MAX_ENFORCED_ABI`].
+const NOT_YET_ENFORCED: &str = "[detected, not yet enforced by nono]";
+
+fn abi_version_string(abi: ABI) -> &'static str {
+    match abi {
+        ABI::V1 => "V1",
+        ABI::V2 => "V2",
+        ABI::V3 => "V3",
+        ABI::V4 => "V4",
+        ABI::V5 => "V5",
+        ABI::V6 => "V6",
+        ABI::V7 => "V7",
+        ABI::V8 => "V8",
+        ABI::V9 => "V9",
+        _ => "unknown",
     }
 }
 
@@ -422,13 +477,61 @@ impl std::fmt::Display for DetectedAbi {
     }
 }
 
+/// Highest Landlock ABI whose access rights and scopes nono enforces.
+///
+/// Detection reports the kernel's ABI up to the newest the `landlock` crate
+/// knows, but handled access rights are derived from this cap. A newer ABI can
+/// add rights that are denied by default once handled: V9's
+/// `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` would block every pathname UNIX socket
+/// connect unless nono also emits allow rules for it. Raise this only together
+/// with the capability and rule mapping for the new ABI's features.
+pub const MAX_ENFORCED_ABI: ABI = ABI::V6;
+
 /// ABI probe order: highest to lowest.
-const ABI_PROBE_ORDER: [ABI; 6] = [ABI::V6, ABI::V5, ABI::V4, ABI::V3, ABI::V2, ABI::V1];
+const ABI_PROBE_ORDER: [ABI; 9] = [
+    ABI::V9,
+    ABI::V8,
+    ABI::V7,
+    ABI::V6,
+    ABI::V5,
+    ABI::V4,
+    ABI::V3,
+    ABI::V2,
+    ABI::V1,
+];
+
+/// `landlock_create_ruleset` flag that returns the kernel's ABI version.
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
+
+/// Return the raw Landlock ABI version reported by the kernel.
+///
+/// Unlike [`detect_abi`], this is not limited to ABIs the `landlock` crate
+/// knows, so it identifies kernels newer than nono recognises. Detection uses
+/// it only as an upper bound on probed candidates; it never selects enforced
+/// access rights, which stay capped at [`MAX_ENFORCED_ABI`].
+///
+/// Returns `None` if Landlock is unavailable.
+#[must_use]
+pub fn kernel_abi_version() -> Option<u32> {
+    // SAFETY: with a NULL attr pointer, zero size, and the VERSION flag, the
+    // kernel only returns an integer and does not read or write user memory.
+    let version = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<RawLandlockRulesetAttr>(),
+            0_usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    u32::try_from(version).ok().filter(|v| *v > 0)
+}
 
 /// Detect the highest Landlock ABI supported by the running kernel.
 ///
-/// Probes from V6 down to V1 using `HardRequirement` compatibility mode.
-/// Returns the highest ABI for which a full ruleset can be created.
+/// Probes from the newest ABI known to the `landlock` crate down to V1 using
+/// `HardRequirement` compatibility mode. Returns the highest ABI for which a
+/// full ruleset can be created. Enforcement is clamped separately to
+/// [`MAX_ENFORCED_ABI`]; see [`DetectedAbi::enforced_abi`].
 ///
 /// The result is cached after the first call since the kernel ABI does not
 /// change at runtime.
@@ -449,10 +552,31 @@ pub fn detect_abi() -> Result<DetectedAbi> {
 }
 
 fn detect_abi_uncached() -> Result<DetectedAbi> {
+    detect_abi_with(kernel_abi_version(), probe_abi_candidate)
+}
+
+/// Select the highest ABI that the kernel reports and a probe confirms.
+///
+/// Probing alone cannot tell V6, V7, and V8 apart: they handle the same access
+/// rights and scopes and differ only in `landlock_restrict_self` flags, which
+/// cannot be probed without restricting the caller. The kernel-reported
+/// version bounds the candidates and the probe confirms each one.
+fn detect_abi_with(
+    kernel_version: Option<u32>,
+    probe: impl Fn(ABI) -> std::result::Result<(), String>,
+) -> Result<DetectedAbi> {
+    let Some(kernel_version) = kernel_version else {
+        return Err(NonoError::SandboxInit(
+            "No supported Landlock ABI detected (kernel ABI version query failed)".to_string(),
+        ));
+    };
     let mut last_error = None;
 
-    for &abi in &ABI_PROBE_ORDER {
-        match probe_abi_candidate(abi) {
+    for &abi in ABI_PROBE_ORDER
+        .iter()
+        .filter(|abi| **abi as u32 <= kernel_version)
+    {
+        match probe(abi) {
             Ok(()) => return Ok(DetectedAbi::new(abi)),
             Err(err) => {
                 debug!("ABI {:?} probe failed: {}", abi, err);
@@ -568,8 +692,10 @@ pub fn support_info() -> SupportInfo {
                 is_supported: true,
                 platform: "linux",
                 details: format!(
-                    "Landlock available ({}, features: {})",
+                    "Landlock available ({}, enforcing {}{}, features: {})",
                     detected,
+                    detected.enforced_version_string(),
+                    unrecognized_kernel_abi_note(&detected),
                     features.join(", ")
                 ),
             }
@@ -580,6 +706,16 @@ pub fn support_info() -> SupportInfo {
             details: "Landlock not available. Requires Linux kernel 5.13+ with Landlock enabled."
                 .to_string(),
         },
+    }
+}
+
+/// Describe a kernel ABI newer than the `landlock` crate recognises, if any.
+fn unrecognized_kernel_abi_note(detected: &DetectedAbi) -> String {
+    match kernel_abi_version() {
+        Some(kernel) if kernel > detected.abi as u32 => {
+            format!(", kernel reports unrecognised ABI V{kernel}")
+        }
+        _ => String::new(),
     }
 }
 
@@ -892,7 +1028,7 @@ fn prepare_with_abi_inner(
     abi: &DetectedAbi,
     tcp_network: TcpNetworkEnforcement,
 ) -> Result<PreparedLandlockSandbox> {
-    let target_abi = abi.abi;
+    let target_abi = abi.enforced_abi();
     let scopes = requested_scopes(caps, abi)?;
 
     if tcp_network.handles_tcp()
@@ -1049,8 +1185,11 @@ fn apply_with_abi_inner(
     abi: &DetectedAbi,
     tcp_network: TcpNetworkEnforcement,
 ) -> Result<SeccompNetFallback> {
-    let target_abi = abi.abi;
-    info!("Using Landlock ABI {:?}", target_abi);
+    let target_abi = abi.enforced_abi();
+    info!(
+        "Using Landlock ABI {:?} (kernel supports {:?})",
+        target_abi, abi.abi
+    );
     let scopes = requested_scopes(caps, abi)?;
 
     if tcp_network.handles_tcp()
@@ -4656,6 +4795,167 @@ mod tests {
         assert_eq!(DetectedAbi::new(ABI::V1).version_string(), "V1");
         assert_eq!(DetectedAbi::new(ABI::V4).version_string(), "V4");
         assert_eq!(DetectedAbi::new(ABI::V6).version_string(), "V6");
+        assert_eq!(DetectedAbi::new(ABI::V7).version_string(), "V7");
+        assert_eq!(DetectedAbi::new(ABI::V8).version_string(), "V8");
+        assert_eq!(DetectedAbi::new(ABI::V9).version_string(), "V9");
+    }
+
+    #[test]
+    fn test_abi_probe_order_covers_every_crate_abi() {
+        // ABI::from saturates to the newest ABI the landlock crate knows.
+        // When a crate upgrade adds an ABI, this fails until the probe order,
+        // version strings, and feature reporting are extended for it.
+        assert_eq!(ABI_PROBE_ORDER[0], ABI::from(i32::MAX));
+        assert_eq!(ABI_PROBE_ORDER[ABI_PROBE_ORDER.len() - 1], ABI::V1);
+        assert!(ABI_PROBE_ORDER.windows(2).all(|w| w[0] > w[1]));
+        assert_eq!(ABI_PROBE_ORDER.len(), ABI::from(i32::MAX) as usize);
+        for abi in ABI_PROBE_ORDER {
+            assert_ne!(DetectedAbi::new(abi).version_string(), "unknown");
+        }
+    }
+
+    #[test]
+    fn test_enforced_abi_is_clamped() {
+        assert_eq!(DetectedAbi::new(ABI::V1).enforced_abi(), ABI::V1);
+        assert_eq!(DetectedAbi::new(ABI::V6).enforced_abi(), ABI::V6);
+        for abi in [ABI::V7, ABI::V8, ABI::V9] {
+            let detected = DetectedAbi::new(abi);
+            assert_eq!(detected.enforced_abi(), MAX_ENFORCED_ABI);
+            assert!(!AccessFs::from_all(detected.enforced_abi()).contains(AccessFs::ResolveUnix));
+        }
+        assert_eq!(DetectedAbi::new(ABI::V9).enforced_version_string(), "V6");
+    }
+
+    #[test]
+    fn test_has_execute_for_v3_and_newer() {
+        assert!(!DetectedAbi::new(ABI::V1).has_execute());
+        assert!(!DetectedAbi::new(ABI::V2).has_execute());
+        for abi in ABI_PROBE_ORDER.into_iter().filter(|abi| *abi >= ABI::V3) {
+            assert!(DetectedAbi::new(abi).has_execute(), "{abi:?}");
+        }
+    }
+
+    #[test]
+    fn test_detected_abi_features_above_enforced_are_marked() {
+        let v6 = DetectedAbi::new(ABI::V6);
+        assert!(!v6.has_audit_log_flags() && !v6.has_tsync() && !v6.has_resolve_unix());
+        assert!(
+            !v6.feature_names()
+                .iter()
+                .any(|n| n.contains(NOT_YET_ENFORCED))
+        );
+
+        let v9 = DetectedAbi::new(ABI::V9);
+        assert!(v9.has_audit_log_flags() && v9.has_tsync() && v9.has_resolve_unix());
+        let marked = v9
+            .feature_names()
+            .into_iter()
+            .filter(|n| n.contains(NOT_YET_ENFORCED))
+            .count();
+        assert_eq!(marked, 3);
+    }
+
+    #[test]
+    fn test_kernel_abi_version_matches_detection() {
+        let Ok(detected) = detect_abi() else {
+            return;
+        };
+        let kernel = kernel_abi_version().expect("Landlock detected but version query failed");
+        let newest_known = ABI_PROBE_ORDER[0] as u32;
+        assert_eq!(detected.abi as u32, kernel.min(newest_known));
+    }
+
+    fn probe_always_succeeds(_: ABI) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
+    #[test]
+    fn test_detect_abi_bounded_by_kernel_version() {
+        // V6-V8 accept identical probe rulesets, so a probe-only detector
+        // would report V8 on these kernels.
+        let v6 = detect_abi_with(Some(6), probe_always_succeeds).expect("simulated V6");
+        assert_eq!(v6.abi, ABI::V6);
+        assert!(!v6.has_audit_log_flags() && !v6.has_tsync());
+
+        let v7 = detect_abi_with(Some(7), probe_always_succeeds).expect("simulated V7");
+        assert_eq!(v7.abi, ABI::V7);
+        assert!(v7.has_audit_log_flags() && !v7.has_tsync());
+
+        let v8 = detect_abi_with(Some(8), probe_always_succeeds).expect("simulated V8");
+        assert_eq!(v8.abi, ABI::V8);
+        assert!(v8.has_tsync() && !v8.has_resolve_unix());
+    }
+
+    #[test]
+    fn test_detect_abi_kernel_newer_than_crate_saturates() {
+        let detected = detect_abi_with(Some(10), probe_always_succeeds).expect("simulated V10");
+        assert_eq!(detected.abi, ABI_PROBE_ORDER[0]);
+    }
+
+    #[test]
+    fn test_detect_abi_still_requires_probe() {
+        let detected = detect_abi_with(Some(9), |abi| {
+            if abi <= ABI::V5 {
+                Ok(())
+            } else {
+                Err("unsupported".to_string())
+            }
+        })
+        .expect("simulated probe failures above V5");
+        assert_eq!(detected.abi, ABI::V5);
+    }
+
+    #[test]
+    fn test_detect_abi_fails_without_kernel_version() {
+        assert!(detect_abi_with(None, probe_always_succeeds).is_err());
+    }
+
+    /// Detection above [`MAX_ENFORCED_ABI`] must not handle newer access
+    /// rights. On a V9+ kernel, handling `ResolveUnix` without allow rules
+    /// would deny this pathname UNIX socket connect with EACCES.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pathname_unix_connect_unaffected_by_unenforced_resolve_unix() {
+        let detected = match detect_abi() {
+            Ok(detected) if detected.has_resolve_unix() => detected,
+            _ => return,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("probe.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind pathname socket");
+        let caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowAll)
+            .set_ipc_mode(IpcMode::Full);
+
+        // SAFETY: fork is used in a test helper; child exits via _exit.
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork() for pathname socket probe failed");
+        if child_pid == 0 {
+            let code = match apply_auto_with_abi(&caps, &detected) {
+                Ok(_) => match std::os::unix::net::UnixStream::connect(&socket_path) {
+                    Ok(_) => 0,
+                    Err(err) if err.raw_os_error() == Some(libc::EACCES) => 1,
+                    Err(_) => 2,
+                },
+                Err(_) => 3,
+            };
+            // SAFETY: _exit is async-signal-safe and ends the forked child.
+            unsafe { libc::_exit(code) };
+        }
+
+        let mut status = 0;
+        // SAFETY: child_pid is the pid returned by fork in the parent.
+        let waited = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+        assert_eq!(waited, child_pid, "waitpid() for probe child failed");
+        drop(listener);
+        assert!(libc::WIFEXITED(status), "probe child did not exit normally");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "pathname connect failed under detected {detected} (1=EACCES, 2=other, 3=apply)"
+        );
     }
 
     #[test]

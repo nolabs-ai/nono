@@ -95,8 +95,8 @@ pub use path::try_canonicalize;
 pub use resource::ResourceLimits;
 #[cfg(target_os = "linux")]
 pub use sandbox::{
-    DetectedAbi, LandlockScopePolicy, NamespaceProbe, NamespaceProbeStage, NamespaceSpec,
-    SeccompOpts, detect_abi, is_wsl2, landlock_scope_policy,
+    DetectedAbi, LandlockScopePolicy, MAX_ENFORCED_ABI, NamespaceProbe, NamespaceProbeStage,
+    NamespaceSpec, SeccompOpts, detect_abi, is_wsl2, kernel_abi_version, landlock_scope_policy,
 };
 pub use sandbox::{Sandbox, SupportInfo};
 pub use scrub::{

@@ -114,11 +114,14 @@ See [Standalone Proxy](/cli/features/networking#standalone-proxy-nono-proxy) for
 
 ### `nono why`
 
-Check why filesystem, network, scope, or command access would be allowed or denied. Designed for both human debugging and programmatic use by AI agents.
+Check why filesystem, pathname Unix socket, network, scope, or command access
+would be allowed or denied. Designed for both human debugging and programmatic
+use by AI agents.
 
 ```bash
 nono why --profile <PROFILE> --command <COMMAND> -- <ARGS...>
 nono why --path <PATH> --op <OP> [OPTIONS]
+nono why --unix-socket <PATH> [--socket-op connect|bind] [OPTIONS]
 nono why --host <HOST> [--port <PORT>] [OPTIONS]
 nono why --scope <SCOPE> [OPTIONS]
 nono why --self --path <PATH> --op <OP> [OPTIONS]  # Inside sandbox
@@ -265,9 +268,12 @@ These flags grant `connect(2)` (and optionally `bind(2)`) on pathname AF_UNIX
 sockets. Abstract-namespace and unnamed sockets are never grantable — only
 filesystem-backed socket paths are supported.
 
-Under restricted network modes (`--block-net` or `--network-profile`),
-explicit socket grants are required. A plain `--allow-file`/`--allow` grant
-no longer implicitly permits socket access.
+On macOS, Seatbelt enforces pathname socket access directly. On Linux,
+pathname socket mediation is off by default; these flags add their implied
+filesystem grants but do not restrict access to other pathname sockets. Set
+`linux.af_unix_mediation` to `"pathname"` in the active profile to enable a
+default-deny socket allowlist. `--block-net` and `--network-profile` do not
+enable Linux AF_UNIX mediation.
 
 #### `--allow-unix-socket`
 
@@ -319,10 +325,9 @@ nono run --block-net --allow-unix-socket-dir-bind $TMPDIR/tsx-$UID -- tsx app.ts
 
 <Note>
   On macOS, `--allow-unix-socket-dir*` is enforced as direct-child-only socket
-  access. On current Linux, pathname AF_UNIX grants are enforced through the
-  implied Landlock filesystem directory grant, which is recursive. The
-  direct-child distinction becomes enforceable on Linux when the seccomp
-  AF_UNIX allowlist path is active.
+  access. Linux enforces that distinction when `linux.af_unix_mediation` is
+  `"pathname"`; with mediation off, nono does not enforce a pathname socket
+  allowlist.
 </Note>
 
 #### `--allow-unix-socket-subtree`
@@ -348,14 +353,18 @@ nono run --block-net --allow-unix-socket-subtree-bind $TMPDIR/nx -- nx serve
 
 #### `--block-net`
 
-Block all network access. Network is **allowed by default**.
+Block outbound IP network access. Network is **allowed by default**.
 
 ```bash
 # Block network for a build process that should be offline
 nono run --allow . --block-net -- cargo build
 ```
 
-On Linux this always installs a static seccomp filter that denies non-Unix sockets and `io_uring_setup()`, with Landlock layered underneath. This closes Landlock's UDP gap, but also breaks programs using io_uring only for file I/O. Local Unix-domain IPC remains available subject to its normal grants.
+On Linux this always installs a static seccomp filter that denies non-Unix
+sockets and `io_uring_setup()`, with Landlock layered underneath. This closes
+Landlock's UDP gap, but also breaks programs using io_uring only for file I/O.
+Pathname Unix sockets are unaffected unless the active profile enables
+`linux.af_unix_mediation = "pathname"`.
 
 #### `--network-profile`
 
@@ -1345,7 +1354,9 @@ nono run --help
 
 ## `nono why` Options
 
-The `why` command checks why filesystem, network, scope, or command access would be allowed or denied. It's designed for both human debugging and programmatic use by AI agents.
+The `why` command checks why filesystem, pathname Unix socket, network, scope,
+or command access would be allowed or denied. It's designed for both human
+debugging and programmatic use by AI agents.
 
 ### `--command`
 
@@ -1368,6 +1379,10 @@ nono why --path ~/.ssh/id_rsa --op read
 nono why --path ./my-project --op write
 ```
 
+Filesystem access and pathname Unix socket operations are separate. When the
+path identifies a socket, `--path` reports the filesystem decision and points
+to `--unix-socket` for the connection decision.
+
 ### `--op`
 
 The operation to check: `read`, `write`, or `readwrite`. Defaults to `read` if not specified.
@@ -1376,6 +1391,26 @@ The operation to check: `read`, `write`, or `readwrite`. Defaults to `read` if n
 nono why --path ./src --op read
 nono why --path ./output --op write
 nono why --path ./data --op readwrite
+```
+
+### `--unix-socket`
+
+Check whether nono permits an operation on a pathname AF_UNIX socket. On Linux,
+the result is `UNMEDIATED` when `linux.af_unix_mediation` is off. This does not
+mean the operation must succeed; host permissions or an outer sandbox may still
+deny it.
+
+```bash
+nono why --profile nolabs-ai/claude --unix-socket /run/docker.sock
+nono why --self --unix-socket /run/user/$UID/bus
+```
+
+### `--socket-op`
+
+Unix socket operation to check: `connect` (the default) or `bind`.
+
+```bash
+nono why --profile my-service --unix-socket /run/my-service.sock --socket-op bind
 ```
 
 ### `--host`
@@ -1443,6 +1478,12 @@ Available context flags:
 - `--allow-file` - Single files with read+write access
 - `--read-file` - Single files with read-only access
 - `--write-file` - Single files with write-only access
+- `--allow-unix-socket` - Exact sockets with connect access
+- `--allow-unix-socket-bind` - Exact sockets with connect and bind access
+- `--allow-unix-socket-dir` - Direct-child sockets with connect access
+- `--allow-unix-socket-dir-bind` - Direct-child sockets with connect and bind access
+- `--allow-unix-socket-subtree` - Descendant sockets with connect access
+- `--allow-unix-socket-subtree-bind` - Descendant sockets with connect and bind access
 - `--block-net` - Block network access
 - `--allow-net` - Force unrestricted network access for this run
 - `--profile`, `-p` - Use a named profile

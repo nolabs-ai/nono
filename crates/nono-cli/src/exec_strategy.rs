@@ -1941,6 +1941,8 @@ fn build_policy_explanations(
             }
             Ok(crate::query_ext::QueryResult::NotSandboxed { .. })
             | Ok(crate::query_ext::QueryResult::ApprovalRequired { .. })
+            | Ok(crate::query_ext::QueryResult::Unmediated { .. })
+            | Ok(crate::query_ext::QueryResult::Unknown { .. })
             | Ok(crate::query_ext::QueryResult::Scope { .. })
             | Err(_) => {}
         }

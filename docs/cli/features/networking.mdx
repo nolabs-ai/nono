@@ -40,7 +40,13 @@ A 256-bit session token is generated for each proxy session. The child must incl
 nono run --allow-cwd --block-net -- cargo build
 ```
 
-No outbound IP connections are permitted. Local Unix-domain IPC remains available subject to its filesystem/socket grants. See [Localhost IPC](#localhost-ipc) for allowing specific TCP ports as exceptions.
+No outbound IP connections are permitted. Unix-domain sockets are local IPC,
+not outbound IP networking, so `--block-net` does not block them. On macOS,
+Seatbelt enforces pathname socket rules directly. On Linux, pathname sockets
+remain unmediated unless the profile enables
+[`linux.af_unix_mediation = "pathname"`](/cli/internals/landlock#pathname-unix-socket-mediation).
+See [Localhost IPC](#localhost-ipc) for allowing specific TCP ports as
+exceptions.
 
 On Linux, the CLI installs a small static seccomp filter on every supported kernel, with Landlock layered underneath. The filter denies Internet socket creation and `io_uring_setup()`, closing the UDP gap in Landlock's TCP-only network controls. Consequently, programs using io_uring solely for file I/O also need to disable that feature when run with `--block-net`.
 
@@ -470,7 +476,8 @@ DNS names may still resolve through the macOS system resolver even though the sa
 
 The WSL2 kernel (6.6) ships with Landlock V3, which does not include TCP network filtering (V4 requires kernel 6.7+). Additionally, the seccomp-based proxy fallback is unavailable due to [WSL2's own seccomp notify listener](https://github.com/microsoft/WSL/issues/9548).
 
-**What works:** `--block-net` (blocks all networking via `SECCOMP_RET_ERRNO`).
+**What works:** `--block-net` (blocks outbound IP networking via
+`SECCOMP_RET_ERRNO`).
 
 **What doesn't work:** Per-port filtering (`--open-port`, `--listen-port`) and proxy-based domain filtering (`--allow-domain`, `--network-profile`, `--credential`). Domain filtering is blocked by default on WSL2 — set `wsl2_proxy_policy: "insecure_proxy"` in your profile's security config to opt in to degraded execution. See [Credential Proxy on WSL2](/cli/internals/wsl2#credential-proxy-on-wsl2) for details.
 

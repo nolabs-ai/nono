@@ -212,14 +212,14 @@ subdirectories. The implied filesystem grant is recursive (Landlock's
 only expressible granularity), so socket scope is enforced separately by
 the supervisor (Linux) or Seatbelt path emission (macOS).
 
-Today, macOS enforces the direct-child versus subtree distinction in Seatbelt.
-Linux V4+ currently relies on Landlock filesystem rules for pathname AF_UNIX,
-so directory socket grants are recursive there until the seccomp AF_UNIX
-allowlist mediation path is enabled.
+macOS enforces pathname socket access directly through Seatbelt, including the
+direct-child versus subtree distinction.
 
-Under restricted network modes (`--block-net` or `--network-profile`),
-`connect(2)` to a Unix socket requires an explicit `unix_socket*` grant
-— a plain `allow_file`/`allow` grant no longer implicitly permits it.
+On Linux, pathname socket mediation is off by default. In that mode,
+`connect(2)` and `bind(2)` are not restricted by nono's filesystem policy, and
+`--block-net` or `--network-profile` does not change that. Set
+`linux.af_unix_mediation` to `"pathname"` to enable a default-deny socket
+allowlist; the process must then have a matching `unix_socket*` grant.
 
 ## Working Directory
 
@@ -280,7 +280,12 @@ nono run --profile claude-deny-git -- claude
 
 #### Blocking Container Access (Docker, Podman, kubectl)
 
-Use `filesystem.deny` as the enforcement mechanism. `commands.deny` remains deprecated startup-only compatibility behavior:
+Access to a container runtime socket grants the authority of the daemon behind
+it. A rootful Docker daemon usually has root access to the host and runs outside
+nono's process sandbox.
+
+On macOS, deny the socket path. nono emits both filesystem and Seatbelt
+`network-outbound` denials:
 
 ```json
 {
@@ -288,14 +293,32 @@ Use `filesystem.deny` as the enforcement mechanism. `commands.deny` remains depr
   "meta": { "name": "no-docker", "version": "1.0.0" },
   "filesystem": {
     "deny": ["/var/run/docker.sock"]
-  },
-  "commands": {
-    "deny": ["docker", "docker-compose", "podman", "kubectl"]
   }
 }
 ```
 
-On macOS, `filesystem.deny` also emits a `network-outbound` deny — exact socket paths are blocked directly, while denied directories recursively block sockets beneath them. Seatbelt classifies `connect(2)` as a network operation, so a file deny alone won't block it. Prefer path- and network-based controls; `commands.deny` is not enforced for child processes.
+On Linux, Landlock filesystem rules do not mediate `connect(2)` to pathname
+Unix sockets. Enable pathname AF_UNIX mediation and do not grant the container
+runtime socket:
+
+```json
+{
+  "extends": "nolabs-ai/claude",
+  "meta": { "name": "no-docker", "version": "1.0.0" },
+  "linux": {
+    "af_unix_mediation": "pathname"
+  }
+}
+```
+
+With mediation enabled, pathname sockets are default-deny and only explicit
+`filesystem.unix_socket*` entries are allowed. `--block-net`, Linux network
+namespaces, and `filesystem.deny` do not replace this control.
+
+If a sensitive workload requires Docker, run it inside a separate container or
+MicroVM with its own daemon. Mounting the host's rootful Docker socket preserves
+the same host authority. `commands.deny` is deprecated startup-only gating and
+must not be used as socket enforcement.
 
 #### Adding Write-Only Access
 
@@ -449,7 +472,7 @@ The `network` section controls network access and credential injection.
 
 | Field | Description |
 |-------|-------------|
-| `block` | Block all network access (default: `false`) |
+| `block` | Block outbound IP network access (default: `false`) |
 | `network_profile` | Network profile name for host filtering (e.g., `minimal`, `claude-code`, `enterprise`). Set to `null` in a child profile to clear an inherited value. |
 | `allow_domain` | Additional domains to allow through the proxy |
 | `open_port` | Localhost TCP ports to allow bidirectional IPC (equivalent to `--open-port`) |

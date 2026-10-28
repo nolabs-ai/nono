@@ -78,6 +78,16 @@ nono run --allow-cwd -- nono why --self --path /var --op write --json
 # {"status":"denied","reason":"not_in_allowed_paths",...}
 ```
 
+### Check pathname Unix socket access
+
+```bash
+# Check connect access under a profile
+nono why --profile nolabs-ai/claude --unix-socket /run/docker.sock
+
+# Check the policy active inside a running sandbox
+nono why --self --unix-socket /run/user/$UID/bus
+```
+
 ### Check network access
 
 ```bash

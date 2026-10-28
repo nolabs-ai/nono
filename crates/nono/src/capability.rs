@@ -1589,7 +1589,21 @@ impl CapabilitySet {
     /// -> [`UnixSocketOp::Send`].
     #[must_use]
     pub fn unix_socket_allowed(&self, sockaddr_path: &Path, op: UnixSocketOp) -> bool {
-        self.unix_sockets.iter().any(|cap| {
+        self.matching_unix_socket(sockaddr_path, op).is_some()
+    }
+
+    /// Return the first AF_UNIX socket capability that covers `sockaddr_path`
+    /// and permits `op`.
+    ///
+    /// Enforcement and diagnostics share this matcher so they cannot disagree
+    /// about file, direct-child, subtree, or bind semantics.
+    #[must_use]
+    pub fn matching_unix_socket(
+        &self,
+        sockaddr_path: &Path,
+        op: UnixSocketOp,
+    ) -> Option<&UnixSocketCapability> {
+        self.unix_sockets.iter().find(|cap| {
             cap.covers(sockaddr_path)
                 && match op {
                     UnixSocketOp::Connect | UnixSocketOp::Send => true, // any grant allows connect/send

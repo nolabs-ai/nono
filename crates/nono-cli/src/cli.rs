@@ -185,7 +185,7 @@ pub enum Commands {
     Wrap(Box<WrapArgs>),
 
     // ── Exploration & debugging ─────────────────────────────────────────
-    /// Check why filesystem, network, scope, or command access would be allowed or denied
+    /// Check why filesystem, Unix socket, network, scope, or command access would be allowed or denied
     #[command(help_template = "\
 {about}
 
@@ -198,6 +198,7 @@ pub enum Commands {
   nono why --path ~/.ssh --op read             # Check if ~/.ssh is readable
   nono why --path ./src --op write --allow .   # Check with capability context
   nono why --json --path ~/.aws --op read      # JSON output for agents
+  nono why --unix-socket /run/docker.sock      # Query pathname Unix socket connect access
   nono why --host api.openai.com --port 443    # Query network access
   nono why --self --path /var --op write       # Inside sandbox, query own capabilities
   nono why --profile gh --command gh -- issue comment 1052
@@ -2247,6 +2248,25 @@ pub struct WhyArgs {
     #[arg(long, help_heading = "QUERY")]
     pub path: Option<PathBuf>,
 
+    /// Pathname AF_UNIX socket to check
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["command", "path", "host", "scope"],
+        help_heading = "QUERY"
+    )]
+    pub unix_socket: Option<PathBuf>,
+
+    /// Unix socket operation to check (default: connect)
+    #[arg(
+        long,
+        value_enum,
+        value_name = "OP",
+        requires = "unix_socket",
+        help_heading = "QUERY"
+    )]
+    pub socket_op: Option<WhySocketOp>,
+
     /// Match absolute literal paths against profile rules without resolving them on this host
     #[arg(long, requires_all = ["path", "profile"], help_heading = "QUERY")]
     pub lexical_profile_path: bool,
@@ -2312,6 +2332,30 @@ pub struct WhyArgs {
     #[arg(long, value_name = "FILE", help_heading = "CONTEXT")]
     pub write_file: Vec<PathBuf>,
 
+    /// Exact pathname Unix sockets to allow connect access (for query context)
+    #[arg(long, value_name = "SOCKET", help_heading = "CONTEXT")]
+    pub allow_unix_socket: Vec<PathBuf>,
+
+    /// Exact pathname Unix sockets to allow connect and bind (for query context)
+    #[arg(long, value_name = "SOCKET", help_heading = "CONTEXT")]
+    pub allow_unix_socket_bind: Vec<PathBuf>,
+
+    /// Direct-child pathname Unix sockets to allow in a directory (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_dir: Vec<PathBuf>,
+
+    /// Direct-child pathname Unix sockets to allow connect and bind (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_dir_bind: Vec<PathBuf>,
+
+    /// Descendant pathname Unix sockets to allow in a subtree (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_subtree: Vec<PathBuf>,
+
+    /// Descendant pathname Unix sockets to allow connect and bind (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
+
     /// Block network access (for query context)
     #[arg(long = "block-net", help_heading = "CONTEXT")]
     pub block_net: bool,
@@ -2348,6 +2392,15 @@ pub enum WhyOp {
     /// Read and write access
     #[value(name = "readwrite")]
     ReadWrite,
+}
+
+/// Pathname Unix socket operation type for why command
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum WhySocketOp {
+    /// Connect to an existing socket
+    Connect,
+    /// Bind and create a socket at this path
+    Bind,
 }
 
 /// Landlock scope type for why command
@@ -3074,6 +3127,71 @@ pub struct TrustExportKeyArgs {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn test_why_unix_socket_defaults_to_connect() {
+        let cli = Cli::parse_from(["nono", "why", "--unix-socket", "/run/example.sock"]);
+        let Commands::Why(args) = cli.command else {
+            panic!("expected why command");
+        };
+        assert_eq!(args.unix_socket, Some(PathBuf::from("/run/example.sock")));
+        assert!(args.socket_op.is_none());
+    }
+
+    #[test]
+    fn test_why_unix_socket_bind_parses() {
+        let cli = Cli::parse_from([
+            "nono",
+            "why",
+            "--unix-socket",
+            "/run/example.sock",
+            "--socket-op",
+            "bind",
+        ]);
+        let Commands::Why(args) = cli.command else {
+            panic!("expected why command");
+        };
+        assert!(matches!(args.socket_op, Some(WhySocketOp::Bind)));
+    }
+
+    #[test]
+    fn test_why_unix_socket_context_grant_parses() {
+        let cli = Cli::parse_from([
+            "nono",
+            "why",
+            "--unix-socket",
+            "/run/example.sock",
+            "--allow-unix-socket",
+            "/run/example.sock",
+        ]);
+        let Commands::Why(args) = cli.command else {
+            panic!("expected why command");
+        };
+        assert_eq!(
+            args.allow_unix_socket,
+            vec![PathBuf::from("/run/example.sock")]
+        );
+    }
+
+    #[test]
+    fn test_why_unix_socket_conflicts_with_path() {
+        assert!(
+            Cli::try_parse_from([
+                "nono",
+                "why",
+                "--path",
+                "/run/example.sock",
+                "--unix-socket",
+                "/run/example.sock",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_why_socket_op_requires_unix_socket() {
+        assert!(Cli::try_parse_from(["nono", "why", "--socket-op", "bind"]).is_err());
+    }
 
     #[test]
     fn test_run_basic() {

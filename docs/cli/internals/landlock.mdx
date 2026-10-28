@@ -135,14 +135,16 @@ nono why --scope abstract-unix-socket --profile nolabs-ai/claude
 ## Pathname Unix Socket Mediation
 
 Landlock filesystem rules and pathname Unix socket IPC are separate security
-surfaces. On Linux, a process that can reach a filesystem-backed Unix socket
-path may be able to communicate with a user-session service through that
-socket unless nono separately mediates AF_UNIX `connect(2)` and `bind(2)`.
+surfaces. A pathname is used as the socket address, but Landlock does not treat
+AF_UNIX `connect(2)` or `bind(2)` as file access. Filesystem allow and deny
+decisions therefore do not determine whether a Linux process can communicate
+through that socket.
 
 For compatibility, this mediation is off by default. Turning on proxy-only
 network mode (for example with `network.allow_domain`) does not enable it: the
 proxy's seccomp filter only forces TCP through the proxy, and Unix-domain IPC
-stays governed by the filesystem rules alone. Profiles that need stricter IPC
+remains unmediated by nono. Plain `--block-net` and Linux network namespaces
+also do not block pathname Unix sockets. Profiles that need stricter IPC
 isolation can opt in:
 
 ```json
@@ -173,15 +175,15 @@ untrusted multi-threaded workloads.
 High-risk socket categories include user service managers, session buses,
 keyring and credential agents, SSH/GPG agents, container runtimes, and package
 manager daemons. Hardened profiles should grant only the specific sockets they
-need.
+need. In particular, access to a rootful Docker socket grants the authority of
+the host daemon, which runs outside nono's process sandbox.
 
 <Warning>
   If you run with `linux.af_unix_mediation` off in a public-facing,
   multi-tenant, privacy-sensitive, or otherwise high-risk deployment, run nono
-  inside a stronger outer isolation boundary such as a MicroVM. Firecracker
-  style MicroVMs are a good fit for service deployments where the VM boundary
-  can isolate host user-session services and credentials from the sandboxed
-  agent.
+  inside a stronger outer isolation boundary such as a container or MicroVM.
+  If the workload needs a container runtime, use a daemon inside that boundary;
+  do not mount the host's rootful Docker socket.
 </Warning>
 
 ## Enforcement Status

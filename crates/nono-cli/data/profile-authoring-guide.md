@@ -221,7 +221,7 @@ Command-policy denials are not filesystem-policy denials. A message like:
 nono: command policy denied gh: Command 'gh' is blocked: agents may read issues but not comment on them
 ```
 
-means the command policy blocked the resolved command invocation. `nono why --path ...` only explains filesystem-policy grants and denials, and `nono why --host ...` only explains network-policy reachability. For command-policy denials, query the command edge directly:
+means the command policy blocked the resolved command invocation. `nono why --path ...` only explains filesystem-policy grants and denials, `nono why --unix-socket ...` explains pathname socket operations, and `nono why --host ...` only explains network-policy reachability. For command-policy denials, query the command edge directly:
 
 ```sh
 nono why --profile <profile> --command gh -- issue comment 1052
@@ -435,7 +435,7 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 
 | Field                   | Type                              | Default  | Description |
 |-------------------------|-----------------------------------|----------|-------------|
-| `block`                 | boolean                           | `false`  | Block all network access. |
+| `block`                 | boolean                           | `false`  | Block outbound IP network access. |
 | `allow_http2`           | boolean                           | `false`  | Allow HTTP/2 to upstream servers via ALPN negotiation. Default is HTTP/1.1 with keep-alive. Equivalent to `--allow-http2`. |
 | `network_profile`       | string or null                    | inherit  | Name from `network-policy.json` for proxy filtering. Set to `null` to clear inherited value. |
 | `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Supports wildcard subdomains (`*.googleapis.com`) and a whole-label wildcard in a non-leading position (`jenkins.*.ci.example.com`, matching exactly one label there). |
@@ -1178,6 +1178,12 @@ With no `filesystem.unix_socket` entries, every AF_UNIX pathname connect and bin
   }
 }
 ```
+
+Access to a container runtime socket grants the authority of the daemon behind
+it. A rootful Docker daemon runs outside nono's process sandbox and usually has
+root access to the host. For sensitive workloads that require Docker, use a
+separate container or MicroVM with its own daemon; mounting the host's rootful
+Docker socket preserves the same host authority.
 
 #### Deprecation note
 

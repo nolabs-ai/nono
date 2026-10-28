@@ -1,7 +1,7 @@
 use crate::audit_attestation::prepare_audit_signer;
 #[cfg(unix)]
 use crate::hook_runtime;
-use crate::launch_runtime::{LaunchPlan, select_threading_context};
+use crate::launch_runtime::{ExecutionFlags, LaunchPlan, select_threading_context};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{SupervisedRuntimeContext, execute_supervised_runtime};
 use crate::{
@@ -365,7 +365,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         &allowed_domain_strs,
         &denied_domain_strs,
         &domain_endpoints,
-        flags.silent,
+        &flags,
     );
     let cap_file_path = cap_file.unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
     if cap_file_path != Path::new("/dev/null") {
@@ -882,9 +882,9 @@ fn write_capability_state_file(
     allowed_domains: &[String],
     denied_domains: &[String],
     domain_endpoints: &[sandbox_state::DomainEndpointState],
-    silent: bool,
+    flags: &ExecutionFlags,
 ) -> Option<std::path::PathBuf> {
-    let state = sandbox_state::SandboxState::from_caps_with_denies(
+    let mut state = sandbox_state::SandboxState::from_caps_with_denies(
         caps,
         bypass_protection_paths,
         deny_paths,
@@ -892,6 +892,12 @@ fn write_capability_state_file(
         denied_domains,
         domain_endpoints,
     );
+    #[cfg(target_os = "linux")]
+    let linux_af_unix_mediation = flags.af_unix_mediation.is_pathname();
+    #[cfg(not(target_os = "linux"))]
+    let linux_af_unix_mediation = false;
+    state.pathname_socket_enforcement =
+        sandbox_state::pathname_socket_enforcement(linux_af_unix_mediation);
 
     for _ in 0..8 {
         let cap_file = next_capability_state_file_path();
@@ -908,7 +914,7 @@ fn write_capability_state_file(
                      Sandboxed processes will not be able to query their own capabilities using 'nono why --self'.",
                     e
                 );
-                if !silent {
+                if !flags.silent {
                     eprintln!(
                         "  WARNING: Capability state file could not be written.\n  \
                          The sandbox is active, but 'nono why --self' will not work inside this sandbox."
@@ -923,7 +929,7 @@ fn write_capability_state_file(
         "Failed to allocate a unique capability state file after repeated collisions. \
          Sandboxed processes will not be able to query their own capabilities using 'nono why --self'."
     );
-    if !silent {
+    if !flags.silent {
         eprintln!(
             "  WARNING: Capability state file could not be written.\n  \
              The sandbox is active, but 'nono why --self' will not work inside this sandbox."

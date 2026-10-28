@@ -70,6 +70,7 @@ fn config(caps: &CapabilitySet, filesystem: bool, proxy: bool) -> ExecConfig<'_>
             proc_comm_notify: filesystem,
         },
         sandbox_policy: LinuxSandboxPolicy::Auto,
+        namespaces: None,
         allowed_env_vars: None,
         denied_env_vars: None,
         case_insensitive_env_vars: false,

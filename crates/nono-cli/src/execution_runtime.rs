@@ -686,6 +686,25 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         }
     };
 
+    // Opt-in namespace isolation: validated against the final network mode
+    // and probed on this host before anything is forked. Never downgraded.
+    #[cfg(target_os = "linux")]
+    let namespaces = if flags.isolate.is_empty() {
+        None
+    } else {
+        Some(crate::isolation::prepare_namespaces(flags.isolate, &caps)?)
+    };
+
+    // With `linux.isolate.loopback` the validated network namespace confines
+    // TCP to its own loopback, so the supervisor's connect destination check
+    // (which allows only localhost:<proxy port>) is lifted with the Landlock
+    // TCP rules. Derived from the probed spec, never from the request alone.
+    #[cfg(target_os = "linux")]
+    let seccomp_proxy_fallback = seccomp_proxy_fallback
+        && !namespaces
+            .as_ref()
+            .is_some_and(|spec| spec.has_network() && spec.loopback_tcp_enabled());
+
     #[cfg(target_os = "linux")]
     if flags.af_unix_mediation.is_pathname() && nono::sandbox::is_wsl2() {
         return Err(NonoError::SandboxInit(
@@ -752,6 +771,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         },
         #[cfg(target_os = "linux")]
         sandbox_policy: flags.sandbox_policy,
+        #[cfg(target_os = "linux")]
+        namespaces,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         case_insensitive_env_vars: flags.case_insensitive_env_vars,

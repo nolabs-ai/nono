@@ -166,6 +166,25 @@ jobs:
       - name: Run doc tests
         run: cargo test --doc --workspace --verbose --no-fail-fast
 
+      - name: Check headless feature set
+        run: cargo check --workspace --no-default-features --locked
+
+  msrv:
+    name: MSRV (Rust 1.95)
+    needs: changes
+    if: ${{ !startsWith(github.head_ref, 'dependabot/github_actions/') && needs.changes.outputs.run_code_jobs == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Check workspace MSRV
+        run: cargo check --workspace --locked
+
   fmt:
     name: Rustfmt
     needs: changes

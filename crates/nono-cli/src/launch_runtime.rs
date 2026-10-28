@@ -250,6 +250,8 @@ pub(crate) struct ExecutionFlags {
     #[cfg(target_os = "linux")]
     pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
     #[cfg(target_os = "linux")]
+    pub(crate) isolate: crate::profile::LinuxIsolateConfig,
+    #[cfg(target_os = "linux")]
     pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) proc_comm_notify: bool,
@@ -309,6 +311,8 @@ impl ExecutionFlags {
             wsl2_proxy_policy: prepared.wsl2_proxy_policy,
             #[cfg(target_os = "linux")]
             af_unix_mediation: prepared.af_unix_mediation,
+            #[cfg(target_os = "linux")]
+            isolate: prepared.isolate,
             #[cfg(target_os = "linux")]
             sandbox_policy: prepared.sandbox_policy,
             #[cfg(target_os = "linux")]

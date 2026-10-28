@@ -166,9 +166,9 @@ pub(crate) fn profile_selects_claude_code(name_or_path: &str, cli_extends: &[Str
 /// Returns `true` when this run loads `target`'s package profile: the exact
 /// package ref, or an inheritance chain reaching it.
 ///
-/// Unlike [`profile_selects_claude_code`] this mirrors the resolver exactly, so
-/// a user profile file shadowing a published name is not the pack: that run
-/// never loads the pack, and the pack's registry status says nothing about it.
+/// Unlike [`profile_selects_claude_code`] this mirrors the resolver exactly. A
+/// bare user profile with a known agent name does not load the fully-qualified
+/// package, so the package's registry status says nothing about that run.
 fn run_loads_official_pack(
     target: OfficialPackStatusTarget,
     name_or_path: &str,
@@ -226,9 +226,9 @@ fn name_loads_official_pack(target: OfficialPackStatusTarget, name: &str) -> boo
 /// Returns `true` when this single name launches `target`'s agent, ignoring
 /// `extends`.
 ///
-/// Differs from [`name_loads_official_pack`] on a user profile file named after
-/// the pack: `~/.config/nono/profiles/claude-code.json` shadows the pack, but it
-/// still launches Claude Code and still needs the Claude Code preparation.
+/// Differs from [`name_loads_official_pack`] for known bare agent names. A user
+/// profile such as `~/.config/nono/profiles/claude-code.json` does not load the
+/// package, but it still launches Claude Code and needs its preparation.
 fn name_launches_official_pack(target: OfficialPackStatusTarget, name: &str) -> bool {
     is_official_package_ref(target, name) || is_official_profile_name(target, name)
 }
@@ -435,10 +435,9 @@ mod tests {
         });
     }
 
-    /// A user profile file named after the pack shadows it, so the run never
-    /// loads the pack — but it is still a Claude Code run and still needs the
-    /// preparation. Regression for the repro in issue #1546, which writes
-    /// exactly these files.
+    /// A user profile using a known bare agent name does not load the package,
+    /// but it is still a Claude Code run and still needs the preparation.
+    /// Regression for the repro in issue #1546, which writes these files.
     #[test]
     fn user_override_of_a_published_name_still_selects_claude_code() {
         with_isolated_config_home(|config_home| {
@@ -455,7 +454,7 @@ mod tests {
                 );
                 assert!(
                     !loads_claude_pack(name),
-                    "but it shadows the pack, so the run does not load the pack"
+                    "a bare user profile does not load the fully-qualified package"
                 );
             }
         });

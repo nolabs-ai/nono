@@ -24,6 +24,8 @@ pub(crate) struct PreparedProfile {
     pub(crate) sandbox_policy: profile::LinuxSandboxPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) explicit_sandbox_policy: Option<profile::LinuxSandboxPolicy>,
+    #[cfg(target_os = "linux")]
+    pub(crate) isolate: profile::LinuxIsolateConfig,
     pub(crate) workdir_access: Option<profile::WorkdirAccess>,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
@@ -832,6 +834,11 @@ fn prepare_profile_with_options(
         explicit_sandbox_policy: loaded_profile
             .as_ref()
             .and_then(|profile| profile.linux.sandbox_policy),
+        #[cfg(target_os = "linux")]
+        isolate: loaded_profile
+            .as_ref()
+            .map(|profile| profile.linux.isolate)
+            .unwrap_or_default(),
         workdir_access: loaded_profile
             .as_ref()
             .map(|profile| profile.workdir.access.clone()),

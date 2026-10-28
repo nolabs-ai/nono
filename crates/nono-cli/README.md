@@ -104,7 +104,7 @@ User profiles can extend built-in, pack, or other user profiles with the `extend
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": { "name": "my-claude" },
   "filesystem": {
     "allow": ["/opt/my-tools"],
@@ -117,7 +117,7 @@ You can also extend multiple profiles at once. Bases are merged left-to-right, t
 
 ```json
 {
-  "extends": ["claude-code", "node-dev"],
+  "extends": ["nolabs-ai/claude", "node-dev"],
   "meta": { "name": "my-fullstack" },
   "filesystem": { "allow": ["/opt/extra"] }
 }
@@ -144,7 +144,7 @@ When extending multiple bases, they are merged left-to-right using the same rule
 Profiles can form chains (up to 10 levels deep). Circular dependencies are detected and rejected. Shared transitive bases are deduplicated.
 
 ```
-my-dev.json → team-base.json → claude-code (pack)
+my-dev.json → team-base.json → nolabs-ai/claude (package)
 ```
 
 ## Deprecated Command Blocking

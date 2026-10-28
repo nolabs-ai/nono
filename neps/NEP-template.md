@@ -5,6 +5,7 @@ authors:
   - your-name
 status: draft
 created: YYYY-MM-DD
+breaking:
 superseded-by:
 ---
 

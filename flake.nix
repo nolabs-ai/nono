@@ -31,7 +31,6 @@
       cargoLock.lockFile = "${self}/Cargo.lock";
 
       nativeBuildInputs = [ pkgs.pkg-config ];
-      buildInputs = [ pkgs.dbus ];
 
       # Tests require /bin/pwd, /usr/bin/env, git, /var/folders, network, etc.
       # and fail in the Nix sandbox. The project's own CI covers testing.
@@ -122,6 +121,8 @@
     devShells = forAllSystems (system: let pkgs = pkgsFor system; in {
       default = pkgs.mkShell {
         nativeBuildInputs = [ pkgs.pkg-config ];
+        # Keep D-Bus tools in the development shell for manual Secret Service
+        # testing; the package build itself uses the pure-Rust zbus client.
         buildInputs = [ pkgs.dbus pkgs.rustc pkgs.cargo ];
       };
     });

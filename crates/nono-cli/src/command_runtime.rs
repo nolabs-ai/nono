@@ -399,6 +399,15 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     }
 
     #[cfg(target_os = "linux")]
+    if !prepared.isolate.is_empty() {
+        return Err(NonoError::ConfigParse(
+            "nono wrap does not support linux.isolate because direct exec has no supervisor \
+             to create the namespaces or serve the proxy bridge. Use `nono run` instead."
+                .to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
     if prepared.af_unix_mediation.is_pathname() {
         return Err(NonoError::ConfigParse(
             "nono wrap does not support linux.af_unix_mediation = \"pathname\" because direct \

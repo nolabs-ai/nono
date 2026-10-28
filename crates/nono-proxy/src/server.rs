@@ -304,9 +304,59 @@ pub struct ProxyHandle {
     intercept_ca_env_vars: Vec<String>,
     /// Credential load warnings collected at startup.
     diagnostics: Vec<crate::diagnostic::ProxyDiagnostic>,
+    /// What [`Self::add_listener`] needs to serve another listener with this
+    /// proxy's state. `None` only for handles built directly in tests.
+    listener_attach: Option<ListenerAttach>,
+}
+
+/// Shared proxy state plus the runtime its accept loops run on.
+struct ListenerAttach {
+    state: Arc<ProxyState>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl ProxyHandle {
+    /// Serve an additional, already-listening socket with this proxy.
+    ///
+    /// Used for the namespace-isolation bridge (NEP-0004): a listener created
+    /// inside the sandbox's network namespace and handed to the supervisor.
+    /// Connections on it are handled exactly like connections on the primary
+    /// listener, including session-token authentication and the connection
+    /// limit. Its local port must equal the proxy port, so requests addressed
+    /// to the proxy itself are still recognised as such.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the port differs from the proxy port, the listener
+    /// cannot be registered with the runtime, or this handle has no runtime.
+    pub fn add_listener(&self, listener: std::net::TcpListener) -> Result<()> {
+        let attach = self.listener_attach.as_ref().ok_or_else(|| {
+            ProxyError::Config("proxy handle cannot accept additional listeners".to_string())
+        })?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| ProxyError::Config(format!("bridge listener address: {e}")))?
+            .port();
+        if port != self.port {
+            return Err(ProxyError::Config(format!(
+                "bridge listener port {port} does not match proxy port {}",
+                self.port
+            )));
+        }
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| ProxyError::Config(format!("bridge listener: {e}")))?;
+        let _entered = attach.runtime.enter();
+        let listener = TcpListener::from_std(listener)
+            .map_err(|e| ProxyError::Config(format!("bridge listener: {e}")))?;
+        attach.runtime.spawn(accept_loop(
+            listener,
+            Arc::clone(&attach.state),
+            self.shutdown_tx.subscribe(),
+        ));
+        Ok(())
+    }
+
     /// Signal the proxy to shut down gracefully.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
@@ -1423,7 +1473,7 @@ pub async fn start_with_network_approval(
     // Spawn accept loop as a task within the current runtime.
     // The caller MUST ensure this runtime is being driven (e.g., via
     // a dedicated thread calling block_on or a multi-thread runtime).
-    tokio::spawn(accept_loop(listener, state, shutdown_rx));
+    tokio::spawn(accept_loop(listener, Arc::clone(&state), shutdown_rx));
 
     Ok(ProxyHandle {
         port,
@@ -1437,6 +1487,10 @@ pub async fn start_with_network_approval(
         intercept_ca_path,
         intercept_ca_env_vars,
         diagnostics: proxy_diagnostics,
+        listener_attach: Some(ListenerAttach {
+            state,
+            runtime: tokio::runtime::Handle::current(),
+        }),
     })
 }
 
@@ -1946,11 +2000,41 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             // routing direct. Without this, bypassed hosts would inherit
             // connect::handle_connect()'s lenient auth (which tolerates
             // missing Proxy-Authorization for Node.js undici compat).
-            token::enforce_proxy_auth(
+            // A failed check answers with a 407 challenge (RFC 9110 section
+            // 15.5.8) so reactive clients can retry with credentials.
+            if let Err(e) = token::enforce_proxy_auth(
                 state.config.require_auth,
                 &header_bytes,
                 &state.session_token,
-            )?;
+            ) {
+                let authority = first_line.split_whitespace().nth(1).unwrap_or("");
+                let host_port = normalize_authority(authority);
+                let (host, port) = connect_target_from_normalized_authority(&host_port)
+                    .unwrap_or_else(|| (host_port.clone(), 443));
+                debug!(
+                    "Bypass CONNECT to {}:{} failed proxy auth: {}",
+                    host, port, e
+                );
+                audit::log_denied(
+                    state.audit_log.as_ref(),
+                    audit::ProxyMode::Connect,
+                    &audit::EventContext {
+                        auth_mechanism: Some(
+                            nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization,
+                        ),
+                        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                        denial_category: Some(
+                            nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                        ),
+                        ..audit::EventContext::default()
+                    },
+                    &host,
+                    port,
+                    "proxy auth missing or invalid",
+                );
+                connect::write_proxy_auth_challenge(&mut stream).await?;
+                return Ok(());
+            }
             connect::handle_connect(
                 first_line,
                 &mut stream,
@@ -2623,6 +2707,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_listener_rejects_port_mismatch() {
+        let handle = start(ProxyConfig::default()).await.unwrap();
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let error = handle.add_listener(other).expect_err("port must match");
+        assert!(error.to_string().contains("does not match proxy port"));
+        handle.shutdown();
+    }
+
+    /// An added listener is served with the proxy's own state: an
+    /// unauthenticated forward request gets the same 407 as on the primary
+    /// listener. Uses 127.0.0.2 to share the proxy's port number in one netns.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_listener_serves_with_proxy_state() {
+        let handle = start(ProxyConfig::default()).await.unwrap();
+        let extra = std::net::TcpListener::bind(("127.0.0.2", handle.port)).unwrap();
+        handle.add_listener(extra).unwrap();
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.2", handle.port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = vec![0_u8; 64];
+        let read = stream.read(&mut response).await.unwrap();
+        let status = String::from_utf8_lossy(&response[..read]);
+        assert!(status.starts_with("HTTP/1.1 407"), "got: {status:?}");
+        handle.shutdown();
+    }
+
+    #[tokio::test]
     async fn test_proxy_ignores_empty_session_token() {
         // An empty override must fall back to a random token, never an
         // effectively-absent credential.
@@ -2654,6 +2770,50 @@ mod tests {
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                     .await;
+            }
+        });
+        format!("127.0.0.1:{}", addr.port())
+    }
+
+    /// A mock upstream (enterprise) proxy: answers any CONNECT with
+    /// `200 Connection Established`, then echoes tunnelled bytes back so a
+    /// chained CONNECT can be verified end-to-end.
+    async fn spawn_mock_external_proxy() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // Consume the CONNECT head up to the blank line.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                match sock.read(&mut byte).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => head.push(byte[0]),
+                }
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if sock
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                }
             }
         });
         format!("127.0.0.1:{}", addr.port())
@@ -3288,6 +3448,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         {
             let _handle = ProxyHandle {
+                listener_attach: None,
                 port: 12345,
                 token: Zeroizing::new("test_token".to_string()),
                 audit_log: Some(audit::new_audit_log()),
@@ -3461,6 +3622,7 @@ mod tests {
                         },
                     ],
                     request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
+                    response_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
                     request_nonce_fields: vec!["refresh_token".to_string()],
                 }],
                 admitted_consumers: vec!["proxy.openai_oauth".to_string()],
@@ -3925,6 +4087,7 @@ mod tests {
     fn test_proxy_env_vars_include_canonical_nono_no_proxy() -> Result<()> {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("a".repeat(64)),
             audit_log: Some(audit::new_audit_log()),
@@ -4005,6 +4168,7 @@ mod tests {
         // backward-compatible path for keyring-backed credentials.
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4070,6 +4234,7 @@ mod tests {
         // without starting a real proxy (which would try to load credentials).
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4139,6 +4304,7 @@ mod tests {
         // like the system keyring. See: #234
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4232,6 +4398,7 @@ mod tests {
     fn test_proxy_credential_env_vars_injects_spiffe_phantom_token() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("session_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4295,6 +4462,7 @@ mod tests {
         // "/ANTHROPIC_BASE_URL=http://127.0.0.1:PORT//anthropic".
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 58406,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4399,6 +4567,7 @@ mod tests {
         // => ANTHROPIC_API_KEY must NOT appear (demonstrates the bug).
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle_no_env_var = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("phantom".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4450,6 +4619,7 @@ mod tests {
         // => ANTHROPIC_API_KEY must be set to the phantom token.
         let (shutdown_tx2, _) = tokio::sync::watch::channel(false);
         let handle_fixed = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("phantom".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4502,6 +4672,7 @@ mod tests {
     fn test_no_proxy_excludes_credential_upstreams() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4541,6 +4712,7 @@ mod tests {
     fn test_no_proxy_empty_when_no_non_credential_hosts() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -4566,6 +4738,7 @@ mod tests {
     fn test_no_proxy_omits_loopback_for_managed_loopback_upstream() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handle = ProxyHandle {
+            listener_attach: None,
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
             audit_log: Some(audit::new_audit_log()),
@@ -5217,6 +5390,345 @@ mod tests {
             Ok(Ok(_)) => {} // answered -> reactive auth handled
             Ok(Err(e)) => panic!("retry read errored: {e}"),
             Err(_) => panic!("retry read timed out — proxy did not answer the retry"),
+        }
+
+        handle.shutdown();
+    }
+
+    /// Read one HTTP response head from `sock` (up to the blank line),
+    /// returning whatever arrived if the peer closes the connection first.
+    /// Bounded by a timeout so a hung proxy fails the test instead of
+    /// hanging it.
+    async fn read_response_head(sock: &mut tokio::net::TcpStream) -> String {
+        let read = async {
+            let mut response = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                match sock.read(&mut byte).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => response.push(byte[0]),
+                }
+                if response.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            response
+        };
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .unwrap_or_default();
+        String::from_utf8_lossy(&response).to_string()
+    }
+
+    /// Issue #2079: with an upstream proxy configured, a CONNECT without
+    /// Proxy-Authorization must be answered with a 407 challenge instead of
+    /// a dropped connection, so reactive proxy-auth clients (RFC 9110
+    /// section 15.5.8) can retry with credentials.
+    #[tokio::test]
+    async fn upstream_proxy_connect_missing_auth_answers_407() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: spawn_mock_external_proxy().await,
+                auth: None,
+                bypass_hosts: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+            .await
+            .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 407 "),
+            "expected a 407 challenge, got: {response:?}"
+        );
+        assert!(
+            response.contains("Proxy-Authenticate: Basic realm=\"nono\""),
+            "the 407 must carry a Proxy-Authenticate challenge, got: {response:?}"
+        );
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.decision == nono::undo::NetworkAuditDecision::Deny
+                    && e.target == "127.0.0.1"
+                    && e.auth_outcome == Some(nono::undo::NetworkAuditAuthOutcome::Failed)
+                    && e.denial_category
+                        == Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed)),
+            "expected an AuthenticationFailed deny audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Issue #2079, bypass variant: a CONNECT to an `upstream_bypass` host
+    /// without Proxy-Authorization must also be answered with a 407 instead
+    /// of a dropped connection.
+    #[tokio::test]
+    async fn upstream_bypass_connect_missing_auth_answers_407() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        let direct = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: "127.0.0.1:1".to_string(),
+                auth: None,
+                bypass_hosts: vec!["127.0.0.1".to_string()],
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(format!("CONNECT {direct} HTTP/1.1\r\nHost: {direct}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 407 "),
+            "expected a 407 challenge, got: {response:?}"
+        );
+        assert!(
+            response.contains("Proxy-Authenticate: Basic realm=\"nono\""),
+            "the 407 must carry a Proxy-Authenticate challenge, got: {response:?}"
+        );
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.decision == nono::undo::NetworkAuditDecision::Deny
+                    && e.target == "127.0.0.1"
+                    && e.auth_outcome == Some(nono::undo::NetworkAuditAuthOutcome::Failed)
+                    && e.denial_category
+                        == Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed)),
+            "expected an AuthenticationFailed deny audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// A credentialed CONNECT must still chain through the upstream proxy:
+    /// 200 Connection Established, with tunnelled bytes relayed both ways.
+    #[tokio::test]
+    async fn upstream_proxy_connect_with_auth_tunnels_through() {
+        use base64::Engine;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: spawn_mock_external_proxy().await,
+                auth: None,
+                bypass_hosts: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let creds = base64::engine::general_purpose::STANDARD
+            .encode(format!("nono:{}", handle.token.as_str()));
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(
+            format!(
+                "CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "expected the chained CONNECT to be tunnelled, got: {response:?}"
+        );
+
+        sock.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        match tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => assert_eq!(buf, *b"ping"),
+            _ => panic!("tunnelled write was not echoed back through the upstream proxy"),
+        }
+
+        handle.shutdown();
+    }
+
+    /// A credentialed CONNECT to an `upstream_bypass` host must still tunnel
+    /// directly to the target, not through the upstream proxy.
+    #[tokio::test]
+    async fn upstream_bypass_connect_with_auth_tunnels_direct() {
+        use base64::Engine;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let direct = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: "127.0.0.1:1".to_string(),
+                auth: None,
+                bypass_hosts: vec!["127.0.0.1".to_string()],
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let creds = base64::engine::general_purpose::STANDARD
+            .encode(format!("nono:{}", handle.token.as_str()));
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(
+            format!(
+                "CONNECT {direct} HTTP/1.1\r\nHost: {direct}\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "expected the bypassed CONNECT to be tunnelled, got: {response:?}"
+        );
+
+        sock.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        match tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await {
+            Ok(Ok(n)) => assert!(
+                String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200 OK"),
+                "the direct tunnel must reach the bypassed target"
+            ),
+            _ => panic!("the direct tunnel did not relay the request"),
+        }
+
+        handle.shutdown();
+    }
+
+    /// With auth disabled, an unauthenticated CONNECT must still chain through
+    /// the upstream proxy without being challenged.
+    #[tokio::test]
+    async fn upstream_proxy_no_auth_connect_tunnels_without_challenge() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: spawn_mock_external_proxy().await,
+                auth: None,
+                bypass_hosts: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+            .await
+            .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "with --no-auth the CONNECT must tunnel without a challenge, got: {response:?}"
+        );
+        assert!(
+            !response.contains("407"),
+            "auth must not be enforced on the chained path when disabled, got: {response:?}"
+        );
+
+        sock.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        match tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => assert_eq!(buf, *b"ping"),
+            _ => panic!("tunnelled write was not echoed back through the upstream proxy"),
+        }
+
+        handle.shutdown();
+    }
+
+    /// With auth disabled, an unauthenticated CONNECT to an `upstream_bypass`
+    /// host must still tunnel directly without being challenged.
+    #[tokio::test]
+    async fn upstream_bypass_no_auth_connect_tunnels_without_challenge() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let direct = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: "127.0.0.1:1".to_string(),
+                auth: None,
+                bypass_hosts: vec!["127.0.0.1".to_string()],
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(format!("CONNECT {direct} HTTP/1.1\r\nHost: {direct}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "with --no-auth the CONNECT must tunnel without a challenge, got: {response:?}"
+        );
+        assert!(
+            !response.contains("407"),
+            "auth must not be enforced on the bypass path when disabled, got: {response:?}"
+        );
+
+        sock.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        match tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await {
+            Ok(Ok(n)) => assert!(
+                String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200 OK"),
+                "the direct tunnel must reach the bypassed target"
+            ),
+            _ => panic!("the direct tunnel did not relay the request"),
         }
 
         handle.shutdown();

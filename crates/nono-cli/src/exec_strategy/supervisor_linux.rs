@@ -816,8 +816,9 @@ pub(super) fn network_notification_out_of_scope(policy: SeccompPolicy, family: u
 ///    (addrlen == 2) have no path to check.
 ///
 /// 2. For `AF_INET`/`AF_INET6` in proxy-only mode:
-///    - `connect()` is allowed to `127.0.0.1:proxy_port` (the nono proxy) or
-///      to an explicitly granted localhost IPC port.
+///    - `connect()` is allowed to `127.0.0.1:proxy_port` (the nono proxy), to
+///      an explicitly granted `connect_port`, or to an explicitly granted
+///      localhost IPC port (the latter only on loopback).
 ///    - `bind()` is allowed on ports in `proxy_bind_ports` or explicitly
 ///      granted localhost IPC ports and ranges.
 ///    - Everything else is denied.
@@ -871,21 +872,24 @@ pub(super) fn decide_network_notification(
 
     match syscall {
         SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => {
-            // Allow connect/sendto/sendmsg/sendmmsg only to loopback + proxy port
-            // or an explicit bidirectional localhost IPC grant (`--open-port`).
+            // An explicit `connect_port` grants direct connect() to that TCP
+            // port. Proxy and bidirectional localhost IPC grants remain loopback-only.
             // sendto/sendmsg/sendmmsg with a destination address is semantically
-            // equivalent to connect for network reach-out (issue #1089).
-            let allowed_port = sockaddr.port == config.proxy_port
+            // equivalent to connect for network reach-out (issue #1089), but a TCP
+            // connect-port grant does not authorize those datagram-style syscalls.
+            let allowed_connect_port =
+                syscall == SYS_CONNECT && config.caps.tcp_connect_ports().contains(&sockaddr.port);
+            let allowed_loopback_port = sockaddr.port == config.proxy_port
                 || config.caps.localhost_ports().contains(&sockaddr.port)
                 || config
                     .caps
                     .localhost_port_ranges()
                     .iter()
                     .any(|&(start, end)| sockaddr.port >= start && sockaddr.port <= end);
-            if sockaddr.is_loopback && allowed_port {
+            if allowed_connect_port || (sockaddr.is_loopback && allowed_loopback_port) {
                 debug!(
-                    "Proxy seccomp: allowing network syscall nr={} to loopback:{}",
-                    syscall, sockaddr.port
+                    "Proxy seccomp: allowing network syscall nr={} to family={} port={} loopback={}",
+                    syscall, sockaddr.family, sockaddr.port, sockaddr.is_loopback
                 );
                 NetworkDecision::Allow
             } else {
@@ -2360,6 +2364,42 @@ mod tests {
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(3000), &config),
                 NetworkDecision::Allow
+            );
+        }
+
+        /// A supervised proxy session must also honor explicit outbound TCP port grants.
+        #[test]
+        fn proxy_only_allows_explicit_tcp_connect_ports() {
+            let backend = DenyAllBackend;
+            let mut caps = nono::CapabilitySet::default();
+            caps.add_tcp_connect_port(5432);
+            let mut config = make_proxy_only_config(&backend, 8080, Vec::new());
+            config.caps = &caps;
+
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(5432), &config),
+                NetworkDecision::Allow,
+                "an explicitly granted TCP connect port must be allowed in supervised proxy mode"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(5432), &config),
+                NetworkDecision::Allow,
+                "an explicit connect-port grant authorizes direct outbound connections"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(5433), &config),
+                NetworkDecision::Deny,
+                "an ungranted TCP connect port must remain denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(5433), &config),
+                NetworkDecision::Deny,
+                "an ungranted external TCP port must remain denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_SENDTO, &inet_external(5432), &config),
+                NetworkDecision::Deny,
+                "a TCP connect-port grant must not authorize datagram-style sendto"
             );
         }
 

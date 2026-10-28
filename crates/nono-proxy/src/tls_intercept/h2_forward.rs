@@ -71,8 +71,10 @@ where
         ctx.host, ctx.port
     );
 
-    // Resolve upstream addresses (DNS-rebind-safe via filter).
-    let check = ctx.filter.check_host(ctx.host, ctx.port).await?;
+    // Resolve upstream addresses (DNS-rebind-safe via filter). Route-scoped
+    // dial — see `resolve_upstream_or_deny` for why the loopback policy is
+    // exempted on this path.
+    let check = ctx.filter.check_route_upstream(ctx.host, ctx.port).await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();
         warn!("h2_forward: upstream host denied by filter: {}", reason);

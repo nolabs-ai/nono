@@ -758,7 +758,7 @@ Groups use a structured allow/deny taxonomy:
 
 - **`claude_code_linux`** — Claude Code Linux-specific state paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L529))
 
-- **`codex_macos`** — Codex macOS-specific state and credential paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L519))
+- **`codex_macos`** — Codex macOS-specific state and credential paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json))
 
 - **`opencode_linux`** — OpenCode binary directory (Landlock requires directory read to execute binaries) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L395))
 
@@ -837,18 +837,18 @@ nono run --profile nolabs-ai/claude -- claude
 ### Codex (`nolabs-ai/codex`)
 
 ```bash
-nono run --profile nolabs-ai/codex -- codex
+nono run --profile nolabs-ai/codex -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
-**Groups:** `codex_macos`, `node_runtime`, `rust_runtime`, `python_runtime`, `nix_runtime`, `git_config`, `unlink_protection` (plus `default` groups)
+**Groups:** `codex_macos` and `user_caches_macos` on macOS; `user_caches_linux` and `linux_sysfs_read` on Linux; plus `node_runtime`, `rust_runtime`, `python_runtime`, `nix_runtime`, `git_config`, and `unlink_protection` on both platforms (in addition to `default` groups)
 
-**Filesystem:** `~/.codex` (read+write), plus git config files from `git_config` group
+**Filesystem:** `~/.codex`, `~/.agents`, and `$NONO_CONFIG/profile-drafts` (read+write); platform user caches (read+write); common toolchain and git config paths (read); `/sys` (read) on Linux; and `~/Library/Keychains` (read+write, with explicit deny bypass) plus `~/Library/Preferences` (read) on macOS
 
 **Network:** Allowed
 
 **CWD:** Read+write
 
-**Special:** OAuth2 login support via `open_urls` (allows `https://auth.openai.com` and localhost). Profile opts into `allow_launch_services`.
+**Special:** OAuth2 login support via `open_urls` (allows `https://auth.openai.com` and localhost). Profile opts into `allow_launch_services`. Interactive sessions should use `--no-daemon` so the app server and tool execution stay inside the same nono sandbox. `--sandbox danger-full-access` leaves nono as the filesystem and network boundary, while `--ask-for-approval on-request` retains Codex's approval flow.
 
 ### OpenCode 2
 

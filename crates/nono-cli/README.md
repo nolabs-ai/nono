@@ -87,7 +87,7 @@ Precedence is: CLI flag, then `NONO_THEME`, then config file, then the default `
 |---------|---------|---------|
 | Pi | `nono pull nolabs-ai/pi` | `nono run --profile nolabs-ai/pi -- pi` |
 | Claude Code | `nono pull nolabs-ai/claude` | `nono run --profile nolabs-ai/claude -- claude` |
-| Codex | `nono pull nolabs-ai/codex` | `nono run --profile nolabs-ai/codex -- codex` |
+| Codex | `nono pull nolabs-ai/codex` | `nono run --profile nolabs-ai/codex -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request` |
 | OpenCode 2 | `nono pull nolabs-ai/opencode` | `nono run --profile nolabs-ai/opencode -- opencode --standalone` |
 | OpenCode 1 | `nono pull nolabs-ai/opencode-v1` | `nono run --profile nolabs-ai/opencode-v1 -- opencode` |
 

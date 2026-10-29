@@ -45,7 +45,7 @@ See [Claude Code](/cli/clients/claude) for the agent-specific details.
 Recommended pattern:
 
 ```bash
-nono run --profile nolabs-ai/codex --allow-cwd -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile nolabs-ai/codex --allow-cwd -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 The important part is the same: let `nono` enforce the filesystem and network boundary, and avoid layering another independent sandbox on top unless you have a specific reason.
@@ -54,6 +54,7 @@ For Codex specifically:
 
 - keep Codex approvals enabled if you want the normal operator prompt flow
 - disable Codex's own sandbox so `nono` remains the single source of filesystem and network enforcement
+- use `--no-daemon` so the interactive client cannot attach to a shared app server outside the active nono sandbox
 
 See [Codex](/cli/clients/codex) for the exact invocation and client-specific notes.
 
@@ -215,7 +216,7 @@ Use built-in, package, or custom user profiles for repeatable workflows:
 
 ```bash
 nono run --profile nolabs-ai/claude -- claude
-nono run --profile nolabs-ai/codex -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile nolabs-ai/codex -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 Profiles make your workflow easier to repeat, share, and audit.
@@ -251,7 +252,7 @@ That preserves runtime cleanup, terminal cleanup, and rollback finalization.
 If you are going to let an agent run while detached, `--rollback` is usually worth the extra bookkeeping:
 
 ```bash
-nono run --detached --rollback --profile nolabs-ai/codex --allow-cwd -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --detached --rollback --profile nolabs-ai/codex --allow-cwd -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 This is the safer operational default for:

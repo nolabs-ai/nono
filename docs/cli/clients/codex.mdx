@@ -6,15 +6,15 @@ description: Sandboxing OpenAI Codex CLI with nono
 Codex is OpenAI's CLI coding agent. It reads repositories, writes files, runs commands, and stores local session state. Running it under nono keeps that access confined to the project and state paths you intentionally grant.
 
 <Note>
-When you run Codex under `nono`, prefer a single sandbox layer: let `nono` enforce filesystem and network boundaries, and start Codex with its own sandbox disabled.
+When you run Codex under `nono`, keep the interactive client and its app server inside the same sandbox, and prefer a single filesystem and network boundary: use `--no-daemon`, let `nono` enforce access, and start Codex with its own sandbox disabled.
 
 Recommended invocation:
 
 ```bash
-nono run --profile nolabs-ai/codex -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile nolabs-ai/codex -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
-This keeps Codex's approval flow while avoiding nested sandboxes that can make denials harder to diagnose. See OpenAI's [agent approvals and security docs](https://developers.openai.com/codex/agent-approvals-security).
+`--no-daemon` makes the TUI use an embedded app server instead of attaching to the shared background server. `--sandbox danger-full-access` avoids a nested Codex sandbox, while `--ask-for-approval on-request` retains Codex's operator approval flow. See OpenAI's [CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli) and [agent approvals and security docs](https://learn.chatgpt.com/docs/agent-approvals-security).
 </Note>
 
 ## Why Sandbox Codex?
@@ -30,94 +30,110 @@ nono makes those boundaries kernel-enforced instead of advisory.
 ## Quick Start
 
 ```bash
-nono run --profile nolabs-ai/codex -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile nolabs-ai/codex -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 If the registry pack `nolabs-ai/codex` isn't installed yet, nono prompts to pull it (see [Automatic Pack Install and Plugin Wiring](#automatic-pack-install-and-plugin-wiring) below).
 
 The pack profile provides:
 
-- **Read+write access** to the current working directory
+- **Read+write access** to the current working directory after nono's standard CWD consent prompt (or when started with `--allow-cwd`)
 - **Read+write access** to `~/.codex` (config, auth state, sessions, caches, and local metadata) and `~/.agents`
-- **Read access** to common user-local runtime paths for Rust, Node.js, Python, and Nix toolchains, plus `~/Library/Preferences` (Codex queries CFPreferences on startup)
+- **Read+write access** to `~/.config/nono/profile-drafts` for persistent capability drafts
+- **Read+write access** to user cache directories (`~/.cache` on both platforms, plus `~/Library/Caches` and `~/Library/Logs` on macOS)
+- **Read access** to common user-local runtime paths for Rust, Node.js, Python, and Nix toolchains; macOS also grants `~/Library/Preferences`, and Linux grants `/sys`
+- **macOS credential access** to `~/Library/Keychains`, which the profile explicitly exempts from the default keychain deny rules for Codex authentication
 - **OAuth login support** via supervised URL opening on Linux and a temporary LaunchServices flag on macOS
 - **Network access** enabled
 - **Interactive mode** enabled for the terminal UI
 
+## App-server isolation
+
+Recent Codex versions normally connect the TUI to a shared background app server. That server owns the agent harness and tool execution and can outlive the TUI that started it. Sandboxing only the TUI is therefore insufficient: it could attach to a server outside nono and execute tools with that server's access.
+
+For interactive sessions, including `codex resume` and `codex fork`, always use `--no-daemon`. It bypasses daemon discovery without stopping or disrupting any shared daemon used by other Codex clients.
+
+- **macOS:** the pack denies Codex's shared-daemon control paths as fail-closed protection. If Codex cannot connect, restart with `--no-daemon`; it does not automatically fall back to an embedded server.
+- **Linux:** Landlock cannot subtract the daemon socket from the broader read-write `~/.codex` grant required for Codex state. `--no-daemon` is therefore the required isolation control.
+
+The flag depends on the command's execution model:
+
+| Command | App-server path | Safe usage with nono |
+| --- | --- | --- |
+| `codex`, `codex resume`, `codex fork` | Interactive; uses the shared daemon by default | Add `--no-daemon` so the app server and tool execution remain in nono's process tree. |
+| `codex exec`, `codex review` | Starts an in-process app server | No `--no-daemon` is needed. The command and its tool execution remain inside nono. |
+| `codex login`, `codex logout`, and other local configuration commands | Does not run an agent tool harness | No `--no-daemon` is needed. The command itself is still constrained by nono. |
+| `codex agents`, `codex queue`, and other commands targeting the shared server | Intentionally connects to a server outside the CLI process | Do not treat these as isolated agent runs. Sandboxing the client does not retroactively sandbox the shared server. |
+
+The outer nono sandbox applies to the command and all processes it starts. It cannot constrain an already-running daemon outside that process tree. Conversely, `--sandbox danger-full-access` only disables Codex's nested sandbox; it does not disable nono.
+
 ## Automatic Pack Install and Plugin Wiring
 
-The Codex profile is distributed as the signed `nolabs-ai/codex` package along with a Codex plugin that provides sandbox-aware diagnostic hooks and a skill for guiding the user through denial recovery.
+The Codex profile is distributed as the signed `nolabs-ai/codex` package along with a Codex plugin that provides a sandbox-diagnostic skill and startup instructions.
 
-The first time you run `nono run --profile nolabs-ai/codex -- codex`, nono prompts to install the pack:
+The first time you run the canonical interactive command, nono prompts to install the pack:
 
 ```
   ⊕  Install nolabs-ai/codex?
 
-     The sandbox profile is provided by this registry package.
+     The requested profile is this registry package's public profile.
 
-     Publisher    nolabs-ai GitHub organisation
+     Namespace    nolabs-ai
      Provenance   Sigstore cryptographic supply chain (verified on pull)
-     Installs     sandbox profile + Codex hooks + diagnostic skill
 
   Continue? [y/N]
 ```
 
 After the one-second input guard enables the prompt, press `Y`. Pressing Enter
 uses the safe default and skips installation. nono pulls the pack, verifies its
-Sigstore provenance, and writes Codex's plugin wiring directly to the files
-Codex actually reads (verified against `openai/codex` source — not the
-`~/.agents/plugins/marketplace.json` that some external docs hint at).
+Sigstore provenance, and writes Codex's plugin wiring to the marketplace,
+cache, and configuration paths Codex reads.
 
 ### What the pull writes
 
 | Path | What goes there |
 |------|-----------------|
-| `~/.config/nono/packages/nolabs-ai/codex/` | The unpacked pack: profile, plugin manifest, hooks, skill. Single source of truth — every Codex-side path below is a symlink or registry entry pointing at this dir. |
-| `~/.codex/plugins/cache/nolabs-ai/codex/local` | Symlink → pack store. Codex's `PluginStore` (`codex-rs/core-plugins/src/store.rs`) walks this dir to discover installed plugin versions. |
-| `~/.codex/config.toml` (fenced block) | `[marketplaces.nolabs-ai]` registers the marketplace; `[plugins."nono@nolabs-ai"] enabled = true` enables the plugin. |
-| `~/.codex/hooks.json` | Hook entries pointing at `<pack store>/bin/nono-hook*.sh` for `PostToolUse`, `PermissionRequest`, `SessionStart`. |
+| `~/.config/nono/packages/nolabs-ai/codex/` | The unpacked and verified pack: profile, plugin manifest, helper, compatibility scripts, and skill. |
+| `~/.config/nono/profile-drafts/.nono-codex-pack-marker` | A pack-owned marker that ensures the writable profile-drafts directory exists. |
+| `~/.codex/plugins/marketplaces/nolabs-ai/plugins/nono` | Symlink to the pack store, exposing the `nono` plugin through Codex's local marketplace layout. |
+| `~/.codex/plugins/marketplaces/nolabs-ai/.agents/plugins/marketplace.json` | Marketplace metadata for the local `nono` plugin. |
+| `~/.codex/plugins/cache/nolabs-ai/nono/local` | Symlink to the pack store used by Codex's plugin cache discovery. |
+| `~/.codex/bin/nono-draft-profile` | Structured helper used by the skill to create profile drafts safely. |
+| `~/.codex/config.toml` (fenced block) | Adds sandbox-denial guidance, registers the local marketplace, and enables `nono@nolabs-ai`. |
 
 The `config.toml` block is fenced with markers so re-pulls and removals never touch your other settings:
 
 ```toml
-# >>> nono-managed (do not edit) >>>
+# >>> nono:nolabs-ai-codex >>>
+developer_instructions = """
+Only treat a permission failure as a nono denial after explicit nono output or a successful `nono why --self` result with status `DENIED`.
+"""
+
 [marketplaces.nolabs-ai]
 source_type = "local"
-source = "/Users/<you>/.config/nono/packages/nolabs-ai/codex"
+source = "/Users/<you>/.codex/plugins/marketplaces/nolabs-ai"
 
 [plugins."nono@nolabs-ai"]
 enabled = true
-# <<< nono-managed <<<
+# <<< nono:nolabs-ai-codex <<<
 ```
 
-### Activating the hooks
+The actual managed `developer_instructions` block contains the complete denial-confirmation and recovery rules; the abbreviated text above only illustrates its position. The fenced merge leaves every setting outside the managed block untouched.
 
-Codex requires an opt-in feature flag for hooks. Add the following to `~/.codex/config.toml` (the section header and the key must be on **separate** lines — this is TOML, not a single-line declaration):
-
-```toml
-[features]
-codex_hooks = true
-```
-
-nono never writes this flag — opting into a Codex feature is your call. After `nono pull` you'll see a one-line reminder if the flag isn't set:
-
-```
-note: Codex hooks need this in ~/.codex/config.toml to fire — add it once and they activate:
-        [features]
-        codex_hooks = true
-```
+Fresh installs deliberately do not register lifecycle hooks. Codex currently renders hook output in the TUI even for silent hook entries, so the pack uses its plugin skill and `developer_instructions` instead. The packaged hook scripts are compatibility no-ops for older installations whose `hooks.json` may still reference them.
 
 ### Subsequent runs
 
-Once installed, `nono run --profile nolabs-ai/codex -- codex` runs silently — no prompt. nono's profile resolver loads the exact package from the package store and re-asserts the marketplace + cache wiring on every run, so deleting any of the entries above is recovered transparently on the next `nono run`.
+Once installed, the canonical interactive command runs without an installation prompt. nono's profile resolver loads the installed profile from the package store. Plugin wiring is applied during `nono pull` and `nono update`, recorded in the package lockfile, and reversed by `nono remove`; an ordinary `nono run` does not repair deleted wiring.
 
-If a newer version of the pack is available, nono prints a one-line hint after the capabilities block:
+Because Codex is a security-sensitive official pack, nono checks its registry status before launching. An outdated installed version produces:
 
 ```
-  update available  nolabs-ai/codex  0.0.11 → 0.0.12   run: nono update
+  [nono] official pack nolabs-ai/codex@0.2.3 status: outdated
+  [nono] update with: nono pull nolabs-ai/codex@0.2.4 --force
 ```
 
-Run `nono update` to apply it, or `nono outdated` to check all installed packs at once. See [Managing Packs](/cli/features/managing-packs) for pinning and other options.
+The general cached pack checker may additionally show a one-line `run: nono update` hint. Use either printed update command, or run `nono outdated` to inspect all installed packs. See [Managing Packs](/cli/features/managing-packs) for pinning and other options.
 
 ### Skipping or automating the prompt
 
@@ -125,18 +141,14 @@ Run `nono update` to apply it, or `nono outdated` to check all installed packs a
 |-------------|-----------|
 | Interactive TTY | Prompt fires; press Enter or `Y` to install. |
 | `NONO_AUTO_MIGRATE=1` | Prompt skipped; pull runs immediately. Useful for CI/scripted setup. |
-| `NONO_NO_MIGRATE=1` | Pull blocked; nono exits cleanly with a hint pointing at `nono pull nolabs-ai/codex`. |
-| Non-TTY (no env override) | Same as `NONO_NO_MIGRATE=1`. |
+| `NONO_NO_MIGRATE=1` | Automatic pull is skipped and the command exits non-zero because the requested profile remains unavailable. |
+| Non-TTY (no env override) | Pull is skipped; nono exits non-zero and prints commands for an explicit pull or a `NONO_AUTO_MIGRATE=1` retry. |
 
-### Hook-driven sandbox diagnostics
+### Skill-driven sandbox diagnostics
 
-The pack's hooks wire into three Codex events:
+The enabled `nono@nolabs-ai` plugin exposes the `nono-sandbox` skill. Together with the managed startup instructions, it teaches Codex to distinguish generic permission failures from confirmed nono denials, run `nono why --self` when a concrete path is available, and offer either a narrowly scoped one-off restart or a structured profile draft.
 
-- **`PostToolUse`** for `Bash`, `apply_patch`, and MCP file tools — when the tool's output matches a sandbox-denial signature (`Operation not permitted`, `EACCES`, `EPERM`, `landlock`), the hook returns `decision: block` with a `reason` string. Codex pauses the agent loop and shows the reason to the user verbatim — no LLM paraphrasing, no "Want me to run nono why?" dangler. The `reason` includes the diagnostic, the allowed paths, and an inline JSON template for the Option B persistent-fix profile (extends `nolabs-ai/codex` and adds the blocked path).
-- **`PermissionRequest`** — when Codex's approval flow asks the user to escalate, the hook denies upstream with a message explaining that approval can't grant access the OS sandbox already blocks. The user is told to restart with `--allow <path>`.
-- **`SessionStart`** — pre-loads the sandbox boundary into the conversation as `additionalContext`, so the model understands the limits from turn 1 and won't reach for "macOS TCC" or "chmod" diagnoses on the first denial.
-
-In `permission_mode = "bypassPermissions"` (Codex's yolo mode), all three hooks stay silent — the user has explicitly opted into running without approval.
+Codex approval cannot expand the capabilities of an already-running nono sandbox. A confirmed denial requires restarting nono with the missing capability or promoting a derived profile.
 
 ### Removing the pack
 
@@ -144,7 +156,7 @@ In `permission_mode = "bypassPermissions"` (Codex's yolo mode), all three hooks 
 nono remove nolabs-ai/codex
 ```
 
-Removes the pack store directory, the cache subtree, the fenced block from `config.toml`, the hook entries from `hooks.json`, and the lockfile entry. `[features] codex_hooks = true` is left alone — it's a user-set Codex preference, not something nono installed.
+Reverses the recorded marketplace, cache, profile-drafts marker, managed `config.toml`, and draft-helper wiring, then removes the pack store and lockfile entry. User-authored Codex settings and unrelated hooks are left untouched. If a reversal fails, nono preserves the lockfile entry and reports the conflict unless you explicitly use `--force`.
 
 ## Custom Profile
 
@@ -164,10 +176,10 @@ Create `~/.config/nono/profiles/my-codex.json` if you want different permissions
 }
 ```
 
-Then start sessions with `nono run --profile my-codex -- codex`.
+Then start interactive sessions with `nono run --profile my-codex -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request`.
 
 <Note>
-The `extends` chain pulls in everything the package profile declares (allow paths, runtime groups, OAuth origin, hook plugin) and merges your additions on top. Package profiles require their fully-qualified name; a user profile named `codex` is separate and does not shadow `nolabs-ai/codex`.
+The `extends` chain inherits the package profile's policy (allow paths, runtime groups, OAuth origin, and other profile fields) and merges your additions on top. The package's plugin wiring is installed separately by `nono pull`; it is not a profile field. Package profiles require their fully-qualified name; a user profile named `codex` is separate and does not shadow `nolabs-ai/codex`.
 </Note>
 
 ## Security Tips
@@ -184,13 +196,13 @@ The profile includes the required browser-open allowlist:
 On Linux, no additional flags are needed:
 
 ```bash
-nono run --profile nolabs-ai/codex -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile nolabs-ai/codex -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 On macOS, enable LaunchServices temporarily for the login session:
 
 ```bash
-nono run --profile nolabs-ai/codex --allow-launch-services -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile nolabs-ai/codex --allow-launch-services -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 After login completes, exit and rerun without `--allow-launch-services`.
@@ -204,15 +216,30 @@ After login completes, exit and rerun without `--allow-launch-services`.
 The profile grants access to the directory you run Codex from. To pin access to a specific repository:
 
 ```bash
-nono run --profile nolabs-ai/codex --workdir ~/projects/my-app -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile nolabs-ai/codex --workdir ~/projects/my-app -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 ### Read-Only Workspace
 
-If you want Codex to keep its local state but not modify the repository:
+If you want Codex to keep all pack-provided state and runtime access but not modify the repository, create `~/.config/nono/profiles/codex-read-only.json`:
+
+```json
+{
+  "extends": "nolabs-ai/codex",
+  "meta": {
+    "name": "codex-read-only",
+    "version": "1.0.0"
+  },
+  "workdir": {
+    "access": "read"
+  }
+}
+```
+
+Then run the noninteractive review command. Unlike the interactive TUI, `codex review` starts its app server in the same `codex` process instead of connecting to the shared background daemon. That process remains inside nono, so `--no-daemon` is not needed here. `--sandbox danger-full-access` disables Codex's nested sandbox, not the outer nono sandbox:
 
 ```bash
-nono run --read . --allow ~/.codex -- codex --sandbox danger-full-access --ask-for-approval on-request review
+nono run --profile codex-read-only -- codex --sandbox danger-full-access --ask-for-approval on-request review
 ```
 
 ### Block Network for Local-Only Work
@@ -220,7 +247,7 @@ nono run --read . --allow ~/.codex -- codex --sandbox danger-full-access --ask-f
 If you want to inspect local code without allowing outbound access:
 
 ```bash
-nono run --profile nolabs-ai/codex --block-net -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile nolabs-ai/codex --block-net -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 ### Use Network Filtering
@@ -228,45 +255,67 @@ nono run --profile nolabs-ai/codex --block-net -- codex --sandbox danger-full-ac
 If you want Codex limited to the built-in host allowlist for coding workflows:
 
 ```bash
-nono run --profile nolabs-ai/codex --network-profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile nolabs-ai/codex --network-profile codex -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 #### Codex Shell-based Tools
 
-The `allow_login_shell` configuration key in Codex controls whether shell-based tools use login-shell semantics. When disabled, login-shell requests are rejected and the subprocess falls back to a non-login shell. This matters because, even with the Codex sandbox disabled, Codex subprocesses will have a narrow set of environment variables.
+The `allow_login_shell` configuration key in Codex controls whether shell-based tools may request login-shell semantics. When it is `false`, requests with `login = true` are rejected, while requests that omit `login` use a non-login shell. On affected tool paths, that non-login-shell environment can omit values that nono injected into the Codex process, even when Codex's own sandbox is disabled.
 
-As a result:
+If those values are missing:
 
-- when domain filtering is enabled, all network requests from commands executed by Codex are denied, regardless of the allowlist;
-- tool commands no longer appear to run inside nono.
+- proxy-filtered network requests from Codex commands fail even for allowed destinations because the proxy variables or token are unavailable;
+- `nono why --self` cannot see `NONO_CAP_FILE`, so a command cannot introspect the active nono capability set.
 
 ##### Option 1: Allow login shell in nono sandbox
 
-Because nono is already sandboxing the execution and filtering environment variables, you can start Codex with its own sandbox and optional hardening disabled.
+Codex defaults `allow_login_shell` to `true`; if neither your configuration nor a managed requirement disables it, the network-filtering command above is already sufficient. To override a user configuration that set it to `false`, pass the setting explicitly. Because nono is already enforcing the outer sandbox, this disables only the optional Codex login-shell hardening for that invocation.
 
 Recommended invocation:
 
 ```bash
-nono run --profile nolabs-ai/codex --network-profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request --config allow_login_shell=true
+nono run --profile nolabs-ai/codex --network-profile codex -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request --config allow_login_shell=true
 ```
 
 ##### Option 2: Explicit configuration
 
 An alternative, more secure, and explicit approach is to keep optional hardening enabled and configure Codex’s `shell_environment_policy` so that required environment variables are passed to the subprocess.
 
-Set `allow_login_shell=false` in the Codex configuration, then add the `shell_environment_policy` block and list required exports:
+Set `allow_login_shell=false` in the Codex configuration, then add the `shell_environment_policy` block and explicitly include the required exports. The `filters` map is the current form of this policy; the older `include_only` array remains supported by Codex for compatibility but is legacy configuration.
+
+Keep `ignore_default_excludes = true` here. Codex's automatic secret-name filter runs before explicit filters and would otherwise remove `NONO_PROXY_TOKEN`; an `include` rule cannot restore it. The explicit include filters still form an allowlist, so unlisted environment variables remain excluded.
 
 ```toml
 [shell_environment_policy]
 inherit = "all"
-ignore_default_excludes = false
-include_only = [
-    "PATH", "HOME", "USER", "SHELL", "TERM", "COLORTERM", "LANG", "LC_*",
-    "NONO_CAP_FILE", "NONO_PROXY_TOKEN", "BROWSER",
-    "NO_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "NODE_USE_ENV_PROXY",
-    "GIT_SSL_CAINFO", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"
-]
+ignore_default_excludes = true
+
+[shell_environment_policy.filters]
+"PATH" = "include"
+"HOME" = "include"
+"USER" = "include"
+"SHELL" = "include"
+"TERM" = "include"
+"COLORTERM" = "include"
+"LANG" = "include"
+"LC_*" = "include"
+"NONO_CAP_FILE" = "include"
+"NONO_PROXY_TOKEN" = "include"
+"BROWSER" = "include"
+"NO_PROXY" = "include"
+"NONO_NO_PROXY" = "include"
+"HTTP_PROXY" = "include"
+"HTTPS_PROXY" = "include"
+"NODE_USE_ENV_PROXY" = "include"
+"GIT_SSL_CAINFO" = "include"
+"CURL_CA_BUNDLE" = "include"
+"NODE_EXTRA_CA_CERTS" = "include"
+"REQUESTS_CA_BUNDLE" = "include"
+"SSL_CERT_FILE" = "include"
+"AWS_CA_BUNDLE" = "include"
 ```
+
+Filter matching is case-insensitive, so the uppercase proxy entries also preserve nono's lowercase `http_proxy`, `https_proxy`, and `no_proxy` exports. See OpenAI's [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) for the complete `shell_environment_policy` semantics.
 
 ### Additional Home-Directory Tools
 
@@ -278,7 +327,7 @@ If a tool exists on your `PATH` but Codex cannot launch it inside the sandbox, g
 nono run --profile nolabs-ai/codex \
   --read ~/.bun/bin \
   --read ~/go/bin \
-  -- codex --sandbox danger-full-access --ask-for-approval on-request
+  -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 See [Network Filtering](/cli/features/networking) and [Security Profiles](/cli/features/profiles-groups) for details on host allowlists, profile format, and precedence rules.

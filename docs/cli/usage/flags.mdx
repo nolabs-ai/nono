@@ -41,7 +41,7 @@ Resolution order:
 nono --theme tokyo-night run --allow-cwd -- claude
 
 # Via environment variable
-NONO_THEME=latte nono run --allow-cwd -- codex
+NONO_THEME=latte nono run --profile nolabs-ai/codex --allow-cwd -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 
 # Config file
 # ~/.config/nono/config.toml

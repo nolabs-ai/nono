@@ -7,7 +7,7 @@ use nono::undo::{
     NetworkAuditAuthMechanism, NetworkAuditAuthOutcome, NetworkAuditDecision,
     NetworkAuditDenialCategory, NetworkAuditEvent, NetworkAuditInjectionMode, NetworkAuditMode,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
@@ -40,37 +40,28 @@ pub struct BufferedAuditEvent {
 /// Every event is buffered (up to [`MAX_AUDIT_EVENTS`]) for the end-of-session
 /// summary. When a sink is attached, events are also delivered to it as they
 /// happen, and the buffer remembers which ones it accepted.
+///
+/// Each delivery holds a read lock on the sink slot until its event is
+/// buffered, and [`AuditLog::detach_sink`] takes the write lock. Once detach
+/// returns, no delivery is in flight, so a finalizer that detaches before
+/// draining sees every delivered event in the buffer.
 #[derive(Default)]
 pub struct AuditLog {
     events: Mutex<Vec<BufferedAuditEvent>>,
-    sink: Mutex<Option<AuditSink>>,
+    sink: RwLock<Option<AuditSink>>,
 }
 
 impl AuditLog {
     /// Deliver subsequent events to `sink` as they happen.
     pub fn attach_sink(&self, sink: AuditSink) {
-        match self.sink.lock() {
-            Ok(mut slot) => *slot = Some(sink),
-            Err(e) => warn!("Network audit sink mutex poisoned while attaching: {}", e),
-        }
+        // A poisoned slot only means a sink panicked; the slot is still valid.
+        *self.sink.write().unwrap_or_else(PoisonError::into_inner) = Some(sink);
     }
 
-    /// Stop live delivery. Later events are only buffered.
+    /// Stop live delivery, waiting for in-flight deliveries to finish.
+    /// Later events are only buffered.
     pub fn detach_sink(&self) {
-        match self.sink.lock() {
-            Ok(mut slot) => *slot = None,
-            Err(e) => warn!("Network audit sink mutex poisoned while detaching: {}", e),
-        }
-    }
-
-    fn current_sink(&self) -> Option<AuditSink> {
-        match self.sink.lock() {
-            Ok(slot) => slot.clone(),
-            Err(e) => {
-                warn!("Network audit sink mutex poisoned while recording: {}", e);
-                None
-            }
-        }
+        *self.sink.write().unwrap_or_else(PoisonError::into_inner) = None;
     }
 }
 
@@ -265,9 +256,14 @@ fn push_event(audit_log: Option<&SharedAuditLog>, event: NetworkAuditEvent) {
         return;
     };
 
-    // Call the sink without holding the buffer lock: it may take other locks
-    // (the session recorder) that a finalizer holds while draining.
-    let live_recorded = match audit_log.current_sink() {
+    // Hold the sink read lock until the event is buffered so detach waits for
+    // this delivery. Call the sink without holding the buffer lock: it may
+    // take other locks (the session recorder).
+    let sink_slot = audit_log
+        .sink
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    let live_recorded = match sink_slot.as_ref() {
         Some(sink) => match sink(&event) {
             Ok(()) => true,
             Err(e) => {
@@ -305,6 +301,7 @@ fn push_event(audit_log: Option<&SharedAuditLog>, event: NetworkAuditEvent) {
             );
         }
     }
+    drop(sink_slot);
 }
 
 pub fn log_allowed(
@@ -888,6 +885,48 @@ mod tests {
         let buffered = drain_buffered_audit_events(&log);
         assert_eq!(buffered.len(), 1);
         assert!(!buffered[0].live_recorded);
+    }
+
+    #[test]
+    fn detach_waits_for_in_flight_delivery() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let log = new_audit_log();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        log.attach_sink(Arc::new(move |_: &NetworkAuditEvent| {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(())
+        }));
+
+        let emitter_log = Arc::clone(&log);
+        let emitter = std::thread::spawn(move || log_connect(&emitter_log, "api.example.com"));
+        entered_rx.recv().unwrap();
+
+        let detached = Arc::new(AtomicBool::new(false));
+        let detacher_log = Arc::clone(&log);
+        let detacher_flag = Arc::clone(&detached);
+        let detacher = std::thread::spawn(move || {
+            detacher_log.detach_sink();
+            detacher_flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !detached.load(Ordering::SeqCst),
+            "detach must wait for the in-flight delivery"
+        );
+
+        release_tx.send(()).unwrap();
+        emitter.join().unwrap();
+        detacher.join().unwrap();
+
+        // Once detach returns, the delivered event is already buffered.
+        let buffered = drain_buffered_audit_events(&log);
+        assert_eq!(buffered.len(), 1);
+        assert!(buffered[0].live_recorded);
     }
 
     #[test]

@@ -1548,21 +1548,27 @@ fn push_network_audit_event(
     config: &SupervisorConfig<'_>,
     event: nono::undo::NetworkAuditEvent,
 ) -> nono::Result<()> {
+    // Record live first, then buffer with the outcome so finalization can
+    // retry a failed write. The buffer also feeds the session metadata.
+    let live_result = config.audit_recorder.as_ref().map(|recorder_mutex| {
+        recorder_mutex
+            .lock()
+            .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))
+            .and_then(|mut recorder| recorder.record_network_event(event.clone()))
+    });
+    let live_recorded = matches!(live_result, Some(Ok(())));
+
     if let Some(events_mutex) = config.network_audit_events {
         let mut events = events_mutex
             .lock()
             .map_err(|_| NonoError::Snapshot("Network audit event lock poisoned".to_string()))?;
-        events.push(event.clone());
+        events.push(nono_proxy::audit::BufferedAuditEvent {
+            event,
+            live_recorded,
+        });
     }
 
-    if let Some(recorder_mutex) = config.audit_recorder.as_ref() {
-        let mut recorder = recorder_mutex
-            .lock()
-            .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
-        recorder.record_network_event(event)?;
-    }
-
-    Ok(())
+    live_result.unwrap_or(Ok(()))
 }
 
 fn network_audit_target(sockaddr: &nono::sandbox::SockaddrInfo) -> String {
@@ -2023,16 +2029,49 @@ mod tests {
                 let recorded = events.lock().expect("lock");
                 assert_eq!(recorded.len(), 1, "exactly one summary event");
                 assert!(matches!(
-                    recorded[0].decision,
+                    recorded[0].event.decision,
                     nono::undo::NetworkAuditDecision::Deny
                 ));
-                let reason = recorded[0].reason.as_deref().unwrap_or_default();
+                assert!(!recorded[0].live_recorded, "no recorder configured");
+                let reason = recorded[0].event.reason.as_deref().unwrap_or_default();
                 assert!(reason.starts_with("4 network syscall denials"), "{reason}");
             }
 
             // Counter was reset: a second flush adds nothing.
             super::super::flush_suppressed_network_denials(&config, &mut throttle);
             assert_eq!(events.lock().expect("lock").len(), 1);
+        }
+
+        #[test]
+        fn network_audit_event_buffers_live_write_outcome() {
+            let backend = DenyAllBackend;
+            let events = std::sync::Mutex::new(Vec::new());
+            let dir = tempfile::tempdir().expect("tempdir");
+            let recorder = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::audit_integrity::AuditRecorder::new(dir.path().to_path_buf())
+                    .expect("recorder"),
+            ));
+            let mut config = make_proxy_only_config(&backend, 8080, vec![]);
+            config.network_audit_events = Some(&events);
+            config.audit_recorder = Some(std::sync::Arc::clone(&recorder));
+
+            let event =
+                || super::super::network_denial_event("a".to_string(), None, "r".to_string());
+            super::super::push_network_audit_event(&config, event()).expect("live write");
+
+            // A closed recorder rejects the live write; the event must stay
+            // buffered as unrecorded so finalization can retry it.
+            recorder
+                .lock()
+                .expect("lock")
+                .record_session_ended("2026-01-01T00:00:00Z".to_string(), 0)
+                .expect("end");
+            assert!(super::super::push_network_audit_event(&config, event()).is_err());
+
+            let buffered = events.lock().expect("lock");
+            assert_eq!(buffered.len(), 2);
+            assert!(buffered[0].live_recorded);
+            assert!(!buffered[1].live_recorded);
         }
 
         fn unix_pathname(path: &Path) -> SockaddrInfo {

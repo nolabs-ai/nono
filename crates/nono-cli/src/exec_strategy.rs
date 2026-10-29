@@ -382,7 +382,7 @@ pub struct SupervisorConfig<'a> {
     pub audit_recorder: Option<Arc<Mutex<crate::audit_integrity::AuditRecorder>>>,
     /// Optional in-memory network/IPC audit events persisted into session metadata.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub network_audit_events: Option<&'a Mutex<Vec<nono::undo::NetworkAuditEvent>>>,
+    pub network_audit_events: Option<&'a Mutex<Vec<nono_proxy::audit::BufferedAuditEvent>>>,
     /// Running proxy handle, used to snapshot network denial events for the
     /// diagnostic footer. Read-only here: session finalization performs the
     /// destructive drain that feeds the persistent audit record.

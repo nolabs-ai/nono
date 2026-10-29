@@ -47,7 +47,7 @@ denied correctly. The gap is the evidence.
 | Landlock TCP and scopes | connect/bind outside port grants; signals; abstract UNIX sockets | No |
 | Static seccomp filters | UDP, raw and non-IP sockets, `io_uring_setup` | No (silent `EPERM`) |
 | Seccomp network and AF_UNIX notifications | proxy-fallback connect/send; pathname UNIX connect/bind | Yes, rate-limited with suppression summaries; no pid |
-| Proxy | hosts, URLs, credential injection | Yes, allows and denials |
+| Proxy | hosts, URLs, credential injection; runtime host approvals (#1781) | Yes: allows, denials and approval decisions, but written to the log only at session end |
 | Command policy | mediated tool commands | Yes |
 | Seatbelt (macOS) | every denial in supervised mode, via `log stream` | Diagnostics only, capped at 50 (`sandbox_log.rs`) |
 | cgroup resource limits | OOM kills, process-count cap | End-of-session terminal report only |
@@ -103,8 +103,10 @@ The recorder writes five classes of event into the existing hash-chained
 audit log (`crates/nono/src/audit.rs`):
 
 1. **Grant ledger.** The resolved, canonicalised `CapabilitySet` at session
-   start, and each grant added later (`capability_decision` already covers
-   approvals).
+   start, and each grant added later, recorded when it is made: filesystem
+   approvals (`capability_decision`) and session-scoped network host
+   approvals (`GrantedForSession`, #1781). Session-scoped denials
+   (`DeniedForSession`) are recorded the same way.
 2. **Denials.** One new payload, `access_denied`, fed by every source in the
    table above. Fields:
    - `source`: `supervisor`, `approval_backend`, `landlock_kernel`,
@@ -456,6 +458,11 @@ confirming before this is accepted.
 - **Clock correlation.** Chain order is recording order (§10), but kernel
   audit timestamps and supervisor timestamps come from different clocks.
   Define how consumers relate the two when reconstructing a timeline.
+- **Decision provenance.** A connection allowed or denied by a cached
+  session decision is recorded as `ApproveGranted` or `ApproveDenied` with
+  the backend name, the same as a fresh prompt. Decide whether to add a
+  field distinguishing "the operator was asked" from "answered from an
+  earlier decision", for network and filesystem approvals alike.
 - **Checkpoint interval.** Choose the time and event-count intervals for
   checkpoints, balancing log volume against how much a crashed session
   loses.

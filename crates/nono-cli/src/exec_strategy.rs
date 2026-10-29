@@ -1549,6 +1549,12 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
 
             let mut killed_by_timeout = false;
 
+            // Off-thread prompts wait for the supervisor loop below to pause
+            // the relay while it runs; see `service_off_thread_prompts`.
+            let relay_registration = pty_proxy
+                .is_some()
+                .then(crate::relay_prompt_gate::register_relay);
+
             // Start the timer only in the parent after fork(), then stop and
             // join it before the session's temp artifacts are torn down.
             let _temp_keepalive = prepared_temp_keepalive.start();
@@ -1595,6 +1601,8 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     )?;
                     (status, Vec::new(), Vec::new(), Vec::new())
                 };
+
+            drop(relay_registration);
 
             // Close the attach listener immediately so no new attach
             // connections can sneak in during teardown.  Without this,
@@ -2162,6 +2170,7 @@ fn wait_for_child_with_pty(
         handle_pty_detach_request(Some(pty), pause_requested, in_band_detach_requested);
         handle_pty_signal_relay(Some(pty));
         handle_pty_suspension(Some(pty), child);
+        service_off_thread_prompts(Some(pty));
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
@@ -2823,6 +2832,7 @@ fn run_supervisor_loop(
         );
         handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
+        service_off_thread_prompts(pty.as_deref_mut());
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
@@ -3287,6 +3297,7 @@ fn run_supervisor_loop_inner(
         );
         handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
+        service_off_thread_prompts(pty.as_deref_mut());
 
         // Drain reparented orphans; if the primary child was among them,
         // surface its status directly.
@@ -3405,26 +3416,35 @@ struct SupervisorDenials {
     seen_request_ids: HashSet<String>,
 }
 
-/// Run an approval request with the PTY relay paused.
+/// Run a supervisor-thread approval request with the PTY relay paused.
 ///
-/// While a terminal client is attached to the PTY relay, the real terminal is
-/// in raw mode and relaying keystrokes to the child, so an interactive prompt
-/// would render garbled and never see the user's answer. Pause the relay
-/// (restoring cooked mode) for the duration of the request and re-enter relay
-/// mode afterwards. A no-op when no terminal-backed client is attached.
+/// See [`crate::pty_proxy::PtyProxy::run_with_terminal_paused`]. Requests
+/// raised on other threads pause the relay through
+/// [`service_off_thread_prompts`] instead.
 fn request_approval_with_relay_paused(
     config: &SupervisorConfig<'_>,
     request: &nono::supervisor::ApprovalRequest,
-    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
+    pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<ApprovalDecision> {
-    let paused_for_prompt = pty
-        .as_mut()
-        .is_some_and(|proxy| proxy.pause_terminal_for_prompt());
-    let result = config.approval_backend.request_approval(request);
-    if paused_for_prompt && let Some(proxy) = pty.as_mut() {
-        proxy.resume_terminal_after_prompt();
+    let request_approval = || config.approval_backend.request_approval(request);
+    match pty {
+        Some(proxy) => proxy.run_with_terminal_paused(request_approval),
+        None => request_approval(),
     }
-    result
+}
+
+/// Pause the PTY relay for terminal prompts raised off the supervisor thread.
+///
+/// Network and proxy endpoint approvals run on proxy worker threads that
+/// cannot reach the relay. They wait in [`crate::relay_prompt_gate`] until
+/// this supervisor-loop hook pauses the relay, and the relay resumes once the
+/// last of them finishes.
+fn service_off_thread_prompts(pty: Option<&mut crate::pty_proxy::PtyProxy>) {
+    if let Some(proxy) = pty {
+        crate::relay_prompt_gate::service_pending_prompts(|prompts| {
+            proxy.run_with_terminal_paused(prompts)
+        });
+    }
 }
 
 /// Handle a single supervisor IPC message.

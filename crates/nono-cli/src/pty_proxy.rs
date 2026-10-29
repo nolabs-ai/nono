@@ -982,6 +982,22 @@ impl PtyProxy {
         true
     }
 
+    /// Run a supervisor-owned prompt with the relay paused.
+    ///
+    /// While a terminal client is attached, the real terminal is in raw mode
+    /// and its keystrokes are relayed to the child, so a prompt would render
+    /// garbled and compete with the child for the user's answer. Restore
+    /// cooked mode for the duration of `prompt`, then re-enter relay mode.
+    /// Runs `prompt` unchanged when no terminal-backed client is attached.
+    pub fn run_with_terminal_paused<T>(&mut self, prompt: impl FnOnce() -> T) -> T {
+        let paused = self.pause_terminal_for_prompt();
+        let result = prompt();
+        if paused {
+            self.resume_terminal_after_prompt();
+        }
+        result
+    }
+
     /// Re-enter relay terminal mode after a supervisor-owned prompt.
     ///
     /// Returns true when a terminal-backed client was resumed.

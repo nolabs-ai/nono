@@ -61,6 +61,7 @@ mod pty_proxy;
 mod pull_ui;
 mod query_ext;
 mod registry_client;
+mod relay_prompt_gate;
 #[cfg(unix)]
 mod remote_run;
 #[cfg(target_os = "linux")]

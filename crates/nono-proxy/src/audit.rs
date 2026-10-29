@@ -20,8 +20,59 @@ pub const AUDIT_TARGET: &str = "nono_proxy::audit";
 /// Maximum number of in-memory network audit events kept per proxy session.
 const MAX_AUDIT_EVENTS: usize = 4096;
 
-/// Shared in-memory sink for network audit events.
-pub type SharedAuditLog = Arc<Mutex<Vec<NetworkAuditEvent>>>;
+/// Shared network audit log: an in-memory buffer plus an optional live sink.
+pub type SharedAuditLog = Arc<AuditLog>;
+
+/// Live destination for network audit events, called once per event as it
+/// happens. Returning an error leaves the event unrecorded, so the caller can
+/// still deliver it from the buffer at session end.
+pub type AuditSink = Arc<dyn Fn(&NetworkAuditEvent) -> nono::Result<()> + Send + Sync>;
+
+/// A buffered network audit event and whether the live sink recorded it.
+#[derive(Debug, Clone)]
+pub struct BufferedAuditEvent {
+    pub event: NetworkAuditEvent,
+    pub live_recorded: bool,
+}
+
+/// In-memory network audit buffer with an optional live sink.
+///
+/// Every event is buffered (up to [`MAX_AUDIT_EVENTS`]) for the end-of-session
+/// summary. When a sink is attached, events are also delivered to it as they
+/// happen, and the buffer remembers which ones it accepted.
+#[derive(Default)]
+pub struct AuditLog {
+    events: Mutex<Vec<BufferedAuditEvent>>,
+    sink: Mutex<Option<AuditSink>>,
+}
+
+impl AuditLog {
+    /// Deliver subsequent events to `sink` as they happen.
+    pub fn attach_sink(&self, sink: AuditSink) {
+        match self.sink.lock() {
+            Ok(mut slot) => *slot = Some(sink),
+            Err(e) => warn!("Network audit sink mutex poisoned while attaching: {}", e),
+        }
+    }
+
+    /// Stop live delivery. Later events are only buffered.
+    pub fn detach_sink(&self) {
+        match self.sink.lock() {
+            Ok(mut slot) => *slot = None,
+            Err(e) => warn!("Network audit sink mutex poisoned while detaching: {}", e),
+        }
+    }
+
+    fn current_sink(&self) -> Option<AuditSink> {
+        match self.sink.lock() {
+            Ok(slot) => slot.clone(),
+            Err(e) => {
+                warn!("Network audit sink mutex poisoned while recording: {}", e);
+                None
+            }
+        }
+    }
+}
 
 /// Proxy mode for audit logging.
 #[derive(Debug, Clone, Copy)]
@@ -83,7 +134,7 @@ impl std::fmt::Display for ProxyMode {
 
 #[must_use]
 pub fn new_audit_log() -> SharedAuditLog {
-    Arc::new(Mutex::new(Vec::new()))
+    Arc::new(AuditLog::default())
 }
 
 /// Clone the collected events without clearing the log.
@@ -93,8 +144,11 @@ pub fn new_audit_log() -> SharedAuditLog {
 /// [`drain_audit_events`] that feeds the persistent audit record.
 #[must_use]
 pub fn snapshot_audit_events(audit_log: &SharedAuditLog) -> Vec<NetworkAuditEvent> {
-    match audit_log.lock() {
-        Ok(events) => events.clone(),
+    match audit_log.events.lock() {
+        Ok(events) => events
+            .iter()
+            .map(|buffered| buffered.event.clone())
+            .collect(),
         Err(e) => {
             warn!(
                 "Network audit log mutex poisoned while snapshotting events: {}",
@@ -107,7 +161,17 @@ pub fn snapshot_audit_events(audit_log: &SharedAuditLog) -> Vec<NetworkAuditEven
 
 #[must_use]
 pub fn drain_audit_events(audit_log: &SharedAuditLog) -> Vec<NetworkAuditEvent> {
-    match audit_log.lock() {
+    drain_buffered_audit_events(audit_log)
+        .into_iter()
+        .map(|buffered| buffered.event)
+        .collect()
+}
+
+/// Drain the buffer, keeping each event's live-delivery status so the caller
+/// can record only the events the sink did not accept.
+#[must_use]
+pub fn drain_buffered_audit_events(audit_log: &SharedAuditLog) -> Vec<BufferedAuditEvent> {
+    match audit_log.events.lock() {
         Ok(mut events) => events.drain(..).collect(),
         Err(e) => {
             warn!(
@@ -201,10 +265,32 @@ fn push_event(audit_log: Option<&SharedAuditLog>, event: NetworkAuditEvent) {
         return;
     };
 
-    match audit_log.lock() {
+    // Call the sink without holding the buffer lock: it may take other locks
+    // (the session recorder) that a finalizer holds while draining.
+    let live_recorded = match audit_log.current_sink() {
+        Some(sink) => match sink(&event) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to record network audit event live: {}", e);
+                false
+            }
+        },
+        None => false,
+    };
+
+    match audit_log.events.lock() {
         Ok(mut events) => {
             if events.len() < MAX_AUDIT_EVENTS {
-                events.push(event);
+                events.push(BufferedAuditEvent {
+                    event,
+                    live_recorded,
+                });
+            } else if live_recorded {
+                warn!(
+                    "Network audit buffer full ({} events); event recorded live but omitted \
+                     from the session summary",
+                    MAX_AUDIT_EVENTS
+                );
             } else {
                 warn!(
                     "Network audit buffer full ({} events); dropping event",
@@ -738,6 +824,89 @@ mod tests {
             "composed message must carry the redacted path: {:?}",
             lines[0]
         );
+    }
+
+    fn log_connect(log: &SharedAuditLog, host: &str) {
+        log_allowed(
+            Some(log),
+            ProxyMode::Connect,
+            &EventContext::default(),
+            host,
+            443,
+            "CONNECT",
+        );
+    }
+
+    #[test]
+    fn attached_sink_receives_events_live_and_buffer_marks_them() {
+        let log = new_audit_log();
+        log_connect(&log, "before.example.com");
+
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let sink_delivered = Arc::clone(&delivered);
+        log.attach_sink(Arc::new(move |event: &NetworkAuditEvent| {
+            sink_delivered.lock().unwrap().push(event.target.clone());
+            Ok(())
+        }));
+        log_connect(&log, "live.example.com");
+
+        assert_eq!(*delivered.lock().unwrap(), vec!["live.example.com"]);
+        let buffered = drain_buffered_audit_events(&log);
+        assert_eq!(buffered.len(), 2, "every event stays in the summary buffer");
+        assert_eq!(buffered[0].event.target, "before.example.com");
+        assert!(!buffered[0].live_recorded);
+        assert_eq!(buffered[1].event.target, "live.example.com");
+        assert!(buffered[1].live_recorded);
+    }
+
+    #[test]
+    fn rejected_live_event_stays_unrecorded() {
+        let log = new_audit_log();
+        log.attach_sink(Arc::new(|_: &NetworkAuditEvent| {
+            Err(nono::NonoError::Snapshot("recorder closed".to_string()))
+        }));
+        log_connect(&log, "api.example.com");
+
+        let buffered = drain_buffered_audit_events(&log);
+        assert_eq!(buffered.len(), 1);
+        assert!(!buffered[0].live_recorded);
+    }
+
+    #[test]
+    fn detached_sink_receives_nothing() {
+        let log = new_audit_log();
+        let delivered = Arc::new(Mutex::new(0usize));
+        let sink_delivered = Arc::clone(&delivered);
+        log.attach_sink(Arc::new(move |_: &NetworkAuditEvent| {
+            *sink_delivered.lock().unwrap() += 1;
+            Ok(())
+        }));
+        log.detach_sink();
+        log_connect(&log, "api.example.com");
+
+        assert_eq!(*delivered.lock().unwrap(), 0);
+        let buffered = drain_buffered_audit_events(&log);
+        assert_eq!(buffered.len(), 1);
+        assert!(!buffered[0].live_recorded);
+    }
+
+    #[test]
+    fn live_sink_still_receives_events_past_buffer_cap() {
+        let log = new_audit_log();
+        let delivered = Arc::new(Mutex::new(0usize));
+        let sink_delivered = Arc::clone(&delivered);
+        log.attach_sink(Arc::new(move |_: &NetworkAuditEvent| {
+            *sink_delivered.lock().unwrap() += 1;
+            Ok(())
+        }));
+        let _warns = capture_warns(|| {
+            for _ in 0..=MAX_AUDIT_EVENTS {
+                log_connect(&log, "api.example.com");
+            }
+        });
+
+        assert_eq!(*delivered.lock().unwrap(), MAX_AUDIT_EVENTS + 1);
+        assert_eq!(drain_audit_events(&log).len(), MAX_AUDIT_EVENTS);
     }
 
     #[test]

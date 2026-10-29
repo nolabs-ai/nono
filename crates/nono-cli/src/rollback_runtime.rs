@@ -523,10 +523,24 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
         rollback_prompt_disabled,
     } = ctx;
 
-    let mut network_events = proxy_handle.map_or_else(
+    // Proxy events were recorded live as they happened; only those the live
+    // sink missed (emitted before it was attached, or rejected) are recorded
+    // here. Supervisor network events are always recorded live. Both sets
+    // still go into the session metadata.
+    if let Some(proxy_handle) = proxy_handle {
+        proxy_handle.detach_audit_sink();
+    }
+    let mut unrecorded_network_events = Vec::new();
+    let mut network_events = Vec::new();
+    for buffered in proxy_handle.map_or_else(
         Vec::new,
-        nono_proxy::server::ProxyHandle::drain_audit_events,
-    );
+        nono_proxy::server::ProxyHandle::drain_buffered_audit_events,
+    ) {
+        if !buffered.live_recorded {
+            unrecorded_network_events.push(buffered.event.clone());
+        }
+        network_events.push(buffered.event);
+    }
     if let Some(events_mutex) = supervisor_network_audit_events {
         let mut supervisor_events = events_mutex.lock().map_err(|_| {
             nono::NonoError::Snapshot("Network audit event lock poisoned".to_string())
@@ -538,8 +552,8 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
             let mut recorder = recorder_mutex.lock().map_err(|_| {
                 nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string())
             })?;
-            for event in &network_events {
-                recorder.record_network_event(event.clone())?;
+            for event in unrecorded_network_events {
+                recorder.record_network_event(event)?;
             }
             recorder.record_session_ended(ended.to_string(), exit_code)?;
             let event_count = recorder.event_count();

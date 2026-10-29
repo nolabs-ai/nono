@@ -389,6 +389,35 @@ impl ProxyHandle {
         }
     }
 
+    /// Drain collected network audit events with their live-delivery status.
+    ///
+    /// Returns an empty vec when network audit was disabled at start.
+    #[must_use]
+    pub fn drain_buffered_audit_events(&self) -> Vec<audit::BufferedAuditEvent> {
+        match self.audit_log.as_ref() {
+            Some(audit_log) => audit::drain_buffered_audit_events(audit_log),
+            None => Vec::new(),
+        }
+    }
+
+    /// Deliver network audit events to `sink` as they happen.
+    ///
+    /// Events emitted before the sink is attached, or that the sink rejects,
+    /// stay buffered with `live_recorded == false`. No-op when network audit
+    /// was disabled at start.
+    pub fn attach_audit_sink(&self, sink: audit::AuditSink) {
+        if let Some(audit_log) = self.audit_log.as_ref() {
+            audit_log.attach_sink(sink);
+        }
+    }
+
+    /// Stop live delivery of network audit events.
+    pub fn detach_audit_sink(&self) {
+        if let Some(audit_log) = self.audit_log.as_ref() {
+            audit_log.detach_sink();
+        }
+    }
+
     /// Whether this proxy allocated the in-memory network audit buffer.
     #[must_use]
     pub fn network_audit_enabled(&self) -> bool {

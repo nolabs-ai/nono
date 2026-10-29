@@ -413,6 +413,9 @@ pub struct AuditRecorder {
     leaf_hashes: Vec<ContentHash>,
     redaction_policy: crate::ScrubPolicy,
     command_policy_summary: CommandPolicySummaryBuilder,
+    /// Set once `session_ended` is recorded; later appends are refused so the
+    /// log cannot grow past the integrity summary computed at session end.
+    ended: bool,
 }
 
 impl AuditRecorder {
@@ -444,6 +447,7 @@ impl AuditRecorder {
             leaf_hashes: Vec::new(),
             redaction_policy,
             command_policy_summary: CommandPolicySummaryBuilder::new(),
+            ended: false,
         })
     }
 
@@ -460,8 +464,12 @@ impl AuditRecorder {
     }
 
     /// Record a session end event.
+    ///
+    /// The recorder accepts no further events afterwards.
     pub fn record_session_ended(&mut self, ended: String, exit_code: i32) -> Result<()> {
-        self.append_event(AuditEventPayload::SessionEnded { ended, exit_code })
+        self.append_event(AuditEventPayload::SessionEnded { ended, exit_code })?;
+        self.ended = true;
+        Ok(())
     }
 
     /// Record a capability approval decision.
@@ -550,6 +558,11 @@ impl AuditRecorder {
     }
 
     fn append_event(&mut self, event: AuditEventPayload) -> Result<()> {
+        if self.ended {
+            return Err(NonoError::Snapshot(
+                "Audit log is closed: session already ended".to_string(),
+            ));
+        }
         let event_bytes = serde_json::to_vec(&event)
             .map_err(|e| NonoError::Snapshot(format!("Failed to serialize audit event: {e}")))?;
         let leaf_hash = hash_event(&event_bytes);
@@ -1723,6 +1736,28 @@ mod tests {
         assert_eq!(verified.event_count, 5);
         assert_eq!(verified.merkle_scheme, "alpha");
         assert!(verified.records_verified);
+    }
+
+    #[test]
+    fn recorder_refuses_events_after_session_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
+            .unwrap();
+        let summary = recorder.finalize().unwrap();
+
+        assert!(
+            recorder
+                .record_session_ended("2026-04-21T00:00:02Z".to_string(), 0)
+                .is_err()
+        );
+        assert_eq!(recorder.event_count(), 2);
+        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert_eq!(verified.event_count, 2);
     }
 
     #[test]

@@ -36,11 +36,7 @@ pub(crate) struct RelayRegistration<'a> {
 
 impl Drop for RelayRegistration<'_> {
     fn drop(&mut self) {
-        let mut state = self
-            .gate
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.gate.lock();
         state.owner = None;
         state.paused = false;
         self.gate.changed.notify_all();
@@ -54,13 +50,9 @@ struct PendingPrompt<'a> {
 
 impl Drop for PendingPrompt<'_> {
     fn drop(&mut self) {
-        // Always release the count, even after a poisoning panic, so the
-        // supervisor never waits on a prompt that no longer exists.
-        let mut state = self
-            .gate
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        // Always release the count so the supervisor never waits on a prompt
+        // that no longer exists.
+        let mut state = self.gate.lock();
         state.pending = state.pending.saturating_sub(1);
         self.gate.changed.notify_all();
     }
@@ -78,12 +70,16 @@ impl RelayPromptGate {
         }
     }
 
-    fn lock(&self) -> Option<MutexGuard<'_, GateState>> {
-        self.state.lock().ok()
+    /// Lock the gate state, recovering from poisoning. Nothing that can panic
+    /// runs while the lock is held (prompts run outside it), so a poisoned
+    /// guard still holds consistent state. Treating poison as fatal would
+    /// instead deny every later off-thread prompt for the rest of the session.
+    fn lock(&self) -> MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn register(&self) -> RelayRegistration<'_> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.lock();
         state.owner = Some(std::thread::current().id());
         state.paused = false;
         RelayRegistration { gate: self }
@@ -93,7 +89,7 @@ impl RelayPromptGate {
     /// active or the caller is the supervisor thread. Returns `None` when the
     /// pause is not in effect by `deadline`, so the caller can fail closed.
     fn run_paused<T>(&self, deadline: Instant, prompt: impl FnOnce() -> T) -> Option<T> {
-        let mut state = self.lock()?;
+        let mut state = self.lock();
         let gated = state
             .owner
             .is_some_and(|owner| owner != std::thread::current().id());
@@ -121,10 +117,11 @@ impl RelayPromptGate {
             if remaining.is_zero() {
                 return false;
             }
-            state = match self.changed.wait_timeout(state, remaining) {
-                Ok((state, _)) => state,
-                Err(_) => return false,
-            };
+            state = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 
@@ -132,9 +129,7 @@ impl RelayPromptGate {
     /// and hold the pause until they all finish. Called from the supervisor
     /// loop, which owns the relay.
     fn service(&self, with_relay_paused: impl FnOnce(&dyn Fn())) {
-        let Some(state) = self.lock() else {
-            return;
-        };
+        let state = self.lock();
         if state.pending == 0 || state.paused {
             return;
         }
@@ -143,7 +138,7 @@ impl RelayPromptGate {
     }
 
     fn hold_pause_until_prompts_finish(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.lock();
         state.paused = true;
         self.changed.notify_all();
         // Each prompt is bounded by its own deadline, so this wait ends.
@@ -195,7 +190,7 @@ mod tests {
         let gate = leak_gate();
         let _registration = gate.register();
         assert_eq!(gate.run_paused(Instant::now(), || 7), Some(7));
-        assert_eq!(gate.lock().expect("gate lock").pending, 0);
+        assert_eq!(gate.lock().pending, 0);
     }
 
     #[test]
@@ -209,7 +204,7 @@ mod tests {
                 relay_paused.load(Ordering::SeqCst)
             })
         });
-        while gate.lock().expect("gate lock").pending == 0 {
+        while gate.lock().pending == 0 {
             std::thread::sleep(Duration::from_millis(1));
         }
 
@@ -223,7 +218,7 @@ mod tests {
 
         assert_eq!(requester.join().expect("join requester"), Some(true));
         assert!(resumed, "relay resumes after the prompt");
-        let state = gate.lock().expect("gate lock");
+        let state = gate.lock();
         assert_eq!(state.pending, 0);
         assert!(!state.paused);
     }
@@ -244,7 +239,7 @@ mod tests {
 
         assert!(result.is_none());
         assert!(!ran.load(Ordering::SeqCst), "prompt must not run unpaused");
-        assert_eq!(gate.lock().expect("gate lock").pending, 0);
+        assert_eq!(gate.lock().pending, 0);
     }
 
     #[test]
@@ -254,10 +249,31 @@ mod tests {
         let requester = std::thread::spawn(move || {
             gate.run_paused(Instant::now() + Duration::from_secs(5), || 7)
         });
-        while gate.lock().expect("gate lock").pending == 0 {
+        while gate.lock().pending == 0 {
             std::thread::sleep(Duration::from_millis(1));
         }
         drop(registration);
+        assert_eq!(requester.join().expect("join requester"), Some(7));
+    }
+
+    #[test]
+    fn poisoned_gate_keeps_serving_prompts() {
+        let gate = leak_gate();
+        let poisoner = std::thread::spawn(move || {
+            let _state = gate.state.lock();
+            panic!("poison the gate");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(gate.state.is_poisoned());
+
+        let _registration = gate.register();
+        let requester = std::thread::spawn(move || {
+            gate.run_paused(Instant::now() + Duration::from_secs(5), || 7)
+        });
+        while gate.lock().pending == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        gate.service(|hold| hold());
         assert_eq!(requester.join().expect("join requester"), Some(7));
     }
 

@@ -232,7 +232,10 @@ async fn connect_to_resolved(addrs: &[SocketAddr], host: &str) -> Result<TcpStre
     let mut last_err = None;
     for addr in addrs {
         match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Ok(stream)) => {
+                crate::upstream_socket::set_liveness(&stream);
+                return Ok(stream);
+            }
             Ok(Err(e)) => {
                 debug!("Connect to {} failed: {}", addr, e);
                 last_err = Some(e.to_string());
@@ -607,6 +610,61 @@ mod tests {
             }
             other => panic!("expected UpstreamConnect, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn open_tcp_upstream_sets_liveness_on_both_strategies() {
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        let connector = TlsConnector::from(std::sync::Arc::new(config));
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let resolved_addrs = [upstream.local_addr().unwrap()];
+        let direct = UpstreamSpec {
+            scheme: UpstreamScheme::Http,
+            host: "upstream.test",
+            port: 80,
+            strategy: UpstreamStrategy::Direct {
+                resolved_addrs: &resolved_addrs,
+            },
+            tls_connector: &connector,
+        };
+        let stream = open_tcp_upstream(&direct).await.unwrap();
+        crate::upstream_socket::assert_liveness(&stream);
+
+        // An enterprise proxy that accepts the CONNECT and holds the tunnel.
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = proxy.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                sock.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = sock.read_to_end(&mut Vec::new()).await;
+        });
+        let via_proxy = UpstreamSpec {
+            scheme: UpstreamScheme::Http,
+            host: "upstream.test",
+            port: 80,
+            strategy: UpstreamStrategy::ExternalProxy {
+                proxy_addr: &proxy_addr,
+                proxy_auth_header: None,
+            },
+            tls_connector: &connector,
+        };
+        let stream = open_tcp_upstream(&via_proxy).await.unwrap();
+        crate::upstream_socket::assert_liveness(&stream);
     }
 
     #[test]

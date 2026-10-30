@@ -197,6 +197,12 @@ fn build_pooled_client(
 
     let mut http = HttpConnector::new_with_resolver(resolver);
     http.enforce_http(false);
+    // As on the CONNECT path (`upstream_socket`): fail a silent upstream fast.
+    http.set_keepalive(Some(crate::upstream_socket::KEEPALIVE_IDLE));
+    http.set_keepalive_interval(Some(crate::upstream_socket::KEEPALIVE_INTERVAL));
+    http.set_keepalive_retries(Some(crate::upstream_socket::KEEPALIVE_RETRIES));
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    http.set_tcp_user_timeout(Some(crate::upstream_socket::USER_TIMEOUT));
 
     let builder = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)

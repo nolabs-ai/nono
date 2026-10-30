@@ -42,6 +42,7 @@ pub mod server;
 pub mod spiffe;
 pub mod tls_intercept;
 pub mod token;
+pub(crate) mod upstream_socket;
 
 #[cfg(test)]
 pub mod test_env;

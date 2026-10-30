@@ -38,6 +38,8 @@ subtle = "2"
 url.workspace = true
 urlencoding = "2"
 globset.workspace = true
+# Keepalive and TCP_USER_TIMEOUT on upstream sockets (upstream_socket.rs).
+socket2 = { version = "0.6", features = ["all"] }
 
 # AWS SigV4 signing support (smithy-rs, no service SDK required)
 # `credentials-login` is required to resolve an active `aws login` session

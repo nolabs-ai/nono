@@ -114,9 +114,25 @@ Both variants `POST` the same JSON body:
 | `network` | `host`, `port`, `protocol`, `resolved_ips` |
 | `endpoint` | `route_id`, `upstream`, `method`, `path`, `rule_label` |
 | `command` | `command`, `args`, `caller`, `intercept_rule` |
+| `unix_socket` | `path`, `op` (`connect`, `bind`) |
 
 Every variant also carries `request_id`, `session_id`, `reason` (nullable), and
-`child_pid`.
+`child_pid`. Endpoint requests carry the session that owns the proxy; only an
+embedding that starts the proxy without session context reports `"proxy"`.
+Network and endpoint requests report `child_pid` 0 because the proxy cannot
+attribute a connection to a process.
+
+Endpoint requests are answered by the `command_policies` approval backends
+when the profile declares them, otherwise by the `network` approval backends,
+so credential endpoint policies under `network.custom_credentials` can ask
+without a command policy.
+
+`unix_socket` requests come from Linux pathname socket mediation
+(`linux.af_unix_mediation: "pathname"`) with `security.capability_elevation`
+and are answered by the `security` backend. Only `connect` and `bind` outside
+the granted socket set are asked; datagram sends, abstract and unnamed
+sockets, denied paths and nono's own state are denied without a request.
+Session-scoped decisions are honoured for the rest of the session.
 
 For CONNECT network approvals, `request_id` is a UUID v4 generated once per
 new approval attempt. It is independent of `host`, `port`, and `session_id`:

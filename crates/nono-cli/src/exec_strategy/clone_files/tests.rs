@@ -195,6 +195,7 @@ fn supervise(
                     denials: &mut denials,
                     trust_interceptor: None,
                     pty: None,
+                    unix_socket_decisions: &mut Default::default(),
                 },
                 &mut network_throttle,
                 &mut ipc_denials,

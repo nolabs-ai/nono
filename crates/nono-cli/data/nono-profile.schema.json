@@ -657,7 +657,7 @@
             { "$ref": "#/$defs/LinuxAfUnixMediation" },
             { "type": "null" }
           ],
-          "description": "Opt-in pathname AF_UNIX mediation. 'off' preserves compatibility. 'pathname' requires explicit filesystem.unix_socket* grants for pathname Unix socket connect/bind."
+          "description": "Opt-in pathname AF_UNIX mediation. 'off' preserves compatibility. 'pathname' requires explicit filesystem.unix_socket* grants for pathname Unix socket connect/bind; with security.capability_elevation, an ungranted connect/bind is put to the security approval backend."
         },
         "sandbox_policy": {
           "oneOf": [

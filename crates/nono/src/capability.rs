@@ -272,7 +272,8 @@ impl std::fmt::Display for UnixSocketMode {
 /// do) are not conflated. The supervisor's seccomp-notify handler maps
 /// `SYS_CONNECT` -> `Connect`, `SYS_BIND` -> `Bind`,
 /// `SYS_SENDTO`/`SYS_SENDMSG`/`SYS_SENDMMSG` -> `Send`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UnixSocketOp {
     /// About to call `connect(2)`.
     Connect,

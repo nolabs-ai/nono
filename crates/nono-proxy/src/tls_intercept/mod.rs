@@ -41,6 +41,7 @@ pub(crate) mod h2_forward;
 pub(crate) mod h2_probe;
 pub mod handle;
 pub(crate) mod http1;
+pub mod rotate;
 pub(crate) mod websocket;
 
 pub use acceptor::build_server_config;
@@ -49,3 +50,4 @@ pub use ca::EphemeralCa;
 pub use cert_cache::CertCache;
 pub(crate) use h2_probe::UpstreamH2Cache;
 pub use handle::{InterceptCtx, InterceptUpstreamProxy, handle_intercept_connect};
+pub use rotate::InterceptCaRotator;

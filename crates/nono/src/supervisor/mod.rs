@@ -31,8 +31,8 @@ pub mod types;
 
 pub use socket::{SupervisorListener, SupervisorSocket};
 pub use types::{
-    ApprovalDecision, ApprovalRequest, AuditEntry, CapabilityRequest, SupervisorMessage,
-    SupervisorResponse, UrlOpenRequest,
+    ApprovalDecision, ApprovalRequest, AuditEntry, CapabilityRequest, SocketAddress,
+    SupervisorMessage, SupervisorResponse, UrlOpenRequest,
 };
 
 use crate::error::Result;
@@ -169,7 +169,7 @@ mod tests {
     }
 
     fn make_capability_request() -> ApprovalRequest {
-        ApprovalRequest::Capability {
+        ApprovalRequest::FileCapability {
             request_id: "test-001".to_string(),
             path: "/tmp/test".into(),
             access: AccessMode::Read,
@@ -274,6 +274,6 @@ mod tests {
         let approval: ApprovalRequest = cap_req.into();
         assert_eq!(approval.request_id(), "r1");
         assert_eq!(approval.session_id(), "s1");
-        assert!(matches!(approval, ApprovalRequest::Capability { .. }));
+        assert!(matches!(approval, ApprovalRequest::FileCapability { .. }));
     }
 }

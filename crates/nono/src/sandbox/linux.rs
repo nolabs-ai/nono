@@ -11,6 +11,7 @@ use landlock::{
 };
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
+use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -2023,14 +2024,16 @@ mod arch_guard {
 
 use arch_guard::{ArchGuarded, prepend_seccomp_arch_guard, prepend_seccomp_arch_guard_vec};
 
-/// Build the openat/openat2 seccomp-notify BPF program.
+/// Build the capability-elevation seccomp-notify BPF program, routing
+/// openat/openat2 and bind to the supervisor.
 ///
 /// Tail (offsets shift by six once the architecture guard is prepended):
 ///   0: ld  [nr]
-///   1: jeq SYS_OPENAT  -> 4 (notify)
-///   2: jeq SYS_OPENAT2 -> 4 (notify)
-///   3: ret ALLOW
-///   4: ret USER_NOTIF
+///   1: jeq SYS_OPENAT  -> 5 (notify)
+///   2: jeq SYS_BIND    -> 5 (notify)
+///   3: jeq SYS_OPENAT2 -> 5 (notify)
+///   4: ret ALLOW
+///   5: ret USER_NOTIF
 ///
 /// The guard returns `SECCOMP_RET_ALLOW` rather than an errno for non-native
 /// ABIs. This filter only ever *expands* access — the supervisor injects fds
@@ -2039,7 +2042,7 @@ use arch_guard::{ArchGuarded, prepend_seccomp_arch_guard, prepend_seccomp_arch_g
 /// every 32-bit process under capability elevation for no security benefit.
 /// Allowing them also keeps the supervisor from ever being handed a
 /// notification whose arguments follow a different ABI's layout.
-fn build_seccomp_openat_notify_filter() -> ArchGuarded<[SockFilterInsn; 11]> {
+fn build_seccomp_capability_notify_filter() -> ArchGuarded<[SockFilterInsn; 12]> {
     let filter = [
         // 0: Load syscall number
         SockFilterInsn {
@@ -2048,28 +2051,35 @@ fn build_seccomp_openat_notify_filter() -> ArchGuarded<[SockFilterInsn; 11]> {
             jf: 0,
             k: SECCOMP_DATA_NR_OFFSET,
         },
-        // 1: If openat, jump to 4 (notify)
+        // 1: If openat, jump to 5 (notify)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 3,
+            jf: 0,
+            k: SYS_OPENAT as u32,
+        },
+        // 2: If bind, jump to 5 (notify)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 2,
             jf: 0,
-            k: SYS_OPENAT as u32,
+            k: SYS_BIND as u32,
         },
-        // 2: If openat2, jump to 4 (notify)
+        // 3: If openat2, jump to 5 (notify)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 1,
             jf: 0,
             k: SYS_OPENAT2 as u32,
         },
-        // 3: Allow all other syscalls
+        // 4: Allow all other syscalls
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_ALLOW,
         },
-        // 4: Route to user notification
+        // 5: Route to user notification
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
@@ -2078,16 +2088,16 @@ fn build_seccomp_openat_notify_filter() -> ArchGuarded<[SockFilterInsn; 11]> {
         },
     ];
 
-    prepend_seccomp_arch_guard::<5, 11>(filter, SECCOMP_RET_ALLOW)
+    prepend_seccomp_arch_guard::<6, 12>(filter, SECCOMP_RET_ALLOW)
 }
 
-/// Install a seccomp-notify BPF filter for openat/openat2.
+/// Install a seccomp-notify BPF filter for openat/openat2 and bind.
 ///
 /// Returns the notify fd. Must be called BEFORE `Sandbox::apply_auto()` (Landlock
 /// `restrict_self()`), so the supervisor can still receive notifications for
 /// paths that Landlock would block.
 ///
-/// The BPF filter routes openat/openat2 to `SECCOMP_RET_USER_NOTIF` and
+/// The BPF filter routes openat/openat2/bind to `SECCOMP_RET_USER_NOTIF` and
 /// allows all other syscalls with `SECCOMP_RET_ALLOW`.
 ///
 /// # Errors
@@ -2099,7 +2109,7 @@ fn build_seccomp_openat_notify_filter() -> ArchGuarded<[SockFilterInsn; 11]> {
 pub fn install_seccomp_notify() -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
 
-    let filter = build_seccomp_openat_notify_filter();
+    let filter = build_seccomp_capability_notify_filter();
     let program = filter.as_slice();
 
     let prog = SockFprog {
@@ -2590,9 +2600,7 @@ pub fn recv_notif(notify_fd: std::os::fd::RawFd) -> Result<SeccompNotif> {
 /// - `/proc/PID/mem` cannot be opened
 /// - The read fails
 /// - The path is not valid UTF-8
-pub fn read_notif_path(pid: u32, addr: u64) -> Result<std::path::PathBuf> {
-    use std::io::Read;
-
+pub fn read_open_path(pid: u32, addr: u64) -> Result<std::path::PathBuf> {
     let mem_path = format!("/proc/{}/mem", pid);
     let mut file = std::fs::File::open(&mem_path)
         .map_err(|e| NonoError::SandboxInit(format!("Failed to open {}: {}", mem_path, e)))?;
@@ -2952,6 +2960,10 @@ pub struct SockaddrInfo {
     /// For pathname `AF_UNIX`: filesystem path from `sockaddr_un.sun_path`.
     /// `None` for non-UNIX, abstract, unnamed, or unclassified sockets.
     pub unix_path: Option<PathBuf>,
+    /// For abstract `AF_UNIX`: the name bytes following the leading NUL in
+    /// `sun_path`, bounded by `addrlen`. Abstract names are length-delimited
+    /// and may contain embedded NULs. `None` for every other kind.
+    pub unix_abstract_name: Option<Vec<u8>>,
 }
 
 /// Seccomp network fallback mode determined during sandbox apply.
@@ -3686,7 +3698,7 @@ pub fn prepare_seccomp_af_unix_filter() -> PreparedSeccompNotifyFilter {
 #[must_use]
 pub fn prepare_seccomp_openat_filter() -> PreparedSeccompNotifyFilter {
     PreparedSeccompNotifyFilter {
-        filter: build_seccomp_openat_notify_filter().into_vec(),
+        filter: build_seccomp_capability_notify_filter().into_vec(),
     }
 }
 
@@ -3888,6 +3900,7 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
                 is_loopback,
                 unix_kind: None,
                 unix_path: None,
+                unix_abstract_name: None,
             })
         }
         libc::AF_INET6 => {
@@ -3913,6 +3926,7 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
                 is_loopback: is_loopback || is_v4_mapped_loopback,
                 unix_kind: None,
                 unix_path: None,
+                unix_abstract_name: None,
             })
         }
         libc::AF_UNIX => {
@@ -3940,12 +3954,20 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
             } else {
                 None
             };
+            // Abstract name is sun_path[1..addrlen-2]; read_len is already
+            // capped at addrlen, so n bounds it.
+            let unix_abstract_name = if matches!(unix_kind, UnixSocketKind::Abstract) {
+                buf.get(3..n).map(<[u8]>::to_vec)
+            } else {
+                None
+            };
             Ok(SockaddrInfo {
                 family,
                 port: 0,
                 is_loopback: true, // Unix sockets are always local
                 unix_kind: Some(unix_kind),
                 unix_path,
+                unix_abstract_name,
             })
         }
         _ => Ok(SockaddrInfo {
@@ -3954,6 +3976,7 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
             is_loopback: false,
             unix_kind: None,
             unix_path: None,
+            unix_abstract_name: None,
         }),
     }
 }
@@ -6009,11 +6032,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_seccomp_openat_notify_filter_allows_compat_abi() {
-        let filter = build_seccomp_openat_notify_filter();
-        // 11 instructions: 0-5 arch guard, then the 5-instruction tail
-        // (6 ld-nr, 7-8 jeq dispatch, 9 ALLOW, 10 USER_NOTIF).
-        assert_eq!(filter.len(), 11);
+    fn test_build_seccomp_capability_notify_filter_allows_compat_abi() {
+        let filter = build_seccomp_capability_notify_filter();
+        // 12 instructions: 0-5 arch guard, then the 6-instruction tail
+        // (6 ld-nr, 7-9 jeq dispatch, 10 ALLOW, 11 USER_NOTIF).
+        assert_eq!(filter.len(), 12);
 
         // Unlike the denying filters, a non-native ABI is ALLOWed here: this
         // filter only expands access, so evading it gains nothing, and denying
@@ -6026,11 +6049,13 @@ mod tests {
 
         assert_eq!(filter[6].k, SECCOMP_DATA_NR_OFFSET);
         assert_eq!(filter[7].k, SYS_OPENAT as u32);
-        assert_eq!(filter[7].jt, 2); // -> insn 10 (USER_NOTIF)
-        assert_eq!(filter[8].k, SYS_OPENAT2 as u32);
-        assert_eq!(filter[8].jt, 1); // -> insn 10
-        assert_eq!(filter[9].k, SECCOMP_RET_ALLOW);
-        assert_eq!(filter[10].k, SECCOMP_RET_USER_NOTIF);
+        assert_eq!(filter[7].jt, 3); // -> insn 11 (USER_NOTIF)
+        assert_eq!(filter[8].k, SYS_BIND as u32);
+        assert_eq!(filter[8].jt, 2); // -> insn 11
+        assert_eq!(filter[9].k, SYS_OPENAT2 as u32);
+        assert_eq!(filter[9].jt, 1); // -> insn 11
+        assert_eq!(filter[10].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[11].k, SECCOMP_RET_USER_NOTIF);
 
         // A compat-ABI openat is allowed straight through rather than being
         // routed to the supervisor, so the supervisor is never handed a
@@ -6038,9 +6063,14 @@ mod tests {
         // Landlock floor still applies, so this grants no extra access.
         const AUDIT_ARCH_I386: u32 = 0x4000_0003;
         const I386_OPENAT: u32 = 295;
+        const I386_BIND: u32 = 361;
 
         assert_eq!(
             evaluate_static_bpf_with_arch(&filter, AUDIT_ARCH_I386, I386_OPENAT, [0; 6]),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate_static_bpf_with_arch(&filter, AUDIT_ARCH_I386, I386_BIND, [0; 6]),
             SECCOMP_RET_ALLOW
         );
         assert_eq!(
@@ -6053,14 +6083,24 @@ mod tests {
             SECCOMP_RET_ALLOW
         );
 
-        // Native openat/openat2 still reach the supervisor.
+        // Native openat/bind/openat2 still reach the supervisor.
         assert_eq!(
             evaluate_static_bpf(&filter, SYS_OPENAT, [0; 6]),
             SECCOMP_RET_USER_NOTIF
         );
         assert_eq!(
+            evaluate_static_bpf(&filter, SYS_BIND, [0; 6]),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(
             evaluate_static_bpf(&filter, SYS_OPENAT2, [0; 6]),
             SECCOMP_RET_USER_NOTIF
+        );
+
+        // Other native syscalls are allowed.
+        assert_eq!(
+            evaluate_static_bpf(&filter, SYS_CONNECT, [0; 6]),
+            SECCOMP_RET_ALLOW
         );
     }
 
@@ -6072,6 +6112,7 @@ mod tests {
             is_loopback: true,
             unix_kind: None,
             unix_path: None,
+            unix_abstract_name: None,
         };
         assert!(info.is_loopback);
         assert_eq!(info.port, 8080);
@@ -6085,6 +6126,7 @@ mod tests {
             is_loopback: true,
             unix_kind: None,
             unix_path: None,
+            unix_abstract_name: None,
         };
         assert!(info.is_loopback);
     }
@@ -6097,6 +6139,7 @@ mod tests {
             is_loopback: false,
             unix_kind: None,
             unix_path: None,
+            unix_abstract_name: None,
         };
         assert!(!info.is_loopback);
     }
@@ -6109,6 +6152,7 @@ mod tests {
             is_loopback: true,
             unix_kind: Some(UnixSocketKind::Pathname),
             unix_path: Some(PathBuf::from("/tmp/test.sock")),
+            unix_abstract_name: None,
         };
         assert!(info.is_loopback);
         assert_eq!(info.port, 0);

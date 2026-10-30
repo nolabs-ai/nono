@@ -115,7 +115,7 @@ mod tests {
         recorder
             .record_capability_decision(AuditEntry {
                 timestamp: UNIX_EPOCH + Duration::from_secs(5),
-                request: ApprovalRequest::Capability {
+                request: ApprovalRequest::FileCapability {
                     request_id: "req-1".to_string(),
                     path: PathBuf::from("/tmp/example"),
                     access: AccessMode::ReadWrite,

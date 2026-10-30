@@ -22,7 +22,6 @@ pub enum DenialReason {
     UnixSocketDenied,
 }
 
-/// Record of a denied access attempt during a supervised session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DenialRecord {
     /// The path that was denied

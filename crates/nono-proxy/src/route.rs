@@ -451,6 +451,52 @@ impl RouteStore {
         matches
     }
 
+    /// Return all routes whose endpoint policy can constrain a plain-HTTP
+    /// forward-proxy request to `host:port`.
+    ///
+    /// The absolute-form forward path (`handle_forward_http`) sees
+    /// `http://host:port/…` targets. A route is a candidate when its upstream
+    /// host matches (wildcard-aware, same grammar as the host filter) and
+    /// either its upstream port equals the request port, or the request uses
+    /// the plain-HTTP default port 80 and the route is the port-443 `https`
+    /// upstream of the same host: `allow_domain` entries with endpoints (and
+    /// URL-form `--allow-domain 'https://host/path'`) always compile to
+    /// `https` upstreams, so without that alias every `http://` request would
+    /// bypass the rules entirely (issue #2174). Loopback routes keep their
+    /// explicit port (often an `http://` upstream on a non-default port), so
+    /// different local services on the same host never gate each other.
+    #[must_use]
+    pub fn lookup_forward_endpoint_candidates(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Vec<(&str, &LoadedRoute)> {
+        let normalised_host = match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
+            Ok(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
+            Err(_) => nono::net_filter::HostFilter::normalize_authority_host(host),
+        };
+        let request_port = port.to_string();
+        let mut matches: Vec<_> = self
+            .routes
+            .iter()
+            .filter(|(_, route)| {
+                route
+                    .upstream_host_port
+                    .as_ref()
+                    .and_then(|hp| hp.rsplit_once(':'))
+                    .is_some_and(|(pattern_host, pattern_port)| {
+                        nono::net_filter::host_pattern_matches(pattern_host, &normalised_host)
+                            && (pattern_port == request_port
+                                || (port == 80 && pattern_port == "443"))
+                    })
+            })
+            .map(|(prefix, route)| (prefix.as_str(), route))
+            .collect();
+        matches.sort_by_key(|(prefix, _)| *prefix);
+        matches
+    }
+
     /// Whether any route for `host:port` requires TLS interception.
     #[must_use]
     pub fn has_intercept_route(&self, host_port: &str) -> bool {
@@ -1083,6 +1129,75 @@ mod tests {
         let store = RouteStore::load(&routes).await.unwrap();
         assert!(store.is_route_upstream("api.openai.com:443"));
         assert!(!store.is_route_upstream("github.com:443"));
+    }
+
+    /// Candidates for the plain-HTTP forward path (issue #2174): exact-port
+    /// matches always apply; port-80 requests also see the port-443 `https`
+    /// upstream of the same host; other ports on the same host do not gate
+    /// each other (loopback services on distinct ports stay independent).
+    #[tokio::test]
+    async fn test_forward_endpoint_candidates() {
+        fn route(prefix: &str, upstream: &str) -> RouteConfig {
+            RouteConfig {
+                redeem_phantoms: Vec::new(),
+                prefix: prefix.to_string(),
+                upstream: upstream.to_string(),
+                credential_key: None,
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![EndpointRule {
+                    method: "GET".to_string(),
+                    path: "/get".to_string(),
+                }],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+                upgrades: vec![],
+                rate_limit: None,
+            }
+        }
+
+        let routes = vec![
+            route("api", "https://api.example.com"),
+            route("local", "http://127.0.0.1:3000"),
+            route("wild", "https://*.example.com"),
+        ];
+        let store = RouteStore::load(&routes).await.unwrap();
+
+        let prefixes = |host: &str, port: u16| -> Vec<String> {
+            store
+                .lookup_forward_endpoint_candidates(host, port)
+                .into_iter()
+                .map(|(prefix, _)| prefix.to_string())
+                .collect()
+        };
+
+        // Exact upstream port match.
+        assert_eq!(prefixes("api.example.com", 443), vec!["api", "wild"]);
+        // Plain-HTTP default port 80 sees the https (443) upstream of the
+        // same host — the issue #2174 bypass.
+        assert_eq!(prefixes("api.example.com", 80), vec!["api", "wild"]);
+        // Wildcard route upstreams match subdomains.
+        assert_eq!(prefixes("other.example.com", 80), vec!["wild"]);
+        // Unrelated hosts never match.
+        assert!(prefixes("example.org", 80).is_empty());
+        // Other ports on the same host don't gate each other (loopback
+        // services on distinct ports stay independent).
+        assert!(prefixes("api.example.com", 8080).is_empty());
+        // Loopback route keeps its explicit port.
+        assert_eq!(prefixes("127.0.0.1", 3000), vec!["local"]);
+        assert!(prefixes("127.0.0.1", 80).is_empty());
+        assert!(prefixes("127.0.0.1", 9999).is_empty());
     }
 
     #[tokio::test]

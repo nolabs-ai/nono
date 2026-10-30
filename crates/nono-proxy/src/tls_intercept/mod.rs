@@ -43,7 +43,7 @@ pub mod handle;
 pub(crate) mod http1;
 pub(crate) mod websocket;
 
-pub use acceptor::build_server_config;
+pub use acceptor::{build_server_config, build_server_config_with_fallback};
 pub use bundle::{BundleInputs, write_bundle};
 pub use ca::EphemeralCa;
 pub use cert_cache::CertCache;

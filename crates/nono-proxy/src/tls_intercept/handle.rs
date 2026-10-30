@@ -168,7 +168,13 @@ pub async fn handle_intercept_connect(stream: &mut TcpStream, ctx: InterceptCtx<
     stream.write_all(response).await?;
     stream.flush().await?;
 
-    let server_config = acceptor::build_server_config(Arc::clone(&ctx.cert_cache), ctx.enable_h2)?;
+    // SNI-less clients (IP-literal dials per RFC 6066, legacy stacks) fall
+    // back to a leaf minted for the CONNECT authority itself.
+    let server_config = acceptor::build_server_config_with_fallback(
+        Arc::clone(&ctx.cert_cache),
+        ctx.host,
+        ctx.enable_h2,
+    )?;
     let tls_acceptor = TlsAcceptor::from(server_config);
 
     let mut tls_stream = match tls_acceptor.accept(&mut *stream).await {
@@ -4562,5 +4568,210 @@ mod tests {
             !response.contains(&client_secret_phantom),
             "the phantom must not be echoed to the client, got: {response}"
         );
+    }
+    // --- TLS interception for IP-literal CONNECT targets / SNI-less clients ---
+
+    /// Reproduces the gap hunt finding: a CONNECT to an IP-literal upstream on
+    /// an intercepting route cannot complete the inner TLS handshake. Clients
+    /// send no SNI for IP literals (RFC 6066), so the cert resolver returns
+    /// None and rustls aborts the handshake, while the same target tunnels
+    /// fine on a non-intercepted route.
+    #[tokio::test]
+    async fn intercept_handshake_serves_ip_literal_connect_target() {
+        use rustls::pki_types::pem::PemObject;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (upstream_port, upstream_rx) = spawn_mock_https_upstream_ip(&ca).await;
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        // Register an oauth token endpoint for the IP authority so the inner
+        // request is dispatched through the real forward pipeline (same shape
+        // as the localhost token-endpoint tests, but for an IP upstream).
+        let ip_endpoint = crate::config::OAuthCaptureConfig {
+            provider: "github".to_string(),
+            token_endpoints: vec![crate::config::OAuthTokenEndpointConfig {
+                host: format!("https://127.0.0.1:{upstream_port}"),
+                path: "/ok".to_string(),
+                response_fields: vec![crate::config::OAuthTokenResponseFieldConfig {
+                    path: "access_token".to_string(),
+                    kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                    format: None,
+                }],
+                request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
+                response_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
+                request_nonce_fields: vec![],
+            }],
+            admitted_consumers: vec!["proxy.github_oauth".to_string()],
+        };
+        let store = Arc::new(OAuthCaptureStore::load(&[ip_endpoint]).unwrap());
+        let mut ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            store,
+            upstream_port,
+        );
+        ctx.host = "127.0.0.1";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = async {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            handle_intercept_connect(&mut sock, ctx).await
+        };
+
+        let client = async {
+            let mut sock = TcpStream::connect(addr).await.unwrap();
+            // The intercept path answers the (already-parsed) CONNECT with 200
+            // before the inner TLS handshake; consume it like a real client.
+            let mut established = Vec::new();
+            while !established.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                assert_eq!(sock.read_exact(&mut byte).await.unwrap(), 1);
+                established.push(byte[0]);
+            }
+            assert!(established.starts_with(b"HTTP/1.1 200"));
+
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(
+                    rustls::pki_types::CertificateDer::from_pem_slice(ca.cert_pem().as_bytes())
+                        .unwrap(),
+                )
+                .unwrap();
+            let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+            // An IP ServerName sends no SNI (RFC 6066).
+            let mut tls = match tokio_rustls::TlsConnector::from(Arc::new(config))
+                .connect(
+                    rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap(),
+                    sock,
+                )
+                .await
+            {
+                Ok(tls) => tls,
+                Err(err) => panic!(
+                    "intercepted handshake to an IP-literal CONNECT target must succeed: {err}"
+                ),
+            };
+
+            // Drive a full request through the intercepted tunnel so the proof
+            // covers the consumer endpoint, not just the handshake.
+            tls.write_all(
+                format!(
+                    "GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nAuthorization: Bearer not-a-phantom\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            // Tolerate a close without TLS close_notify on the inner
+            // session (known rough edge, see issue #2074); the response
+            // bytes are what matter here.
+            let mut response = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match tls.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        response.extend_from_slice(&buf[..n]);
+                        if response.windows(4).any(|w| w == b"\r\n\r\n")
+                            && response.ends_with(b"{\"access_token\":\"ok\"}")
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            let response = String::from_utf8_lossy(&response);
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "inner request must round-trip through the IP-literal intercept: {response}"
+            );
+        };
+
+        let (_client_result, server_result) = tokio::join!(client, server);
+        // A full round-trip completed; tolerate either close semantics.
+        let _ = server_result;
+        let upstream_received = upstream_rx.await.unwrap();
+        assert!(
+            upstream_received.starts_with("GET /ok HTTP/1.1\r\n"),
+            "upstream must receive the inner request, got: {upstream_received}"
+        );
+    }
+
+    /// Mock HTTPS upstream whose certificate carries an iPAddress SAN and is
+    /// signed by the session CA, so the proxy's upstream leg (which dials the
+    /// IP literal with `ServerName::IpAddress`) can verify it.
+    async fn spawn_mock_https_upstream_ip(
+        ca: &crate::tls_intercept::ca::EphemeralCa,
+    ) -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::AsyncReadExt;
+
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        ))];
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.signed_by(&key_pair, ca.issuer()).unwrap();
+        let server_config = rustls::server::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+                key_pair.serialize_der(),
+            )),
+        )
+        .unwrap();
+        let server_config = Arc::new(server_config);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            let mut tls_stream = tokio_rustls::TlsAcceptor::from(server_config)
+                .accept(tcp_stream)
+                .await
+                .unwrap();
+            let mut received = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = tls_stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+                if received.windows(4).position(|w| w == b"\r\n\r\n").is_some() {
+                    break;
+                }
+            }
+            tls_stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"access_token\":\"ok\"}",
+                )
+                .await
+                .unwrap();
+            let _ = tls_stream.shutdown().await;
+            let _ = tx.send(String::from_utf8_lossy(&received).to_string());
+        });
+        (port, rx)
     }
 }

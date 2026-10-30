@@ -392,6 +392,24 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         output::print_supervised_info(flags.silent, rollback.requested, network.is_proxy_active());
     }
 
+    // `unix://` approval helpers on every surface. Neither the agent nor a
+    // mediated command may be able to replace one of these sockets.
+    let approval_sockets = crate::approval_runtime::approval_socket_paths(
+        [&flags.approval_backends]
+            .into_iter()
+            .chain(
+                flags
+                    .command_policies
+                    .as_ref()
+                    .map(|config| &config.approval_backends),
+            )
+            .chain(
+                network
+                    .proxy_options()
+                    .map(|proxy| &proxy.network_approval_backends),
+            ),
+    );
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let shared_broker = crate::tool_sandbox::token_broker::new_shared_broker();
     let active_proxy = start_proxy_runtime(
@@ -455,6 +473,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 blocked_commands: caps.blocked_commands(),
                 outer_caps: &caps,
                 deny_paths: &deny_paths,
+                approval_sockets: &approval_sockets,
                 policy_root: &requested_workdir,
                 proxy_credentials: &tool_sandbox_proxy_credentials,
                 reserved_proxy_ports: &reserved_proxy_ports,
@@ -486,6 +505,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 blocked_commands: caps.blocked_commands(),
                 outer_caps: &caps,
                 deny_paths: &deny_paths,
+                approval_sockets: &approval_sockets,
                 bypass_protection_paths: &flags.bypass_protection_paths,
                 policy_root: &requested_workdir,
                 proxy_credentials: &tool_sandbox_proxy_credentials,
@@ -533,6 +553,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             "--audit-sign-key requires supervised execution".to_string(),
         ));
     }
+
+    // `caps` is final here: the proxy and tool-sandbox grants are in. Check
+    // before the sandbox applies and before any approval can be requested.
+    crate::approval_runtime::reject_child_replaceable_approval_sockets(&caps, &approval_sockets)?;
 
     apply_pre_fork_sandbox(
         strategy,

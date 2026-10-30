@@ -75,7 +75,7 @@ tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "sig
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 futures-util = "0.3"
 
-ureq = { version = "3", features = ["platform-verifier", "socks-proxy"] }
+ureq = { version = "~3.5", features = ["platform-verifier", "socks-proxy"] }
 semver = "1"
 
 zeroize.workspace = true

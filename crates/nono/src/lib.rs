@@ -67,8 +67,8 @@ pub mod undo;
 
 // Re-exports for convenience
 pub use broker_path::{
-    safe_broker_path_for_binary, sanitize_broker_path, sanitize_broker_path_for_binary,
-    writable_path_dirs,
+    path_writable_by, safe_broker_path_for_binary, sanitize_broker_path,
+    sanitize_broker_path_for_binary, writable_path_dirs,
 };
 pub use capability::{
     AccessMode, CapabilitySet, CapabilitySource, CoveringCapabilities, FsCapability, IpcMode,

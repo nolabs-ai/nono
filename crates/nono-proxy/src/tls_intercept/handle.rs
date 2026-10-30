@@ -584,7 +584,7 @@ pub(crate) async fn select_intercept_route<'a>(
                     rule_label: rule_label.clone(),
                     reason: Some(request_reason),
                     child_pid: 0,
-                    session_id: "proxy".to_string(),
+                    session_id: approval_backends.session_id().to_string(),
                 };
                 let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(60));
                 let deadline = std::time::Instant::now()
@@ -3078,6 +3078,66 @@ mod tests {
                 panic!("denied approval must reject the request, got Selected({selected:?})")
             }
         }
+    }
+
+    /// Records the session each endpoint approval request names.
+    struct SessionRecordingBackend {
+        sessions: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl nono::ApprovalBackend for SessionRecordingBackend {
+        fn request_approval(
+            &self,
+            request: &nono::ApprovalRequest,
+        ) -> nono::Result<nono::ApprovalDecision> {
+            if let nono::ApprovalRequest::Endpoint { session_id, .. } = request {
+                self.sessions
+                    .lock()
+                    .map_err(|_| nono::NonoError::SandboxInit("poisoned".to_string()))?
+                    .push(session_id.clone());
+            }
+            Ok(nono::ApprovalDecision::Denied {
+                reason: "recorded".to_string(),
+            })
+        }
+
+        fn backend_name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    /// An endpoint approval names the sandbox session that owns the proxy, so
+    /// a backend can attribute it rather than seeing the literal "proxy".
+    #[tokio::test]
+    async fn endpoint_approval_request_names_the_registry_session() {
+        let store = RouteStore::load(&[approval_gated_route("gated")])
+            .await
+            .unwrap();
+        let backend = std::sync::Arc::new(SessionRecordingBackend {
+            sessions: std::sync::Mutex::new(Vec::new()),
+        });
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone())
+            .with_session_id("sess-intercept");
+
+        let selection = select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            InterceptRouteRequest {
+                method: "GET",
+                path: "/gated",
+                websocket_path: None,
+            },
+            None,
+            Some(&registry),
+        )
+        .await;
+
+        assert!(matches!(selection, RouteSelection::Rejected(403)));
+        assert_eq!(
+            *backend.sessions.lock().unwrap(),
+            vec!["sess-intercept".to_string()]
+        );
     }
 
     /// An approval backend failure must fail closed, mirroring the reverse

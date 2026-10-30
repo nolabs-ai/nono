@@ -1220,7 +1220,7 @@ async fn enforce_endpoint_policy(
                 rule_label: rule_label.clone(),
                 reason: Some(request_reason),
                 child_pid: 0,
-                session_id: "proxy".to_string(),
+                session_id: approval_backends.session_id().to_string(),
             };
             let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(60));
             let deadline = std::time::Instant::now()

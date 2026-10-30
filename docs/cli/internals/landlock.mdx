@@ -163,6 +163,14 @@ When enabled, pathname AF_UNIX sockets are default-deny and must match explicit
 `filesystem.unix_socket*` grants. Broad filesystem read/write grants no longer
 imply permission to talk to every socket under those paths.
 
+With `security.capability_elevation`, a pathname `connect(2)` or `bind(2)`
+outside those grants is put to the `security` approval backend (a terminal
+prompt by default) instead of being denied outright. A session-scoped answer
+applies to the same socket and operation for the rest of the session. Datagram
+sends, abstract and unnamed sockets, paths the policy denies, and nono's own
+state are still denied without asking. An approved socket is resumed exactly
+like a granted one, so the race described below applies to it too.
+
 Allowed pathname sockets are resumed through Linux seccomp user notification.
 Because seccomp receives the syscall before the kernel copies `sockaddr_un`
 from userspace, a multi-threaded sandboxed process can race an allowed

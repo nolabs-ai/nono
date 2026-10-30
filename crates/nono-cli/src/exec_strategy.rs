@@ -3051,6 +3051,7 @@ fn run_supervisor_loop_inner(
     let tool_sandbox_url_listener_fd =
         tool_sandbox_runtime.and_then(|runtime| runtime.url_listener_fd());
     let mut rate_limiter = supervisor_linux::RateLimiter::new(10, 5);
+    let mut unix_socket_decisions = supervisor_linux::UnixSocketSessionDecisions::new();
     let mut denials = SupervisorDenials {
         fs: Vec::new(),
         url: Vec::new(),
@@ -3201,6 +3202,7 @@ fn run_supervisor_loop_inner(
                             denials: &mut denials.fs,
                             trust_interceptor: trust_interceptor.as_mut(),
                             pty: pty.as_deref_mut(),
+                            unix_socket_decisions: &mut unix_socket_decisions,
                         },
                     )
                 {
@@ -3220,6 +3222,7 @@ fn run_supervisor_loop_inner(
                             denials: &mut denials.fs,
                             trust_interceptor: trust_interceptor.as_mut(),
                             pty: pty.as_deref_mut(),
+                            unix_socket_decisions: &mut unix_socket_decisions,
                         },
                         &mut *network_throttle,
                         &mut ipc_denials,

@@ -3026,8 +3026,17 @@ pub(crate) fn start_proxy_runtime(
         .enable_all()
         .build()
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy runtime: {}", e)))?;
-    let approval_registry =
-        crate::approval_runtime::build_proxy_approval_registry(proxy.command_policies.as_ref())?;
+    let approval_registry = crate::approval_runtime::build_proxy_approval_registry(
+        proxy.command_policies.as_ref(),
+        Some((
+            &proxy.network_approval_backends,
+            proxy
+                .network_approval_defaults
+                .as_ref()
+                .and_then(|defaults| defaults.backend.clone()),
+        )),
+        &proxy.session_id,
+    )?;
     // Interactive host-approval backend for CONNECT targets not on the
     // allowlist. `None` when the profile's `network.approval_backends` is empty,
     // preserving the immediate-403 behavior for not-allowed hosts. A configured

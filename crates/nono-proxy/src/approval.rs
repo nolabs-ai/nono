@@ -25,11 +25,15 @@ pub(crate) fn sanitize_reason_for_log(reason: &str) -> String {
     sanitized
 }
 
+/// Session id reported by registries that were not given one.
+const UNATTRIBUTED_SESSION_ID: &str = "proxy";
+
 /// Named approval backend registry used by endpoint-policy `approve` routes.
 #[derive(Clone, Default)]
 pub struct ApprovalBackendRegistry {
     default_backend: Option<String>,
     backends: Arc<BTreeMap<String, Arc<dyn ApprovalBackend>>>,
+    session_id: Option<Arc<str>>,
 }
 
 impl ApprovalBackendRegistry {
@@ -42,7 +46,26 @@ impl ApprovalBackendRegistry {
         Self {
             default_backend,
             backends: Arc::new(backends),
+            session_id: None,
         }
+    }
+
+    /// Attribute endpoint approval requests routed through this registry to
+    /// the sandbox session that owns the proxy.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        self.session_id = (!session_id.is_empty()).then(|| Arc::from(session_id));
+        self
+    }
+
+    /// Session id stamped on endpoint approval requests. Registries built
+    /// without session context report `"proxy"`.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        self.session_id
+            .as_deref()
+            .unwrap_or(UNATTRIBUTED_SESSION_ID)
     }
 
     /// Build a compatibility registry for callers that have one backend.
@@ -79,6 +102,17 @@ impl ApprovalBackendRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_reports_its_session_or_the_unattributed_marker() {
+        let registry = ApprovalBackendRegistry::default();
+        assert_eq!(registry.session_id(), "proxy");
+        assert_eq!(registry.clone().with_session_id("").session_id(), "proxy");
+        assert_eq!(
+            registry.with_session_id("sess-123").session_id(),
+            "sess-123"
+        );
+    }
 
     struct TestBackend {
         name: &'static str,

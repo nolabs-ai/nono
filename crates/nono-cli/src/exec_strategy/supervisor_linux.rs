@@ -122,6 +122,21 @@ pub(super) struct SeccompNotificationState<'a> {
     pub(super) denials: &'a mut Vec<DenialRecord>,
     pub(super) trust_interceptor: Option<&'a mut TrustInterceptor>,
     pub(super) pty: Option<&'a mut crate::pty_proxy::PtyProxy>,
+    pub(super) unix_socket_decisions: &'a mut UnixSocketSessionDecisions,
+}
+
+/// Session-scoped answers to unix socket approvals, keyed by canonical path
+/// and operation. `true` is "always allow", `false` is "always deny".
+pub(super) type UnixSocketSessionDecisions =
+    std::collections::HashMap<(std::path::PathBuf, UnixSocketOp), bool>;
+
+/// What the network handler needs to put a unix socket request to the
+/// approval backend. Absent while draining after the child exits.
+struct UnixSocketApproval<'a> {
+    child: Pid,
+    rate_limiter: &'a mut RateLimiter,
+    pty: Option<&'a mut crate::pty_proxy::PtyProxy>,
+    decisions: &'a mut UnixSocketSessionDecisions,
 }
 
 /// Read the TGID (thread group ID / process ID) of a thread from /proc/<tid>/status.
@@ -249,6 +264,7 @@ fn handle_received_filesystem_notification(
         denials,
         mut trust_interceptor,
         pty,
+        unix_socket_decisions: _,
     } = state;
 
     // 1. Receive the notification
@@ -365,7 +381,11 @@ fn handle_received_filesystem_notification(
         std::borrow::Cow::Borrowed(canonicalized.as_path())
     };
 
-    // 4. Check protected roots BEFORE initial-set fast-path.
+    // 4. Check protected roots BEFORE initial-set fast-path. The one exception
+    // is an exact file the initial set grants: grant construction rejects any
+    // user or profile path inside a protected root, so such a grant is one nono
+    // made itself (the TLS-intercept trust bundle under the session directory).
+    // Without it, elevation would deny what Landlock allows.
     let protected_root = crate::protected_paths::overlapping_protected_root(
         &canonicalized,
         false,
@@ -377,7 +397,8 @@ fn handle_received_filesystem_notification(
             false,
             config.protected_roots,
         )
-    });
+    })
+    .filter(|_| !grants_exact_file(&cap_check_path, access, initial_caps));
     if let Some(protected_root) = protected_root {
         debug!(
             "Seccomp: path {} blocked by protected root {}",
@@ -754,12 +775,18 @@ fn handle_received_filesystem_notification(
 /// Split out as an explicit type so the (testable) policy logic is decoupled
 /// from the (untestable) seccomp-notify response plumbing. Callers translate
 /// `Allow` to `continue_notif(…)` and `Deny` to `respond_notif_errno(…, EACCES)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum NetworkDecision {
     /// Allow the operation.
     Allow,
     /// Fail the syscall with `EACCES`.
     Deny,
+    /// A pathname unix socket outside the granted set that the approval
+    /// backend may answer; denied when no backend can be consulted.
+    Ask {
+        path: std::path::PathBuf,
+        op: UnixSocketOp,
+    },
 }
 
 /// Whether a trapped network syscall on address `family` carries no policy
@@ -1002,6 +1029,16 @@ fn decide_af_unix_pathname(
             canonical.display()
         );
         NetworkDecision::Allow
+    } else if unix_socket_approvable(canonical.as_path(), op, config) {
+        debug!(
+            "Proxy seccomp: AF_UNIX {} on {} needs approval",
+            op,
+            canonical.display()
+        );
+        NetworkDecision::Ask {
+            path: canonical,
+            op,
+        }
     } else {
         debug!(
             "Proxy seccomp: denying AF_UNIX {} on {}: no matching capability",
@@ -1010,6 +1047,82 @@ fn decide_af_unix_pathname(
         );
         NetworkDecision::Deny
     }
+}
+
+/// Whether a socket outside the granted set may be put to the approval
+/// backend. Mirrors file elevation: only with `capability_elevation`, never
+/// for nono's protected state or a path the policy denies, and never for
+/// datagram sends, which would ask once per message.
+fn unix_socket_approvable(
+    canonical: &std::path::Path,
+    op: UnixSocketOp,
+    config: &SupervisorConfig<'_>,
+) -> bool {
+    config.seccomp_policy.capability_elevation
+        && matches!(op, UnixSocketOp::Connect | UnixSocketOp::Bind)
+        && crate::protected_paths::overlapping_protected_root(
+            canonical,
+            false,
+            config.protected_roots,
+        )
+        .is_none()
+        && !is_under_deny_path(canonical, config.deny_paths)
+}
+
+/// Put a unix socket request to the approval backend, honouring and
+/// recording session-scoped answers. Every failure path denies.
+fn request_unix_socket_approval(
+    config: &SupervisorConfig<'_>,
+    approval: Option<&mut UnixSocketApproval<'_>>,
+    path: &std::path::Path,
+    op: UnixSocketOp,
+) -> Result<bool> {
+    let Some(approval) = approval else {
+        return Ok(false);
+    };
+    let key = (path.to_path_buf(), op);
+    if let Some(granted) = approval.decisions.get(&key) {
+        return Ok(*granted);
+    }
+    if !approval.rate_limiter.try_acquire() {
+        debug!("Rate limited unix socket approval for {}", path.display());
+        return Ok(false);
+    }
+
+    let request = nono::supervisor::ApprovalRequest::UnixSocket {
+        request_id: format!("unix-socket-{}", unique_request_id()),
+        path: path.to_path_buf(),
+        op,
+        reason: Some("Sandbox intercepted unix socket operation (seccomp-notify)".to_string()),
+        child_pid: approval.child.as_raw() as u32,
+        session_id: config.session_id.to_string(),
+    };
+    let decision_started = Instant::now();
+    let decision = match super::request_approval_with_relay_paused(
+        config,
+        &request,
+        approval.pty.as_deref_mut(),
+    ) {
+        Ok(decision) => decision,
+        Err(e) => {
+            warn!("Approval backend error for unix socket request: {}", e);
+            ApprovalDecision::Denied {
+                reason: format!("Approval backend error: {e}"),
+            }
+        }
+    };
+    match decision {
+        ApprovalDecision::GrantedForSession => {
+            approval.decisions.insert(key, true);
+        }
+        ApprovalDecision::DeniedForSession => {
+            approval.decisions.insert(key, false);
+        }
+        _ => {}
+    }
+    let granted = decision.is_granted();
+    record_capability_audit(config, request, decision_started, decision)?;
+    Ok(granted)
 }
 
 fn resolve_af_unix_sockaddr_path(
@@ -1121,6 +1234,12 @@ pub(super) fn handle_combined_notification(
             network_throttle,
             state.denials,
             ipc_denials,
+            Some(UnixSocketApproval {
+                child,
+                rate_limiter: state.rate_limiter,
+                pty: state.pty,
+                decisions: state.unix_socket_decisions,
+            }),
             notif,
         )
     }
@@ -1140,6 +1259,7 @@ pub(super) fn handle_network_notification(
         network_throttle,
         denials,
         ipc_denials,
+        None,
         notif,
     )
 }
@@ -1150,6 +1270,7 @@ fn handle_received_network_notification(
     network_throttle: &mut NetworkDenialThrottle,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+    mut approval: Option<UnixSocketApproval<'_>>,
     notif: nono::sandbox::SeccompNotif,
 ) -> nono::error::Result<()> {
     use nono::sandbox::{
@@ -1316,9 +1437,23 @@ fn handle_received_network_notification(
     }
 
     for sockaddr in &sockaddrs {
-        match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
-            NetworkDecision::Allow => {}
-            NetworkDecision::Deny => {
+        let allowed = match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config)
+        {
+            NetworkDecision::Allow => true,
+            NetworkDecision::Deny => false,
+            NetworkDecision::Ask { path, op } => {
+                match request_unix_socket_approval(config, approval.as_mut(), &path, op) {
+                    Ok(granted) => granted && notif_id_valid(notify_fd, notif.id)?,
+                    Err(e) => {
+                        let _ = respond_notif_errno(notify_fd, notif.id, libc::EACCES);
+                        return Err(e);
+                    }
+                }
+            }
+        };
+        match allowed {
+            true => {}
+            false => {
                 // Enforcement is unconditional: the throttle only bounds how
                 // much bookkeeping this denial may create.
                 let record = network_throttle.admit();
@@ -1637,6 +1772,18 @@ fn current_unix_millis() -> u64 {
     }
 }
 
+/// Whether the initial set grants exactly this file with the requested access.
+/// Directory grants never qualify.
+fn grants_exact_file(
+    path: &std::path::Path,
+    requested: AccessMode,
+    initial_caps: &[InitialCapability],
+) -> bool {
+    initial_caps
+        .iter()
+        .any(|cap| cap.is_file && cap.path == path && cap.access.contains(requested))
+}
+
 /// Check if a path matches any capability in the initial set.
 ///
 /// Prefers the most specific capability. If the path is covered but the
@@ -1688,6 +1835,36 @@ fn match_initial_capability<'a>(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn only_an_exact_sufficient_file_grant_counts_as_exact() {
+        let bundle = PathBuf::from("/state/nono/sessions/s1/intercept-ca.pem");
+        let caps = vec![
+            InitialCapability {
+                path: bundle.clone(),
+                access: AccessMode::Read,
+                is_file: true,
+            },
+            InitialCapability {
+                path: PathBuf::from("/state/nono/sessions/s2"),
+                access: AccessMode::ReadWrite,
+                is_file: false,
+            },
+        ];
+
+        assert!(grants_exact_file(&bundle, AccessMode::Read, &caps));
+        assert!(!grants_exact_file(&bundle, AccessMode::Write, &caps));
+        assert!(!grants_exact_file(
+            &PathBuf::from("/state/nono/sessions/s1/other.pem"),
+            AccessMode::Read,
+            &caps
+        ));
+        assert!(!grants_exact_file(
+            &PathBuf::from("/state/nono/sessions/s2/audit.log"),
+            AccessMode::Read,
+            &caps
+        ));
+    }
 
     #[test]
     fn test_rate_limiter_allows_burst() {
@@ -2207,6 +2384,82 @@ mod tests {
                     &config,
                 ),
                 NetworkDecision::Deny
+            );
+        }
+
+        fn make_elevated_config<'a>(backend: &'a DenyAllBackend) -> SupervisorConfig<'a> {
+            let mut config = make_config(backend, 8080, Vec::new(), &[]);
+            config.seccomp_policy.capability_elevation = true;
+            config
+        }
+
+        #[test]
+        fn af_unix_connect_without_grant_asks_when_elevation_is_on() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "test.sock");
+            let _listener = UnixListener::bind(&path).expect("bind unix listener");
+            let config = make_elevated_config(&backend);
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Ask {
+                    path: path.canonicalize().expect("canonical"),
+                    op: nono::UnixSocketOp::Connect,
+                }
+            );
+        }
+
+        #[test]
+        fn af_unix_datagram_send_is_never_asked() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "test.sock");
+            let _listener = UnixListener::bind(&path).expect("bind unix listener");
+            let config = make_elevated_config(&backend);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_SENDTO, &unix_pathname(&path), &config),
+                NetworkDecision::Deny
+            );
+        }
+
+        #[test]
+        fn af_unix_denied_or_protected_paths_are_never_asked() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "test.sock");
+            let _listener = UnixListener::bind(&path).expect("bind unix listener");
+            let root = dir.path().canonicalize().expect("canonical");
+            let roots = vec![root];
+
+            let mut config = make_elevated_config(&backend);
+            config.deny_paths = &roots;
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Deny,
+                "a path the policy denies must not reach a reviewer"
+            );
+
+            let mut config = make_elevated_config(&backend);
+            config.protected_roots = &roots;
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Deny,
+                "nono's protected state must not reach a reviewer"
             );
         }
 

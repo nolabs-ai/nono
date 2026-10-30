@@ -159,6 +159,19 @@ impl TerminalApproval {
                     prompt_line!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
+            ApprovalRequest::UnixSocket {
+                path, op, reason, ..
+            } => {
+                prompt_line!("[nono] The sandboxed process is requesting unix socket access:");
+                prompt_line!(
+                    "[nono]   Socket: {}",
+                    sanitize_for_terminal(&path.display().to_string())
+                );
+                prompt_line!("[nono]   Op:     {op}");
+                if let Some(r) = reason {
+                    prompt_line!("[nono]   Reason: {}", sanitize_for_terminal(r));
+                }
+            }
             ApprovalRequest::Endpoint {
                 route_id,
                 upstream,
@@ -181,10 +194,13 @@ impl TerminalApproval {
         }
         prompt_line!("[nono]");
 
-        // Network prompts offer session-scoped choices so an "always" answer
-        // suppresses re-prompting for the rest of the session. Every other
-        // request type keeps the one-shot [y/N] prompt.
-        let is_network = matches!(request, ApprovalRequest::Network { .. });
+        // Network and unix socket prompts offer session-scoped choices so an
+        // "always" answer suppresses re-prompting for the rest of the session.
+        // Every other request type keeps the one-shot [y/N] prompt.
+        let is_network = matches!(
+            request,
+            ApprovalRequest::Network { .. } | ApprovalRequest::UnixSocket { .. }
+        );
         let prompt = if is_network {
             prompt_line!("[nono]   1) Allow once");
             prompt_line!("[nono]   2) Always allow (this session)");

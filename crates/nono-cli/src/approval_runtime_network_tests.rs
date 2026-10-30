@@ -46,6 +46,66 @@ struct WebhookServer {
     url: String,
     requests: mpsc::UnboundedReceiver<HttpRequest>,
     task: JoinHandle<()>,
+    _socket_dir: Option<tempfile::TempDir>,
+}
+
+/// Read one HTTP/1.1 request, hand it to the test, and write its reply.
+async fn serve_webhook_connection<S>(stream: S, tx: mpsc::UnboundedSender<HttpRequest>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut stream = BufReader::new(stream);
+    let mut line = String::new();
+    stream.read_line(&mut line).await.unwrap();
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap().to_string();
+    let path = parts.next().unwrap().to_string();
+    let mut headers = BTreeMap::new();
+    loop {
+        line.clear();
+        stream.read_line(&mut line).await.unwrap();
+        if line == "\r\n" {
+            break;
+        }
+        let (name, value) = line.split_once(':').unwrap();
+        headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+    }
+    let len = headers
+        .get("content-length")
+        .map(|s| s.parse::<usize>().unwrap())
+        .unwrap_or(0);
+    assert!(len < 65536);
+    let mut body = vec![0; len];
+    stream.read_exact(&mut body).await.unwrap();
+    let body = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    };
+    let (response, reply) = oneshot::channel();
+    if tx
+        .send(HttpRequest {
+            method,
+            path,
+            headers,
+            body,
+            response,
+        })
+        .is_err()
+    {
+        return;
+    }
+    if let Ok((status, body)) = reply.await {
+        let response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .get_mut()
+            .write_all(response.as_bytes())
+            .await
+            .unwrap();
+    }
 }
 
 impl WebhookServer {
@@ -59,34 +119,7 @@ impl WebhookServer {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let (stream, _) = accepted.unwrap();
-                        let tx = tx.clone();
-                        connections.spawn(async move {
-                            let mut stream = BufReader::new(stream);
-                            let mut line = String::new();
-                            stream.read_line(&mut line).await.unwrap();
-                            let mut parts = line.split_whitespace();
-                            let method = parts.next().unwrap().to_string();
-                            let path = parts.next().unwrap().to_string();
-                            let mut headers = BTreeMap::new();
-                            loop {
-                                line.clear();
-                                stream.read_line(&mut line).await.unwrap();
-                                if line == "\r\n" { break; }
-                                let (name, value) = line.split_once(':').unwrap();
-                                headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
-                            }
-                            let len = headers.get("content-length").map(|s| s.parse::<usize>().unwrap()).unwrap_or(0);
-                            assert!(len < 65536);
-                            let mut body = vec![0; len];
-                            stream.read_exact(&mut body).await.unwrap();
-                            let body = if body.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&body).unwrap() };
-                            let (response, reply) = oneshot::channel();
-                            if tx.send(HttpRequest { method, path, headers, body, response }).is_err() { return; }
-                            if let Ok((status, body)) = reply.await {
-                                let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                                stream.get_mut().write_all(response.as_bytes()).await.unwrap();
-                            }
-                        });
+                        connections.spawn(serve_webhook_connection(stream, tx.clone()));
                     }
                     Some(result) = connections.join_next() => { result.unwrap(); }
                 }
@@ -96,15 +129,45 @@ impl WebhookServer {
             url,
             requests,
             task,
+            _socket_dir: None,
+        }
+    }
+
+    /// Same server, listening on a Unix socket and addressed as `unix://`.
+    async fn start_unix() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("approval.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let url = format!("unix://{}", socket.display());
+        let (tx, requests) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        connections.spawn(serve_webhook_connection(stream, tx.clone()));
+                    }
+                    Some(result) = connections.join_next() => { result.unwrap(); }
+                }
+            }
+        });
+        Self {
+            url,
+            requests,
+            task,
+            _socket_dir: Some(dir),
         }
     }
 
     fn backend(&self) -> WebhookApproval {
+        let (http, url) =
+            agent_for_target(parse_webhook_target(&self.url).unwrap(), DEADLINE).unwrap();
         WebhookApproval {
             name: "test-webhook".to_string(),
-            url: self.url.clone(),
+            url,
             timeout: DEADLINE,
-            http: build_agent(DEADLINE),
+            http,
             platform: None,
             poll_backoff: Duration::ZERO,
         }
@@ -494,4 +557,94 @@ async fn webhook_retry_and_signed_polls_retain_the_attempt_id() {
     };
     assert_eq!(tokio::join!(session.connect(upstream.port), respond).0, 200);
     assert!(session.decisions.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unix_webhook_posts_root_to_localhost_and_applies_decisions() {
+    let mut webhook = WebhookServer::start_unix().await;
+    let session = Session::new(Arc::new(webhook.backend()), "session-a");
+    let upstream = Upstream::start().await;
+    for (decision, expected) in [("allow", 200), ("deny", 403)] {
+        let respond = async {
+            let request = webhook.next().await;
+            assert_eq!(request.path, "/");
+            assert_eq!(
+                request.headers.get("host").map(String::as_str),
+                Some("localhost")
+            );
+            request.network_id(session.id, upstream.port);
+            request.respond(200, &format!(r#"{{"decision":"{decision}"}}"#));
+        };
+        assert_eq!(
+            tokio::join!(session.connect(upstream.port), respond).0,
+            expected
+        );
+    }
+
+    // A session grant over the socket is cached like any other webhook's.
+    let respond = async {
+        webhook
+            .next()
+            .await
+            .respond(200, r#"{"decision":"allow_session"}"#);
+    };
+    assert_eq!(tokio::join!(session.connect(upstream.port), respond).0, 200);
+    assert_eq!(session.connect(upstream.port).await, 200);
+    assert!(webhook.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn unix_webhook_non_2xx_denies() {
+    let mut webhook = WebhookServer::start_unix().await;
+    let session = Session::new(Arc::new(webhook.backend()), "session-a");
+    let upstream = Upstream::start().await;
+    let respond = async {
+        webhook.next().await.respond(500, r#"{"decision":"allow"}"#);
+    };
+    assert_eq!(tokio::join!(session.connect(upstream.port), respond).0, 403);
+    assert!(session.decisions.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unix_webhook_missing_or_dead_socket_denies() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.sock");
+    // A bound-then-closed listener leaves a socket file nobody accepts on.
+    let dead = dir.path().join("dead.sock");
+    drop(std::os::unix::net::UnixListener::bind(&dead).unwrap());
+    let upstream = Upstream::start().await;
+    for socket in [missing, dead] {
+        let (http, url) = agent_for_target(WebhookTarget::Unix { socket }, DEADLINE).unwrap();
+        let backend = WebhookApproval {
+            name: "test-webhook".to_string(),
+            url,
+            timeout: DEADLINE,
+            http,
+            platform: None,
+            poll_backoff: Duration::ZERO,
+        };
+        let session = Session::new(Arc::new(backend), "session-a");
+        assert_eq!(session.connect(upstream.port).await, 403);
+        assert!(session.decisions.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn chain_mixing_unix_and_http_webhooks_asks_both() {
+    let mut unix = WebhookServer::start_unix().await;
+    let mut http = WebhookServer::start().await;
+    let session = Session::new(
+        Arc::new(ChainApproval {
+            name: "all".to_string(),
+            mode: ApprovalChainMode::All,
+            backends: vec![Arc::new(unix.backend()), Arc::new(http.backend())],
+        }),
+        "session-a",
+    );
+    let upstream = Upstream::start().await;
+    let respond = async {
+        unix.next().await.respond(200, r#"{"decision":"allow"}"#);
+        http.next().await.respond(200, r#"{"decision":"allow"}"#);
+    };
+    assert_eq!(tokio::join!(session.connect(upstream.port), respond).0, 200);
 }

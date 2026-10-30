@@ -1781,7 +1781,7 @@
         },
         "url": {
           "type": "string",
-          "description": "Webhook URL for webhook approval backends. Optional when auth is platform: nono then derives <platform_url>/api/v1/approvals from its enrollment."
+          "description": "Webhook URL for webhook approval backends: http(s)://... or unix:///abs/path.sock. Optional when auth is platform: nono then derives <platform_url>/api/v1/approvals from its enrollment."
         },
         "auth": {
           "type": "string",

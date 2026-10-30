@@ -110,6 +110,23 @@ pub fn writable_path_dirs(path_value: &str, outer_caps: &CapabilitySet) -> Vec<P
     writable
 }
 
+/// Return whether the sandbox could create, replace, or redirect `path`.
+///
+/// This is `true` when a write grant covers `path`, any of its directories, or
+/// any symlink hop on the way to it, including a symlink at an intermediate
+/// directory that a writable parent would let the sandbox retarget. A path
+/// that can't be proven safe (relative, containing NUL, a symlink cycle, or
+/// too deep to resolve) is reported as writable.
+#[must_use]
+pub fn path_writable_by(path: &Path, caps: &CapabilitySet) -> bool {
+    if path.is_relative() || path.as_os_str().as_encoded_bytes().contains(&0) {
+        return true;
+    }
+    path.ancestors()
+        .filter(|ancestor| ancestor.parent().is_some())
+        .any(|ancestor| !matches!(walk_chain(ancestor, caps), Some(false)))
+}
+
 fn filter_path(path_value: &str, mut keep: impl FnMut(&Path) -> bool) -> String {
     let kept: Vec<PathBuf> = std::env::split_paths(path_value)
         .filter(|entry| keep(entry))
@@ -729,5 +746,64 @@ mod tests {
         let mut perms = std::fs::metadata(path).expect("metadata").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(path, perms).expect("chmod");
+    }
+
+    #[test]
+    fn path_writable_by_rejects_writable_parent_or_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_dir = dir.path().join("helper").join("s");
+        std::fs::create_dir_all(&socket_dir).expect("mkdir");
+        let socket = socket_dir.join("approval.sock");
+        assert!(path_writable_by(&socket, &caps_with_write(&socket_dir)));
+        assert!(path_writable_by(&socket, &caps_with_write(dir.path())));
+        assert!(!path_writable_by(&socket, &caps_with_read(dir.path())));
+        assert!(!path_writable_by(&socket, &CapabilitySet::new()));
+    }
+
+    #[test]
+    fn path_writable_by_rejects_missing_path_under_writable_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("not-created").join("approval.sock");
+        assert!(path_writable_by(&socket, &caps_with_write(dir.path())));
+        assert!(!path_writable_by(&socket, &caps_with_read(dir.path())));
+    }
+
+    #[test]
+    fn path_writable_by_rejects_relative_paths() {
+        assert!(path_writable_by(
+            Path::new("helper/approval.sock"),
+            &CapabilitySet::new()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_writable_by_rejects_symlinked_directory_into_writable_area() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writable = dir.path().join("writable");
+        std::fs::create_dir_all(&writable).expect("mkdir writable");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&writable, &link).expect("symlink");
+        assert!(path_writable_by(
+            &link.join("approval.sock"),
+            &caps_with_write(&writable)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_writable_by_rejects_retargetable_intermediate_symlink() {
+        // `outer/link -> safe`: `safe` is read-only, but `outer` is writable,
+        // so the sandbox could point `link` somewhere it controls.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let safe = dir.path().join("safe");
+        let outer = dir.path().join("outer");
+        std::fs::create_dir_all(&safe).expect("mkdir safe");
+        std::fs::create_dir_all(&outer).expect("mkdir outer");
+        let link = outer.join("link");
+        std::os::unix::fs::symlink(&safe, &link).expect("symlink");
+        let socket = link.join("approval.sock");
+        assert!(path_writable_by(&socket, &caps_with_write(&outer)));
+        assert!(!path_writable_by(&socket, &caps_with_read(dir.path())));
     }
 }

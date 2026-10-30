@@ -121,6 +121,8 @@ struct ToolSandboxState {
     /// Agent's resolved filesystem deny paths; a command's live cwd under any of
     /// these is rejected (the agent's broad allow may otherwise cover them).
     deny_paths: Vec<PathBuf>,
+    /// `unix://` approval sockets no command sandbox may be able to replace.
+    approval_sockets: Vec<(String, PathBuf)>,
     plan: ResolvedToolSandboxPlan,
     shims_by_command: BTreeMap<String, ShimIdentity>,
     credential_handles: BTreeMap<String, ResolvedCredential>,
@@ -273,6 +275,7 @@ impl PreparedToolSandboxRuntime {
             blocked_commands,
             outer_caps,
             deny_paths,
+            approval_sockets,
             policy_root,
             proxy_credentials,
             reserved_proxy_ports,
@@ -404,6 +407,7 @@ impl PreparedToolSandboxRuntime {
                 policy_root: policy_root.to_path_buf(),
                 outer_caps: outer_caps.clone(),
                 deny_paths: deny_paths.to_vec(),
+                approval_sockets: approval_sockets.to_vec(),
                 plan,
                 shims_by_command,
                 credential_handles,
@@ -3798,6 +3802,10 @@ fn build_child_caps(
     add_proxy_trust_bundle_caps(&mut caps, state, policy)?;
     add_policy_credentials(&mut caps, state, policy)?;
     add_url_open_caps(&mut caps, state, policy)?;
+    crate::approval_runtime::reject_child_replaceable_approval_sockets(
+        &caps,
+        &state.approval_sockets,
+    )?;
     Ok(caps)
 }
 
@@ -6572,6 +6580,7 @@ mod tests {
             policy_root: PathBuf::from("/tmp"),
             outer_caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
+            approval_sockets: Vec::new(),
             plan: ResolvedToolSandboxPlan {
                 config: CommandPoliciesConfig::default(),
                 resolved: ResolvedCommandBinaries {

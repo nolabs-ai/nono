@@ -124,7 +124,7 @@ impl TerminalApproval {
                 reason,
                 ..
             } => {
-                prompt_line!("[nono] The sandboxed process is requesting network access:");
+                prompt_line!("[nono] A connection through the nono proxy needs approval:");
                 prompt_line!("[nono]   Host:     {}", sanitize_for_terminal(host));
                 prompt_line!("[nono]   Port:     {port}");
                 prompt_line!("[nono]   Protocol: {protocol}");

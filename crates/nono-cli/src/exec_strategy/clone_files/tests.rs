@@ -870,6 +870,7 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
                 blocked_commands: &[],
                 outer_caps: &caps,
                 deny_paths: &[],
+                approval_sockets: &[],
                 policy_root: directory.path(),
                 proxy_credentials: &credentials,
                 reserved_proxy_ports: &Default::default(),

@@ -286,15 +286,6 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     let supervisor_network_audit_events = audit_state
         .as_ref()
         .map(|_| std::sync::Mutex::new(Vec::new()));
-    if let (Some(proxy_handle), Some(recorder_mutex)) = (proxy_handle, audit_recorder.as_ref()) {
-        let recorder_mutex = Arc::clone(recorder_mutex);
-        proxy_handle.attach_audit_sink(Arc::new(move |event| {
-            recorder_mutex
-                .lock()
-                .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?
-                .record_network_event(event.clone())
-        }));
-    }
     if let Some(recorder_mutex) = audit_recorder.as_ref() {
         let mut recorder = recorder_mutex
             .lock()
@@ -327,6 +318,19 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
                 },
             )?;
         }
+    }
+    // Establish the session lifecycle before enabling live proxy writes. Any
+    // event emitted before this point remains in the proxy buffer and is
+    // replayed during finalization, while every live event is guaranteed to
+    // follow `session_started` in the append-only log.
+    if let (Some(proxy_handle), Some(recorder_mutex)) = (proxy_handle, audit_recorder.as_ref()) {
+        let recorder_mutex = Arc::clone(recorder_mutex);
+        proxy_handle.attach_audit_sink(Arc::new(move |event| {
+            recorder_mutex
+                .lock()
+                .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?
+                .record_network_event(event.clone())
+        }));
     }
 
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;

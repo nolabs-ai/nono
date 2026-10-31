@@ -256,6 +256,14 @@ impl SeccompPolicy {
     }
 }
 
+/// Whether the child must be launched through the raw-clone bootstrap:
+/// network notifications need its listener handoff, and namespace isolation
+/// needs its synchronized parent/child id-map step.
+#[cfg(target_os = "linux")]
+fn uses_clone_bootstrap(config: &ExecConfig<'_>) -> bool {
+    config.seccomp_policy.needs_network_notify() || config.namespaces.is_some()
+}
+
 /// Configuration for command execution.
 pub struct ExecConfig<'a> {
     /// The command to execute (program + args).
@@ -304,6 +312,11 @@ pub struct ExecConfig<'a> {
     /// Linux network enforcement backend for this session.
     #[cfg(target_os = "linux")]
     pub sandbox_policy: crate::profile::LinuxSandboxPolicy,
+    /// Opt-in namespace isolation (NEP-0004). When set, the child is launched
+    /// through the raw-clone bootstrap, which enters these namespaces before
+    /// Landlock and seccomp apply. Partial application is fatal.
+    #[cfg(target_os = "linux")]
+    pub namespaces: Option<nono::NamespaceSpec>,
     /// Allow-list of environment variable names. When set, only variables
     /// matching a glob pattern (e.g. `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -369,7 +382,7 @@ pub struct SupervisorConfig<'a> {
     pub audit_recorder: Option<Arc<Mutex<crate::audit_integrity::AuditRecorder>>>,
     /// Optional in-memory network/IPC audit events persisted into session metadata.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub network_audit_events: Option<&'a Mutex<Vec<nono::undo::NetworkAuditEvent>>>,
+    pub network_audit_events: Option<&'a Mutex<Vec<nono_proxy::audit::BufferedAuditEvent>>>,
     /// Running proxy handle, used to snapshot network denial events for the
     /// diagnostic footer. Read-only here: session finalization performs the
     /// destructive drain that feeds the persistent audit record.
@@ -612,7 +625,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     let socket_pair = if needs_child_ipc {
         let pair = SupervisorSocket::pair()?;
         #[cfg(target_os = "linux")]
-        let pair = if config.seccomp_policy.needs_network_notify() {
+        let pair = if uses_clone_bootstrap(config) {
             (
                 clone_files::promote_supervisor_socket(pair.0)?,
                 clone_files::promote_supervisor_socket(pair.1)?,
@@ -942,14 +955,17 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // Serialize notification listener ownership, including destruction, across
     // shared-table bootstraps. Ordinary proxy I/O threads remain concurrent.
     #[cfg(target_os = "linux")]
-    let _listener_ownership_guard = if config.seccomp_policy.child_requires_dumpable() {
-        Some(clone_files::lock_listener_ownership()?)
-    } else {
-        None
-    };
+    let _listener_ownership_guard =
+        if config.seccomp_policy.child_requires_dumpable() || config.namespaces.is_some() {
+            Some(clone_files::lock_listener_ownership()?)
+        } else {
+            None
+        };
     #[cfg(target_os = "linux")]
-    let mut clone_bootstrap = if config.seccomp_policy.needs_network_notify() {
-        if !supervisor.is_some_and(|sup| sup.seccomp_policy == config.seccomp_policy) {
+    let mut clone_bootstrap = if uses_clone_bootstrap(config) {
+        if config.seccomp_policy.needs_network_notify()
+            && !supervisor.is_some_and(|sup| sup.seccomp_policy == config.seccomp_policy)
+        {
             return Err(NonoError::SandboxInit(
                 "Network notifications require a supervisor with matching notification policy"
                     .into(),
@@ -1450,6 +1466,38 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 .as_mut()
                 .and_then(|bootstrap| bootstrap.network.take());
 
+            // Namespace isolation proxy bridge: serve the listener the child
+            // created inside its network namespace with the session proxy.
+            // Failing to attach it is fatal; the child would have no egress
+            // path and the profile asked for proxied egress.
+            #[cfg(target_os = "linux")]
+            if let Some(bridge) = clone_bootstrap
+                .as_mut()
+                .and_then(|bootstrap| bootstrap.bridge.take())
+            {
+                let attached = supervisor
+                    .and_then(|sup| sup.proxy_handle)
+                    .ok_or_else(|| {
+                        NonoError::SandboxInit(
+                            "namespace isolation bridge requires a running proxy".to_string(),
+                        )
+                    })
+                    .and_then(|handle| {
+                        handle
+                            .add_listener(std::net::TcpListener::from(bridge))
+                            .map_err(|e| {
+                                NonoError::SandboxInit(format!(
+                                    "cannot attach namespace isolation bridge to proxy: {e}"
+                                ))
+                            })
+                    });
+                if let Err(error) = attached {
+                    let _ = signal::kill(child, Signal::SIGKILL);
+                    let _ = waitpid(child, None);
+                    return Err(error);
+                }
+            }
+
             // Set up signal forwarding.
             setup_signal_forwarding(child, pty_proxy.as_ref().map(|p| p.poll_fds().0));
             let _signal_forwarding_guard = SignalForwardingGuard;
@@ -1501,6 +1549,12 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
 
             let mut killed_by_timeout = false;
 
+            // Off-thread prompts wait for the supervisor loop below to pause
+            // the relay while it runs; see `service_off_thread_prompts`.
+            let relay_registration = pty_proxy
+                .is_some()
+                .then(crate::relay_prompt_gate::register_relay);
+
             // Start the timer only in the parent after fork(), then stop and
             // join it before the session's temp artifacts are torn down.
             let _temp_keepalive = prepared_temp_keepalive.start();
@@ -1547,6 +1601,8 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     )?;
                     (status, Vec::new(), Vec::new(), Vec::new())
                 };
+
+            drop(relay_registration);
 
             // Close the attach listener immediately so no new attach
             // connections can sneak in during teardown.  Without this,
@@ -1728,6 +1784,15 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     )
                     .with_canonical_denial_paths(canonical_denial_paths)
                     .with_network_denials(network_denials);
+                #[cfg(target_os = "linux")]
+                {
+                    base_formatter = base_formatter.with_network_isolated(
+                        config
+                            .namespaces
+                            .as_ref()
+                            .is_some_and(nono::NamespaceSpec::has_network),
+                    );
+                }
                 if let Some(program) = config.command.first() {
                     let argv_display: Vec<String> = config
                         .command
@@ -1884,6 +1949,8 @@ fn build_policy_explanations(
             }
             Ok(crate::query_ext::QueryResult::NotSandboxed { .. })
             | Ok(crate::query_ext::QueryResult::ApprovalRequired { .. })
+            | Ok(crate::query_ext::QueryResult::Unmediated { .. })
+            | Ok(crate::query_ext::QueryResult::Unknown { .. })
             | Ok(crate::query_ext::QueryResult::Scope { .. })
             | Err(_) => {}
         }
@@ -2103,6 +2170,7 @@ fn wait_for_child_with_pty(
         handle_pty_detach_request(Some(pty), pause_requested, in_band_detach_requested);
         handle_pty_signal_relay(Some(pty));
         handle_pty_suspension(Some(pty), child);
+        service_off_thread_prompts(Some(pty));
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
@@ -2764,6 +2832,7 @@ fn run_supervisor_loop(
         );
         handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
+        service_off_thread_prompts(pty.as_deref_mut());
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
@@ -2867,6 +2936,11 @@ fn reap_reparented_orphans(child: Pid) -> Option<WaitStatus> {
             }
         }
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn reap_credential_orphans_for_test() {
+    let _ = reap_reparented_orphans(Pid::from_raw(i32::MAX));
 }
 
 /// Supervisor IPC event loop for capability expansion (Linux).
@@ -3223,6 +3297,7 @@ fn run_supervisor_loop_inner(
         );
         handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
+        service_off_thread_prompts(pty.as_deref_mut());
 
         // Drain reparented orphans; if the primary child was among them,
         // surface its status directly.
@@ -3341,26 +3416,35 @@ struct SupervisorDenials {
     seen_request_ids: HashSet<String>,
 }
 
-/// Run an approval request with the PTY relay paused.
+/// Run a supervisor-thread approval request with the PTY relay paused.
 ///
-/// While a terminal client is attached to the PTY relay, the real terminal is
-/// in raw mode and relaying keystrokes to the child, so an interactive prompt
-/// would render garbled and never see the user's answer. Pause the relay
-/// (restoring cooked mode) for the duration of the request and re-enter relay
-/// mode afterwards. A no-op when no terminal-backed client is attached.
+/// See [`crate::pty_proxy::PtyProxy::run_with_terminal_paused`]. Requests
+/// raised on other threads pause the relay through
+/// [`service_off_thread_prompts`] instead.
 fn request_approval_with_relay_paused(
     config: &SupervisorConfig<'_>,
     request: &nono::supervisor::ApprovalRequest,
-    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
+    pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<ApprovalDecision> {
-    let paused_for_prompt = pty
-        .as_mut()
-        .is_some_and(|proxy| proxy.pause_terminal_for_prompt());
-    let result = config.approval_backend.request_approval(request);
-    if paused_for_prompt && let Some(proxy) = pty.as_mut() {
-        proxy.resume_terminal_after_prompt();
+    let request_approval = || config.approval_backend.request_approval(request);
+    match pty {
+        Some(proxy) => proxy.run_with_terminal_paused(request_approval),
+        None => request_approval(),
     }
-    result
+}
+
+/// Pause the PTY relay for terminal prompts raised off the supervisor thread.
+///
+/// Network and proxy endpoint approvals run on proxy worker threads that
+/// cannot reach the relay. They wait in [`crate::relay_prompt_gate`] until
+/// this supervisor-loop hook pauses the relay, and the relay resumes once the
+/// last of them finishes.
+fn service_off_thread_prompts(pty: Option<&mut crate::pty_proxy::PtyProxy>) {
+    if let Some(proxy) = pty {
+        crate::relay_prompt_gate::service_pending_prompts(|prompts| {
+            proxy.run_with_terminal_paused(prompts)
+        });
+    }
 }
 
 /// Handle a single supervisor IPC message.

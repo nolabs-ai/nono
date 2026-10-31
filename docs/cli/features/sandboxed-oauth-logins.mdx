@@ -507,6 +507,8 @@ RUST_LOG=nono_proxy::oauth_capture=debug,nono_proxy::tls_intercept=debug \
 nono run --profile codex-oauth --allow-cwd -- codex login --device-auth
 ```
 
+`codex login` is an authentication command, not an interactive agent session, so it does not use the shared app-server path and does not need `--no-daemon`.
+
 Expected evidence:
 
 ```text

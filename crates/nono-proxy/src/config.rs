@@ -332,6 +332,12 @@ pub struct OAuthTokenEndpointConfig {
     /// Request body encoding for token refresh/exchange requests.
     #[serde(default)]
     pub request_body: OAuthTokenRequestBodyFormat,
+    /// Response body encoding for token endpoint replies. `Auto` selects JSON
+    /// or form encoding from the response's `Content-Type` header; a body
+    /// whose content type matches neither, or contradicts an explicit
+    /// `Json`/`Form` setting, is rejected rather than guessed at.
+    #[serde(default)]
+    pub response_body: OAuthTokenRequestBodyFormat,
     /// JSON request fields where phantom tokens must be resolved before
     /// forwarding token refresh/exchange requests upstream.
     #[serde(default)]
@@ -1504,6 +1510,33 @@ pub fn resolved_credential_format(inject_header: &str, credential_format: Option
     }
 }
 
+/// RFC 7230 `token`: whether `name` is a valid HTTP header field name.
+/// Shared predicate for every header-name validation across the workspace.
+#[must_use]
+pub fn is_http_header_token(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
 /// Configuration for an external (enterprise) proxy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalProxyConfig {
@@ -1613,6 +1646,33 @@ pub struct AwsAuthConfig {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_http_header_token_char_alphanumeric() {
+        assert!(is_http_header_token("aZ09"));
+    }
+
+    #[test]
+    fn test_http_header_token_char_special_chars() {
+        // valid special chars in header token names: !#$%&'*+-.^_`|~
+        for c in "!#$%&'*+-.^_`|~".chars() {
+            assert!(
+                is_http_header_token(&c.to_string()),
+                "Expected '{c}' to be a valid tchar"
+            );
+        }
+    }
+
+    #[test]
+    fn test_http_header_token_char_rejects_invalid() {
+        // Control chars, space, colon, parentheses should be rejected
+        assert!(!is_http_header_token("a b"));
+        assert!(!is_http_header_token("a:b"));
+        assert!(!is_http_header_token("a(b"));
+        assert!(!is_http_header_token("a)b"));
+        assert!(!is_http_header_token("a\rb"));
+        assert!(!is_http_header_token("a\nb"));
+    }
 
     #[test]
     fn test_default_config() {

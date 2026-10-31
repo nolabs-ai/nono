@@ -79,6 +79,8 @@ fn test_schema_network_config_matches_rust_model() {
             "tls_intercept",
             "upstream_proxy",
             "upstream_bypass",
+            "approval_backends",
+            "approval_defaults",
         ],
     );
 }
@@ -1107,8 +1109,32 @@ fn test_schema_linux_config_matches_rust_model() {
     assert_schema_properties(
         &schema,
         "LinuxConfig",
-        &["af_unix_mediation", "sandbox_policy"],
+        &["af_unix_mediation", "sandbox_policy", "isolate"],
     );
+}
+
+#[test]
+fn test_schema_linux_isolate_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "LinuxIsolateConfig",
+        &["network", "loopback", "ipc", "uts"],
+    );
+}
+
+#[test]
+fn test_schema_validates_linux_isolate() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({ "linux": { "isolate": { "network": true, "loopback": true, "ipc": true, "uts": false } } });
+    validator
+        .validate(&profile)
+        .unwrap_or_else(|e| panic!("linux.isolate should validate: {e}"));
+    // Phase 2 fields are not accepted until they are implemented, so a
+    // profile cannot believe it is mount-masked when it is not.
+    let phase_two = json!({ "linux": { "isolate": { "mounts": true } } });
+    assert!(validator.validate(&phase_two).is_err());
 }
 
 #[test]

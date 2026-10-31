@@ -665,6 +665,36 @@
             { "type": "null" }
           ],
           "description": "Which Linux sandboxing mechanism to install. Defaults to 'auto' (Landlock plus a static seccomp network baseline, falling back to seccomp-only networking when the kernel ABI lacks Landlock network support)."
+        },
+        "isolate": {
+          "$ref": "#/$defs/LinuxIsolateConfig"
+        }
+      }
+    },
+    "LinuxIsolateConfig": {
+      "type": "object",
+      "description": "Opt-in namespace isolation (NEP-0004). Every field defaults to false. Fields merge by logical OR across profile layers and the CLI: any layer can enable a namespace and none can disable it. Requested isolation that the host cannot provide is a startup error, never a silent downgrade. Inert on macOS. Not supported by `nono wrap`.",
+      "additionalProperties": false,
+      "properties": {
+        "network": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run in a new user + network namespace containing only loopback. Egress is possible only through the session proxy. Requires a blocked or proxied network, and cannot be combined with network.open_port, network.connect_port, network.listen_port, or network.no_proxy."
+        },
+        "loopback": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow TCP bind and connect on any port of the isolated network namespace's own loopback, for local dev servers and tests. Requires network. Egress stays proxy-only; UDP, raw sockets, and netlink stay denied; host localhost services stay unreachable. The network.open_port / listen_port / connect_port fields remain rejected because they mean host localhost."
+        },
+        "ipc": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run in a new user + IPC namespace (SysV IPC and POSIX message queues are not shared with the host)."
+        },
+        "uts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run in a new user + UTS namespace (hostname changes do not affect the host)."
         }
       }
     },
@@ -966,6 +996,18 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Hosts to bypass the upstream proxy and route directly. Supports exact hostnames and wildcard suffixes (e.g., *.example.com)."
+        },
+        "approval_backends": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ApprovalBackendConfig" },
+          "description": "Where runtime host-approval prompts are sent when a CONNECT target is not on the allowlist. For run and shell, a non-empty map activates strict proxy filtering even with an empty allowlist when network.block is false/omitted and --block-net is absent: unlisted hosts require approval rather than being allowed implicitly. Both hard-block forms conflict with configured approval backends and are rejected; approvals cannot lift a block. --allow-net clears these profile approval settings. Host denies and metadata/link-local SSRF protection cannot be overridden. Empty (default) preserves static-policy behavior without prompts. Session-scoped 'Always allow'/'Always deny' answers suppress re-prompting for the rest of the session."
+        },
+        "approval_defaults": {
+          "oneOf": [
+            { "$ref": "#/$defs/ApprovalDefaultsConfig" },
+            { "type": "null" }
+          ],
+          "description": "Which entry in network.approval_backends answers host-approval prompts by default; 'backend' names it. Only backend is used here; configure timeout_secs on terminal/webhook backend entries, not approval_defaults. When null, no prompt occurs unless approval_backends is set, in which case a default must resolve (we fail rather than guess)."
         }
       }
     },
@@ -1749,7 +1791,7 @@
         "timeout_secs": {
           "type": "integer",
           "minimum": 1,
-          "description": "Backend-specific approval timeout in seconds."
+          "description": "Backend-specific approval timeout in seconds. Terminal defaults to 600 seconds and bounds prompt-slot waiting, anti-typeahead delay, and answer reading; expiry denies and releases the prompt reader. Webhook defaults to 60 seconds. Set this on terminal/webhook backends; chain bounds derive from their children."
         },
         "mode": {
           "type": "string",

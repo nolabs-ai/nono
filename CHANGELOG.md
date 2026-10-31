@@ -1,5 +1,164 @@
 # Changelog
 
+## [0.81.0] - 2026-10-29
+
+### Security Advisories
+
+- [GHSA-wh99-5qx8-cgh4](https://github.com/nolabs-ai/nono/security/advisories/GHSA-wh99-5qx8-cgh4)
+- [GHSA-p39g-3xw6-83jx](https://github.com/nolabs-ai/nono/security/advisories/GHSA-p39g-3xw6-83jx)
+- [GHSA-p398-cgqf-c48x](https://github.com/nolabs-ai/nono/security/advisories/GHSA-p398-cgqf-c48x)
+
+### Bug Fixes
+
+- *(proxy)* Redeem phantoms inside Basic credentials on token endpoints (#2225) ([#2225](https://github.com/nolabs-ai/nono/pull/2225))
+
+- *(why)* Add pathname Unix socket policy diagnostics (#2220) ([#2220](https://github.com/nolabs-ai/nono/pull/2220))
+
+- *(proxy)* Prevent UTF-8 nonce parsing panic (#2216) ([#2216](https://github.com/nolabs-ai/nono/pull/2216))
+
+- *(sandbox)* Deny io_uring during AF_UNIX mediation (#2215) ([#2215](https://github.com/nolabs-ai/nono/pull/2215))
+
+- *(oauth-capture)* Rewrite form-urlencoded OAuth token responses (#1836) ([#1836](https://github.com/nolabs-ai/nono/pull/1836))
+
+- *(proxy)* Answer 407 when an unauthenticated CONNECT arrives with an upstream proxy (#2133) ([#2133](https://github.com/nolabs-ai/nono/pull/2133))
+
+- *(proxy)* Honor connect ports in supervised mode (#2189) ([#2189](https://github.com/nolabs-ai/nono/pull/2189))
+
+- *(profiles)* Simplify package profile listing for fully qualified names (#2166) ([#2166](https://github.com/nolabs-ai/nono/pull/2166))
+
+- *(proxy)* Redact proxy audit paths, reasons, and upstream URLs (#2181) ([#2181](https://github.com/nolabs-ai/nono/pull/2181))
+
+- *(proxy)* Retain ownership of credential command children (#2073) ([#2073](https://github.com/nolabs-ai/nono/pull/2073))
+
+- *(cli)* Resolve wrapper exec targets after env assignments (#2165) ([#2165](https://github.com/nolabs-ai/nono/pull/2165))
+
+- *(cli)* Keep --log-file output under --silent (#2159) ([#2159](https://github.com/nolabs-ai/nono/pull/2159))
+
+- *(proxy)* Tolerate skew in certificates (#2126) ([#2126](https://github.com/nolabs-ai/nono/pull/2126))
+
+- *(proxy)* Resolve the Authorization phantom on token endpoint requests (#2136) ([#2136](https://github.com/nolabs-ai/nono/pull/2136))
+
+- *(policy)* Grant system_read_linux_core access to /var/lib/ca-certificates (#2149) ([#2149](https://github.com/nolabs-ai/nono/pull/2149))
+
+- *(policy)* Enable Nix runtime and cache/channel access (#2151) ([#2151](https://github.com/nolabs-ai/nono/pull/2151))
+
+- *(ci)* Update cargo audit failures (#2127) ([#2127](https://github.com/nolabs-ai/nono/pull/2127))
+
+- *(proxy)* Use HTTP/1.1 for AWS intercept routes (#2111) ([#2111](https://github.com/nolabs-ai/nono/pull/2111))
+
+
+### Build
+
+- Add NEP roadmap generation script and workflow (#2144) ([#2144](https://github.com/nolabs-ai/nono/pull/2144))
+
+
+### CI/CD
+
+- Stop notifying retired downstream repos (#2110) ([#2110](https://github.com/nolabs-ai/nono/pull/2110))
+
+
+### Dependencies
+
+- *(deps)* Bump vt100 from 0.16.2 to 0.18.1 (#2206) ([#2206](https://github.com/nolabs-ai/nono/pull/2206))
+
+- *(deps)* Bump jsonschema from 0.58.6 to 0.60.1 (#2205) ([#2205](https://github.com/nolabs-ai/nono/pull/2205))
+
+- *(deps)* Bump the sigstore group across 1 directory with 2 updates (#2202) ([#2202](https://github.com/nolabs-ai/nono/pull/2202))
+
+- *(deps)* Bump the routine-rust group across 1 directory with 9 updates (#2212) ([#2212](https://github.com/nolabs-ai/nono/pull/2212))
+
+- *(deps)* Bump the routine-actions group with 2 updates (#2203) ([#2203](https://github.com/nolabs-ai/nono/pull/2203))
+
+- *(deps)* Bump ctutils to 0.4.4 (#2192) ([#2192](https://github.com/nolabs-ai/nono/pull/2192))
+
+- *(deps)* Update Rust TLS dependencies (#2175) ([#2175](https://github.com/nolabs-ai/nono/pull/2175))
+
+- *(deps)* Bump the sigstore group across 1 directory with 2 updates (#2160) ([#2160](https://github.com/nolabs-ai/nono/pull/2160))
+
+- *(deps)* Bump cachix/install-nix-action (#2161) ([#2161](https://github.com/nolabs-ai/nono/pull/2161))
+
+- *(deps)* Bump the routine-rust group with 5 updates (#2162) ([#2162](https://github.com/nolabs-ai/nono/pull/2162))
+
+- *(deps)* Bump jsonschema from 0.56.0 to 0.58.6 (#2123) ([#2123](https://github.com/nolabs-ai/nono/pull/2123))
+
+- *(deps)* Bump dirs from 6.0.0 to 7.0.0 (#2124) ([#2124](https://github.com/nolabs-ai/nono/pull/2124))
+
+- *(deps)* Bump the routine-rust group with 6 updates (#2122) ([#2122](https://github.com/nolabs-ai/nono/pull/2122))
+
+- *(deps)* Group routine Dependabot updates (#2119) ([#2119](https://github.com/nolabs-ai/nono/pull/2119))
+
+- *(deps)* Bump hyper-util from 0.1.20 to 0.1.21 (#2115) ([#2115](https://github.com/nolabs-ai/nono/pull/2115))
+
+- *(deps)* Bump hyper from 1.11.1 to 1.12.0 (#2117) ([#2117](https://github.com/nolabs-ai/nono/pull/2117))
+
+- *(deps)* Bump tokio from 1.53.1 to 1.53.2 (#2116) ([#2116](https://github.com/nolabs-ai/nono/pull/2116))
+
+- *(deps)* Bump uuid from 1.26.1 to 1.28.0 (#2114) ([#2114](https://github.com/nolabs-ai/nono/pull/2114))
+
+- *(deps)* Bump ureq from 3.4.1 to 3.4.2 (#2113) ([#2113](https://github.com/nolabs-ai/nono/pull/2113))
+
+
+### Documentation
+
+- Document safe Codex app server isolation (#2227) ([#2227](https://github.com/nolabs-ai/nono/pull/2227))
+
+- *(neps)* Add nep-0008 session flight recorder proposal (#2223) ([#2223](https://github.com/nolabs-ai/nono/pull/2223))
+
+- *(claude)* Clarify packaged macOS keychain access (#2219) ([#2219](https://github.com/nolabs-ai/nono/pull/2219))
+
+- *(cli)* Document network.listen_port_range in profiles-groups (#2153) ([#2153](https://github.com/nolabs-ai/nono/pull/2153))
+
+- *(neps)* Add NEP 0007 for remote supervisor decisions over vsock (#2150) ([#2150](https://github.com/nolabs-ai/nono/pull/2150))
+
+- *(readme)* Rewrite introduction and feature breakdown (#2139) ([#2139](https://github.com/nolabs-ai/nono/pull/2139))
+
+- *(readme)* Remove references to archived TypeScript and Go bindings (#2138) ([#2138](https://github.com/nolabs-ai/nono/pull/2138))
+
+
+### Features
+
+- *(proxy)* Network approval backends (#1781) ([#1781](https://github.com/nolabs-ai/nono/pull/1781))
+
+- *(sandbox)* Detect Landlock ABI up to V9, keep enforcement at V6 (#2217) ([#2217](https://github.com/nolabs-ai/nono/pull/2217))
+
+- *(proxy)* Include denial_category in proxy deny log lines (#2173) ([#2173](https://github.com/nolabs-ai/nono/pull/2173))
+
+- *(policy)* Add `rtk_state` group (#2155) ([#2155](https://github.com/nolabs-ai/nono/pull/2155))
+
+- *(linux)* Opt-in namespace isolation (NEP-0004) (#2145) ([#2145](https://github.com/nolabs-ai/nono/pull/2145))
+
+- *(profiles)* Require fully qualified package profile names (#2118) ([#2118](https://github.com/nolabs-ai/nono/pull/2118))
+
+- *(cli)* Skip approval requests for ungrantable procfs paths (#2054) ([#2054](https://github.com/nolabs-ai/nono/pull/2054))
+
+
+### Miscellaneous
+
+- Clean up workspace dependencies and build configuration (#2210) ([#2210](https://github.com/nolabs-ai/nono/pull/2210))
+
+- *(nix)* Update prebuilt hashes for v0.80.0 (#2109) ([#2109](https://github.com/nolabs-ai/nono/pull/2109))
+
+
+### Performance
+
+- *(linux)* Read only the ELF regions the exec gate parses (#2195) ([#2195](https://github.com/nolabs-ai/nono/pull/2195))
+
+
+### Refactoring
+
+- *(headers)* Consolidate the HTTP token check (#2168) ([#2168](https://github.com/nolabs-ai/nono/pull/2168))
+
+## [0.80.0] - 2026-10-13
+
+### Dependencies
+
+- *(deps)* Bump quinn-proto to 0.11.18 (#2106) ([#2106](https://github.com/nolabs-ai/nono/pull/2106))
+
+
+### Features
+
+- *(command-policy)* Support SHA-256 executable pinning (#2105) ([#2105](https://github.com/nolabs-ai/nono/pull/2105))
+
 ## [0.80.0] - 2026-10-12
 
 ### Bug Fixes

@@ -1,6 +1,6 @@
 [package]
 name = "nono-proxy"
-version = "0.80.0"
+version = "0.81.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -18,7 +18,7 @@ default = ["system-keyring"]
 system-keyring = ["nono/system-keyring"]
 
 [dependencies]
-nono = { version = "0.80.0", path = "../nono", default-features = false }
+nono = { version = "0.81.0", path = "../nono", default-features = false }
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -31,7 +31,8 @@ zeroize.workspace = true
 sha2.workspace = true
 sha1.workspace = true
 getrandom.workspace = true
-base64 = "0.23"
+uuid = { workspace = true, features = ["v4"] }
+base64.workspace = true
 regex = "1"
 subtle = "2"
 url.workspace = true
@@ -53,27 +54,27 @@ aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 
 # TLS for upstream connections (reverse proxy mode)
-hyper-rustls = { version = "0.27", features = ["http1", "http2", "ring", "webpki-tokio"] }
+hyper-rustls = { version = "0.27.10", features = ["http1", "http2", "ring", "webpki-tokio"] }
 # HTTP/2 framing for CONNECT-intercept h2 forwarding (gRPC support)
 h2 = "0.4"
 bytes = "1"
 http = "1"
 tower-service = "0.3"
-tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
-webpki-roots = "1"
+tokio-rustls = "0.26.6"
+rustls = { version = "0.23.46", features = ["ring"] }
+webpki-roots = "1.0.10"
 
 # TLS interception (CONNECT-mode L7 filtering and credential injection):
 # ephemeral session CA + per-host leaf certificate generation. `ring` matches
-# the rustls crypto provider used elsewhere; `aws_lc_rs` is disabled to avoid
-# a second, redundant crypto stack in the dependency tree.
+# the provider explicitly selected for proxy TLS. The AWS SDK separately uses
+# AWS-LC for its own HTTPS client.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
 x509-parser = "0.18"
 # Read the host's system trust store (used to compose the trust bundle that
 # the sandboxed child consumes via SSL_CERT_FILE / REQUESTS_CA_BUNDLE / etc.).
 # We need full DER certs for PEM emission; webpki-roots only ships parsed
 # TrustAnchors, so it can't be the source for a system bundle.
-rustls-native-certs = "0.8"
+rustls-native-certs = "0.8.5"
 # Date/time used by `rcgen` for cert validity windows. Already pulled in as a
 # transitive dep of rcgen; declared explicitly because we use OffsetDateTime
 # directly to set not_before/not_after.

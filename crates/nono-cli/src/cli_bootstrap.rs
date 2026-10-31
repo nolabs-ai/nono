@@ -43,6 +43,10 @@ pub(crate) fn init_internal_entrypoint_tracing() {
 }
 
 pub(crate) fn init_tracing(cli: &Cli) {
+    // Resolve the log file filter before RUST_LOG is exported below. Under
+    // `--silent` the export is "off", which must not reach the log file.
+    let file_filter = tracing_filter(cli, true);
+
     // Export the resolved CLI verbosity into RUST_LOG (unless already set) so it
     // propagates to internal re-exec subprocesses — notably the command-mediation
     // child launcher, which forwards RUST_LOG and inits its own subscriber. This
@@ -62,7 +66,7 @@ pub(crate) fn init_tracing(cli: &Cli) {
         Some(path) => match SharedFileMakeWriter::new(path) {
             Ok(writer) => {
                 tracing_subscriber::fmt()
-                    .with_env_filter(tracing_filter(cli))
+                    .with_env_filter(file_filter)
                     .with_target(false)
                     .with_ansi(false)
                     .with_writer(writer)
@@ -75,7 +79,7 @@ pub(crate) fn init_tracing(cli: &Cli) {
                     err
                 );
                 tracing_subscriber::fmt()
-                    .with_env_filter(tracing_filter(cli))
+                    .with_env_filter(tracing_filter(cli, false))
                     .with_target(false)
                     .with_writer(io::stderr)
                     .init();
@@ -83,7 +87,7 @@ pub(crate) fn init_tracing(cli: &Cli) {
         },
         None => {
             tracing_subscriber::fmt()
-                .with_env_filter(tracing_filter(cli))
+                .with_env_filter(tracing_filter(cli, false))
                 .with_target(false)
                 .with_writer(io::stderr)
                 .init();
@@ -91,19 +95,27 @@ pub(crate) fn init_tracing(cli: &Cli) {
     }
 }
 
-fn tracing_filter(cli: &Cli) -> EnvFilter {
-    cli_log_override(cli)
-        .map(EnvFilter::new)
-        .unwrap_or_else(|| {
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
-        })
+// `--silent` only mutes terminal output. An explicit log file keeps the
+// verbosity / RUST_LOG filter.
+fn tracing_filter(cli: &Cli, to_file: bool) -> EnvFilter {
+    let level = if to_file {
+        cli_verbosity_level(cli)
+    } else {
+        cli_log_override(cli)
+    };
+    level.map(EnvFilter::new).unwrap_or_else(|| {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
+    })
 }
 
 fn cli_log_override(cli: &Cli) -> Option<&'static str> {
     if cli.silent {
         return Some("off");
     }
+    cli_verbosity_level(cli)
+}
 
+fn cli_verbosity_level(cli: &Cli) -> Option<&'static str> {
     match cli_verbosity(cli) {
         0 => None,
         1 => Some("info"),
@@ -195,9 +207,54 @@ impl Write for SharedFileWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::SharedFileMakeWriter;
+    use super::{SharedFileMakeWriter, tracing_filter};
+    use crate::cli::Cli;
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
+    use clap::Parser;
     use std::io::{Read, Write};
     use tracing_subscriber::fmt::writer::MakeWriter;
+
+    #[test]
+    fn silent_mutes_stderr_filter_but_not_log_file_filter() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvVarGuard::set_all(&[("RUST_LOG", "nono_proxy::audit=info")]);
+
+        let cli = Cli::parse_from([
+            "nono",
+            "--silent",
+            "--log-file",
+            "/tmp/nono.log",
+            "run",
+            "--allow",
+            ".",
+            "echo",
+            "hi",
+        ]);
+        assert_eq!(tracing_filter(&cli, false).to_string(), "off");
+        assert_eq!(
+            tracing_filter(&cli, true).to_string(),
+            "nono_proxy::audit=info"
+        );
+
+        env.remove("RUST_LOG");
+        assert_eq!(tracing_filter(&cli, false).to_string(), "off");
+        assert_eq!(tracing_filter(&cli, true).to_string(), "warn");
+
+        let cli = Cli::parse_from([
+            "nono",
+            "--silent",
+            "--log-file",
+            "/tmp/nono.log",
+            "run",
+            "-vv",
+            "--allow",
+            ".",
+            "echo",
+            "hi",
+        ]);
+        assert_eq!(tracing_filter(&cli, false).to_string(), "off");
+        assert_eq!(tracing_filter(&cli, true).to_string(), "debug");
+    }
 
     #[test]
     fn shared_file_make_writer_appends_output() {

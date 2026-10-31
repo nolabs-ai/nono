@@ -816,8 +816,9 @@ pub(super) fn network_notification_out_of_scope(policy: SeccompPolicy, family: u
 ///    (addrlen == 2) have no path to check.
 ///
 /// 2. For `AF_INET`/`AF_INET6` in proxy-only mode:
-///    - `connect()` is allowed to `127.0.0.1:proxy_port` (the nono proxy) or
-///      to an explicitly granted localhost IPC port.
+///    - `connect()` is allowed to `127.0.0.1:proxy_port` (the nono proxy), to
+///      an explicitly granted `connect_port`, or to an explicitly granted
+///      localhost IPC port (the latter only on loopback).
 ///    - `bind()` is allowed on ports in `proxy_bind_ports` or explicitly
 ///      granted localhost IPC ports and ranges.
 ///    - Everything else is denied.
@@ -871,21 +872,24 @@ pub(super) fn decide_network_notification(
 
     match syscall {
         SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => {
-            // Allow connect/sendto/sendmsg/sendmmsg only to loopback + proxy port
-            // or an explicit bidirectional localhost IPC grant (`--open-port`).
+            // An explicit `connect_port` grants direct connect() to that TCP
+            // port. Proxy and bidirectional localhost IPC grants remain loopback-only.
             // sendto/sendmsg/sendmmsg with a destination address is semantically
-            // equivalent to connect for network reach-out (issue #1089).
-            let allowed_port = sockaddr.port == config.proxy_port
+            // equivalent to connect for network reach-out (issue #1089), but a TCP
+            // connect-port grant does not authorize those datagram-style syscalls.
+            let allowed_connect_port =
+                syscall == SYS_CONNECT && config.caps.tcp_connect_ports().contains(&sockaddr.port);
+            let allowed_loopback_port = sockaddr.port == config.proxy_port
                 || config.caps.localhost_ports().contains(&sockaddr.port)
                 || config
                     .caps
                     .localhost_port_ranges()
                     .iter()
                     .any(|&(start, end)| sockaddr.port >= start && sockaddr.port <= end);
-            if sockaddr.is_loopback && allowed_port {
+            if allowed_connect_port || (sockaddr.is_loopback && allowed_loopback_port) {
                 debug!(
-                    "Proxy seccomp: allowing network syscall nr={} to loopback:{}",
-                    syscall, sockaddr.port
+                    "Proxy seccomp: allowing network syscall nr={} to family={} port={} loopback={}",
+                    syscall, sockaddr.family, sockaddr.port, sockaddr.is_loopback
                 );
                 NetworkDecision::Allow
             } else {
@@ -1544,21 +1548,27 @@ fn push_network_audit_event(
     config: &SupervisorConfig<'_>,
     event: nono::undo::NetworkAuditEvent,
 ) -> nono::Result<()> {
+    // Record live first, then buffer with the outcome so finalization can
+    // retry a failed write. The buffer also feeds the session metadata.
+    let live_result = config.audit_recorder.as_ref().map(|recorder_mutex| {
+        recorder_mutex
+            .lock()
+            .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))
+            .and_then(|mut recorder| recorder.record_network_event(event.clone()))
+    });
+    let live_recorded = matches!(live_result, Some(Ok(())));
+
     if let Some(events_mutex) = config.network_audit_events {
         let mut events = events_mutex
             .lock()
             .map_err(|_| NonoError::Snapshot("Network audit event lock poisoned".to_string()))?;
-        events.push(event.clone());
+        events.push(nono_proxy::audit::BufferedAuditEvent {
+            event,
+            live_recorded,
+        });
     }
 
-    if let Some(recorder_mutex) = config.audit_recorder.as_ref() {
-        let mut recorder = recorder_mutex
-            .lock()
-            .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
-        recorder.record_network_event(event)?;
-    }
-
-    Ok(())
+    live_result.unwrap_or(Ok(()))
 }
 
 fn network_audit_target(sockaddr: &nono::sandbox::SockaddrInfo) -> String {
@@ -2019,16 +2029,49 @@ mod tests {
                 let recorded = events.lock().expect("lock");
                 assert_eq!(recorded.len(), 1, "exactly one summary event");
                 assert!(matches!(
-                    recorded[0].decision,
+                    recorded[0].event.decision,
                     nono::undo::NetworkAuditDecision::Deny
                 ));
-                let reason = recorded[0].reason.as_deref().unwrap_or_default();
+                assert!(!recorded[0].live_recorded, "no recorder configured");
+                let reason = recorded[0].event.reason.as_deref().unwrap_or_default();
                 assert!(reason.starts_with("4 network syscall denials"), "{reason}");
             }
 
             // Counter was reset: a second flush adds nothing.
             super::super::flush_suppressed_network_denials(&config, &mut throttle);
             assert_eq!(events.lock().expect("lock").len(), 1);
+        }
+
+        #[test]
+        fn network_audit_event_buffers_live_write_outcome() {
+            let backend = DenyAllBackend;
+            let events = std::sync::Mutex::new(Vec::new());
+            let dir = tempfile::tempdir().expect("tempdir");
+            let recorder = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::audit_integrity::AuditRecorder::new(dir.path().to_path_buf())
+                    .expect("recorder"),
+            ));
+            let mut config = make_proxy_only_config(&backend, 8080, vec![]);
+            config.network_audit_events = Some(&events);
+            config.audit_recorder = Some(std::sync::Arc::clone(&recorder));
+
+            let event =
+                || super::super::network_denial_event("a".to_string(), None, "r".to_string());
+            super::super::push_network_audit_event(&config, event()).expect("live write");
+
+            // A closed recorder rejects the live write; the event must stay
+            // buffered as unrecorded so finalization can retry it.
+            recorder
+                .lock()
+                .expect("lock")
+                .record_session_ended("2026-01-01T00:00:00Z".to_string(), 0)
+                .expect("end");
+            assert!(super::super::push_network_audit_event(&config, event()).is_err());
+
+            let buffered = events.lock().expect("lock");
+            assert_eq!(buffered.len(), 2);
+            assert!(buffered[0].live_recorded);
+            assert!(!buffered[1].live_recorded);
         }
 
         fn unix_pathname(path: &Path) -> SockaddrInfo {
@@ -2360,6 +2403,42 @@ mod tests {
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(3000), &config),
                 NetworkDecision::Allow
+            );
+        }
+
+        /// A supervised proxy session must also honor explicit outbound TCP port grants.
+        #[test]
+        fn proxy_only_allows_explicit_tcp_connect_ports() {
+            let backend = DenyAllBackend;
+            let mut caps = nono::CapabilitySet::default();
+            caps.add_tcp_connect_port(5432);
+            let mut config = make_proxy_only_config(&backend, 8080, Vec::new());
+            config.caps = &caps;
+
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(5432), &config),
+                NetworkDecision::Allow,
+                "an explicitly granted TCP connect port must be allowed in supervised proxy mode"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(5432), &config),
+                NetworkDecision::Allow,
+                "an explicit connect-port grant authorizes direct outbound connections"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(5433), &config),
+                NetworkDecision::Deny,
+                "an ungranted TCP connect port must remain denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(5433), &config),
+                NetworkDecision::Deny,
+                "an ungranted external TCP port must remain denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_SENDTO, &inet_external(5432), &config),
+                NetworkDecision::Deny,
+                "a TCP connect-port grant must not authorize datagram-style sendto"
             );
         }
 

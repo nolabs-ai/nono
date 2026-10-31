@@ -7,15 +7,63 @@ use nono::undo::{
     NetworkAuditAuthMechanism, NetworkAuditAuthOutcome, NetworkAuditDecision,
     NetworkAuditDenialCategory, NetworkAuditEvent, NetworkAuditInjectionMode, NetworkAuditMode,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+
+/// `tracing` target for proxy audit events.
+///
+/// Every emitter in this module uses it; any sink selection must use the
+/// same target, so sinks and emitters cannot drift apart.
+pub const AUDIT_TARGET: &str = "nono_proxy::audit";
 
 /// Maximum number of in-memory network audit events kept per proxy session.
 const MAX_AUDIT_EVENTS: usize = 4096;
 
-/// Shared in-memory sink for network audit events.
-pub type SharedAuditLog = Arc<Mutex<Vec<NetworkAuditEvent>>>;
+/// Shared network audit log: an in-memory buffer plus an optional live sink.
+pub type SharedAuditLog = Arc<AuditLog>;
+
+/// Live destination for network audit events, called once per event as it
+/// happens. Returning an error leaves the event unrecorded, so the caller can
+/// still deliver it from the buffer at session end.
+pub type AuditSink = Arc<dyn Fn(&NetworkAuditEvent) -> nono::Result<()> + Send + Sync>;
+
+/// A buffered network audit event and whether the live sink recorded it.
+#[derive(Debug, Clone)]
+pub struct BufferedAuditEvent {
+    pub event: NetworkAuditEvent,
+    pub live_recorded: bool,
+}
+
+/// In-memory network audit buffer with an optional live sink.
+///
+/// Every event is buffered (up to [`MAX_AUDIT_EVENTS`]) for the end-of-session
+/// summary. When a sink is attached, events are also delivered to it as they
+/// happen, and the buffer remembers which ones it accepted.
+///
+/// Each delivery holds a read lock on the sink slot until its event is
+/// buffered, and [`AuditLog::detach_sink`] takes the write lock. Once detach
+/// returns, no delivery is in flight, so a finalizer that detaches before
+/// draining sees every delivered event in the buffer.
+#[derive(Default)]
+pub struct AuditLog {
+    events: Mutex<Vec<BufferedAuditEvent>>,
+    sink: RwLock<Option<AuditSink>>,
+}
+
+impl AuditLog {
+    /// Deliver subsequent events to `sink` as they happen.
+    pub fn attach_sink(&self, sink: AuditSink) {
+        // A poisoned slot only means a sink panicked; the slot is still valid.
+        *self.sink.write().unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Stop live delivery, waiting for in-flight deliveries to finish.
+    /// Later events are only buffered.
+    pub fn detach_sink(&self) {
+        *self.sink.write().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
 
 /// Proxy mode for audit logging.
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +95,23 @@ pub struct EventContext<'a> {
     pub spiffe_context: Option<nono::undo::SpiffeAuditContext>,
 }
 
+/// Log label for a denial category. Matches its serialized audit-event form.
+fn denial_category_label(category: &NetworkAuditDenialCategory) -> &'static str {
+    match category {
+        NetworkAuditDenialCategory::AuthenticationFailed => "authentication_failed",
+        NetworkAuditDenialCategory::EndpointPolicy => "endpoint_policy",
+        NetworkAuditDenialCategory::ManagedCredentialUnavailable => {
+            "managed_credential_unavailable"
+        }
+        NetworkAuditDenialCategory::HostDenied => "host_denied",
+        NetworkAuditDenialCategory::InterceptHandshakeFailed => "intercept_handshake_failed",
+        NetworkAuditDenialCategory::UpstreamConnectFailed => "upstream_connect_failed",
+        NetworkAuditDenialCategory::ConnectBypassesL7 => "connect_bypasses_l7",
+        NetworkAuditDenialCategory::ExternalProxyRejected => "external_proxy_rejected",
+        NetworkAuditDenialCategory::UnsupportedUpgrade => "unsupported_upgrade",
+    }
+}
+
 impl std::fmt::Display for ProxyMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -60,7 +125,7 @@ impl std::fmt::Display for ProxyMode {
 
 #[must_use]
 pub fn new_audit_log() -> SharedAuditLog {
-    Arc::new(Mutex::new(Vec::new()))
+    Arc::new(AuditLog::default())
 }
 
 /// Clone the collected events without clearing the log.
@@ -70,8 +135,11 @@ pub fn new_audit_log() -> SharedAuditLog {
 /// [`drain_audit_events`] that feeds the persistent audit record.
 #[must_use]
 pub fn snapshot_audit_events(audit_log: &SharedAuditLog) -> Vec<NetworkAuditEvent> {
-    match audit_log.lock() {
-        Ok(events) => events.clone(),
+    match audit_log.events.lock() {
+        Ok(events) => events
+            .iter()
+            .map(|buffered| buffered.event.clone())
+            .collect(),
         Err(e) => {
             warn!(
                 "Network audit log mutex poisoned while snapshotting events: {}",
@@ -84,7 +152,17 @@ pub fn snapshot_audit_events(audit_log: &SharedAuditLog) -> Vec<NetworkAuditEven
 
 #[must_use]
 pub fn drain_audit_events(audit_log: &SharedAuditLog) -> Vec<NetworkAuditEvent> {
-    match audit_log.lock() {
+    drain_buffered_audit_events(audit_log)
+        .into_iter()
+        .map(|buffered| buffered.event)
+        .collect()
+}
+
+/// Drain the buffer, keeping each event's live-delivery status so the caller
+/// can record only the events the sink did not accept.
+#[must_use]
+pub fn drain_buffered_audit_events(audit_log: &SharedAuditLog) -> Vec<BufferedAuditEvent> {
+    match audit_log.events.lock() {
         Ok(mut events) => events.drain(..).collect(),
         Err(e) => {
             warn!(
@@ -126,15 +204,89 @@ fn map_mode(mode: ProxyMode) -> NetworkAuditMode {
     }
 }
 
+/// Build an event seeded from `ctx`, with all unset fields defaulted and the
+/// upstream URL scrubbed. Each emitter fills in only what distinguishes it.
+fn ctx_event(
+    mode: ProxyMode,
+    decision: NetworkAuditDecision,
+    ctx: &EventContext<'_>,
+    target: &str,
+) -> NetworkAuditEvent {
+    NetworkAuditEvent {
+        timestamp_unix_ms: now_unix_millis(),
+        mode: map_mode(mode),
+        decision,
+        route_id: ctx.route_id.map(str::to_string),
+        auth_mechanism: ctx.auth_mechanism.clone(),
+        auth_outcome: ctx.auth_outcome.clone(),
+        managed_credential_active: ctx.managed_credential_active,
+        injection_mode: ctx.injection_mode.clone(),
+        denial_category: ctx.denial_category.clone(),
+        endpoint_policy_action: ctx.endpoint_policy_action.map(str::to_string),
+        endpoint_policy_rule: ctx.endpoint_policy_rule.map(str::to_string),
+        approval_backend: ctx.approval_backend.map(str::to_string),
+        credential_capture_action: None,
+        credential_capture_name: None,
+        credential_capture_command: None,
+        credential_capture_argv: None,
+        credential_capture_exit_status: None,
+        credential_capture_duration_ms: None,
+        credential_capture_stdout_bytes: None,
+        credential_capture_stderr: None,
+        credential_capture_cache_scope: None,
+        credential_capture_output_format: None,
+        credential_capture_header_names: None,
+        credential_capture_stdin_mode: None,
+        credential_capture_interactive: None,
+        spiffe_context: ctx.spiffe_context.clone(),
+        target: target.to_string(),
+        upstream: ctx
+            .upstream
+            .map(|upstream| nono::scrub_value(upstream).into_owned()),
+        port: None,
+        method: None,
+        path: None,
+        status: None,
+        reason: None,
+    }
+}
+
 fn push_event(audit_log: Option<&SharedAuditLog>, event: NetworkAuditEvent) {
     let Some(audit_log) = audit_log else {
         return;
     };
 
-    match audit_log.lock() {
+    // Hold the sink read lock until the event is buffered so detach waits for
+    // this delivery. Call the sink without holding the buffer lock: it may
+    // take other locks (the session recorder).
+    let sink_slot = audit_log
+        .sink
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    let live_recorded = match sink_slot.as_ref() {
+        Some(sink) => match sink(&event) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to record network audit event live: {}", e);
+                false
+            }
+        },
+        None => false,
+    };
+
+    match audit_log.events.lock() {
         Ok(mut events) => {
             if events.len() < MAX_AUDIT_EVENTS {
-                events.push(event);
+                events.push(BufferedAuditEvent {
+                    event,
+                    live_recorded,
+                });
+            } else if live_recorded {
+                warn!(
+                    "Network audit buffer full ({} events); event recorded live but omitted \
+                     from the session summary",
+                    MAX_AUDIT_EVENTS
+                );
             } else {
                 warn!(
                     "Network audit buffer full ({} events); dropping event",
@@ -149,6 +301,7 @@ fn push_event(audit_log: Option<&SharedAuditLog>, event: NetworkAuditEvent) {
             );
         }
     }
+    drop(sink_slot);
 }
 
 pub fn log_allowed(
@@ -160,53 +313,14 @@ pub fn log_allowed(
     method: &str,
 ) {
     info!(
-        target: "nono_proxy::audit",
-        mode = %mode,
-        host = host,
-        port = port,
-        method = method,
-        decision = "allow",
-        "proxy request allowed"
+        target: AUDIT_TARGET,
+        "proxy request allowed mode={mode} host={host} port={port} method={method} decision=allow"
     );
 
-    push_event(
-        audit_log,
-        NetworkAuditEvent {
-            timestamp_unix_ms: now_unix_millis(),
-            mode: map_mode(mode),
-            decision: NetworkAuditDecision::Allow,
-            route_id: ctx.route_id.map(str::to_string),
-            auth_mechanism: ctx.auth_mechanism.clone(),
-            auth_outcome: ctx.auth_outcome.clone(),
-            managed_credential_active: ctx.managed_credential_active,
-            injection_mode: ctx.injection_mode.clone(),
-            denial_category: None,
-            endpoint_policy_action: ctx.endpoint_policy_action.map(str::to_string),
-            endpoint_policy_rule: ctx.endpoint_policy_rule.map(str::to_string),
-            approval_backend: ctx.approval_backend.map(str::to_string),
-            credential_capture_action: None,
-            credential_capture_name: None,
-            credential_capture_command: None,
-            credential_capture_argv: None,
-            credential_capture_exit_status: None,
-            credential_capture_duration_ms: None,
-            credential_capture_stdout_bytes: None,
-            credential_capture_stderr: None,
-            credential_capture_cache_scope: None,
-            credential_capture_output_format: None,
-            credential_capture_header_names: None,
-            credential_capture_stdin_mode: None,
-            credential_capture_interactive: None,
-            spiffe_context: ctx.spiffe_context.clone(),
-            target: host.to_string(),
-            upstream: ctx.upstream.map(str::to_string),
-            port: Some(port),
-            method: Some(method.to_string()),
-            path: None,
-            status: None,
-            reason: None,
-        },
-    );
+    let mut event = ctx_event(mode, NetworkAuditDecision::Allow, ctx, host);
+    event.port = Some(port);
+    event.method = Some(method.to_string());
+    push_event(audit_log, event);
 }
 
 pub fn log_denied(
@@ -217,22 +331,58 @@ pub fn log_denied(
     port: u16,
     reason: &str,
 ) {
+    let reason = nono::scrub_value(reason);
+    info!(
+        target: AUDIT_TARGET,
+        "proxy request denied mode={mode} host={host} port={port} decision=deny reason={reason}{}",
+        ctx.denial_category
+            .as_ref()
+            .map(|category| format!(" denial_category={}", denial_category_label(category)))
+            .unwrap_or_default()
+    );
+
+    let mut event = ctx_event(mode, NetworkAuditDecision::Deny, ctx, host);
+    event.port = Some(port);
+    event.reason = Some(reason.into_owned());
+    push_event(audit_log, event);
+}
+
+/// Records a runtime host-approval decision on the CONNECT (transparent tunnel)
+/// path — the outcome of an interactive/backend prompt for a host that is not
+/// on the static allowlist.
+///
+/// `decision` distinguishes the approval lifecycle states
+/// ([`NetworkAuditDecision::ApproveGranted`] / [`ApproveDenied`] / etc.) from a
+/// plain static `Allow`/`Deny`, so the audit trail can tell a runtime approval
+/// apart from an allowlist hit. `ctx.approval_backend` names the deciding
+/// backend; `reason` carries the denial reason on refusal.
+///
+/// [`ApproveDenied`]: NetworkAuditDecision::ApproveDenied
+pub fn log_connect_approval(
+    audit_log: Option<&SharedAuditLog>,
+    ctx: &EventContext<'_>,
+    host: &str,
+    port: u16,
+    decision: NetworkAuditDecision,
+    reason: Option<&str>,
+) {
     info!(
         target: "nono_proxy::audit",
-        mode = %mode,
+        mode = %ProxyMode::Connect,
         host = host,
         port = port,
-        decision = "deny",
+        decision = ?decision,
+        approval_backend = ctx.approval_backend,
         reason = reason,
-        "proxy request denied"
+        "connect host approval decision"
     );
 
     push_event(
         audit_log,
         NetworkAuditEvent {
             timestamp_unix_ms: now_unix_millis(),
-            mode: map_mode(mode),
-            decision: NetworkAuditDecision::Deny,
+            mode: map_mode(ProxyMode::Connect),
+            decision,
             route_id: ctx.route_id.map(str::to_string),
             auth_mechanism: ctx.auth_mechanism.clone(),
             auth_outcome: ctx.auth_outcome.clone(),
@@ -262,7 +412,7 @@ pub fn log_denied(
             method: None,
             path: None,
             status: None,
-            reason: Some(reason.to_string()),
+            reason: reason.map(str::to_string),
         },
     );
 }
@@ -278,54 +428,17 @@ pub fn log_l7_request(
     path: &str,
     status: u16,
 ) {
+    let path = nono::scrub_value(path);
     info!(
-        target: "nono_proxy::audit",
-        mode = %mode,
-        target = target,
-        method = method,
-        path = path,
-        status = status,
-        "l7 proxy response"
+        target: AUDIT_TARGET,
+        "l7 proxy response mode={mode} target={target} method={method} path={path} status={status}"
     );
 
-    push_event(
-        audit_log,
-        NetworkAuditEvent {
-            timestamp_unix_ms: now_unix_millis(),
-            mode: map_mode(mode),
-            decision: NetworkAuditDecision::Allow,
-            route_id: ctx.route_id.map(str::to_string),
-            auth_mechanism: ctx.auth_mechanism.clone(),
-            auth_outcome: ctx.auth_outcome.clone(),
-            managed_credential_active: ctx.managed_credential_active,
-            injection_mode: ctx.injection_mode.clone(),
-            denial_category: None,
-            endpoint_policy_action: ctx.endpoint_policy_action.map(str::to_string),
-            endpoint_policy_rule: ctx.endpoint_policy_rule.map(str::to_string),
-            approval_backend: ctx.approval_backend.map(str::to_string),
-            credential_capture_action: None,
-            credential_capture_name: None,
-            credential_capture_command: None,
-            credential_capture_argv: None,
-            credential_capture_exit_status: None,
-            credential_capture_duration_ms: None,
-            credential_capture_stdout_bytes: None,
-            credential_capture_stderr: None,
-            credential_capture_cache_scope: None,
-            credential_capture_output_format: None,
-            credential_capture_header_names: None,
-            credential_capture_stdin_mode: None,
-            credential_capture_interactive: None,
-            spiffe_context: ctx.spiffe_context.clone(),
-            target: target.to_string(),
-            upstream: ctx.upstream.map(str::to_string),
-            port: None,
-            method: Some(method.to_string()),
-            path: Some(path.to_string()),
-            status: Some(status),
-            reason: None,
-        },
-    );
+    let mut event = ctx_event(mode, NetworkAuditDecision::Allow, ctx, target);
+    event.method = Some(method.to_string());
+    event.path = Some(path.into_owned());
+    event.status = Some(status);
+    push_event(audit_log, event);
 }
 
 /// Logs an endpoint-policy decision (before the upstream request).
@@ -343,56 +456,29 @@ pub fn log_l7_policy_decision(
     rule_label: &str,
     reason: Option<&str>,
 ) {
+    let path = nono::scrub_value(path);
+    let reason = reason.map(nono::scrub_value);
     info!(
-        target: "nono_proxy::audit",
-        mode = %mode,
-        target = target,
-        method = method,
-        path = path,
-        decision = ?decision,
-        endpoint_policy_action = action,
-        endpoint_policy_rule = rule_label,
-        "l7 endpoint policy decision"
+        target: AUDIT_TARGET,
+        "l7 endpoint policy decision mode={mode} target={target} method={method} path={path} \
+         decision={decision:?} endpoint_policy_action={action} endpoint_policy_rule={rule_label}{}{}",
+        reason.as_deref()
+            .map(|reason| format!(" reason={reason}"))
+            .unwrap_or_default(),
+        ctx.denial_category
+            .as_ref()
+            .map(|category| format!(" denial_category={}", denial_category_label(category)))
+            .unwrap_or_default()
     );
 
-    push_event(
-        audit_log,
-        NetworkAuditEvent {
-            timestamp_unix_ms: now_unix_millis(),
-            mode: map_mode(mode),
-            decision,
-            route_id: ctx.route_id.map(str::to_string),
-            auth_mechanism: ctx.auth_mechanism.clone(),
-            auth_outcome: ctx.auth_outcome.clone(),
-            managed_credential_active: ctx.managed_credential_active,
-            injection_mode: ctx.injection_mode.clone(),
-            denial_category: ctx.denial_category.clone(),
-            endpoint_policy_action: Some(action.to_string()),
-            endpoint_policy_rule: Some(rule_label.to_string()),
-            approval_backend: ctx.approval_backend.map(str::to_string),
-            credential_capture_action: None,
-            credential_capture_name: None,
-            credential_capture_command: None,
-            credential_capture_argv: None,
-            credential_capture_exit_status: None,
-            credential_capture_duration_ms: None,
-            credential_capture_stdout_bytes: None,
-            credential_capture_stderr: None,
-            credential_capture_cache_scope: None,
-            credential_capture_output_format: None,
-            credential_capture_header_names: None,
-            credential_capture_stdin_mode: None,
-            credential_capture_interactive: None,
-            spiffe_context: ctx.spiffe_context.clone(),
-            target: target.to_string(),
-            upstream: ctx.upstream.map(str::to_string),
-            port,
-            method: Some(method.to_string()),
-            path: Some(path.to_string()),
-            status: None,
-            reason: reason.map(str::to_string),
-        },
-    );
+    let mut event = ctx_event(mode, decision, ctx, target);
+    event.port = port;
+    event.method = Some(method.to_string());
+    event.path = Some(path.into_owned());
+    event.endpoint_policy_action = Some(action.to_string());
+    event.endpoint_policy_rule = Some(rule_label.to_string());
+    event.reason = reason.map(|reason| reason.into_owned());
+    push_event(audit_log, event);
 }
 
 #[derive(Debug, Clone)]
@@ -420,7 +506,7 @@ pub struct CredentialCaptureAudit<'a> {
     pub reason: Option<&'a str>,
 }
 
-/// The captured credential value is never recorded — only command metadata,
+/// The captured credential value is never recorded; only command metadata,
 /// timing, byte counts, and redacted stderr are persisted.
 pub fn log_credential_capture(
     audit_log: Option<&SharedAuditLog>,
@@ -428,57 +514,51 @@ pub fn log_credential_capture(
     event: CredentialCaptureAudit<'_>,
 ) {
     info!(
-        target: "nono_proxy::audit",
-        mode = %mode,
-        route_id = event.route_id,
-        credential = event.credential_name,
-        action = event.action,
-        decision = ?event.decision,
-        method = event.request_method,
-        path = event.request_path,
-        "credential capture event"
+        target: AUDIT_TARGET,
+        "credential capture event mode={mode} route_id={} credential={} action={} decision={:?} \
+         method={} path={}",
+        event.route_id,
+        event.credential_name,
+        event.action,
+        event.decision,
+        event.request_method,
+        nono::scrub_value(event.request_path)
     );
 
-    push_event(
-        audit_log,
-        NetworkAuditEvent {
-            timestamp_unix_ms: now_unix_millis(),
-            mode: map_mode(mode),
-            decision: event.decision,
-            route_id: Some(event.route_id.to_string()),
-            auth_mechanism: None,
-            auth_outcome: None,
-            managed_credential_active: Some(true),
-            injection_mode: None,
-            denial_category: event
-                .reason
-                .map(|_| NetworkAuditDenialCategory::ManagedCredentialUnavailable),
-            endpoint_policy_action: None,
-            endpoint_policy_rule: None,
-            approval_backend: None,
-            credential_capture_action: Some(event.action.to_string()),
-            credential_capture_name: Some(event.credential_name.to_string()),
-            credential_capture_command: event.command.map(str::to_string),
-            credential_capture_argv: event.argv.map(<[String]>::to_vec),
-            credential_capture_exit_status: event.exit_status,
-            credential_capture_duration_ms: event.duration_ms,
-            credential_capture_stdout_bytes: event.stdout_bytes,
-            credential_capture_stderr: event.stderr_redacted.map(str::to_string),
-            credential_capture_cache_scope: event.cache_scope.map(str::to_string),
-            credential_capture_output_format: event.output_format.map(str::to_string),
-            credential_capture_header_names: event.header_names.map(<[String]>::to_vec),
-            credential_capture_stdin_mode: event.stdin_mode.map(str::to_string),
-            credential_capture_interactive: event.interactive,
-            spiffe_context: None,
-            target: event.request_host.to_string(),
-            upstream: event.upstream.map(str::to_string),
-            port: event.request_port,
-            method: Some(event.request_method.to_string()),
-            path: Some(event.request_path.to_string()),
-            status: None,
-            reason: event.reason.map(str::to_string),
-        },
+    let mut audit_event = ctx_event(
+        mode,
+        event.decision,
+        &EventContext::default(),
+        event.request_host,
     );
+    audit_event.route_id = Some(event.route_id.to_string());
+    audit_event.managed_credential_active = Some(true);
+    audit_event.denial_category = event
+        .reason
+        .map(|_| NetworkAuditDenialCategory::ManagedCredentialUnavailable);
+    audit_event.credential_capture_action = Some(event.action.to_string());
+    audit_event.credential_capture_name = Some(event.credential_name.to_string());
+    audit_event.credential_capture_command = event.command.map(str::to_string);
+    audit_event.credential_capture_argv = event.argv.map(<[String]>::to_vec);
+    audit_event.credential_capture_exit_status = event.exit_status;
+    audit_event.credential_capture_duration_ms = event.duration_ms;
+    audit_event.credential_capture_stdout_bytes = event.stdout_bytes;
+    audit_event.credential_capture_stderr = event.stderr_redacted.map(str::to_string);
+    audit_event.credential_capture_cache_scope = event.cache_scope.map(str::to_string);
+    audit_event.credential_capture_output_format = event.output_format.map(str::to_string);
+    audit_event.credential_capture_header_names = event.header_names.map(<[String]>::to_vec);
+    audit_event.credential_capture_stdin_mode = event.stdin_mode.map(str::to_string);
+    audit_event.credential_capture_interactive = event.interactive;
+    audit_event.upstream = event
+        .upstream
+        .map(|upstream| nono::scrub_value(upstream).into_owned());
+    audit_event.port = event.request_port;
+    audit_event.method = Some(event.request_method.to_string());
+    audit_event.path = Some(nono::scrub_value(event.request_path).into_owned());
+    audit_event.reason = event
+        .reason
+        .map(|reason| nono::scrub_value(reason).into_owned());
+    push_event(audit_log, audit_event);
 }
 
 #[cfg(test)]
@@ -539,6 +619,56 @@ mod tests {
     }
 
     #[test]
+    fn denial_category_label_matches_audit_json() {
+        for category in [
+            NetworkAuditDenialCategory::AuthenticationFailed,
+            NetworkAuditDenialCategory::EndpointPolicy,
+            NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+            NetworkAuditDenialCategory::HostDenied,
+            NetworkAuditDenialCategory::InterceptHandshakeFailed,
+            NetworkAuditDenialCategory::UpstreamConnectFailed,
+            NetworkAuditDenialCategory::ConnectBypassesL7,
+            NetworkAuditDenialCategory::ExternalProxyRejected,
+            NetworkAuditDenialCategory::UnsupportedUpgrade,
+        ] {
+            let json = serde_json::to_string(&category).unwrap();
+            assert_eq!(json, format!("\"{}\"", denial_category_label(&category)));
+        }
+    }
+
+    #[test]
+    fn log_denied_emits_denial_category() {
+        let lines = capture_info_fields(|| {
+            log_denied(
+                None,
+                ProxyMode::ConnectIntercept,
+                &EventContext {
+                    denial_category: Some(NetworkAuditDenialCategory::UpstreamConnectFailed),
+                    ..EventContext::default()
+                },
+                "api.anthropic.com",
+                443,
+                "I/O error: Broken pipe (os error 32)",
+            );
+            log_denied(
+                None,
+                ProxyMode::Connect,
+                &EventContext::default(),
+                "example.com",
+                443,
+                "no category",
+            );
+        });
+
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("denial_category=upstream_connect_failed"),
+            "got {lines:?}"
+        );
+        assert!(!lines[1].contains("denial_category"), "got {lines:?}");
+    }
+
+    #[test]
     fn log_l7_policy_decision_records_endpoint_context() {
         let log = new_audit_log();
 
@@ -589,6 +719,233 @@ mod tests {
         assert_eq!(event.method.as_deref(), Some("POST"));
         assert_eq!(event.path.as_deref(), Some("/v1/tasks/123/comments"));
         assert_eq!(event.reason.as_deref(), Some("approval required"));
+    }
+
+    /// Redaction has to happen at the emitter: request paths can carry
+    /// credentials in query strings even though no header or body is logged.
+    #[test]
+    fn l7_request_redacts_sensitive_query_params_in_path() {
+        let log = new_audit_log();
+        let lines = capture_audit_messages(|| {
+            log_l7_request(
+                Some(&log),
+                ProxyMode::Reverse,
+                &EventContext::default(),
+                "api.example.com",
+                "GET",
+                "/v1/items?api_key=sk-live-secret&page=2",
+                200,
+            );
+        });
+
+        let expected = "/v1/items?api_key=[REDACTED]&page=2";
+        let events = drain_audit_events(&log);
+        assert_eq!(events[0].path.as_deref(), Some(expected));
+        assert!(
+            lines[0].contains(&format!("path={expected}")),
+            "composed message must carry the redacted path: {:?}",
+            lines[0]
+        );
+    }
+
+    /// Denial reasons can embed URLs from upstream or config errors; URL
+    /// userinfo and sensitive query keys must not reach either sink.
+    #[test]
+    fn denial_reason_redacts_url_credentials_and_query_params() {
+        let log = new_audit_log();
+        let lines = capture_audit_messages(|| {
+            log_denied(
+                Some(&log),
+                ProxyMode::Reverse,
+                &EventContext::default(),
+                "api.example.com",
+                443,
+                "upstream https://user:pass@example.com/v1?token=abc failed",
+            );
+        });
+
+        let expected = "upstream https://user:[REDACTED]@example.com/v1?token=[REDACTED] failed";
+        let events = drain_audit_events(&log);
+        assert_eq!(events[0].reason.as_deref(), Some(expected));
+        assert!(
+            lines[0].contains(&format!("reason={expected}")),
+            "composed message must carry the redacted reason: {:?}",
+            lines[0]
+        );
+    }
+
+    /// Credential capture records echo the triggering request path and
+    /// upstream URL; both go through the same redaction boundary.
+    #[test]
+    fn credential_capture_redacts_path_and_upstream() {
+        let log = new_audit_log();
+        let lines = capture_audit_messages(|| {
+            log_credential_capture(
+                Some(&log),
+                ProxyMode::Reverse,
+                CredentialCaptureAudit {
+                    route_id: "internal-api",
+                    credential_name: "deploy-token",
+                    action: "captured",
+                    decision: NetworkAuditDecision::Allow,
+                    command: None,
+                    argv: None,
+                    exit_status: Some(0),
+                    duration_ms: Some(1),
+                    stdout_bytes: Some(12),
+                    stderr_redacted: None,
+                    cache_scope: None,
+                    output_format: Some("text"),
+                    header_names: None,
+                    stdin_mode: None,
+                    interactive: None,
+                    upstream: Some("https://svc:secret@upstream.example"),
+                    request_host: "api.example.com",
+                    request_port: Some(443),
+                    request_method: "GET",
+                    request_path: "/v1/items?access_token=abc123",
+                    reason: None,
+                },
+            );
+        });
+
+        let expected_path = "/v1/items?access_token=[REDACTED]";
+        let events = drain_audit_events(&log);
+        assert_eq!(events[0].path.as_deref(), Some(expected_path));
+        assert_eq!(
+            events[0].upstream.as_deref(),
+            Some("https://svc:[REDACTED]@upstream.example")
+        );
+        assert!(
+            lines[0].contains(&format!("path={expected_path}")),
+            "composed message must carry the redacted path: {:?}",
+            lines[0]
+        );
+    }
+
+    fn log_connect(log: &SharedAuditLog, host: &str) {
+        log_allowed(
+            Some(log),
+            ProxyMode::Connect,
+            &EventContext::default(),
+            host,
+            443,
+            "CONNECT",
+        );
+    }
+
+    #[test]
+    fn attached_sink_receives_events_live_and_buffer_marks_them() {
+        let log = new_audit_log();
+        log_connect(&log, "before.example.com");
+
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let sink_delivered = Arc::clone(&delivered);
+        log.attach_sink(Arc::new(move |event: &NetworkAuditEvent| {
+            sink_delivered.lock().unwrap().push(event.target.clone());
+            Ok(())
+        }));
+        log_connect(&log, "live.example.com");
+
+        assert_eq!(*delivered.lock().unwrap(), vec!["live.example.com"]);
+        let buffered = drain_buffered_audit_events(&log);
+        assert_eq!(buffered.len(), 2, "every event stays in the summary buffer");
+        assert_eq!(buffered[0].event.target, "before.example.com");
+        assert!(!buffered[0].live_recorded);
+        assert_eq!(buffered[1].event.target, "live.example.com");
+        assert!(buffered[1].live_recorded);
+    }
+
+    #[test]
+    fn rejected_live_event_stays_unrecorded() {
+        let log = new_audit_log();
+        log.attach_sink(Arc::new(|_: &NetworkAuditEvent| {
+            Err(nono::NonoError::Snapshot("recorder closed".to_string()))
+        }));
+        log_connect(&log, "api.example.com");
+
+        let buffered = drain_buffered_audit_events(&log);
+        assert_eq!(buffered.len(), 1);
+        assert!(!buffered[0].live_recorded);
+    }
+
+    #[test]
+    fn detached_sink_receives_nothing() {
+        let log = new_audit_log();
+        let delivered = Arc::new(Mutex::new(0usize));
+        let sink_delivered = Arc::clone(&delivered);
+        log.attach_sink(Arc::new(move |_: &NetworkAuditEvent| {
+            *sink_delivered.lock().unwrap() += 1;
+            Ok(())
+        }));
+        log.detach_sink();
+        log_connect(&log, "api.example.com");
+
+        assert_eq!(*delivered.lock().unwrap(), 0);
+        let buffered = drain_buffered_audit_events(&log);
+        assert_eq!(buffered.len(), 1);
+        assert!(!buffered[0].live_recorded);
+    }
+
+    #[test]
+    fn detach_waits_for_in_flight_delivery() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let log = new_audit_log();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        log.attach_sink(Arc::new(move |_: &NetworkAuditEvent| {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(())
+        }));
+
+        let emitter_log = Arc::clone(&log);
+        let emitter = std::thread::spawn(move || log_connect(&emitter_log, "api.example.com"));
+        entered_rx.recv().unwrap();
+
+        let detached = Arc::new(AtomicBool::new(false));
+        let detacher_log = Arc::clone(&log);
+        let detacher_flag = Arc::clone(&detached);
+        let detacher = std::thread::spawn(move || {
+            detacher_log.detach_sink();
+            detacher_flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !detached.load(Ordering::SeqCst),
+            "detach must wait for the in-flight delivery"
+        );
+
+        release_tx.send(()).unwrap();
+        emitter.join().unwrap();
+        detacher.join().unwrap();
+
+        // Once detach returns, the delivered event is already buffered.
+        let buffered = drain_buffered_audit_events(&log);
+        assert_eq!(buffered.len(), 1);
+        assert!(buffered[0].live_recorded);
+    }
+
+    #[test]
+    fn live_sink_still_receives_events_past_buffer_cap() {
+        let log = new_audit_log();
+        let delivered = Arc::new(Mutex::new(0usize));
+        let sink_delivered = Arc::clone(&delivered);
+        log.attach_sink(Arc::new(move |_: &NetworkAuditEvent| {
+            *sink_delivered.lock().unwrap() += 1;
+            Ok(())
+        }));
+        let _warns = capture_warns(|| {
+            for _ in 0..=MAX_AUDIT_EVENTS {
+                log_connect(&log, "api.example.com");
+            }
+        });
+
+        assert_eq!(*delivered.lock().unwrap(), MAX_AUDIT_EVENTS + 1);
+        assert_eq!(drain_audit_events(&log).len(), MAX_AUDIT_EVENTS);
     }
 
     #[test]
@@ -648,6 +1005,107 @@ mod tests {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    /// Capture the composed MESSAGE of every audit-target event, as a fmt
+    /// sink would render it.
+    fn capture_audit_messages(f: impl FnOnce()) -> Vec<String> {
+        let subscriber = AuditMessageRecorder::default();
+        let messages = subscriber.messages.clone();
+        tracing::subscriber::with_default(subscriber, f);
+        messages
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    #[derive(Clone, Default)]
+    struct AuditMessageRecorder {
+        messages: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for AuditMessageRecorder {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == AUDIT_TARGET
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MessageVisitor::default();
+            event.record(&mut visitor);
+            if visitor.message.is_empty() {
+                return;
+            }
+            if let Ok(mut messages) = self.messages.lock() {
+                messages.push(visitor.message);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Capture every INFO field of all events, joined by spaces. The
+    /// upstream denial-category tests check individual structured fields.
+    fn capture_info_fields(f: impl FnOnce()) -> Vec<String> {
+        let subscriber = InfoFieldRecorder::default();
+        let lines = subscriber.lines.clone();
+        tracing::subscriber::with_default(subscriber, f);
+        lines.lock().map(|guard| guard.clone()).unwrap_or_default()
+    }
+
+    #[derive(Clone, Default)]
+    struct InfoFieldRecorder {
+        lines: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for InfoFieldRecorder {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::INFO
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            if let Ok(mut lines) = self.lines.lock() {
+                lines.push(visitor.fields.join(" "));
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: Vec<String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
     }
 
     #[derive(Clone, Default)]

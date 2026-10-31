@@ -486,28 +486,6 @@ fn default_inject_header() -> String {
     "Authorization".to_string()
 }
 
-/// Check if a character is a valid HTTP header token character.
-fn is_http_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(
-            c,
-            '!' | '#'
-                | '$'
-                | '%'
-                | '&'
-                | '\''
-                | '*'
-                | '+'
-                | '-'
-                | '.'
-                | '^'
-                | '_'
-                | '`'
-                | '|'
-                | '~'
-        )
-}
-
 /// Validate a credential key.
 ///
 /// Accepts either:
@@ -778,7 +756,7 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
                     name
                 )));
             }
-            if !header.chars().all(is_http_token_char) {
+            if !nono_proxy::config::is_http_header_token(header) {
                 return Err(NonoError::ProfileParse(format!(
                     "proxy.inject_header '{}' for custom credential '{}' contains invalid characters; \
                      header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
@@ -993,7 +971,7 @@ fn validate_header_name(cred_name: &str, header: &str) -> Result<()> {
             cred_name
         )));
     }
-    if !header.chars().all(is_http_token_char) {
+    if !nono_proxy::config::is_http_header_token(header) {
         return Err(NonoError::ProfileParse(format!(
             "inject_header '{}' for custom credential '{}' contains invalid characters; \
              header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
@@ -1011,7 +989,7 @@ fn validate_header_mode(name: &str, cred: &CustomCredentialDef) -> Result<()> {
             name
         )));
     }
-    if !cred.inject_header.chars().all(is_http_token_char) {
+    if !nono_proxy::config::is_http_header_token(&cred.inject_header) {
         return Err(NonoError::ProfileParse(format!(
             "inject_header '{}' for custom credential '{}' contains invalid characters; \
              header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
@@ -1519,7 +1497,7 @@ fn validate_credential_capture_entries(profile: &Profile) -> Result<()> {
 }
 
 fn is_safe_capture_header_name(name: &str) -> bool {
-    if name.is_empty() || !name.chars().all(is_http_token_char) {
+    if !nono_proxy::config::is_http_header_token(name) {
         return false;
     }
     !matches!(
@@ -1865,6 +1843,31 @@ pub struct NetworkConfig {
     /// Hosts to bypass the upstream proxy and route directly.
     #[serde(default, rename = "upstream_bypass")]
     pub upstream_bypass: Vec<String>,
+    /// Where runtime host-approval prompts are sent when a CONNECT target is not
+    /// on the allowlist.
+    ///
+    /// A named backend here (e.g. `terminal`, `webhook`, or a `chain`)
+    /// answers the prompt; an approved host is tunnelled, a denied one gets a
+    /// 403. For `run` and `shell`, a non-empty map activates the proxy even
+    /// with an empty allowlist, provided `network.block` is false or omitted
+    /// and `--block-net` is absent. The empty allowlist then requires approval
+    /// rather than allowing all hosts. Both hard-block forms conflict with
+    /// configured approval backends and are rejected; approvals cannot lift
+    /// a block. `--allow-net` clears these profile approval settings. Explicit host denies and metadata /
+    /// link-local SSRF protection cannot be overridden by approval.
+    /// Empty (default) keeps the existing static-policy behavior: a not-allowed
+    /// host is denied immediately with no prompt. Uses the same
+    /// [`ApprovalBackendConfig`] shape as `security.approval_backends`.
+    /// Session-scoped "Always allow"/"Always deny" answers suppress re-prompting
+    /// for the rest of the session.
+    #[serde(default)]
+    pub approval_backends: BTreeMap<String, ApprovalBackendConfig>,
+    /// Which entry in `approval_backends` answers host-approval prompts by
+    /// default. `None` (default) means no prompt unless `approval_backends` is
+    /// set, in which case a default must be resolvable (we fail rather than
+    /// guess).
+    #[serde(default)]
+    pub approval_defaults: Option<ApprovalDefaultsConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2348,6 +2351,67 @@ pub struct LinuxConfig {
     /// Which sandboxing mechanism to use. Defaults to `auto`.
     #[serde(default)]
     pub sandbox_policy: Option<LinuxSandboxPolicy>,
+    /// Opt-in namespace isolation (NEP-0004). Every field defaults off.
+    #[serde(default, skip_serializing_if = "LinuxIsolateConfig::is_empty")]
+    pub isolate: LinuxIsolateConfig,
+}
+
+/// Opt-in Linux namespace isolation (NEP-0004).
+///
+/// Every field defaults off and is permanently opt-in. Fields merge by logical
+/// OR across profile layers and the CLI, like `network.block`: any layer can
+/// turn a namespace on, and no layer can turn one off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxIsolateConfig {
+    /// New user + network namespace containing only loopback. Egress is
+    /// possible only through the session proxy bridge.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network: bool,
+    /// Allow TCP bind and connect on any port inside the isolated network
+    /// namespace's own loopback. Requires `network`. Egress stays proxy-only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loopback: bool,
+    /// New IPC namespace (SysV IPC and POSIX message queues).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ipc: bool,
+    /// New UTS namespace (hostname and domain name).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uts: bool,
+}
+
+impl LinuxIsolateConfig {
+    /// Whether no namespace is requested.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.network && !self.loopback && !self.ipc && !self.uts
+    }
+
+    /// OR-merge: the result requests every namespace either side requests.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            network: self.network || other.network,
+            loopback: self.loopback || other.loopback,
+            ipc: self.ipc || other.ipc,
+            uts: self.uts || other.uts,
+        }
+    }
+
+    /// Short names of the requested namespaces, for diagnostics.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn labels(&self) -> Vec<&'static str> {
+        [
+            (self.network, "net"),
+            (self.loopback, "loopback"),
+            (self.ipc, "ipc"),
+            (self.uts, "uts"),
+        ]
+        .into_iter()
+        .filter_map(|(on, label)| on.then_some(label))
+        .collect()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3226,6 +3290,13 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
         &profile.security.approval_backends,
         profile.security.approval_defaults.as_ref(),
     )?;
+    // Same static checks for the network host-approval backend surface, so a
+    // malformed `network.approval_backends` fails at load rather than at proxy
+    // launch. The validator is section-agnostic (backend map + defaults).
+    crate::command_policy::validate_security_approval_backends(
+        &profile.network.approval_backends,
+        profile.network.approval_defaults.as_ref(),
+    )?;
     Ok(profile)
 }
 
@@ -3747,6 +3818,17 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.network.upstream_bypass,
                 &child.network.upstream_bypass,
             ),
+            approval_backends: {
+                // Child overrides base by backend name, matching the child-wins
+                // key semantics used for `security.approval_backends`.
+                let mut merged = base.network.approval_backends;
+                merged.extend(child.network.approval_backends);
+                merged
+            },
+            approval_defaults: child
+                .network
+                .approval_defaults
+                .or(base.network.approval_defaults),
         },
         linux: LinuxConfig {
             af_unix_mediation: child
@@ -3754,6 +3836,8 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .af_unix_mediation
                 .or(base.linux.af_unix_mediation),
             sandbox_policy: child.linux.sandbox_policy.or(base.linux.sandbox_policy),
+            // OR-merge: an extending profile can add isolation, never remove it.
+            isolate: base.linux.isolate.merge(child.linux.isolate),
         },
         diagnostics: DiagnosticsConfig {
             redaction: RedactionConfig {
@@ -5541,37 +5625,6 @@ mod tests {
     }
 
     // ============================================================================
-    // is_http_token_char tests
-    // ============================================================================
-
-    #[test]
-    fn test_http_token_char_alphanumeric() {
-        assert!(is_http_token_char('a'));
-        assert!(is_http_token_char('Z'));
-        assert!(is_http_token_char('0'));
-        assert!(is_http_token_char('9'));
-    }
-
-    #[test]
-    fn test_http_token_char_special_chars() {
-        // valid special chars in header token names: !#$%&'*+-.^_`|~
-        for c in "!#$%&'*+-.^_`|~".chars() {
-            assert!(is_http_token_char(c), "Expected '{}' to be valid tchar", c);
-        }
-    }
-
-    #[test]
-    fn test_http_token_char_rejects_invalid() {
-        // Control chars, space, colon, parentheses should be rejected
-        assert!(!is_http_token_char(' '));
-        assert!(!is_http_token_char(':'));
-        assert!(!is_http_token_char('('));
-        assert!(!is_http_token_char(')'));
-        assert!(!is_http_token_char('\r'));
-        assert!(!is_http_token_char('\n'));
-    }
-
-    // ============================================================================
     // Custom credential validation integration tests
     //
     // These test the full validation chain including:
@@ -6803,6 +6856,8 @@ mod tests {
                 tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
+                approval_backends: BTreeMap::new(),
+                approval_defaults: None,
             },
             diagnostics: DiagnosticsConfig::default(),
             linux: LinuxConfig::default(),
@@ -6894,6 +6949,8 @@ mod tests {
                 tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
+                approval_backends: BTreeMap::new(),
+                approval_defaults: None,
             },
             diagnostics: DiagnosticsConfig::default(),
             linux: LinuxConfig::default(),
@@ -6993,6 +7050,79 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_parses_linux_isolate() {
+        let profile: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"iso"},"linux":{"isolate":{"network":true,"uts":true}}}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            profile.linux.isolate,
+            LinuxIsolateConfig {
+                network: true,
+                ipc: false,
+                uts: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_profile_rejects_unimplemented_isolate_fields() {
+        // Phase 2 mount masking is not implemented; accepting the field would
+        // let a profile believe it is masked when it is not.
+        let result = serde_json::from_str::<Profile>(
+            r#"{"meta":{"name":"iso"},"linux":{"isolate":{"mounts":true}}}"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_merge_profiles_isolate_is_or_merged() {
+        let mut base = base_profile();
+        base.linux.isolate.network = true;
+        let mut child = child_profile();
+        child.linux.isolate.ipc = true;
+        let merged = merge_profiles(base, child);
+        assert!(
+            merged.linux.isolate.network,
+            "child cannot drop base isolation"
+        );
+        assert!(merged.linux.isolate.ipc, "child can add isolation");
+        assert!(!merged.linux.isolate.uts);
+    }
+
+    #[test]
+    fn test_profile_parses_and_merges_isolate_loopback() {
+        let profile: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"iso"},"linux":{"isolate":{"network":true,"loopback":true}}}"#,
+        )
+        .expect("parse");
+        assert!(profile.linux.isolate.loopback);
+        #[cfg(target_os = "linux")]
+        assert_eq!(profile.linux.isolate.labels(), vec!["net", "loopback"]);
+
+        let mut base = base_profile();
+        base.linux.isolate.loopback = true;
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"linux":{"isolate":{"loopback":false}}}"#,
+        )
+        .expect("parse");
+        assert!(merge_profiles(base, child).linux.isolate.loopback);
+    }
+
+    #[test]
+    fn test_merge_profiles_explicit_false_cannot_remove_isolation() {
+        let mut base = base_profile();
+        base.linux.isolate.network = true;
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"linux":{"isolate":{"network":false}}}"#,
+        )
+        .expect("parse");
+        let merged = merge_profiles(base, child);
+        assert!(merged.linux.isolate.network);
+    }
+
+    #[test]
     fn test_merge_profiles_appends_security_groups() {
         let merged = merge_profiles(base_profile(), child_profile());
         assert!(merged.groups.include.contains(&"base_group".to_string()));
@@ -7053,6 +7183,87 @@ mod tests {
                 .and_then(|d| d.backend)
                 .as_deref(),
             Some("terminal-gate")
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_unions_network_approval_backends() {
+        let mut base = base_profile();
+        base.network.approval_backends.insert(
+            "terminal-gate".to_string(),
+            ApprovalBackendConfig {
+                backend_type: crate::command_policy::ApprovalBackendType::Terminal,
+                url: None,
+                timeout_secs: None,
+                mode: None,
+                backends: Vec::new(),
+                auth: None,
+            },
+        );
+        base.network.approval_defaults = Some(ApprovalDefaultsConfig {
+            backend: Some("terminal-gate".to_string()),
+            timeout_secs: None,
+        });
+
+        let mut child = child_profile();
+        child.network.approval_backends.insert(
+            "webhook-gate".to_string(),
+            ApprovalBackendConfig {
+                backend_type: crate::command_policy::ApprovalBackendType::Webhook,
+                url: Some("https://approval.example".to_string()),
+                timeout_secs: Some(30),
+                mode: None,
+                backends: Vec::new(),
+                auth: None,
+            },
+        );
+
+        let merged = merge_profiles(base, child);
+        // Both backends survive the union; child adds without dropping base.
+        assert!(
+            merged
+                .network
+                .approval_backends
+                .contains_key("terminal-gate")
+        );
+        assert!(
+            merged
+                .network
+                .approval_backends
+                .contains_key("webhook-gate")
+        );
+        // Child has no network defaults, so base's default is inherited.
+        assert_eq!(
+            merged
+                .network
+                .approval_defaults
+                .and_then(|d| d.backend)
+                .as_deref(),
+            Some("terminal-gate")
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_child_network_approval_defaults_win() {
+        let mut base = base_profile();
+        base.network.approval_defaults = Some(ApprovalDefaultsConfig {
+            backend: Some("base-default".to_string()),
+            timeout_secs: None,
+        });
+        let mut child = child_profile();
+        child.network.approval_defaults = Some(ApprovalDefaultsConfig {
+            backend: Some("child-default".to_string()),
+            timeout_secs: None,
+        });
+
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged
+                .network
+                .approval_defaults
+                .and_then(|d| d.backend)
+                .as_deref(),
+            Some("child-default")
         );
     }
 
@@ -7325,6 +7536,25 @@ mod tests {
 
         let merged = merge_profiles(base, child);
         assert!(merged.network.block, "base block=true must be inherited");
+    }
+
+    #[test]
+    fn test_merge_profiles_network_approvals_cannot_clear_inherited_block() {
+        let mut base = base_profile();
+        base.network.block = true;
+        let mut child = child_profile();
+        child.network.approval_backends.insert(
+            "terminal".to_string(),
+            serde_json::from_str(r#"{"type":"terminal"}"#).expect("terminal backend"),
+        );
+        let merged = merge_profiles(base, child);
+        assert!(
+            merged.network.block,
+            "approval config cannot loosen an inherited hard block"
+        );
+        assert!(merged.network.approval_backends.contains_key("terminal"));
+        // Launch validation rejects this combination instead of starting an
+        // approval proxy that could override the inherited network block.
     }
 
     #[test]

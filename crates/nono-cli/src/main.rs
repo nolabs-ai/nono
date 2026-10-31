@@ -30,6 +30,8 @@ mod execution_runtime;
 #[cfg(unix)]
 mod hook_runtime;
 mod instruction_deny;
+#[cfg(target_os = "linux")]
+mod isolation;
 mod jsonc;
 mod launch_runtime;
 #[cfg(target_os = "linux")]
@@ -59,6 +61,7 @@ mod pty_proxy;
 mod pull_ui;
 mod query_ext;
 mod registry_client;
+mod relay_prompt_gate;
 #[cfg(unix)]
 mod remote_run;
 #[cfg(target_os = "linux")]
@@ -308,6 +311,8 @@ mod tests {
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -318,6 +323,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Default::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]
@@ -387,6 +394,8 @@ mod tests {
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -397,6 +406,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Default::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]

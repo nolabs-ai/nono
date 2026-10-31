@@ -16,7 +16,7 @@ usage() {
 Usage:
   ./scripts/test-linux-container.sh
   ./scripts/test-linux-container.sh cargo test -p nono-cli
-  ./scripts/test-linux-container.sh bash -c 'cargo run -q -p nono-cli -- run --profile always-further/claude --dry-run -- echo ok'
+  ./scripts/test-linux-container.sh bash -c 'cargo run -q -p nono-cli -- run --profile nolabs-ai/claude --dry-run -- echo ok'
 
 Behavior:
   - Builds a reusable Linux dev image with required system packages

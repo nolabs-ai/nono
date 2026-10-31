@@ -88,12 +88,14 @@ Expected evidence:
 
 Run mode:
 
+`codex exec` starts its app server in-process, so the complete noninteractive run remains in the nono sandbox without `--no-daemon`.
+
 ```sh
 RUST_LOG=nono_proxy::oauth_capture=debug,nono_proxy::tls_intercept=debug \
 target/debug/nono run \
   --profile codex-oauth \
   --allow-cwd \
-  -- codex exec "reply with ok"
+  -- codex --sandbox danger-full-access --ask-for-approval never exec "reply with ok"
 ```
 
 Expected evidence:

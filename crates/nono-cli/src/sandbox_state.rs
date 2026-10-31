@@ -8,6 +8,7 @@
 use crate::capability_ext::new_exact_path_capability;
 use nono::{
     AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, ResourceLimits, Result,
+    SocketScope, UnixSocketCapability,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
@@ -23,6 +24,13 @@ use std::os::unix::fs::OpenOptionsExt;
 pub struct SandboxState {
     /// Filesystem capabilities
     pub fs: Vec<FsCapState>,
+    /// Pathname AF_UNIX socket capabilities in effect for this sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unix_sockets: Vec<UnixSocketCapability>,
+    /// OS enforcement mode for pathname AF_UNIX sockets. `None` means the
+    /// state was written by an older build and cannot answer socket queries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pathname_socket_enforcement: Option<PathnameSocketEnforcement>,
     /// Whether network is blocked
     pub net_blocked: bool,
     /// Commands explicitly allowed
@@ -55,6 +63,44 @@ pub struct SandboxState {
     /// nono builds; `#[serde(default)]` keeps those loadable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimits>,
+}
+
+/// Enforcement applied to pathname AF_UNIX operations for a running sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathnameSocketEnforcement {
+    /// Linux seccomp pathname mediation is disabled.
+    LinuxUnmediated,
+    /// Linux seccomp pathname mediation enforces explicit socket grants.
+    LinuxAllowlist,
+    /// macOS Seatbelt enforces pathname socket policy directly.
+    MacosSeatbelt,
+}
+
+/// Resolve the platform enforcement mode from the Linux mediation setting.
+/// The argument is ignored on macOS, where Seatbelt is always the backend.
+#[must_use]
+pub fn pathname_socket_enforcement(
+    linux_mediation_enabled: bool,
+) -> Option<PathnameSocketEnforcement> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(if linux_mediation_enabled {
+            PathnameSocketEnforcement::LinuxAllowlist
+        } else {
+            PathnameSocketEnforcement::LinuxUnmediated
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = linux_mediation_enabled;
+        Some(PathnameSocketEnforcement::MacosSeatbelt)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = linux_mediation_enabled;
+        None
+    }
 }
 
 /// Serializable domain endpoint restriction state
@@ -171,6 +217,8 @@ impl SandboxState {
                     }
                 })
                 .collect(),
+            unix_sockets: caps.unix_socket_capabilities().to_vec(),
+            pathname_socket_enforcement: None,
             net_blocked: caps.is_network_blocked(),
             allowed_commands: caps.allowed_commands().to_vec(),
             blocked_commands: caps.blocked_commands().to_vec(),
@@ -213,6 +261,10 @@ impl SandboxState {
                 restore_directory_capability(fs_cap, access, &source)?
             };
             caps.add_fs(cap);
+        }
+
+        for stored in &self.unix_sockets {
+            caps.add_unix_socket(restore_unix_socket_capability(stored)?);
         }
 
         if !self.allowed_domains.is_empty() {
@@ -279,6 +331,25 @@ impl SandboxState {
 
         Ok(())
     }
+}
+
+fn restore_unix_socket_capability(stored: &UnixSocketCapability) -> Result<UnixSocketCapability> {
+    let mut restored = match stored.scope {
+        SocketScope::File => UnixSocketCapability::new_file(&stored.original, stored.mode)?,
+        SocketScope::DirChildren => UnixSocketCapability::new_dir(&stored.original, stored.mode)?,
+        SocketScope::DirSubtree => {
+            UnixSocketCapability::new_dir_subtree(&stored.original, stored.mode)?
+        }
+    };
+    if restored.resolved != stored.resolved {
+        return Err(NonoError::ConfigParse(format!(
+            "unix socket grant canonical path drifted at state reload: serialized resolved={}, actual resolved={}",
+            stored.resolved.display(),
+            restored.resolved.display(),
+        )));
+    }
+    restored.source = stored.source.clone();
+    Ok(restored)
 }
 
 fn parse_access_mode(access: &str) -> Result<AccessMode> {
@@ -673,6 +744,8 @@ pub fn cleanup_stale_state_files() {
 mod tests {
     use super::*;
     use nono::CapabilitySource;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
     use tempfile::tempdir;
 
     #[test]
@@ -689,6 +762,69 @@ mod tests {
             .expect("to_caps failed on network-only state");
         assert!(restored.is_network_blocked());
         assert_eq!(restored.allowed_commands(), vec!["pip"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_sandbox_state_roundtrip_preserves_unix_socket_policy() {
+        let dir = tempdir().expect("tempdir");
+        let socket_path = dir.path().join("service.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let mut socket =
+            UnixSocketCapability::new_file(&socket_path, nono::UnixSocketMode::Connect)
+                .expect("socket capability");
+        socket.source = CapabilitySource::Profile;
+        let mut caps = CapabilitySet::new();
+        caps.add_unix_socket(socket);
+
+        let mut state = SandboxState::from_caps(&caps, &[], &[], &[]);
+        state.pathname_socket_enforcement = Some(PathnameSocketEnforcement::LinuxAllowlist);
+        let json = serde_json::to_string(&state).expect("serialize");
+        let restored: SandboxState = serde_json::from_str(&json).expect("deserialize");
+        let restored_caps = restored.to_caps().expect("restore caps");
+
+        assert_eq!(
+            restored.pathname_socket_enforcement,
+            Some(PathnameSocketEnforcement::LinuxAllowlist)
+        );
+        let restored_socket = restored_caps
+            .unix_socket_capabilities()
+            .first()
+            .expect("restored socket");
+        assert_eq!(restored_socket.source, CapabilitySource::Profile);
+        assert_eq!(restored_socket.mode, nono::UnixSocketMode::Connect);
+        assert_eq!(restored_socket.scope, SocketScope::File);
+    }
+
+    #[test]
+    fn test_legacy_sandbox_state_has_unknown_socket_enforcement() {
+        let state = SandboxState::from_caps(&CapabilitySet::new(), &[], &[], &[]);
+        let mut value = serde_json::to_value(state).expect("serialize state");
+        let object = value.as_object_mut().expect("state object");
+        object.remove("unix_sockets");
+        object.remove("pathname_socket_enforcement");
+
+        let state: SandboxState = serde_json::from_value(value).expect("legacy state");
+        assert!(state.pathname_socket_enforcement.is_none());
+        assert!(state.unix_sockets.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_sandbox_state_rejects_drifted_unix_socket_path() {
+        let dir = tempdir().expect("tempdir");
+        let socket_path = dir.path().join("service.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let mut caps = CapabilitySet::new();
+        caps.add_unix_socket(
+            UnixSocketCapability::new_file(&socket_path, nono::UnixSocketMode::Connect)
+                .expect("socket capability"),
+        );
+        let mut state = SandboxState::from_caps(&caps, &[], &[], &[]);
+        state.unix_sockets[0].resolved = dir.path().join("other.sock");
+
+        let error = state.to_caps().expect_err("drifted socket must fail");
+        assert!(error.to_string().contains("canonical path drifted"));
     }
 
     #[test]
@@ -933,6 +1069,8 @@ mod tests {
                 dev: None,
                 ino: None,
             }],
+            unix_sockets: vec![],
+            pathname_socket_enforcement: None,
             net_blocked: false,
             allowed_commands: vec![],
             blocked_commands: vec![],

@@ -20,7 +20,7 @@ nono run --profile nolabs-ai/claude -- claude
 ```
 
 <Warning>
-**macOS users:** Claude Code needs LaunchServices access when a session will need browser login. `nono` now auto-enables this for the `claude-code` profile when it does not detect refresh-capable local auth. You can also pass the flag explicitly for first use or `claude /login`:
+**macOS users:** Claude Code needs LaunchServices access when a session will need browser login. `nono` now auto-enables this for the `nolabs-ai/claude` profile when it does not detect refresh-capable local auth. You can also pass the flag explicitly for first use or `claude /login`:
 
 ```bash
 nono run --profile nolabs-ai/claude --allow-launch-services -- claude
@@ -36,34 +36,37 @@ The profile provides:
 - **Read+write access** to `~/.vscode` (VS Code extensions directory)
 - **Read+write access** to the OS-specific VS Code app data directory:
   `~/Library/Application Support/Code` on macOS, `~/.config/Code` on Linux
-- **Read+write grants** for Claude Code's OS-specific credential storage:
-  macOS login keychain files, or `~/.local/share/claude` on Linux. On macOS,
-  the keychain deny remains active until you also add a matching
-  `filesystem.bypass_protection` entry (or `--bypass-protection` flag) for the
-  keychain path you intend to use.
+- **Read+write access** to Claude Code's OS-specific credential storage:
+  `~/Library/Keychains` on macOS, or `~/.local/share/claude` on Linux. On macOS,
+  the packaged profile already includes the matching
+  `filesystem.bypass_protection` entry, so no additional flag is required.
 - **Network access** enabled (required for Anthropic API)
 - **Interactive mode** enabled (preserves TTY for Claude's terminal UI)
 - **Automatic hook installation** for sandbox-aware error handling
 - **OAuth2 login support** via supervised URL opening (allows `claude /login` to work)
 
-If Claude needs the macOS login keychain, explicitly lift the deny for that
-existing file. The profile already supplies the matching filesystem grant:
-
-```bash
-nono run --profile nolabs-ai/claude \
-  --bypass-protection "$HOME/Library/Keychains/login.keychain-db" -- claude
-```
-
-Add a separate bypass only for another keychain file that Claude actually needs.
+<Warning>
+On macOS, this profile intentionally lets Claude Code use the user's login
+keychain. macOS may still apply item-specific access controls or authorization
+prompts, but nono does not block Claude's access to the Keychains directory or
+the keychain services. If you do not want agent-level keychain access, use a
+separate profile that does not extend `nolabs-ai/claude`; inherited filesystem
+grants and protection bypasses are additive and cannot be removed by an
+extending profile. You can copy the packaged Claude profile into a new user
+profile, remove its `~/Library/Keychains` grant and matching
+`filesystem.bypass_protection` entry, and keep the default keychain deny to
+create a no-keychain variant.
+</Warning>
 
 ## Custom Profile
 
-If you need different permissions, create a custom profile at `~/.config/nono/profiles/claude-code.json`:
+If you need different permissions, create a custom profile at `~/.config/nono/profiles/my-claude.json` that extends the package profile:
 
 ```json
 {
+  "extends": "nolabs-ai/claude",
   "meta": {
-    "name": "claude-code",
+    "name": "my-claude",
     "version": "1.0.0",
     "description": "Claude Code with additional project access"
   },
@@ -89,7 +92,7 @@ If you want to inherit the Claude Code profile but remove its network filtering,
 ```json
 {
   "meta": { "name": "claude-code-netopen" },
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "network": { "network_profile": null }
 }
 ```
@@ -97,16 +100,16 @@ If you want to inherit the Claude Code profile but remove its network filtering,
 Then run:
 
 ```bash
-nono run --profile nolabs-ai/claude-netopen -- claude
+nono run --profile claude-code-netopen -- claude
 ```
 
 **Usage:**
 ```bash
-nono run --profile nolabs-ai/claude -- claude
+nono run --profile my-claude -- claude
 ```
 
 <Note>
-Custom profiles with the same name override the pack profile. Remove or rename the file to revert to the pack-provided profile.
+Package profiles use fully-qualified names, so a bare user profile cannot override `nolabs-ai/claude`.
 </Note>
 
 ## Multiple Claude Profiles (`CLAUDE_CONFIG_DIR`)
@@ -127,7 +130,7 @@ Alternatively, create a custom profile that includes the paths:
 ```json
 {
   "meta": { "name": "claude-work" },
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "filesystem": {
     "allow": ["$HOME/.claude-work", "$HOME/.claude-work.lock"]
   }
@@ -215,7 +218,7 @@ nono run --profile nolabs-ai/claude --allow-domain my-internal-api.example.com -
 
 Running `claude /login` inside a sandbox requires the browser to open outside the sandboxed process. On Linux (Landlock), `nono` can delegate approved URLs to the unsandboxed parent process. On macOS (Seatbelt), Claude's login flow needs a temporary LaunchServices permission to open the browser.
 
-The `claude-code` profile includes an origin allowlist that controls which URLs may be opened during supervised login flows:
+The `nolabs-ai/claude` profile includes an origin allowlist that controls which URLs may be opened during supervised login flows:
 
 - `https://claude.ai` (OAuth2 authorize endpoint)
 - `localhost` callbacks (for the OAuth2 redirect)
@@ -226,7 +229,7 @@ On Linux, no additional flags are needed:
 nono run --profile nolabs-ai/claude -- claude
 ```
 
-On macOS, `nono` auto-enables LaunchServices for the `claude-code` profile when no refresh-capable local auth is detected. You can also enable it explicitly for the login session:
+On macOS, `nono` auto-enables LaunchServices for the `nolabs-ai/claude` profile when no refresh-capable local auth is detected. You can also enable it explicitly for the login session:
 
 ```bash
 nono run --profile nolabs-ai/claude --allow-launch-services -- claude
@@ -245,7 +248,7 @@ If your organization uses a custom identity provider for Claude Code authenticat
 ```json
 {
   "meta": { "name": "claude-code-custom-auth" },
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "open_urls": {
     "allow_origins": [
       "https://claude.ai",
@@ -322,7 +325,7 @@ Save as `~/.config/nono/profiles/claude-code-secretive.json`:
     "version": "1.0.0",
     "description": "Claude Code with Secretive SSH agent support"
   },
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "filesystem": {
     "read": [
       "$HOME/.ssh/config",
@@ -336,7 +339,7 @@ Save as `~/.config/nono/profiles/claude-code-secretive.json`:
 
 **Usage:**
 ```bash
-nono run --profile nolabs-ai/claude-secretive --allow-cwd -- claude
+nono run --profile claude-code-secretive --allow-cwd -- claude
 ```
 
 The profile extends the standard Claude Code profile with:
@@ -366,14 +369,14 @@ See [Security Profiles](/cli/features/profiles-groups) for details on profile fo
 
 ## Automatic Pack Install and Plugin Wiring
 
-As of v0.43, the `claude-code` profile is no longer compiled into the CLI. It's distributed as a signed registry pack at `nolabs-ai/claude` along with a Claude Code plugin that provides sandbox-aware diagnostics.
+The Claude Code profile is distributed as the signed `nolabs-ai/claude` package rather than being compiled into the CLI. The package also provides sandbox-aware diagnostics through a Claude Code plugin.
 
 The first time you run `nono run --profile nolabs-ai/claude -- claude`, nono prompts to install the pack:
 
 ```
   ⊕  Install nolabs-ai/claude?
 
-     The `claude-code` profile is provided by this registry pack.
+     The sandbox profile is provided by this registry package.
 
      Publisher    nolabs-ai GitHub organisation
      Provenance   Sigstore cryptographic supply chain (verified on pull)
@@ -405,7 +408,7 @@ The pack store is the single source of truth — every Claude-side path is a sym
 
 ### Subsequent Runs
 
-Once installed, `nono run --profile nolabs-ai/claude -- claude` runs silently — no prompt. nono's profile resolver finds `claude-code` in the pack store and re-asserts the marketplace wiring on every run, so deleting any of the symlinks above is recovered transparently on the next `nono run`.
+Once installed, `nono run --profile nolabs-ai/claude -- claude` runs silently — no prompt. nono's profile resolver loads the exact package from the package store and re-asserts the marketplace wiring on every run, so deleting any of the symlinks above is recovered transparently on the next `nono run`.
 
 If a newer version of the pack is available, nono prints a one-line hint after the capabilities block:
 
@@ -424,19 +427,19 @@ Run `nono update` to apply it, or `nono outdated` to check all installed packs a
 | `NONO_NO_MIGRATE=1` | Pull blocked; nono exits cleanly with a hint pointing at `nono pull nolabs-ai/claude`. |
 | Non-TTY (no env override) | Same as `NONO_NO_MIGRATE=1` — nono exits cleanly with a hint. |
 
-### User Profiles That Extend `claude-code`
+### User Profiles That Extend `nolabs-ai/claude`
 
-If you have a custom profile under `~/.config/nono/profiles/` that does `"extends": "claude-code"`, nono's chain-aware resolver detects the missing base and triggers the same install prompt. You don't need to migrate your existing profiles — they keep working after the upgrade.
+Custom profiles must use the package's fully-qualified name in `extends`. If `nolabs-ai/claude` is not installed, an interactive run can offer to install that exact package.
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": { "name": "claude-with-docs", "version": "1.0.0" },
   "filesystem": { "read": ["$HOME/Documents"] }
 }
 ```
 
-The first time you run `nono run --profile claude-with-docs`, the prompt fires for `nolabs-ai/claude`. After accept, the profile resolves cleanly via the pack-installed `claude-code` base.
+The first time you run `nono run --profile claude-with-docs`, the prompt fires for `nolabs-ai/claude`. After acceptance, the profile resolves through the installed package.
 
 ## Hook-Driven Sandbox Diagnostics
 

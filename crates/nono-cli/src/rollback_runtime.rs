@@ -38,7 +38,7 @@ pub(crate) struct RollbackExitContext<'a> {
     pub(crate) audit_tracked_paths: Vec<PathBuf>,
     pub(crate) audit_recorder: Option<&'a Mutex<AuditRecorder>>,
     pub(crate) supervisor_network_audit_events:
-        Option<&'a Mutex<Vec<nono::undo::NetworkAuditEvent>>>,
+        Option<&'a Mutex<Vec<nono_proxy::audit::BufferedAuditEvent>>>,
     pub(crate) audit_integrity_enabled: bool,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
@@ -523,23 +523,39 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
         rollback_prompt_disabled,
     } = ctx;
 
-    let mut network_events = proxy_handle.map_or_else(
+    // Proxy and supervisor network events are recorded live as they happen;
+    // only those whose live write was missed (emitted before the proxy sink
+    // was attached, or rejected) are recorded here. Both sets still go into
+    // the session metadata. Detaching waits for in-flight proxy deliveries,
+    // so the drain below sees every delivered event.
+    if let Some(proxy_handle) = proxy_handle {
+        proxy_handle.detach_audit_sink();
+    }
+    let mut buffered_events = proxy_handle.map_or_else(
         Vec::new,
-        nono_proxy::server::ProxyHandle::drain_audit_events,
+        nono_proxy::server::ProxyHandle::drain_buffered_audit_events,
     );
     if let Some(events_mutex) = supervisor_network_audit_events {
         let mut supervisor_events = events_mutex.lock().map_err(|_| {
             nono::NonoError::Snapshot("Network audit event lock poisoned".to_string())
         })?;
-        network_events.extend(supervisor_events.drain(..));
+        buffered_events.extend(supervisor_events.drain(..));
+    }
+    let mut unrecorded_network_events = Vec::new();
+    let mut network_events = Vec::with_capacity(buffered_events.len());
+    for buffered in buffered_events {
+        if !buffered.live_recorded {
+            unrecorded_network_events.push(buffered.event.clone());
+        }
+        network_events.push(buffered.event);
     }
     let (audit_event_count, audit_integrity, command_policy_summary) =
         if let Some(recorder_mutex) = audit_recorder {
             let mut recorder = recorder_mutex.lock().map_err(|_| {
                 nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string())
             })?;
-            for event in &network_events {
-                recorder.record_network_event(event.clone())?;
+            for event in unrecorded_network_events {
+                recorder.record_network_event(event)?;
             }
             recorder.record_session_ended(ended.to_string(), exit_code)?;
             let event_count = recorder.event_count();

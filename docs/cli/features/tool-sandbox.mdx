@@ -64,6 +64,12 @@ Each entry under `approval_backends` is one of:
 | `webhook` | `url`, `auth`, `timeout_secs` | Ask an HTTP endpoint. Omit `auth` for a plain endpoint that answers the `POST` with the decision. Set `auth: "platform"` to sign every request with this client's enrollment key and follow the submit-and-poll exchange; `url` may then be omitted and defaults to the enrolled platform's approval route. Both variants are specified in `docs/protocols/approval-webhook-v1.md`. |
 | `chain` | `mode` (`all` or `any`), `backends` | Combine other backends. |
 
+Terminal approval has a total `timeout_secs` budget of 600 seconds by default,
+including waiting for the prompt slot and the anti-typeahead delay. A shorter
+command-policy caller deadline takes precedence. Expiry denies the request,
+restores terminal state, and releases the prompt reader rather than leaving it
+waiting for a late answer.
+
 Each entry under `commands` uses the command name as the key:
 
 | Field | Value | Use |

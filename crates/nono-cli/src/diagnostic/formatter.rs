@@ -390,6 +390,15 @@ fn format_allow_net_help_line() -> String {
     "[nono]   --allow-net        unrestricted network for this session".to_string()
 }
 
+/// Network grant help for sessions in an isolated network namespace.
+///
+/// `--allow-net` is rejected alongside `linux.isolate.network`, so the only
+/// remedy that can work is proxied access to a named host.
+fn format_allow_domain_help_line() -> String {
+    "[nono]   --allow-domain <host>  proxied access to a host (network isolation has no direct route out)"
+        .to_string()
+}
+
 fn format_command_succeeded_with_stderr_line() -> String {
     "[nono] The command succeeded, but stderr showed a likely sandbox-related access issue."
         .to_string()
@@ -690,6 +699,9 @@ pub struct DiagnosticFormatter<'a> {
     /// `network_blocked_hint`. Populated only in supervised mode with an
     /// active proxy.
     network_denials: Vec<nono::undo::NetworkAuditEvent>,
+    /// The session ran in an isolated network namespace (NEP-0004), where
+    /// `--allow-net` is a configuration error.
+    network_isolated: bool,
 }
 
 impl<'a> DiagnosticFormatter<'a> {
@@ -719,6 +731,7 @@ impl<'a> DiagnosticFormatter<'a> {
             canonical_denial_paths: Vec::new(),
             session_diagnostics: &[],
             network_denials: Vec::new(),
+            network_isolated: false,
         }
     }
 
@@ -922,6 +935,15 @@ impl<'a> DiagnosticFormatter<'a> {
     #[must_use]
     pub fn with_network_denials(mut self, denials: Vec<nono::undo::NetworkAuditEvent>) -> Self {
         self.network_denials = denials;
+        self
+    }
+
+    /// Mark the session as running in an isolated network namespace, so
+    /// network grant help suggests `--allow-domain` instead of `--allow-net`.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn with_network_isolated(mut self, isolated: bool) -> Self {
+        self.network_isolated = isolated;
         self
     }
 
@@ -2157,7 +2179,15 @@ impl<'a> DiagnosticFormatter<'a> {
         lines.push("[nono]   --write <path>     write-only access to directory".to_string());
 
         if self.caps.is_network_blocked() && stderr_network_diagnostic(diagnostics).is_some() {
-            lines.push(format_allow_net_help_line());
+            lines.push(self.network_grant_help_line());
+        }
+    }
+
+    fn network_grant_help_line(&self) -> String {
+        if self.network_isolated {
+            format_allow_domain_help_line()
+        } else {
+            format_allow_net_help_line()
         }
     }
 
@@ -2168,7 +2198,7 @@ impl<'a> DiagnosticFormatter<'a> {
     /// evidence this failure was network-related.
     fn format_network_grant_help(&self, lines: &mut Vec<String>) {
         lines.push("[nono] To grant additional access, re-run with:".to_string());
-        lines.push(format_allow_net_help_line());
+        lines.push(self.network_grant_help_line());
     }
 
     /// Render proxy-observed network denials with grant guidance.
@@ -3955,6 +3985,35 @@ mod tests {
         // Both symptoms were observed, so both remedies are genuine.
         assert!(output.contains("--allow <path>"));
         assert!(output.contains("--allow-net"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_network_isolated_suggests_allow_domain_not_allow_net() {
+        // --allow-net is rejected alongside linux.isolate.network, so the hint
+        // must point at the only remedy that can work: proxied access.
+        let caps = make_test_caps();
+        let observation = || ErrorObservation {
+            primary_verdict: None,
+            blocked_protected_file: None,
+            path_hints: Vec::new(),
+            missing_paths: Vec::new(),
+            non_sandbox_failure: None,
+            network_blocked_hint: true,
+        };
+        let isolated = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_error_observation(observation())
+            .with_network_isolated(true)
+            .format_footer(1);
+        assert!(!isolated.contains("--allow-net"), "{isolated}");
+        assert!(isolated.contains("--allow-domain <host>"), "{isolated}");
+
+        let plain = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_error_observation(observation())
+            .format_footer(1);
+        assert!(plain.contains("--allow-net"), "{plain}");
     }
 
     #[test]

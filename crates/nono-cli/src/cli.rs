@@ -185,7 +185,7 @@ pub enum Commands {
     Wrap(Box<WrapArgs>),
 
     // ── Exploration & debugging ─────────────────────────────────────────
-    /// Check why filesystem, network, scope, or command access would be allowed or denied
+    /// Check why filesystem, Unix socket, network, scope, or command access would be allowed or denied
     #[command(help_template = "\
 {about}
 
@@ -198,6 +198,7 @@ pub enum Commands {
   nono why --path ~/.ssh --op read             # Check if ~/.ssh is readable
   nono why --path ./src --op write --allow .   # Check with capability context
   nono why --json --path ~/.aws --op read      # JSON output for agents
+  nono why --unix-socket /run/docker.sock      # Query pathname Unix socket connect access
   nono why --host api.openai.com --port 443    # Query network access
   nono why --self --path /var --op write       # Inside sandbox, query own capabilities
   nono why --profile gh --command gh -- issue comment 1052
@@ -516,7 +517,7 @@ SESSION PICKER:
   nono profile init my-agent --extends default --groups deny_credentials
                                                # Extend an existing profile
   nono profile init my-agent --full            # Generate a full skeleton
-  nono profile list                            # List all profiles (built-in and user)
+  nono profile list                            # List built-in, package, and user profiles
   nono profile show nolabs-ai/claude            # Show an installed package profile
   nono profile diff default nolabs-ai/claude    # Compare two profiles
   nono profile validate my-agent               # Validate a profile by name
@@ -897,7 +898,7 @@ pub struct ProfileCmdArgs {
 pub enum ProfileCommands {
     /// Generate a skeleton profile JSON file
     Init(ProfileInitArgs),
-    /// List all available profiles (built-in and user)
+    /// List all available profiles (built-in, package, and user)
     List(ProfileListArgs),
     /// Show a fully resolved profile
     Show(ProfileShowArgs),
@@ -1347,6 +1348,27 @@ pub struct SandboxArgs {
     #[cfg(target_os = "linux")]
     #[arg(long, help_heading = "OPTIONS", value_name = "POLICY")]
     pub sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
+
+    /// Run the command in new Linux namespaces (opt-in, NEP-0004).
+    ///
+    /// Comma-separated list of: net, loopback, ipc, uts. Always adds a user
+    /// namespace. `loopback` (requires `net`) allows TCP bind/connect on any
+    /// port of the namespace's own loopback, for local dev servers and tests.
+    /// `net` leaves only loopback; egress is possible only through the session
+    /// proxy, so it requires --block-net or a proxied network policy and cannot
+    /// be combined with direct-access grants (--open-port, --listen-port,
+    /// --allow-connect-port, network.no_proxy). Adds to any `linux.isolate`
+    /// set by the profile; it cannot remove it. Fails at startup if this host
+    /// cannot create the namespaces.
+    #[cfg(target_os = "linux")]
+    #[arg(
+        long,
+        help_heading = "OPTIONS",
+        value_name = "NAMESPACES",
+        value_enum,
+        value_delimiter = ','
+    )]
+    pub isolate: Vec<IsolateNamespace>,
 
     /// Allow HTTP/2 multiplexing for upstream proxy connections.
     ///
@@ -1838,6 +1860,34 @@ pub struct WrapSandboxArgs {
     pub dry_run: bool,
 }
 
+/// A namespace that `--isolate` can request.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum IsolateNamespace {
+    /// Network namespace containing only loopback.
+    Net,
+    /// TCP on the isolated network namespace's own loopback (requires `net`).
+    Loopback,
+    /// IPC namespace.
+    Ipc,
+    /// UTS namespace.
+    Uts,
+}
+
+#[cfg(target_os = "linux")]
+impl SandboxArgs {
+    /// The isolation set requested on the command line.
+    pub fn isolate_config(&self) -> crate::profile::LinuxIsolateConfig {
+        let has = |namespace| self.isolate.contains(&namespace);
+        crate::profile::LinuxIsolateConfig {
+            network: has(IsolateNamespace::Net),
+            loopback: has(IsolateNamespace::Loopback),
+            ipc: has(IsolateNamespace::Ipc),
+            uts: has(IsolateNamespace::Uts),
+        }
+    }
+}
+
 impl From<WrapSandboxArgs> for SandboxArgs {
     fn from(args: WrapSandboxArgs) -> Self {
         Self {
@@ -1895,6 +1945,8 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             dry_run: args.dry_run,
             #[cfg(target_os = "linux")]
             sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Vec::new(),
         }
     }
 }
@@ -2196,6 +2248,25 @@ pub struct WhyArgs {
     #[arg(long, help_heading = "QUERY")]
     pub path: Option<PathBuf>,
 
+    /// Pathname AF_UNIX socket to check
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["command", "path", "host", "scope"],
+        help_heading = "QUERY"
+    )]
+    pub unix_socket: Option<PathBuf>,
+
+    /// Unix socket operation to check (default: connect)
+    #[arg(
+        long,
+        value_enum,
+        value_name = "OP",
+        requires = "unix_socket",
+        help_heading = "QUERY"
+    )]
+    pub socket_op: Option<WhySocketOp>,
+
     /// Match absolute literal paths against profile rules without resolving them on this host
     #[arg(long, requires_all = ["path", "profile"], help_heading = "QUERY")]
     pub lexical_profile_path: bool,
@@ -2261,6 +2332,30 @@ pub struct WhyArgs {
     #[arg(long, value_name = "FILE", help_heading = "CONTEXT")]
     pub write_file: Vec<PathBuf>,
 
+    /// Exact pathname Unix sockets to allow connect access (for query context)
+    #[arg(long, value_name = "SOCKET", help_heading = "CONTEXT")]
+    pub allow_unix_socket: Vec<PathBuf>,
+
+    /// Exact pathname Unix sockets to allow connect and bind (for query context)
+    #[arg(long, value_name = "SOCKET", help_heading = "CONTEXT")]
+    pub allow_unix_socket_bind: Vec<PathBuf>,
+
+    /// Direct-child pathname Unix sockets to allow in a directory (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_dir: Vec<PathBuf>,
+
+    /// Direct-child pathname Unix sockets to allow connect and bind (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_dir_bind: Vec<PathBuf>,
+
+    /// Descendant pathname Unix sockets to allow in a subtree (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_subtree: Vec<PathBuf>,
+
+    /// Descendant pathname Unix sockets to allow connect and bind (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
+
     /// Block network access (for query context)
     #[arg(long = "block-net", help_heading = "CONTEXT")]
     pub block_net: bool,
@@ -2297,6 +2392,15 @@ pub enum WhyOp {
     /// Read and write access
     #[value(name = "readwrite")]
     ReadWrite,
+}
+
+/// Pathname Unix socket operation type for why command
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum WhySocketOp {
+    /// Connect to an existing socket
+    Connect,
+    /// Bind and create a socket at this path
+    Bind,
 }
 
 /// Landlock scope type for why command
@@ -3023,6 +3127,71 @@ pub struct TrustExportKeyArgs {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn test_why_unix_socket_defaults_to_connect() {
+        let cli = Cli::parse_from(["nono", "why", "--unix-socket", "/run/example.sock"]);
+        let Commands::Why(args) = cli.command else {
+            panic!("expected why command");
+        };
+        assert_eq!(args.unix_socket, Some(PathBuf::from("/run/example.sock")));
+        assert!(args.socket_op.is_none());
+    }
+
+    #[test]
+    fn test_why_unix_socket_bind_parses() {
+        let cli = Cli::parse_from([
+            "nono",
+            "why",
+            "--unix-socket",
+            "/run/example.sock",
+            "--socket-op",
+            "bind",
+        ]);
+        let Commands::Why(args) = cli.command else {
+            panic!("expected why command");
+        };
+        assert!(matches!(args.socket_op, Some(WhySocketOp::Bind)));
+    }
+
+    #[test]
+    fn test_why_unix_socket_context_grant_parses() {
+        let cli = Cli::parse_from([
+            "nono",
+            "why",
+            "--unix-socket",
+            "/run/example.sock",
+            "--allow-unix-socket",
+            "/run/example.sock",
+        ]);
+        let Commands::Why(args) = cli.command else {
+            panic!("expected why command");
+        };
+        assert_eq!(
+            args.allow_unix_socket,
+            vec![PathBuf::from("/run/example.sock")]
+        );
+    }
+
+    #[test]
+    fn test_why_unix_socket_conflicts_with_path() {
+        assert!(
+            Cli::try_parse_from([
+                "nono",
+                "why",
+                "--path",
+                "/run/example.sock",
+                "--unix-socket",
+                "/run/example.sock",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_why_socket_op_requires_unix_socket() {
+        assert!(Cli::try_parse_from(["nono", "why", "--socket-op", "bind"]).is_err());
+    }
 
     #[test]
     fn test_run_basic() {

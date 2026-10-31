@@ -70,15 +70,15 @@ This keeps the predefined profile stable and auditable while giving you full con
 
 ### Profile Sources
 
-Profiles can come from three sources, in order of precedence:
+Profiles can come from three sources:
 
 | Source | Location | Trust Level |
 |--------|----------|-------------|
-| CLI flags | Command line | Highest - explicit user intent |
-| User profiles | `~/.config/nono/profiles/*.json` or `*.jsonc` | Medium - user-defined |
-| Pack / preset profiles | Installed packs or compiled presets | Base - audited defaults |
+| Built-in profiles | Compiled into nono | Base - audited defaults |
+| Package profiles | Installed packs, addressed as `<namespace>/<package>` | Base - signed package defaults |
+| User profiles | `~/.config/nono/profiles/*.json` or `*.jsonc` | User-defined |
 
-CLI flags always override profile settings.
+Bare names resolve user profiles first and built-ins second, so a user profile can override a built-in with the same name. Package profiles occupy a separate fully-qualified namespace and cannot be shadowed by a bare user profile. CLI flags are applied after the selected profile and always take precedence.
 
 <Note>
   nono resolves config paths via `$XDG_CONFIG_HOME/nono/` on every platform. If
@@ -212,14 +212,14 @@ subdirectories. The implied filesystem grant is recursive (Landlock's
 only expressible granularity), so socket scope is enforced separately by
 the supervisor (Linux) or Seatbelt path emission (macOS).
 
-Today, macOS enforces the direct-child versus subtree distinction in Seatbelt.
-Linux V4+ currently relies on Landlock filesystem rules for pathname AF_UNIX,
-so directory socket grants are recursive there until the seccomp AF_UNIX
-allowlist mediation path is enabled.
+macOS enforces pathname socket access directly through Seatbelt, including the
+direct-child versus subtree distinction.
 
-Under restricted network modes (`--block-net` or `--network-profile`),
-`connect(2)` to a Unix socket requires an explicit `unix_socket*` grant
-— a plain `allow_file`/`allow` grant no longer implicitly permits it.
+On Linux, pathname socket mediation is off by default. In that mode,
+`connect(2)` and `bind(2)` are not restricted by nono's filesystem policy, and
+`--block-net` or `--network-profile` does not change that. Set
+`linux.af_unix_mediation` to `"pathname"` to enable a default-deny socket
+allowlist; the process must then have a matching `unix_socket*` grant.
 
 ## Working Directory
 
@@ -267,7 +267,7 @@ Block a specific path that a base profile would otherwise allow:
     "name": "claude-deny-git",
     "version": "1.0.0"
   },
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "filesystem": {
     "deny": ["$HOME/.gitconfig"]
   }
@@ -280,22 +280,45 @@ nono run --profile claude-deny-git -- claude
 
 #### Blocking Container Access (Docker, Podman, kubectl)
 
-Use `filesystem.deny` as the enforcement mechanism. `commands.deny` remains deprecated startup-only compatibility behavior:
+Access to a container runtime socket grants the authority of the daemon behind
+it. A rootful Docker daemon usually has root access to the host and runs outside
+nono's process sandbox.
+
+On macOS, deny the socket path. nono emits both filesystem and Seatbelt
+`network-outbound` denials:
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": { "name": "no-docker", "version": "1.0.0" },
   "filesystem": {
     "deny": ["/var/run/docker.sock"]
-  },
-  "commands": {
-    "deny": ["docker", "docker-compose", "podman", "kubectl"]
   }
 }
 ```
 
-On macOS, `filesystem.deny` also emits a `network-outbound` deny — exact socket paths are blocked directly, while denied directories recursively block sockets beneath them. Seatbelt classifies `connect(2)` as a network operation, so a file deny alone won't block it. Prefer path- and network-based controls; `commands.deny` is not enforced for child processes.
+On Linux, Landlock filesystem rules do not mediate `connect(2)` to pathname
+Unix sockets. Enable pathname AF_UNIX mediation and do not grant the container
+runtime socket:
+
+```json
+{
+  "extends": "nolabs-ai/claude",
+  "meta": { "name": "no-docker", "version": "1.0.0" },
+  "linux": {
+    "af_unix_mediation": "pathname"
+  }
+}
+```
+
+With mediation enabled, pathname sockets are default-deny and only explicit
+`filesystem.unix_socket*` entries are allowed. `--block-net`, Linux network
+namespaces, and `filesystem.deny` do not replace this control.
+
+If a sensitive workload requires Docker, run it inside a separate container or
+MicroVM with its own daemon. Mounting the host's rootful Docker socket preserves
+the same host authority. `commands.deny` is deprecated startup-only gating and
+must not be used as socket enforcement.
 
 #### Adding Write-Only Access
 
@@ -371,7 +394,7 @@ you do not want nono to keep offering it as a profile addition:
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": { "name": "claude-local", "version": "1.0.0" },
   "filesystem": {
     "suppress_save_prompt": ["$HOME/.copilot/settings.json"]
@@ -428,7 +451,9 @@ The `network` section controls network access and credential injection.
     "network_profile": "claude-code",
     "allow_domain": ["my-internal-api.example.com"],
     "open_port": [3000],
+    "open_port_range": [[3001, 3010]],
     "listen_port": [8080],
+    "listen_port_range": [[9000, 9010]],
     "no_proxy": ["redis"],
     "credentials": ["openai", "anthropic"],
     "upstream_proxy": "squid.corp:3128",
@@ -447,11 +472,13 @@ The `network` section controls network access and credential injection.
 
 | Field | Description |
 |-------|-------------|
-| `block` | Block all network access (default: `false`) |
+| `block` | Block outbound IP network access (default: `false`) |
 | `network_profile` | Network profile name for host filtering (e.g., `minimal`, `claude-code`, `enterprise`). Set to `null` in a child profile to clear an inherited value. |
 | `allow_domain` | Additional domains to allow through the proxy |
 | `open_port` | Localhost TCP ports to allow bidirectional IPC (equivalent to `--open-port`) |
+| `open_port_range` | Inclusive localhost TCP port ranges to allow bidirectional IPC, e.g. `[[3001, 3010]]`. Multiple ranges are allowed; overlapping ranges are merged automatically |
 | `listen_port` | TCP ports the sandboxed child may listen on (equivalent to `--listen-port`) |
+| `listen_port_range` | Inclusive TCP port ranges the sandboxed child may listen on (bind only), e.g. `[[9000, 9010]]`. Multiple ranges are allowed; overlapping ranges are merged automatically |
 | `no_proxy` | Additional client-side `NO_PROXY` / `no_proxy` host patterns in proxy mode; supports safe single-label local aliases, canonical IPs, and explicit suffix patterns; does not grant network access, so direct connections still require matching sandbox permissions; entries overlapping route upstreams or `allow_domain` fail configuration so proxy-enforced routes cannot be bypassed |
 | `credentials` | Credential services to enable via reverse proxy (e.g., `openai`, `anthropic`) |
 | `custom_credentials` | Custom credential service definitions for APIs not in the built-in list |
@@ -550,10 +577,10 @@ nono run --profile ./profiles/my-agent.json -- my-command
 CLI flags always take precedence over profile settings:
 
 ```bash
-# Use claude-code profile but block network
+# Use the Claude package profile but block network
 nono run --profile nolabs-ai/claude --block-net -- claude
 
-# Use claude-code profile but add a custom domain
+# Use the Claude package profile but add a custom domain
 nono run --profile nolabs-ai/claude --allow-domain custom-api.example.com -- claude
 
 # Add extra directory access
@@ -565,12 +592,12 @@ To keep a base profile but clear an inherited network profile, set `network.netw
 ```json
 {
   "meta": { "name": "claude-code-netopen" },
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "network": { "network_profile": null }
 }
 ```
 
-You can also create a user profile with the same name to override a pack profile entirely.
+Package profiles occupy a separate, fully-qualified namespace. A bare user profile name cannot override one.
 
 ---
 
@@ -709,7 +736,9 @@ Groups use a structured allow/deny taxonomy:
 
 - **`java_runtime`** — Java runtime and build tool paths (SDKMAN, Maven, Gradle) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L462))
 
-- **`nix_runtime`** — Nix package manager runtime paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L558))
+- **`nix_runtime`** — Nix package manager runtime paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L560))
+
+- **`nix_profile_state_write`** — Write access to `~/.local/state/nix/profiles` for `nix profile` mutations such as `nix profile add` ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L577))
 
 - **`user_tools`** — User-local executables, .desktop files, man pages, and shell completions ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L360))
 
@@ -729,9 +758,11 @@ Groups use a structured allow/deny taxonomy:
 
 - **`claude_code_linux`** — Claude Code Linux-specific state paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L529))
 
-- **`codex_macos`** — Codex macOS-specific state and credential paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L519))
+- **`codex_macos`** — Codex macOS-specific state and credential paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json))
 
 - **`opencode_linux`** — OpenCode binary directory (Landlock requires directory read to execute binaries) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L395))
+
+- **`rtk_state`** — rtk history database and persisted state under `~/.local/share/rtk` ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L407))
 
 - **`vscode_macos`** — Visual Studio Code configuration and extension directories for macOS ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L538))
 
@@ -787,7 +818,7 @@ The base profile that all other profiles extend. Provides system path access, de
 
 **CWD:** None
 
-### claude-code
+### Claude Code (`nolabs-ai/claude`)
 
 ```bash
 nono run --profile nolabs-ai/claude -- claude
@@ -803,21 +834,21 @@ nono run --profile nolabs-ai/claude -- claude
 
 **Special:** Auto-installs Claude Code hooks. OAuth2 login support via `open_urls` (allows `https://claude.ai` and localhost). Profile opts into `allow_launch_services` for macOS browser opening.
 
-### codex
+### Codex (`nolabs-ai/codex`)
 
 ```bash
-nono run --profile nolabs-ai/codex -- codex
+nono run --profile nolabs-ai/codex -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request
 ```
 
-**Groups:** `codex_macos`, `node_runtime`, `rust_runtime`, `python_runtime`, `nix_runtime`, `git_config`, `unlink_protection` (plus `default` groups)
+**Groups:** `codex_macos` and `user_caches_macos` on macOS; `user_caches_linux` and `linux_sysfs_read` on Linux; plus `node_runtime`, `rust_runtime`, `python_runtime`, `nix_runtime`, `git_config`, and `unlink_protection` on both platforms (in addition to `default` groups)
 
-**Filesystem:** `~/.codex` (read+write), plus git config files from `git_config` group
+**Filesystem:** `~/.codex`, `~/.agents`, and `$NONO_CONFIG/profile-drafts` (read+write); platform user caches (read+write); common toolchain and git config paths (read); `/sys` (read) on Linux; and `~/Library/Keychains` (read+write, with explicit deny bypass) plus `~/Library/Preferences` (read) on macOS
 
 **Network:** Allowed
 
 **CWD:** Read+write
 
-**Special:** OAuth2 login support via `open_urls` (allows `https://auth.openai.com` and localhost). Profile opts into `allow_launch_services`.
+**Special:** OAuth2 login support via `open_urls` (allows `https://auth.openai.com` and localhost). Profile opts into `allow_launch_services`. Interactive sessions should use `--no-daemon` so the app server and tool execution stay inside the same nono sandbox. `--sandbox danger-full-access` leaves nono as the filesystem and network boundary, while `--ask-for-approval on-request` retains Codex's approval flow.
 
 ### OpenCode 2
 
@@ -851,7 +882,7 @@ nono run --profile nolabs-ai/opencode-v1 -- opencode
 
 **Special:** Do not use `--standalone`; it is an OpenCode 2 flag. The v1 and v2 packs share plugin installation paths, so remove one before switching to the other.
 
-### openclaw
+### OpenClaw (`nolabs-ai/openclaw`)
 
 ```bash
 nono run --profile nolabs-ai/openclaw -- openclaw

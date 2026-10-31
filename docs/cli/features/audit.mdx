@@ -44,7 +44,7 @@ Each session records:
 | **Timestamps** | Start time, end time, duration |
 | **Exit code** | How the process terminated |
 | **Audit events** | Session start/end plus supervisor-observed events such as capability decisions and URL opens |
-| **Network events** | Proxy audit log (when network proxy is active) |
+| **Network events** | Proxy audit log (when network proxy is active), with the secure default redaction policy applied to request paths, denial reasons, and upstream URLs |
 | **Tracked paths** | Writable policy roots for the session |
 | **Merkle roots** | Filesystem-state commitments (when `--audit-integrity` or `--rollback` is active) |
 | **Snapshots** | Content-addressable rollback metadata (when `--rollback` is active) |

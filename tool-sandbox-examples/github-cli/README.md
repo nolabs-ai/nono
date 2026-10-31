@@ -254,7 +254,7 @@ Read an issue through the allowed invocation and endpoint policy:
 nono run --no-audit --silent --allow-cwd \
   --profile "$GH_PROFILE" \
   -- gh issue view 1052 \
-    --repo always-further/nono \
+    --repo nolabs-ai/nono \
     --json title,url,state
 ```
 
@@ -263,7 +263,7 @@ Read the same issue through `gh api`, constrained by L7 endpoint policy:
 ```bash
 nono run --no-audit --silent --allow-cwd \
   --profile "$GH_PROFILE" \
-  -- gh api repos/always-further/nono/issues/1052
+  -- gh api repos/nolabs-ai/nono/issues/1052
 ```
 
 Try a blocked high-level mutation:
@@ -272,7 +272,7 @@ Try a blocked high-level mutation:
 nono run --no-audit --silent --allow-cwd \
   --profile "$GH_PROFILE" \
   -- gh issue comment 1052 \
-    --repo always-further/nono \
+    --repo nolabs-ai/nono \
     --body 'nono arg deny test'
 ```
 
@@ -282,7 +282,7 @@ Try the same class of mutation through the API:
 nono run --no-audit --silent --allow-cwd \
   --profile "$GH_PROFILE" \
   -- gh api -X POST \
-    repos/always-further/nono/issues/1052/comments \
+    repos/nolabs-ai/nono/issues/1052/comments \
     -f body='nono L7 deny test'
 ```
 

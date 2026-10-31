@@ -105,7 +105,31 @@ pub async fn forward_request<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    forward_request_with_response_rewrite(inbound, request_bytes, body, upstream, audit, None).await
+    forward_request_inner(inbound, request_bytes, body, upstream, audit, None, false).await
+}
+
+/// Like [`forward_request`], for callers that serve exactly one request per
+/// inbound connection and close it afterwards.
+///
+/// The final response head is rewritten to carry `Connection: close` so the
+/// client does not reuse a connection the proxy is about to drop. Without it,
+/// a keep-alive client (e.g. an MCP Streamable HTTP client) writes its next
+/// request onto a socket nobody reads, and the request is lost when the
+/// connection closes.
+///
+/// `request_bytes` must already ask the upstream for `Connection: close`: the
+/// response body is relayed until upstream EOF.
+pub async fn forward_request_closing_inbound<S>(
+    inbound: &mut S,
+    request_bytes: &[u8],
+    body: &[u8],
+    upstream: UpstreamSpec<'_>,
+    audit: AuditCtx<'_>,
+) -> Result<u16>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    forward_request_inner(inbound, request_bytes, body, upstream, audit, None, true).await
 }
 
 pub async fn forward_request_with_response_rewrite<S>(
@@ -119,16 +143,42 @@ pub async fn forward_request_with_response_rewrite<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    forward_request_inner(
+        inbound,
+        request_bytes,
+        body,
+        upstream,
+        audit,
+        response_rewrite,
+        false,
+    )
+    .await
+}
+
+async fn forward_request_inner<S>(
+    inbound: &mut S,
+    request_bytes: &[u8],
+    body: &[u8],
+    upstream: UpstreamSpec<'_>,
+    audit: AuditCtx<'_>,
+    response_rewrite: Option<ResponseRewrite<'_>>,
+    close_inbound: bool,
+) -> Result<u16>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let status = match upstream.scheme {
         UpstreamScheme::Https => {
             let mut tls_stream = open_https_upstream(&upstream).await?;
             write_request(&mut tls_stream, request_bytes, body).await?;
-            stream_or_rewrite_response(&mut tls_stream, inbound, response_rewrite).await?
+            stream_or_rewrite_response(&mut tls_stream, inbound, response_rewrite, close_inbound)
+                .await?
         }
         UpstreamScheme::Http => {
             let mut tcp_stream = open_http_upstream(&upstream).await?;
             write_request(&mut tcp_stream, request_bytes, body).await?;
-            stream_or_rewrite_response(&mut tcp_stream, inbound, response_rewrite).await?
+            stream_or_rewrite_response(&mut tcp_stream, inbound, response_rewrite, close_inbound)
+                .await?
         }
     };
 
@@ -148,14 +198,17 @@ async fn stream_or_rewrite_response<U, I>(
     upstream: &mut U,
     inbound: &mut I,
     response_rewrite: Option<ResponseRewrite<'_>>,
+    close_inbound: bool,
 ) -> Result<u16>
 where
     U: AsyncRead + AsyncWrite + Unpin,
     I: AsyncWrite + Unpin,
 {
-    match response_rewrite {
-        Some(rewrite) => buffer_rewrite_response(upstream, inbound, rewrite).await,
-        None => stream_response(upstream, inbound).await,
+    match (response_rewrite, close_inbound) {
+        // The rewrite path re-frames the whole response itself.
+        (Some(rewrite), _) => buffer_rewrite_response(upstream, inbound, rewrite).await,
+        (None, true) => stream_response_closing_inbound(upstream, inbound).await,
+        (None, false) => stream_response(upstream, inbound).await,
     }
 }
 
@@ -295,6 +348,115 @@ where
     }
 
     Ok(status_code)
+}
+
+/// Cap on a buffered response head while looking for its terminator. A head
+/// that exceeds it is relayed unmodified rather than buffered without bound.
+const MAX_RESPONSE_HEAD_BYTES: usize = 64 * 1024;
+
+/// Stream the upstream response back, forcing `Connection: close` on the
+/// final response head.
+///
+/// Interim `1xx` heads (e.g. `100 Continue`) are relayed untouched. Body bytes
+/// read together with the final head are written after the rewritten head, so
+/// nothing read past the header terminator is lost. The body is then relayed
+/// until upstream EOF.
+async fn stream_response_closing_inbound<U, I>(upstream: &mut U, inbound: &mut I) -> Result<u16>
+where
+    U: AsyncRead + AsyncWrite + Unpin,
+    I: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 8192];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut status_code: Option<u16> = None;
+
+    loop {
+        if let Some(head_end) = find_header_end(&pending) {
+            let head_len = head_end + 4;
+            let status = parse_response_status(&pending);
+            if (100..200).contains(&status) && status != 101 {
+                inbound.write_all(&pending[..head_len]).await?;
+                pending.drain(..head_len);
+                continue;
+            }
+            inbound
+                .write_all(&rewrite_head_connection_close(&pending[..head_end]))
+                .await?;
+            inbound.write_all(&pending[head_len..]).await?;
+            status_code = Some(status);
+            break;
+        }
+        if pending.len() > MAX_RESPONSE_HEAD_BYTES {
+            debug!("Upstream response head exceeds limit; relaying unmodified");
+            break;
+        }
+        match upstream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => pending.extend_from_slice(&buf[..n]),
+            Err(e) => {
+                debug!("Upstream read error: {}", e);
+                break;
+            }
+        }
+    }
+
+    let status_code = match status_code {
+        Some(status) => status,
+        None => {
+            // No complete head (EOF, read error, or oversized): pass through
+            // whatever arrived, as `stream_response` would.
+            inbound.write_all(&pending).await?;
+            parse_response_status(&pending)
+        }
+    };
+    inbound.flush().await?;
+
+    loop {
+        let n = match upstream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                debug!("Upstream read error: {}", e);
+                break;
+            }
+        };
+        inbound.write_all(&buf[..n]).await?;
+        inbound.flush().await?;
+    }
+
+    Ok(status_code)
+}
+
+/// Rebuild a response head (without its terminating blank line) with every
+/// `Connection`, `Keep-Alive`, and `Proxy-Connection` field replaced by a
+/// single `Connection: close`. Works on bytes so non-UTF-8 values survive.
+fn rewrite_head_connection_close(head: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(head.len() + 24);
+    let mut dropping = false;
+    for (i, line) in head.split(|&b| b == b'\n').enumerate() {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if i > 0 {
+            // obs-fold continuation lines belong to the previous field.
+            let is_continuation = line.first().is_some_and(|&b| b == b' ' || b == b'\t');
+            if !is_continuation {
+                let name = line
+                    .iter()
+                    .position(|&b| b == b':')
+                    .map(|colon| line[..colon].trim_ascii())
+                    .unwrap_or_default();
+                dropping = name.eq_ignore_ascii_case(b"connection")
+                    || name.eq_ignore_ascii_case(b"keep-alive")
+                    || name.eq_ignore_ascii_case(b"proxy-connection");
+            }
+            if dropping {
+                continue;
+            }
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out
 }
 
 /// Parse HTTP status code from the first response chunk.
@@ -560,6 +722,65 @@ mod tests {
         assert_eq!(parse_response_status(b""), 502);
         assert_eq!(parse_response_status(b"garbage"), 502);
         assert_eq!(parse_response_status(b"NOT-HTTP 200 OK"), 502);
+    }
+
+    #[test]
+    fn rewrite_head_connection_close_replaces_connection_fields() {
+        let head = b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nmcp-session-id: abc\r\nCONNECTION : upgrade,\r\n  te\r\nContent-Type: text/event-stream";
+        let rewritten = rewrite_head_connection_close(head);
+        assert_eq!(
+            rewritten,
+            b"HTTP/1.1 200 OK\r\nmcp-session-id: abc\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    async fn relay_closing(upstream_bytes: &[u8]) -> (u16, Vec<u8>) {
+        let (mut upstream, mut upstream_peer) = tokio::io::duplex(64 * 1024);
+        upstream_peer.write_all(upstream_bytes).await.unwrap();
+        drop(upstream_peer);
+        let mut inbound = Vec::new();
+        let status = stream_response_closing_inbound(&mut upstream, &mut inbound)
+            .await
+            .unwrap();
+        (status, inbound)
+    }
+
+    #[tokio::test]
+    async fn closing_relay_keeps_body_bytes_read_with_head() {
+        let body = "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1}\r\n\r\n";
+        let upstream = format!(
+            "HTTP/1.1 200 OK\r\nconnection: keep-alive\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+            body.len()
+        );
+        let (status, inbound) = relay_closing(upstream.as_bytes()).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            String::from_utf8(inbound).unwrap(),
+            format!(
+                "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                body.len()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_relay_passes_interim_responses_through() {
+        let (status, inbound) = relay_closing(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 202);
+        assert_eq!(
+            inbound,
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_relay_passes_through_incomplete_head() {
+        let (status, inbound) = relay_closing(b"garbage without terminator").await;
+        assert_eq!(status, 502);
+        assert_eq!(inbound, b"garbage without terminator");
     }
 
     #[test]

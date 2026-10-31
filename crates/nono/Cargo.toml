@@ -58,6 +58,7 @@ typify = "0.8"
 serde_json.workspace = true
 syn = "3"
 prettyplease = "0.3"
+gix = { version = "0.90.0", default-features = false, features = ["sha1", "status"] }
 
 [dev-dependencies]
 tempfile.workspace = true

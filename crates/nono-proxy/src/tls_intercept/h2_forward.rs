@@ -779,6 +779,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            base_url_env_var: None,
             endpoint_rules: vec![EndpointRule {
                 method: "*".to_string(),
                 path: "/**".to_string(),
@@ -862,6 +863,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            base_url_env_var: None,
             endpoint_rules: rules,
             tls_ca: None,
             tls_client_cert: None,
@@ -1667,6 +1669,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            base_url_env_var: None,
             endpoint_rules: vec![EndpointRule {
                 method: "*".to_string(),
                 path: "/**".to_string(),
@@ -2063,6 +2066,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![EndpointRule {
                     method: "*".to_string(),
                     path: "/v1/**".to_string(),
@@ -2090,6 +2094,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![EndpointRule {
                     method: "*".to_string(),
                     path: "/v1/**".to_string(),
@@ -2272,6 +2277,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            base_url_env_var: None,
             endpoint_rules: rules,
             tls_ca: None,
             tls_client_cert: None,
@@ -2401,6 +2407,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            base_url_env_var: None,
             endpoint_rules: Vec::new(),
             tls_ca: None,
             tls_client_cert: None,
@@ -2609,6 +2616,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
                 tls_client_cert: None,
@@ -2634,6 +2642,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![
                     EndpointRule {
                         method: "*".to_string(),

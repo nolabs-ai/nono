@@ -43,3 +43,5 @@ _Under active authoring; not yet ready for a decision._
   Let nono split its supervisor across a virtual-machine boundary.
 - **[NEP-0008: Session flight recorder](neps/0008-session-flight-recorder.md)** — _Breaking: not yet assessed_
   Make the audit log a complete, self-describing record of an agent session: every access nono denied, from every enforcement layer, with the reason and the process responsible; every grant the agent held; every allowed access to paths an operator marked as sensitive; and a statement of which sources were live, so an operator can tell "nothing happened" apart from "nono could not see it".
+- **[NEP-0009: OAuth 2.0 login and device enrollment from the CLI (`nono login`)](neps/0009-cli-login.md)** — _Non-breaking_
+  Add `nono login`, which signs a developer in to a nono platform through a standard OAuth 2.0 flow and, on first use, enrolls the machine in the same round trip.

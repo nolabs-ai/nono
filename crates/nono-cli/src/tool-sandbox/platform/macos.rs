@@ -3108,6 +3108,9 @@ fn build_child_launch_spec_for_binary(
     )?;
     let mut caps = build_child_caps(state, binary, policy, request, &cwd, context.proxy_scope)?;
     caps.deduplicate();
+    if let Some(tag) = state.outer_caps.seatbelt_log_tag() {
+        caps.set_seatbelt_log_tag(tag)?;
+    }
 
     Ok(ToolSandboxChildLaunchSpec {
         real_binary: binary.canonical_path.as_os_str().as_bytes().to_vec(),
@@ -4644,6 +4647,7 @@ fn caps_to_spec(caps: &CapabilitySet) -> ChildCapsSpec {
         proxy_bind_port_ranges: caps.localhost_port_ranges().to_vec(),
         tcp_connect_ports: caps.tcp_connect_ports().to_vec(),
         tcp_bind_ports: caps.tcp_bind_ports().to_vec(),
+        seatbelt_log_tag: caps.seatbelt_log_tag().map(str::to_string),
     }
 }
 
@@ -4674,6 +4678,9 @@ fn caps_from_spec(spec: &ChildCapsSpec) -> Result<CapabilitySet> {
     }
     for port in &spec.tcp_bind_ports {
         caps.add_tcp_bind_port(*port);
+    }
+    if let Some(tag) = spec.seatbelt_log_tag.as_deref() {
+        caps.set_seatbelt_log_tag(tag)?;
     }
     Ok(caps)
 }
@@ -7278,6 +7285,7 @@ mod tests {
             proxy_bind_port_ranges: Vec::new(),
             tcp_connect_ports: Vec::new(),
             tcp_bind_ports: Vec::new(),
+            seatbelt_log_tag: None,
         };
 
         let err = caps_from_spec(&spec).err().ok_or_else(|| {
@@ -7287,6 +7295,15 @@ mod tests {
         })?;
         assert!(err.to_string().contains("resolves to"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn child_cap_spec_carries_seatbelt_log_tag() -> Result<()> {
+        let mut caps = CapabilitySet::new();
+        caps.set_seatbelt_log_tag("NONOGOV_35480")?;
+        let restored = caps_from_spec(&caps_to_spec(&caps))?;
+        assert_eq!(restored.seatbelt_log_tag(), Some("NONOGOV_35480"));
         Ok(())
     }
 

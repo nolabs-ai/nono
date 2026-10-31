@@ -62,43 +62,111 @@ pub(crate) fn init_tracing(cli: &Cli) {
             std::env::set_var("RUST_LOG", level)
         };
     }
+    // journald wins over `--log-file`/`NONO_LOG_FILE`: the flag names the sink,
+    // while a log-file env var is often inherited from a launcher the user is
+    // trying to replace.
+    if install_journald(cli) {
+        return;
+    }
     match cli.log_file.as_deref() {
         Some(path) => match SharedFileMakeWriter::new(path) {
-            Ok(writer) => {
-                tracing_subscriber::fmt()
-                    .with_env_filter(file_filter)
-                    .with_target(false)
-                    .with_ansi(false)
-                    .with_writer(writer)
-                    .init();
-            }
+            Ok(writer) => init_file_tracing(file_filter, writer),
             Err(err) => {
                 eprintln!(
                     "nono: failed to open log file {}: {}; falling back to stderr",
                     path.display(),
                     err
                 );
-                tracing_subscriber::fmt()
-                    .with_env_filter(tracing_filter(cli, false))
-                    .with_target(false)
-                    .with_writer(io::stderr)
-                    .init();
+                init_stderr_tracing(tracing_filter(cli, false));
             }
         },
-        None => {
-            tracing_subscriber::fmt()
-                .with_env_filter(tracing_filter(cli, false))
-                .with_target(false)
-                .with_writer(io::stderr)
+        None => init_stderr_tracing(tracing_filter(cli, false)),
+    }
+}
+
+fn init_file_tracing(filter: EnvFilter, writer: SharedFileMakeWriter) {
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(writer)
+        .init();
+}
+
+fn init_stderr_tracing(filter: EnvFilter) {
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(io::stderr)
+        .init();
+}
+
+/// Syslog identifier so `journalctl -t nono-proxy` selects these records.
+#[cfg(target_os = "linux")]
+const JOURNALD_SYSLOG_IDENTIFIER: &str = "nono-proxy";
+
+/// Returns `false` when `--log-journald` is unset or the socket is unreachable,
+/// so the caller falls through to the file/stderr sink.
+#[cfg(target_os = "linux")]
+fn install_journald(cli: &Cli) -> bool {
+    if !cli.log_journald {
+        return false;
+    }
+
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    match tracing_journald::Layer::new() {
+        Ok(layer) => {
+            tracing_subscriber::registry()
+                .with(
+                    layer
+                        .with_syslog_identifier(JOURNALD_SYSLOG_IDENTIFIER.to_string())
+                        .with_filter(journald_filter(cli)),
+                )
                 .init();
+            true
+        }
+        Err(err) => {
+            eprintln!(
+                "nono: failed to connect to systemd-journald: {err}; \
+                 continuing without journald logging"
+            );
+            false
         }
     }
 }
 
-// `--silent` only mutes terminal output. An explicit log file keeps the
+/// Other targets have no journald socket, so the flag cannot be honored there.
+#[cfg(not(target_os = "linux"))]
+fn install_journald(cli: &Cli) -> bool {
+    if cli.log_journald {
+        eprintln!("nono: --log-journald requires Linux with systemd; ignoring");
+    }
+    false
+}
+
+/// Journald is the only sink, so the filter must admit audit records that the
+/// stderr default of `warn` would drop: they are `INFO`, and without a
+/// `nono_proxy` directive `--log-journald` would miss the events it exists for.
+/// The directive replaces a `RUST_LOG` directive for the same target.
+#[cfg(target_os = "linux")]
+fn journald_filter(cli: &Cli) -> EnvFilter {
+    let level = cli_verbosity_level(cli).unwrap_or("info");
+    let mut filter = tracing_filter(cli, true);
+    // Literal prefix plus a level from `cli_verbosity_level`, so parsing
+    // cannot fail.
+    if let Ok(directive) = format!("nono_proxy={level}").parse() {
+        filter = filter.add_directive(directive);
+    }
+    filter
+}
+
+// `--silent` only mutes terminal output. A log file or the journal keeps the
 // verbosity / RUST_LOG filter.
-fn tracing_filter(cli: &Cli, to_file: bool) -> EnvFilter {
-    let level = if to_file {
+fn tracing_filter(cli: &Cli, non_terminal: bool) -> EnvFilter {
+    let level = if non_terminal {
         cli_verbosity_level(cli)
     } else {
         cli_log_override(cli)
@@ -277,5 +345,94 @@ mod tests {
 
         assert!(contents.contains("first line"));
         assert!(contents.contains("second line"));
+    }
+
+    /// Captures what `journald_filter` admits, with the file writer standing in
+    /// for the journal.
+    #[cfg(target_os = "linux")]
+    fn capture_journald_filter(verbosity: u8, f: &dyn Fn()) -> String {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("journald.log");
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(SharedFileMakeWriter::new(&path).expect("capture writer"))
+                .with_filter(super::journald_filter(&test_cli(verbosity))),
+        );
+        tracing::subscriber::with_default(subscriber, f);
+        let mut contents = String::new();
+        std::fs::File::open(&path)
+            .expect("open capture")
+            .read_to_string(&mut contents)
+            .expect("read capture");
+        contents
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn journald_filter_floors_proxy_records_at_info() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvVarGuard::set_all(&[("RUST_LOG", "")]);
+        env.remove("RUST_LOG");
+
+        let default = capture_journald_filter(0, &|| {
+            tracing::info!(
+                target: nono_proxy::audit::AUDIT_TARGET,
+                "proxy request allowed"
+            );
+            tracing::debug!(
+                target: nono_proxy::audit::AUDIT_TARGET,
+                "CONNECT request to example.com:443"
+            );
+            tracing::info!(target: "nono_cli::unrelated", "cli info noise");
+            tracing::warn!(target: "nono_cli::unrelated", "cli warning");
+        });
+        assert!(default.contains("proxy request allowed"), "{default:?}");
+        assert!(!default.contains("CONNECT request to"), "{default:?}");
+        assert!(!default.contains("cli info noise"), "{default:?}");
+        assert!(default.contains("cli warning"), "{default:?}");
+
+        let verbose = capture_journald_filter(2, &|| {
+            tracing::debug!(
+                target: nono_proxy::audit::AUDIT_TARGET,
+                "CONNECT request to example.com:443"
+            );
+        });
+        assert!(verbose.contains("CONNECT request to"), "{verbose:?}");
+    }
+
+    /// The floor replaces a `RUST_LOG` directive for the same target, so an
+    /// `INFO` audit record survives a stricter environment setting.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn journald_filter_replaces_rust_log_proxy_directive() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarGuard::set_all(&[("RUST_LOG", "nono_proxy=error")]);
+
+        let captured = capture_journald_filter(0, &|| {
+            tracing::info!(
+                target: nono_proxy::audit::AUDIT_TARGET,
+                "proxy request allowed"
+            );
+            tracing::debug!(
+                target: nono_proxy::audit::AUDIT_TARGET,
+                "CONNECT request to example.com:443"
+            );
+        });
+        assert!(captured.contains("proxy request allowed"), "{captured:?}");
+        assert!(!captured.contains("CONNECT request to"), "{captured:?}");
+    }
+
+    /// `Cli` with `args.verbose` set, for filter tests (`0` = default, `1` = `-v`).
+    #[cfg(target_os = "linux")]
+    fn test_cli(verbosity: u8) -> Cli {
+        let mut cli = Cli::parse_from(["nono", "proxy"]);
+        if let crate::cli::Commands::Proxy(args) = &mut cli.command {
+            args.verbose = verbosity;
+        }
+        cli
     }
 }

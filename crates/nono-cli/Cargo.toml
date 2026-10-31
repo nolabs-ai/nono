@@ -97,6 +97,8 @@ jsonc-parser = { version = "0.34", features = ["serde"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }
 landlock.workspace = true
+# `--log-journald` sink; other targets have no journald socket.
+tracing-journald.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }

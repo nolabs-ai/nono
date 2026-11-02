@@ -3,8 +3,9 @@ nep: 0004
 title: Opt-in Linux namespace isolation
 authors:
   - lukehinds
-status: proposed
+status: accepted
 created: 2026-09-29
+breaking: false
 superseded-by:
 ---
 
@@ -19,6 +20,19 @@ seccomp enforcement. This structurally removes the local-IPC escape classes
 (abstract AF_UNIX sockets, netlink, direct IP, and — with the mount mask —
 pathname AF_UNIX endpoints such as the D-Bus session bus and the systemd
 user manager) instead of mediating them syscall-by-syscall.
+
+## Implementation status
+
+Partially implemented as of 2026-11-02:
+
+- Phase 1 and private TCP loopback shipped in v0.81.0
+  ([#2145](https://github.com/nolabs-ai/nono/pull/2145)): user/network/IPC/UTS
+  namespaces, the passed-listener proxy bridge and startup validation.
+- Landlock ABI detection and reporting through V9 shipped separately in
+  [#2217](https://github.com/nolabs-ai/nono/pull/2217); enforcement stays at V6.
+- Pending: Phase 2 mount masks and private `/tmp`, SOCKS5, packaged AppArmor
+  support, external-namespace detection and isolation audit metadata.
+  Reverse forwarding remains deferred; WSL2 support remains unverified.
 
 ## Motivation
 
@@ -114,8 +128,7 @@ rule. Opt-in keeps nono completely userland-purposed by default.
 
 ### Phasing
 
-**Phase 1 — network isolation (`user` + `net`, with `ipc` and `uts` as
-free riders).**
+**Phase 1 — network isolation (`user` + `net`, with optional `ipc` and `uts`).**
 
 The workload runs in a new user namespace (single-uid/gid identity
 mapping; the enabler for everything else while unprivileged) and a new
@@ -276,9 +289,9 @@ across platforms (`require_isolation`) remains out of scope (see Resolved
 Questions).
 
 `ipc` (SysV shm/sem/msg, POSIX MQs no longer shared with the host) and
-`uts` (hostname immutable from the host's perspective) namespaces are
-included in Phase 1 because they are one flag each at the same `unshare`
-call site and break almost nothing.
+`uts` (hostname immutable from the host's perspective) are available in
+Phase 1. Each requires explicit selection and can be requested independently
+of `network`; `--isolate net` does not enable either automatically.
 
 **Phase 2 — minimal mount mask (`user` + `mnt`).**
 
@@ -310,15 +323,13 @@ rules it already inherited, so nesting does not weaken enforcement.
 The `landlock` crate nono already ships (0.4.7) exposes ABI V7
 (Linux 6.15: audit flags), V8 (Linux 7.0: `TSYNC` all-threads restrict)
 and V9 (Linux 7.1: `AccessFs::ResolveUnix`); only ABI 10 (UDP) and 11
-still need upstream crate work. The lag is in nono's own code
-(`DetectedAbi` and the feature listing stop at V6), so adoption can start
-immediately and proceeds in risk order:
+still need upstream crate work. Detection and reporting now reach V9
+(#2217), while enforcement remains capped at V6. Adoption proceeds in
+risk order:
 
-1. **Detection and reporting** (routine, no NEP): extend `DetectedAbi`
-   through V9, surface kernel-vs-enforced ABI per class in `nono why` and
-   diagnostics (including the crate's errata signal). Also yields field
-   data on how fast V9 kernels arrive — the number that decides when the
-   fallbacks below can be demoted.
+1. **Detection and reporting** (shipped, #2217): `DetectedAbi` and
+   diagnostics distinguish detected support through V9 from enforced V6.
+   Per-class backend reporting remains part of the composition work below.
 2. **ABI 8 `TSYNC`** (routine): apply-path hygiene; most valuable for
    `nono wrap`'s multi-threaded self-sandboxing; best-effort below V8.
 3. **ABI 7 audit flags** (routine, opt-in diagnostics): kernel-logged
@@ -387,18 +398,19 @@ existing `linux.af_unix_mediation` precedent):
 {
   "linux": {
     "isolate": {
-      "network": true,        // Phase 1: user+net (+ipc+uts)
+      "network": true,        // Phase 1: user+net
       "loopback": true,       // Phase 1 follow-up: TCP on the namespace's own lo; requires network
       "ipc": true,            // may also be set without network
       "uts": true,
       "mounts": true,         // Phase 2: user+mnt, default mask list
-      "extra_masks": ["/opt/corp/agent.sock"]  // additive only
+      "extra_masks": ["/opt/corp/agent.sock"]  // Phase 2: additive only
     }
   }
 }
 ```
 
-CLI: `--isolate net,loopback,ipc,uts,mounts` (comma list) as sugar for the same.
+Current CLI: `--isolate net,loopback,ipc,uts` (comma list).
+`mounts` and `extra_masks` are planned Phase 2 fields and are not accepted yet.
 
 **Merge semantics.** The boolean `isolate` fields merge like `network.block`:
 logical OR across every profile layer, packs and the CLI. Any layer can turn

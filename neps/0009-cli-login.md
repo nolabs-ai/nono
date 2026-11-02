@@ -31,6 +31,14 @@ authorization grant ([RFC 8628]) as the fallback when no local browser is
 available. Tokens are bound to a key the CLI generates for the session, using
 DPoP ([RFC 9449]).
 
+## Implementation status
+
+Implemented in `nono-cli` by PR #2250, pending acceptance of this NEP:
+`nono login` (browser and device-code flows, `--org`), `nono logout`, session
+use by `nono run --remote`, `nono ps --remote` and `nono connect`, the
+`cli-login-v1` protocol document and conformance fixtures. Open questions
+below remain open.
+
 ## Motivation
 
 Today a person who wants to use a hosted nono platform from the terminal must:

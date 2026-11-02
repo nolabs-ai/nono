@@ -106,8 +106,12 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
         proxy.session_id.clone(),
         nono::CapabilitySet::default(),
     )?;
-    let approval_registry =
-        crate::approval_runtime::build_proxy_approval_registry(proxy.command_policies.as_ref())?;
+    let approval_registry = crate::approval_runtime::build_proxy_approval_registry(
+        proxy.command_policies.as_ref(),
+        // Standalone mode does not consult network approval backends.
+        None,
+        &proxy.session_id,
+    )?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

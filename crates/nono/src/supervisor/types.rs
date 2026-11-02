@@ -7,7 +7,7 @@
 //! [`ApprovalRequest`] is the generalised form consumed by [`crate::supervisor::ApprovalBackend`].
 //! It covers file capability, network, and command-policy launch requests.
 
-use crate::capability::AccessMode;
+use crate::capability::{AccessMode, UnixSocketOp};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -117,6 +117,22 @@ pub enum ApprovalRequest {
         /// Session identifier
         session_id: String,
     },
+    /// A pathname unix socket `connect` or `bind` outside the granted socket
+    /// set (Linux seccomp-notify, `linux.af_unix_mediation: pathname`).
+    UnixSocket {
+        /// Unique identifier for this request
+        request_id: String,
+        /// Canonical socket path
+        path: PathBuf,
+        /// `connect` or `bind`; datagram sends are never escalated
+        op: UnixSocketOp,
+        /// Human-readable reason
+        reason: Option<String>,
+        /// PID of the requesting child process
+        child_pid: u32,
+        /// Session identifier
+        session_id: String,
+    },
 }
 
 impl ApprovalRequest {
@@ -127,7 +143,8 @@ impl ApprovalRequest {
             ApprovalRequest::Capability { request_id, .. }
             | ApprovalRequest::Network { request_id, .. }
             | ApprovalRequest::Endpoint { request_id, .. }
-            | ApprovalRequest::Command { request_id, .. } => request_id,
+            | ApprovalRequest::Command { request_id, .. }
+            | ApprovalRequest::UnixSocket { request_id, .. } => request_id,
         }
     }
 
@@ -138,7 +155,8 @@ impl ApprovalRequest {
             ApprovalRequest::Capability { session_id, .. }
             | ApprovalRequest::Network { session_id, .. }
             | ApprovalRequest::Endpoint { session_id, .. }
-            | ApprovalRequest::Command { session_id, .. } => session_id,
+            | ApprovalRequest::Command { session_id, .. }
+            | ApprovalRequest::UnixSocket { session_id, .. } => session_id,
         }
     }
 }

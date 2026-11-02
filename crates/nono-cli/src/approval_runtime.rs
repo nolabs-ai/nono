@@ -10,20 +10,35 @@ use std::time::{Duration, Instant};
 
 const WEBHOOK_RESPONSE_LIMIT_BYTES: u64 = 64 * 1024;
 
+/// Build the endpoint-approval registry for a session's proxy. Requests routed
+/// through it carry `session_id`, so a backend can attribute them to the
+/// sandbox session rather than to the proxy.
+///
+/// `command_policies` backends answer endpoint `approve` decisions when the
+/// profile declares them. Otherwise `network_fallback` (the profile's
+/// `network.approval_backends` and default) does, so a credential endpoint
+/// policy on `network.custom_credentials` can ask without a command policy,
+/// which nono only accepts when it names a command.
 pub(crate) fn build_proxy_approval_registry(
     config: Option<&CommandPoliciesConfig>,
+    network_fallback: Option<(&BTreeMap<String, ApprovalBackendConfig>, Option<String>)>,
+    session_id: &str,
 ) -> Result<Option<nono_proxy::approval::ApprovalBackendRegistry>> {
-    let Some(config) = config else {
-        return Ok(None);
+    let (backends, default_backend) = match config {
+        Some(config) if !config.approval_backends.is_empty() => (
+            &config.approval_backends,
+            config.approval_defaults.backend.clone(),
+        ),
+        _ => match network_fallback {
+            Some((backends, default_backend)) if !backends.is_empty() => {
+                (backends, default_backend)
+            }
+            _ => return Ok(None),
+        },
     };
-    if config.approval_backends.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(build_approval_registry_from(
-        &config.approval_backends,
-        config.approval_defaults.backend.clone(),
-    )?))
+    Ok(Some(
+        build_approval_registry_from(backends, default_backend)?.with_session_id(session_id),
+    ))
 }
 
 pub(crate) fn build_approval_registry(
@@ -974,6 +989,51 @@ mod tests {
         };
 
         assert!(chain.request_approval(&request()).unwrap().is_granted());
+    }
+
+    fn webhook(url: &str) -> ApprovalBackendConfig {
+        ApprovalBackendConfig {
+            backend_type: ApprovalBackendType::Webhook,
+            url: Some(url.to_string()),
+            timeout_secs: Some(5),
+            mode: None,
+            backends: Vec::new(),
+            auth: None,
+        }
+    }
+
+    #[test]
+    fn endpoint_registry_prefers_command_policies_then_network_backends() {
+        let network = BTreeMap::from([("net".to_string(), webhook("https://net.example"))]);
+        let fallback = Some((&network, Some("net".to_string())));
+
+        let registry = build_proxy_approval_registry(None, fallback.clone(), "sess-1")
+            .unwrap()
+            .expect("network backends answer endpoint approvals without command policies");
+        let (name, _) = registry.resolve(None).unwrap();
+        assert_eq!(name, "net");
+        assert_eq!(registry.session_id(), "sess-1");
+
+        let mut commands = CommandPoliciesConfig::default();
+        commands
+            .approval_backends
+            .insert("cmd".to_string(), webhook("https://cmd.example"));
+        commands.approval_defaults.backend = Some("cmd".to_string());
+        let registry = build_proxy_approval_registry(Some(&commands), fallback, "sess-1")
+            .unwrap()
+            .expect("command policy backends");
+        assert_eq!(registry.resolve(None).unwrap().0, "cmd");
+
+        assert!(
+            build_proxy_approval_registry(None, None, "sess-1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            build_proxy_approval_registry(None, Some((&BTreeMap::new(), None)), "sess-1")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

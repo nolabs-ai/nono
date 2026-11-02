@@ -1365,6 +1365,16 @@ mod tests {
         SandboxArgs::default()
     }
 
+    #[cfg(target_os = "macos")]
+    struct RemoveDir<'a>(&'a Path);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for RemoveDir<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0);
+        }
+    }
+
     #[test]
     fn test_from_args_basic() {
         let dir = tempdir().expect("Failed to create temp dir");
@@ -1662,6 +1672,151 @@ mod tests {
         assert!(
             !caps.path_covered(&child),
             "exact-path fallback must not recursively cover descendants"
+        );
+    }
+
+    /// `read_file` of a directory plus `bypass_protection` of that directory.
+    /// Dry-run lists the grant as `(file)`. `why` allows that directory and
+    /// denies a nested file with `path_not_granted`. The Seatbelt hole stays
+    /// `literal`, so the sandbox does not open the subtree those diagnostics deny.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_read_file_directory_bypass_matches_why_and_seatbelt() {
+        // `/tmp` resolves under `/private`, which `system_read_macos` grants,
+        // so `why` allows a child there. This shape is a path no system grant covers.
+        let home = std::env::var_os("HOME").expect("HOME");
+        let dir = Path::new(&home).join(format!(
+            ".nono-exact-bypass-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _cleanup = RemoveDir(&dir);
+        std::fs::create_dir_all(&dir).expect("create fixture root");
+        let granted = dir.join("dir");
+        std::fs::create_dir_all(&granted).expect("create dir");
+        let nested = granted.join("sub");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        let child = nested.join("leaf");
+        std::fs::write(&child, "hidden").expect("write child");
+        let resolved = granted.canonicalize().expect("canonicalize dir");
+
+        let profile_path = dir.join("repro.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{
+                "meta": {{ "name": "repro", "version": "0.0.1" }},
+                "filesystem": {{
+                    "read_file": ["{}"],
+                    "bypass_protection": ["{}"]
+                }}
+            }}"#,
+                granted.display(),
+                granted.display()
+            ),
+        )
+        .expect("write profile");
+
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+        let prepared =
+            with_env_lock(|| CapabilitySet::from_profile(&profile, workdir.path(), &args))
+                .expect("build caps");
+
+        assert!(
+            prepared.caps.fs_capabilities().iter().any(|cap| {
+                cap.is_file
+                    && cap.access == AccessMode::Read
+                    && cap.resolved == resolved
+                    && cap.source.is_user_intent()
+            }),
+            "dry-run must list the directory grant as (file)"
+        );
+        assert!(
+            prepared
+                .applied_bypass_paths
+                .iter()
+                .any(|bypass| bypass.is_file && bypass.path == resolved),
+            "bypass hole must stay literal, got: {:?}",
+            prepared.applied_bypass_paths
+        );
+        assert!(
+            !prepared.caps.path_covered(&child),
+            "exact-file grant must not cover the nested file"
+        );
+
+        // Same order as `run_why`: a covering deny wins, otherwise query grants.
+        let policy = crate::policy::EffectiveDenyPolicy::from_applied_bypasses(
+            &prepared.deny_paths,
+            &prepared.applied_bypass_paths,
+        );
+        assert!(
+            policy
+                .matching_deny_for_access(&resolved, AccessMode::Read)
+                .is_none(),
+            "the granted directory is not under filesystem.deny"
+        );
+        let dir_result = crate::query_ext::query_path(
+            &resolved,
+            AccessMode::Read,
+            &prepared.caps,
+            policy.bypass_paths(),
+        )
+        .expect("why dir");
+        let resolved_display = resolved.display().to_string();
+        assert!(
+            matches!(
+                dir_result,
+                crate::query_ext::QueryResult::Allowed {
+                    ref reason,
+                    granted_path: Some(ref granted_path),
+                    source: Some(ref source),
+                    ..
+                } if reason == "granted_path"
+                    && granted_path == &resolved_display
+                    && source == "profile"
+            ),
+            "why must allow the directory via the exact profile grant, got {dir_result:?}"
+        );
+        assert!(
+            policy
+                .matching_deny_for_access(&child, AccessMode::Read)
+                .is_none(),
+            "the nested file is outside filesystem.deny"
+        );
+        let child_result = crate::query_ext::query_path(
+            &child,
+            AccessMode::Read,
+            &prepared.caps,
+            policy.bypass_paths(),
+        )
+        .expect("why child");
+        assert!(
+            matches!(
+                child_result,
+                crate::query_ext::QueryResult::Denied { ref reason, .. } if reason == "path_not_granted"
+            ),
+            "why must deny the nested file, got {child_result:?}"
+        );
+
+        let rules = prepared.caps.platform_rules().join("\n");
+        let matched: Vec<_> = rules
+            .lines()
+            .filter(|line| line.contains(&resolved_display))
+            .collect();
+        assert!(
+            !matched.is_empty(),
+            "Seatbelt rules must name the bypass path, got: {rules}"
+        );
+        assert!(
+            matched
+                .iter()
+                .all(|line| line.contains("literal") && !line.contains("subpath")),
+            "Seatbelt hole must stay literal so enforcement matches why, got: {matched:?}"
         );
     }
 

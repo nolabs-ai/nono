@@ -36,6 +36,7 @@ mod jsonc;
 mod launch_runtime;
 #[cfg(target_os = "linux")]
 mod lineage_cgroup;
+mod login_cmd;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
@@ -49,6 +50,7 @@ mod package_cmd;
 mod package_status;
 mod platform;
 mod platform_client;
+mod platform_oauth;
 mod policy;
 mod profile;
 mod profile_cmd;

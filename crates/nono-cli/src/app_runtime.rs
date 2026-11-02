@@ -67,6 +67,12 @@ fn dispatch_command(
         Commands::Platform(args) => run_command_with_update(update_handle, silent, || {
             platform_client::run_platform(args)
         }),
+        Commands::Login(args) => {
+            run_command_with_update(update_handle, silent, || crate::login_cmd::run_login(args))
+        }
+        Commands::Logout(args) => {
+            run_command_with_update(update_handle, silent, || crate::login_cmd::run_logout(args))
+        }
         Commands::Connect(args) => run_command_with_update(update_handle, silent, || {
             #[cfg(unix)]
             {

@@ -48,6 +48,8 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   rollback   Manage rollback sessions (browse, restore, cleanup)
   audit      View audit trail of sandboxed commands
   platform   Enroll with and inspect an audit control plane
+  login      Sign in to a nono platform as yourself
+  logout     Sign out of the platform
   trust      Manage file trust and attestation
 
 \x1b[1mPACKS\x1b[0m
@@ -291,6 +293,46 @@ pub enum Commands {
   nono platform status --json
 ")]
     Platform(PlatformArgs),
+
+    /// Sign in to a nono platform as yourself
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono login [--url <origin>] [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Sign in to app.nolabs.ai through the browser with GitHub or Google
+    nono login
+
+    # Over SSH or in a container: sign in with a code on another device
+    nono login --device-code
+
+    # Sign in to a self-hosted platform
+    nono login --url https://nono.example.com
+
+    # See your account and organizations, or work in another organization
+    nono login
+    nono login --org acme
+")]
+    Login(LoginArgs),
+
+    /// Sign out of the platform
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono logout
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Revoke this terminal's platform sign-in
+    nono logout
+")]
+    Logout(LogoutArgs),
 
     /// Manage file trust and attestation
     #[command(subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
@@ -2139,13 +2181,13 @@ pub struct RemoteRunArgs {
     /// Remote workspace name or ID; prompts when omitted in a terminal
     #[arg(long, requires = "remote", help_heading = "REMOTE")]
     pub workspace: Option<String>,
-    /// Platform origin; defaults to the enrolled platform
+    /// Platform origin; defaults to the signed-in or enrolled platform
     #[arg(long = "platform-url", requires = "remote", help_heading = "REMOTE")]
     pub platform_url: Option<String>,
     /// Console origin; defaults to enrolled console discovery
     #[arg(long, requires = "remote", help_heading = "REMOTE")]
     pub console: Option<String>,
-    /// Protected Run API personal access token file (or NONO_RUN_TOKEN)
+    /// Run API personal access token file (or NONO_RUN_TOKEN); not needed after `nono login`
     #[arg(long = "run-token-file", requires = "remote", help_heading = "REMOTE")]
     pub run_token_file: Option<PathBuf>,
     /// Console token file override; normally browser authorization is automatic
@@ -2650,6 +2692,34 @@ pub struct PlatformEnrollArgs {
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
 }
+
+#[derive(Parser, Debug)]
+pub struct LoginArgs {
+    /// Platform origin for a self-hosted platform; defaults to the platform
+    /// you last signed in to, else https://app.nolabs.ai
+    #[arg(long, env = "NONO_PLATFORM_URL")]
+    pub url: Option<String>,
+
+    /// Organization to work in (name, slug or ID); when already signed in,
+    /// switches to it without a browser. NONO_ORG overrides it for one command
+    #[arg(long)]
+    pub org: Option<String>,
+
+    /// Sign in through a local browser and a loopback redirect
+    #[arg(long, conflicts_with = "device_code")]
+    pub browser: bool,
+
+    /// Sign in with a user code on any device (for SSH sessions and containers)
+    #[arg(long)]
+    pub device_code: bool,
+
+    /// Print the sign-in URL instead of opening a browser
+    #[arg(long)]
+    pub no_open: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct LogoutArgs {}
 
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
@@ -4744,6 +4814,8 @@ mod tests {
         "rollback",
         "audit",
         "platform",
+        "login",
+        "logout",
         "trust",
         "policy",
         "profile",

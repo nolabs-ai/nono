@@ -95,11 +95,11 @@ shlex = "2"
 jsonc-parser = { version = "0.34", features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }
+nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir", "hostname"] }
 landlock.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }
+nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir", "hostname"] }
 security-framework = "3"
 security-framework-sys = "2"
 core-foundation = "0.10"

@@ -8,6 +8,17 @@ use nono::{AccessMode, ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoE
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
+/// Print one prompt line without a bare `\n`, so it renders even if the
+/// terminal is still in raw mode (for example, when the relay ends mid-prompt).
+macro_rules! prompt_line {
+    () => {
+        crate::startup_prompt::print_terminal_safe_stderr("")
+    };
+    ($($arg:tt)*) => {
+        crate::startup_prompt::print_terminal_safe_stderr(&format!($($arg)*))
+    };
+}
+
 /// Bound the complete attempt, including waiting for another prompt and the
 /// anti-type-ahead delay, before the proxy's timeout-plus-grace backstop.
 pub(crate) const TERMINAL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
@@ -65,11 +76,17 @@ impl TerminalApproval {
             });
         }
 
-        Self::prompt(
-            request,
-            deadline,
-            crate::terminal_prompt::read_consent_line_until,
-        )
+        // Off the supervisor thread (network and proxy endpoint approvals),
+        // the PTY relay may still own the terminal. Prompt only once the
+        // supervisor has paused it, and fail closed if that never happens.
+        crate::relay_prompt_gate::run_with_relay_paused(deadline, || {
+            Self::prompt(
+                request,
+                deadline,
+                crate::terminal_prompt::read_consent_line_until,
+            )
+        })
+        .unwrap_or(Ok(ApprovalDecision::Timeout))
     }
 
     fn prompt(
@@ -82,7 +99,7 @@ impl TerminalApproval {
         let Some(_prompt_guard) = acquire_prompt_slot(&APPROVAL_PROMPT_LOCK, deadline)? else {
             return Ok(ApprovalDecision::Timeout);
         };
-        eprintln!();
+        prompt_line!();
         match request {
             ApprovalRequest::Capability {
                 path,
@@ -90,14 +107,14 @@ impl TerminalApproval {
                 reason,
                 ..
             } => {
-                eprintln!("[nono] The sandboxed process is requesting additional access:");
-                eprintln!(
+                prompt_line!("[nono] The sandboxed process is requesting additional access:");
+                prompt_line!(
                     "[nono]   Path:   {}",
                     sanitize_for_terminal(&path.display().to_string())
                 );
-                eprintln!("[nono]   Access: {}", format_access_mode(access));
+                prompt_line!("[nono]   Access: {}", format_access_mode(access));
                 if let Some(r) = reason {
-                    eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
+                    prompt_line!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
             ApprovalRequest::Network {
@@ -107,12 +124,12 @@ impl TerminalApproval {
                 reason,
                 ..
             } => {
-                eprintln!("[nono] The sandboxed process is requesting network access:");
-                eprintln!("[nono]   Host:     {}", sanitize_for_terminal(host));
-                eprintln!("[nono]   Port:     {port}");
-                eprintln!("[nono]   Protocol: {protocol}");
+                prompt_line!("[nono] The sandboxed process is requesting network access:");
+                prompt_line!("[nono]   Host:     {}", sanitize_for_terminal(host));
+                prompt_line!("[nono]   Port:     {port}");
+                prompt_line!("[nono]   Protocol: {protocol}");
                 if let Some(r) = reason {
-                    eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
+                    prompt_line!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
             ApprovalRequest::Command {
@@ -123,23 +140,23 @@ impl TerminalApproval {
                 reason,
                 ..
             } => {
-                eprintln!("[nono] command-policy launch requires approval:");
-                eprintln!("[nono]   Command: {}", sanitize_for_terminal(command));
+                prompt_line!("[nono] command-policy launch requires approval:");
+                prompt_line!("[nono]   Command: {}", sanitize_for_terminal(command));
                 let display_args: Vec<String> = args
                     .iter()
                     .skip(1)
                     .map(|a| sanitize_for_terminal(a))
                     .collect();
                 if !display_args.is_empty() {
-                    eprintln!("[nono]   Args:    {}", display_args.join(" "));
+                    prompt_line!("[nono]   Args:    {}", display_args.join(" "));
                 }
-                eprintln!("[nono]   Caller:  {}", sanitize_for_terminal(caller));
-                eprintln!(
+                prompt_line!("[nono]   Caller:  {}", sanitize_for_terminal(caller));
+                prompt_line!(
                     "[nono]   Rule:    {}",
                     sanitize_for_terminal(intercept_rule)
                 );
                 if let Some(r) = reason {
-                    eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
+                    prompt_line!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
             ApprovalRequest::Endpoint {
@@ -151,34 +168,35 @@ impl TerminalApproval {
                 reason,
                 ..
             } => {
-                eprintln!("[nono] Proxy endpoint access requires approval:");
-                eprintln!("[nono]   Route:   {}", sanitize_for_terminal(route_id));
-                eprintln!("[nono]   Method:  {}", sanitize_for_terminal(method));
-                eprintln!("[nono]   Path:    {}", sanitize_for_terminal(path));
-                eprintln!("[nono]   Upstream: {}", sanitize_for_terminal(upstream));
-                eprintln!("[nono]   Rule:    {}", sanitize_for_terminal(rule_label));
+                prompt_line!("[nono] Proxy endpoint access requires approval:");
+                prompt_line!("[nono]   Route:   {}", sanitize_for_terminal(route_id));
+                prompt_line!("[nono]   Method:  {}", sanitize_for_terminal(method));
+                prompt_line!("[nono]   Path:    {}", sanitize_for_terminal(path));
+                prompt_line!("[nono]   Upstream: {}", sanitize_for_terminal(upstream));
+                prompt_line!("[nono]   Rule:    {}", sanitize_for_terminal(rule_label));
                 if let Some(r) = reason {
-                    eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
+                    prompt_line!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
         }
-        eprintln!("[nono]");
+        prompt_line!("[nono]");
 
         // Network prompts offer session-scoped choices so an "always" answer
         // suppresses re-prompting for the rest of the session. Every other
         // request type keeps the one-shot [y/N] prompt.
         let is_network = matches!(request, ApprovalRequest::Network { .. });
         let prompt = if is_network {
-            eprintln!("[nono]   1) Allow once");
-            eprintln!("[nono]   2) Always allow (this session)");
-            eprintln!("[nono]   3) Deny once");
-            eprintln!("[nono]   4) Always deny (this session)");
+            prompt_line!("[nono]   1) Allow once");
+            prompt_line!("[nono]   2) Always allow (this session)");
+            prompt_line!("[nono]   3) Deny once");
+            prompt_line!("[nono]   4) Always deny (this session)");
             "[nono] Choose [1-4, default 3]: "
         } else {
             "[nono] Grant access? [y/N] "
         };
         let Some(input) = read_line(prompt, deadline)? else {
-            eprintln!("\n[nono] Approval timed out; access denied.");
+            prompt_line!();
+            prompt_line!("[nono] Approval timed out; access denied.");
             return Ok(ApprovalDecision::Timeout);
         };
         if Instant::now() >= deadline {
@@ -190,29 +208,29 @@ impl TerminalApproval {
             // answer denies this one request without persisting the decision.
             match input.trim().to_ascii_lowercase().as_str() {
                 "1" | "y" | "yes" => {
-                    eprintln!("[nono] Access granted.");
+                    prompt_line!("[nono] Access granted.");
                     Ok(ApprovalDecision::Granted)
                 }
                 "2" => {
-                    eprintln!("[nono] Access granted for this session.");
+                    prompt_line!("[nono] Access granted for this session.");
                     Ok(ApprovalDecision::GrantedForSession)
                 }
                 "4" => {
-                    eprintln!("[nono] Access denied for this session.");
+                    prompt_line!("[nono] Access denied for this session.");
                     Ok(ApprovalDecision::DeniedForSession)
                 }
                 _ => {
-                    eprintln!("[nono] Access denied.");
+                    prompt_line!("[nono] Access denied.");
                     Ok(ApprovalDecision::Denied {
                         reason: "User denied the request".to_string(),
                     })
                 }
             }
         } else if is_affirmative_response(&input) {
-            eprintln!("[nono] Access granted.");
+            prompt_line!("[nono] Access granted.");
             Ok(ApprovalDecision::Granted)
         } else {
-            eprintln!("[nono] Access denied.");
+            prompt_line!("[nono] Access denied.");
             Ok(ApprovalDecision::Denied {
                 reason: "User denied the request".to_string(),
             })

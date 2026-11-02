@@ -609,7 +609,10 @@ async fn connect_to_resolved(addrs: &[SocketAddr], host: &str) -> Result<TcpStre
     let mut last_err = None;
     for addr in addrs {
         match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Ok(stream)) => {
+                crate::upstream_socket::set_liveness(&stream);
+                return Ok(stream);
+            }
             Ok(Err(e)) => {
                 debug!("Connect to {} failed: {}", addr, e);
                 last_err = Some(e.to_string());
@@ -709,6 +712,16 @@ async fn write_upstream_failure<S: AsyncWrite + Unpin>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_to_resolved_sets_liveness() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addrs = [listener.local_addr().unwrap()];
+
+        let stream = connect_to_resolved(&addrs, "upstream.test").await.unwrap();
+
+        crate::upstream_socket::assert_liveness(&stream);
+    }
 
     #[test]
     fn test_parse_connect_with_port() {

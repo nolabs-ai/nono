@@ -1648,10 +1648,11 @@ async fn attach(
         HeaderValue::from_static(TERMINAL_PROTOCOL_V1),
     );
 
+    let connector = websocket_tls_connector()?;
     let mut progress = ConnectionProgress::start(&url);
     let connection = tokio::time::timeout(
         WEBSOCKET_CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async(request),
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector)),
     );
     tokio::pin!(connection);
     let mut animation = tokio::time::interval(std::time::Duration::from_millis(90));
@@ -1773,6 +1774,41 @@ fn set_initial_terminal_size(url: &mut Url, cols: u16, rows: u16) {
     url.query_pairs_mut()
         .append_pair("cols", &cols.to_string())
         .append_pair("rows", &rows.to_string());
+}
+
+/// TLS for the terminal WebSocket, with the crypto provider named explicitly.
+///
+/// The dependency graph enables both rustls providers (`ring` via ureq,
+/// `aws-lc-rs` via the AWS SDK in nono-proxy), so rustls cannot pick a
+/// process default and `connect_async` panics when it builds its own config.
+/// Like nono-proxy, select `ring` here rather than installing a process-wide
+/// default. Trust anchors are the platform's native roots, which is what
+/// tokio-tungstenite's `rustls-tls-native-roots` used; an empty store is an
+/// error, never an unverified connection.
+fn websocket_tls_connector() -> Result<tokio_tungstenite::Connector> {
+    let native = rustls_native_certs::load_native_certs();
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, _ignored) = roots.add_parsable_certificates(native.certs);
+    if added == 0 {
+        let detail = native
+            .errors
+            .first()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default();
+        return Err(NonoError::ConfigParse(format!(
+            "no trusted root certificates found for the terminal connection{detail}"
+        )));
+    }
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|error| NonoError::ConfigParse(format!("terminal TLS configuration: {error}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+        config,
+    )))
 }
 
 fn ws_error(error: tokio_tungstenite::tungstenite::Error) -> NonoError {
@@ -2015,6 +2051,22 @@ mod tests {
         writer.write_all(b"\x1b").map_err(NonoError::Io)?;
         assert_eq!(read_selector_key(&input)?, SelectorKey::Cancel);
         Ok(())
+    }
+
+    /// Regression: with both rustls providers enabled there is no process
+    /// default, and `connect_async` panicked building its TLS config. The
+    /// connector names its provider, so building it returns a result (a
+    /// connector, or the explicit no-roots error on a host without a trust
+    /// store) and never panics.
+    #[test]
+    fn websocket_tls_connector_does_not_need_a_process_default_provider() {
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        match websocket_tls_connector() {
+            Ok(connector) => {
+                assert!(matches!(connector, tokio_tungstenite::Connector::Rustls(_)))
+            }
+            Err(error) => assert!(error.to_string().contains("no trusted root certificates")),
+        }
     }
 
     #[test]

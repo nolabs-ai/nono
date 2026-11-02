@@ -99,4 +99,5 @@ CI fails PRs that leave them stale.
 | 0005 | Windows enforcement backend | draft | Breaking: not yet assessed |
 | 0007 | Supervisor decisions, audit and credentials outside a microVM guest | draft | Breaking: not yet assessed |
 | 0008 | Session flight recorder | draft | Breaking: not yet assessed |
+| 0009 | OAuth 2.0 login and device enrollment from the CLI (`nono login`) | draft | Non-breaking |
 <!-- nep-index:end -->

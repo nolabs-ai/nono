@@ -95,10 +95,10 @@ Use `nono why --self --host https://github.com/some/path` inside the sandbox to 
 
 ### Runtime Host Approval
 
-For `nono run` and `nono shell`, configure `network.approval_backends` to ask
-before connecting to hosts outside the static allowlist. Backends can be
-`terminal`, `webhook`, or `chain`. An approval-only profile needs no static
-allowlist entry or other proxy feature:
+For `nono run`, `nono shell`, and standalone `nono proxy`, configure
+`network.approval_backends` to ask before connecting to hosts outside the
+static allowlist. Backends can be `terminal`, `webhook`, or `chain`. An
+approval-only profile needs no static allowlist entry or other proxy feature:
 
 ```json
 {
@@ -144,9 +144,14 @@ backend itself. A terminal backend without an available terminal denies.
 
 Host approvals apply to direct CONNECT tunnels, including destinations that
 bypass an enterprise upstream proxy. CONNECTs forwarded to the enterprise
-proxy do not consult these backends and need static allowlist grants. The
-standalone `nono proxy` does not load network approval backends, and `nono wrap`
-rejects them because it cannot host an approval proxy.
+proxy do not consult these backends and need static allowlist grants.
+`nono wrap` rejects them because it cannot host an approval proxy.
+
+For a local approval helper, point a `webhook` backend at a Unix socket
+(`"url": "unix:///abs/path/approval.sock"`) instead of a loopback port. A
+sandbox that may listen on TCP ports can take a loopback port over when the
+helper is not holding it. `run` and `shell` refuse to launch if the sandbox
+could write to the socket or any directory above it, or bind it.
 
 See the [approval webhook protocol](https://github.com/nolabs-ai/nono/blob/main/docs/protocols/approval-webhook-v1.md)
 for webhook configuration, chain behavior, and grant scope.
@@ -342,7 +347,7 @@ On startup it prints the proxy URL (with the embedded credential), the raw token
   Press Ctrl-C to stop.
 ```
 
-Static network and credential settings are loaded from `--profile` and extended/overridden by explicit flags. Unlike `run` and `shell`, standalone `nono proxy` does not load `network.approval_backends`; do not use an approval-only profile to restrict it. Allow-domains and credentials are merged on top of the profile; the network profile and upstream proxy are overridden by flags. Credential injection for known services and `cmd://` credential-capture routes carry through the profile exactly as they do under `nono run`.
+Static network and credential settings are loaded from `--profile` and extended/overridden by explicit flags. `network.approval_backends` work as they do under `run`: an approval-only profile makes the proxy strict, and allowlist misses are sent to the configured backend. "Always allow" and "Always deny" answers apply to every client of the proxy until it stops. A terminal backend needs the proxy to run in a terminal; without one, every miss is denied. Allow-domains and credentials are merged on top of the profile; the network profile and upstream proxy are overridden by flags. Credential injection for known services and `cmd://` credential-capture routes carry through the profile exactly as they do under `nono run`.
 
 ### Flags
 

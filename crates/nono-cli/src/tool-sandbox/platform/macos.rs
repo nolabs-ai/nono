@@ -163,6 +163,8 @@ struct ToolSandboxState {
     /// Agent's resolved filesystem deny paths; a command's live cwd under any of
     /// these is rejected (the agent's broad allow may otherwise cover them).
     deny_paths: Vec<PathBuf>,
+    /// `unix://` approval sockets no command sandbox may be able to replace.
+    approval_sockets: Vec<(String, PathBuf)>,
     /// The agent's deny paths paired with the bypass_protection paths that lift
     /// them. A command policy's own keychain grant is authorized against this,
     /// so a mediated command can never exceed the agent's keychain authority.
@@ -290,6 +292,7 @@ impl PreparedToolSandboxRuntime {
             blocked_commands,
             outer_caps,
             deny_paths,
+            approval_sockets,
             bypass_protection_paths,
             policy_root,
             proxy_credentials,
@@ -373,6 +376,7 @@ impl PreparedToolSandboxRuntime {
                 policy_root: policy_root.to_path_buf(),
                 outer_caps: outer_caps.clone(),
                 deny_paths: deny_paths.to_vec(),
+                approval_sockets: approval_sockets.to_vec(),
                 deny_policy,
                 keychain_deny_rules,
                 keychain_db_forms,
@@ -3228,6 +3232,10 @@ fn build_child_caps(
     // wins, so a rule like `(allow process-exec* (literal "/usr/bin/security"))`
     // overrides the exec gate's earlier `(deny process-exec*)`.
     add_unsafe_seatbelt_rules(&mut caps, policy)?;
+    crate::approval_runtime::reject_child_replaceable_approval_sockets(
+        &caps,
+        &state.approval_sockets,
+    )?;
     Ok(caps)
 }
 
@@ -5804,6 +5812,7 @@ mod tests {
             policy_root: PathBuf::from("/tmp"),
             outer_caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
+            approval_sockets: Vec::new(),
             deny_policy: crate::policy::EffectiveDenyPolicy::new(&[], &[]),
             keychain_deny_rules: Vec::new(),
             keychain_db_forms: Vec::new(),

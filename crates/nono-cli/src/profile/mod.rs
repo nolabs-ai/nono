@@ -1848,10 +1848,10 @@ pub struct NetworkConfig {
     ///
     /// A named backend here (e.g. `terminal`, `webhook`, or a `chain`)
     /// answers the prompt; an approved host is tunnelled, a denied one gets a
-    /// 403. For `run` and `shell`, a non-empty map activates the proxy even
-    /// with an empty allowlist, provided `network.block` is false or omitted
-    /// and `--block-net` is absent. The empty allowlist then requires approval
-    /// rather than allowing all hosts. Both hard-block forms conflict with
+    /// 403. For `run`, `shell`, and standalone `proxy`, a non-empty map
+    /// activates the proxy even with an empty allowlist, provided
+    /// `network.block` is false or omitted and `--block-net` is absent. The
+    /// empty allowlist then requires approval rather than allowing all hosts. Both hard-block forms conflict with
     /// configured approval backends and are rejected; approvals cannot lift
     /// a block. `--allow-net` clears these profile approval settings. Explicit host denies and metadata /
     /// link-local SSRF protection cannot be overridden by approval.

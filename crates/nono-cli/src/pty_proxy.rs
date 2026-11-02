@@ -1391,7 +1391,16 @@ impl PtyProxy {
                     );
                 }
             }
-            EnhancedKeyMatch::Invalid => self.flush_pending_detach_escape(forwarded),
+            EnhancedKeyMatch::Invalid => {
+                if self.detach_sequence[..self.pending_detach_match_len]
+                    .iter()
+                    .any(|&key| is_enhanced_key_echo(&self.pending_detach_escape, key))
+                {
+                    self.pending_detach_escape.clear();
+                } else {
+                    self.flush_pending_detach_escape(forwarded);
+                }
+            }
         }
 
         true
@@ -1440,25 +1449,14 @@ pub(crate) fn match_enhanced_key_sequence(bytes: &[u8], expected_key: u8) -> Enh
     };
 
     if last == b'u' {
-        if body.is_empty()
-            || !body
-                .iter()
-                .all(|b| b.is_ascii_digit() || matches!(b, b';' | b':'))
+        let Some(report) = parse_csi_u_key_report(body) else {
+            return EnhancedKeyMatch::Invalid;
+        };
+        // Only a press advances a detach match. Repeat and release reports
+        // (kitty "report event types") are handled by is_enhanced_key_echo.
+        return if report.event_type == KITTY_EVENT_PRESS
+            && enhanced_key_matches(expected_key, report.codepoint, report.modifiers)
         {
-            return EnhancedKeyMatch::Invalid;
-        }
-        let mut fields = body.split(|b| matches!(b, b';' | b':'));
-        let Some(first_field) = fields.next() else {
-            return EnhancedKeyMatch::Invalid;
-        };
-        if first_field.is_empty() {
-            return EnhancedKeyMatch::Invalid;
-        }
-        let Some(codepoint) = parse_ascii_u32(first_field) else {
-            return EnhancedKeyMatch::Invalid;
-        };
-        let modifiers = fields.find_map(parse_ascii_u32).unwrap_or(1);
-        return if enhanced_key_matches(expected_key, codepoint, modifiers) {
             EnhancedKeyMatch::Matched
         } else {
             EnhancedKeyMatch::Invalid
@@ -1495,6 +1493,75 @@ pub(crate) fn match_enhanced_key_sequence(bytes: &[u8], expected_key: u8) -> Enh
     }
 
     EnhancedKeyMatch::Invalid
+}
+
+/// Returns true when `bytes` is a complete kitty CSI-u repeat or release
+/// report for `key`.
+///
+/// Applications that enable kitty event reporting (e.g. pi pushes flags 7)
+/// make the terminal send `\x1b[93;5:3u` after the `\x1b[93;5u` press of
+/// Ctrl-]. Detach matchers use this to swallow those reports for keys already
+/// matched instead of letting them reset a partial detach sequence.
+pub(crate) fn is_enhanced_key_echo(bytes: &[u8], key: u8) -> bool {
+    let Some(body) = bytes
+        .strip_prefix(b"\x1b[")
+        .and_then(|rest| rest.strip_suffix(b"u"))
+    else {
+        return false;
+    };
+    parse_csi_u_key_report(body).is_some_and(|report| {
+        report.event_type != KITTY_EVENT_PRESS
+            && enhanced_key_matches(key, report.codepoint, report.modifiers)
+    })
+}
+
+const KITTY_EVENT_PRESS: u32 = 1;
+/// Caps Lock and Num Lock bits of a kitty modifier mask; they do not change
+/// which key was pressed.
+const KITTY_LOCK_MODIFIER_BITS: u32 = 64 | 128;
+
+struct CsiUKeyReport {
+    codepoint: u32,
+    modifiers: u32,
+    event_type: u32,
+}
+
+/// Parse the body of `CSI key[:shifted[:base]] [; modifiers[:event] [; text]] u`.
+fn parse_csi_u_key_report(body: &[u8]) -> Option<CsiUKeyReport> {
+    if body.is_empty()
+        || !body
+            .iter()
+            .all(|b| b.is_ascii_digit() || matches!(b, b';' | b':'))
+    {
+        return None;
+    }
+    let mut fields = body.split(|b| *b == b';');
+    let codepoint = parse_ascii_u32(fields.next()?.split(|b| *b == b':').next()?)?;
+
+    let (modifiers, event_type) = match fields.next() {
+        None => (1, KITTY_EVENT_PRESS),
+        Some(field) => {
+            let mut parts = field.split(|b| *b == b':');
+            let modifiers = match parts.next() {
+                Some(m) if !m.is_empty() => parse_ascii_u32(m)?,
+                _ => 1,
+            };
+            let event_type = match parts.next() {
+                Some(e) if !e.is_empty() => parse_ascii_u32(e)?,
+                _ => KITTY_EVENT_PRESS,
+            };
+            (modifiers, event_type)
+        }
+    };
+    let modifiers = modifiers
+        .checked_sub(1)
+        .map(|bits| (bits & !KITTY_LOCK_MODIFIER_BITS).saturating_add(1))?;
+
+    Some(CsiUKeyReport {
+        codepoint,
+        modifiers,
+        event_type,
+    })
 }
 
 fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
@@ -3481,6 +3548,38 @@ mod tests {
         let forwarded = proxy.filter_client_input(b"\x1b[93;5u\x1b[100;1u");
         assert!(forwarded.is_empty());
         assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_detaches_with_kitty_event_type_reports() {
+        // pi pushes kitty flags 7, so Ctrl-] arrives as a press then a release
+        // (and repeats when held). These must not reset the partial match.
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5u");
+        assert!(forwarded.is_empty());
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5:2u\x1b[93;5:3u");
+        assert!(forwarded.is_empty());
+        assert_eq!(proxy.pending_detach_match_len, 1);
+        let forwarded = proxy.filter_client_input(b"d");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_detaches_with_explicit_press_alternate_keys_and_locks() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        // Alternate base-layout key, Caps Lock (bit 64) and explicit press.
+        let forwarded = proxy.filter_client_input(b"\x1b[93::93;69:1u\x1b[100;1:1u");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_does_not_match_detach_on_release_only() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5:3ud");
+        assert_eq!(forwarded, b"\x1b[93;5:3ud");
+        assert!(!proxy.take_detach_request());
     }
 
     #[test]

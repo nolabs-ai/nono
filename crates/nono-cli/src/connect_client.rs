@@ -1853,7 +1853,13 @@ impl DetachMatcher {
                         }
                     }
                     crate::pty_proxy::EnhancedKeyMatch::Invalid => {
-                        self.flush_pending(&mut forward);
+                        if self.sequence[..self.pending_match_len].iter().any(|&key| {
+                            crate::pty_proxy::is_enhanced_key_echo(&self.pending_escape, key)
+                        }) {
+                            self.pending_escape.clear();
+                        } else {
+                            self.flush_pending(&mut forward);
+                        }
                     }
                 }
                 continue;
@@ -2167,6 +2173,15 @@ mod tests {
         let third = matcher.push(b"d");
         assert!(third.forward.is_empty());
         assert!(third.detach);
+    }
+
+    #[test]
+    fn detach_matcher_ignores_kitty_release_of_matched_prefix() {
+        let mut matcher = DetachMatcher::new(vec![0x1d, b'd']);
+        let matched = matcher.push(b"\x1b[93;5u\x1b[93;5:3ud");
+        assert!(matched.forward.is_empty());
+        assert!(matched.detach);
+        assert!(!matcher.pending_bytes());
     }
 
     #[test]

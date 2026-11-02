@@ -397,6 +397,17 @@ mod tests {
         }
     }
 
+    fn unix_socket_request() -> ApprovalRequest {
+        ApprovalRequest::UnixSocket {
+            request_id: "unix-001".to_string(),
+            path: "/tmp/test.sock".into(),
+            op: nono::UnixSocketOp::Connect,
+            reason: None,
+            child_pid: 42,
+            session_id: "sess-001".to_string(),
+        }
+    }
+
     // ── backend name ─────────────────────────────────────────────────────────
 
     #[test]
@@ -487,7 +498,7 @@ mod tests {
         assert!(matches!(second, ApprovalDecision::Timeout));
     }
 
-    // ── non-TTY auto-deny (all three variants) ────────────────────────────────
+    // ── non-TTY auto-deny ────────────────────────────────────────────────────
     //
     // When stderr is not a terminal (e.g. in CI or when redirected), the
     // backend must return Denied for every request type without attempting to
@@ -543,6 +554,53 @@ mod tests {
             .request_approval(&endpoint_request())
             .expect("no error");
         assert!(decision.is_denied());
+    }
+
+    #[test]
+    fn non_tty_auto_denies_unix_socket_request() {
+        if std::io::stderr().is_terminal() {
+            return;
+        }
+        assert!(
+            TerminalApproval
+                .request_approval(&unix_socket_request())
+                .expect("no error")
+                .is_denied()
+        );
+    }
+
+    #[test]
+    fn unix_socket_prompt_supports_once_session_and_default_denial() {
+        for (input, expected) in [
+            ("1", ApprovalDecision::Granted),
+            ("2", ApprovalDecision::GrantedForSession),
+            ("4", ApprovalDecision::DeniedForSession),
+        ] {
+            let decision = TerminalApproval::prompt(
+                &unix_socket_request(),
+                Instant::now() + Duration::from_secs(5),
+                |prompt, _| {
+                    assert!(prompt.contains("1-4"));
+                    Ok(Some(input.to_string()))
+                },
+            )
+            .expect("prompt");
+            assert_eq!(
+                std::mem::discriminant(&decision),
+                std::mem::discriminant(&expected)
+            );
+        }
+        for input in ["", "3", "invalid"] {
+            assert!(
+                TerminalApproval::prompt(
+                    &unix_socket_request(),
+                    Instant::now() + Duration::from_secs(5),
+                    |_, _| Ok(Some(input.to_string())),
+                )
+                .expect("prompt")
+                .is_denied()
+            );
+        }
     }
 
     // ── auto-deny reason is populated ─────────────────────────────────────────

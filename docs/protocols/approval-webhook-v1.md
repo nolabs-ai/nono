@@ -133,6 +133,8 @@ and are answered by the `security` backend. Only `connect` and `bind` outside
 the granted socket set are asked; datagram sends, abstract and unnamed
 sockets, denied paths and nono's own state are denied without a request.
 Session-scoped decisions are honoured for the rest of the session.
+Bind approval requires an existing filesystem write grant on the socket's
+parent directory; otherwise the operation is denied without a request.
 
 For CONNECT network approvals, `request_id` is a UUID v4 generated once per
 new approval attempt. It is independent of `host`, `port`, and `session_id`:

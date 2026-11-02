@@ -5,6 +5,7 @@ authors:
   - Luke Hinds
 status: draft
 created: 2026-09-21
+breaking: false
 superseded-by:
 ---
 
@@ -23,6 +24,13 @@ identity, and grants it only to the fresh child sandbox. Supporting Tool
 Sandbox features—wildcard command mediation, caller-declared environment
 forwarding, and Unix-domain socket grants—provide the controlled execution
 context in which this expansion operates.
+
+## Implementation status
+
+As of 2026-11-02, caller policies, `export_env`, `session_export_env`,
+`unix_socket_bind` and `@git:fsmonitor-socket` are implemented. The central
+`approval_fs` flow, `NONO_TOOL_SANDBOX_FS_REQUEST` channel and
+`commands."*"` mediation remain proposed. This NEP remains draft.
 
 ## Motivation
 

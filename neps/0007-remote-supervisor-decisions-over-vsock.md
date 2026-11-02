@@ -5,6 +5,7 @@ authors:
   - Luke Hinds
 status: draft
 created: 2026-10-16
+breaking:
 superseded-by:
 ---
 
@@ -19,11 +20,18 @@ injection move to a host-side nono component reached over vsock. The guest
 never holds the policy authority, the audit history or the credentials, so a
 full guest compromise does not yield them.
 
+## Implementation status
+
+As of 2026-11-02, the spike described below has not landed in this workspace.
+The remote protocol, vsock backend, concurrent dispatch, shared audit chains
+and host component remain proposed. Audit-format compatibility must be
+assessed before acceptance; `breaking` remains unset.
+
 ## Motivation
 
-To date we have recommended nono be combined with a nicroVM for hostile-code and multi-tenant deployments ("Composing with an outer boundary"). At present that
-composition is all-or-nothing: the whole supervisor runs in the guest. If an
-attacker escapes Landlock and seccomp through a guest kernel bug, they own the guest, and with it:
+We recommend combining nono with a microVM for hostile-code and multi-tenant
+deployments ("Composing with an outer boundary"). Currently the whole
+supervisor runs in the guest. A guest kernel compromise therefore exposes:
 
 - the credentials the supervisor or its proxy hold (in guest memory, and in
   every memory snapshot of the guest);
@@ -31,7 +39,8 @@ attacker escapes Landlock and seccomp through a guest kernel bug, they own the g
 - the audit log (it can be rewritten or suppressed before it leaves the guest);
 - every approval decision (the attacker can answer its own requests).
 
-This is not a suprise as we modelled nono on the premise of trusting userspace, not agent space, but a MicroVM swaps things around and now the entire guest can be argued to be 'untrusted'.
+The current model trusts the supervisor's userspace. In a microVM deployment,
+the entire guest may instead need to be treated as untrusted.
 
 The VM still protects the host, but the assets worth stealing from an agent deployment — credentials, egress and an honest record — are lost.
 

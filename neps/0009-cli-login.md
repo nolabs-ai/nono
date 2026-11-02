@@ -27,6 +27,12 @@ Without one, it goes to the platform default.
 Token-based `nono platform enroll --token` stays as the path for workloads,
 CI, and fleet provisioning.
 
+## Implementation status
+
+Unimplemented as of 2026-11-02. The CLI still uses token enrollment and the
+existing remote-attach authorization flow. `nono login`, `nono logout`, the
+OAuth protocol document and conformance fixtures remain proposed.
+
 ## Motivation
 
 Today a developer machine gets connected in three steps:
@@ -177,6 +183,9 @@ Anything else fails closed. The CLI never follows endpoints on other origins.
    also accept it through Pushed Authorization Requests ([RFC 9126]), which
    keeps parameters out of the browser history.
 
+   The example includes `nono:device.enroll` for first enrollment only;
+   subsequent sign-ins omit it, as required by the local state machine.
+
 3. **Sign in and consent (platform).** The platform shows its login page and
    federates to the tenant IdP as configured. It resolves user and tenant from
    that sign-in, never from CLI-supplied parameters. When the scope includes
@@ -296,8 +305,8 @@ Rules:
 
 ### Using the tokens
 
-- `nono connect`, `nono ps --remote`, and audit delivery for login-enrolled
-  devices obtain access tokens with the `refresh_token` grant plus DPoP. Each
+- `nono connect` and `nono ps --remote` for login-enrolled devices obtain
+  access tokens with the `refresh_token` grant plus DPoP. Each
   API call presents `Authorization: DPoP <token>` with a fresh proof. A copied
   refresh token is useless without the device key.
 - Device-level operations that need no human, such as audit delivery and
@@ -317,7 +326,8 @@ flow is a follow-up, tracked in Open Questions.
 
 ### Protocol specification
 
-The flow is specified in `docs/protocols/cli-login-v1.md`, which covers:
+The proposed `docs/protocols/cli-login-v1.md` has not been added. Before
+implementation, it must specify:
 
 - the discovery requirements;
 - the scopes;
@@ -326,8 +336,8 @@ The flow is specified in `docs/protocols/cli-login-v1.md`, which covers:
 - the `/platform/cli/complete` contract;
 - the landing-page rules.
 
-Fixtures go in `tests/fixtures/`. The server lives in the platform repo, and
-the protocol document is normative for both sides.
+Conformance fixtures belong in `tests/fixtures/`. Server implementation belongs
+in the platform repo; the completed protocol must be normative for both sides.
 
 ### Platform differences and compatibility
 

@@ -33,15 +33,15 @@ SECTIONS = [
 ]
 VALID_STATUSES = {s for s, _, _ in SECTIONS} | {"rejected", "superseded"}
 
-# `breaking:` frontmatter: true = API-breaking, needs a major version bump;
+# `breaking:` frontmatter: true = incompatible public API or behavior change;
 # false = not breaking; empty/absent = not yet assessed. Unassessed is a
 # distinct state so a NEP nobody has reviewed is never presented as safe.
 BREAKING_LABELS = {
-    "breaking": "Breaking (targets {major})",
+    "breaking": "Breaking",
     "unassessed": "Breaking: not yet assessed",
     "compatible": "Non-breaking",
 }
-# Sort order within a status: surface what constrains the version first.
+# Sort order within a status: surface compatibility impact first.
 BREAKING_ORDER = {"breaking": 0, "unassessed": 1, "compatible": 2}
 
 FILE_RE = re.compile(r"^(\d{4})-.+\.md$")
@@ -103,8 +103,8 @@ def next_major():
     return f"{int(ver.group(1)) + 1}.0"
 
 
-def label(n, major):
-    return BREAKING_LABELS[n["breaking"]].format(major=major)
+def label(n):
+    return BREAKING_LABELS[n["breaking"]]
 
 
 def breaking_of(name, meta):
@@ -148,7 +148,7 @@ def load_neps():
     return neps
 
 
-def render_index(neps, major):
+def render_index(neps):
     rows = [
         "| NEP  | Title | Status | Breaking |",
         "|------|-------|--------|----------|",
@@ -156,7 +156,7 @@ def render_index(neps, major):
     for n in neps:
         rows.append(
             f"| {n['number']} | {n['title']} | {n['status']}"
-            f" | {label(n, major)} |"
+            f" | {label(n)} |"
         )
     return "\n".join(rows)
 
@@ -173,10 +173,11 @@ def render_roadmap(neps, major):
         "do not need a NEP and are not listed here. A proposal's position reflects",
         "its NEP status, not a delivery date.",
         "",
-        f"Next major release: **{major}**. NEPs flagged as API-breaking require a major",
-        f"version increase and are targeted at {major}. Within each section they are",
-        "listed first, then NEPs whose impact has not yet been assessed, then",
-        "non-breaking NEPs.",
+        f"Next major release: **{major}**. Before 1.0, scoped breaking changes may ship",
+        "after review. From 1.0, incompatible changes to the stable public API require",
+        "a major version increase. Breaking labels describe compatibility impact.",
+        "Within each section, breaking NEPs are listed first, then unassessed NEPs,",
+        "then non-breaking NEPs.",
         "",
     ]
     for status, heading, blurb in SECTIONS:
@@ -190,7 +191,7 @@ def render_roadmap(neps, major):
         for n in group:
             out.append(
                 f"- **[NEP-{n['number']}: {n['title']}](neps/{n['file']})**"
-                f" — _{label(n, major)}_"
+                f" — _{label(n)}_"
             )
             if n["summary"]:
                 out.append(f"  {n['summary']}")
@@ -198,7 +199,7 @@ def render_roadmap(neps, major):
     return "\n".join(out).rstrip("\n") + "\n"
 
 
-def render_readme(neps, major):
+def render_readme(neps):
     text = README.read_text(encoding="utf-8")
     begin, end = text.find(INDEX_BEGIN), text.find(INDEX_END)
     if begin == -1 or end == -1 or end < begin:
@@ -206,7 +207,7 @@ def render_readme(neps, major):
     return (
         text[: begin + len(INDEX_BEGIN)]
         + "\n"
-        + render_index(neps, major)
+        + render_index(neps)
         + "\n"
         + text[end:]
     )
@@ -219,7 +220,7 @@ def main(argv):
         major = next_major()
         generated = {
             ROADMAP: render_roadmap(neps, major),
-            README: render_readme(neps, major),
+            README: render_readme(neps),
         }
     except NepError as err:
         print(f"error: {err}", file=sys.stderr)

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use socket2::{Domain, SockAddr, Socket, Type};
 use ureq::config::Config;
 use ureq::http::Uri;
 use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
@@ -48,7 +49,15 @@ impl Connector<()> for UnixConnector {
     ) -> Result<Option<Self::Out>, Error> {
         // A missing socket (ENOENT) or a dead helper (ECONNREFUSED) is an
         // error here, which the webhook backend turns into a denial.
-        let stream = UnixStream::connect(&self.socket)?;
+        let timeout = check(details.timeout)?;
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        let address = SockAddr::unix(&self.socket)?;
+        let connected = match timeout.not_zero() {
+            Some(after) => socket.connect_timeout(&address, *after),
+            None => socket.connect(&address),
+        };
+        map_io(connected, timeout)?;
+        let stream = UnixStream::from(socket);
         let config = details.config;
         let buffers = LazyBuffers::new(config.input_buffer_size(), config.output_buffer_size());
         let transport = UnixTransport {
@@ -127,7 +136,7 @@ fn check(timeout: NextTimeout) -> Result<NextTimeout, Error> {
     }
 }
 
-fn map_io(result: io::Result<usize>, timeout: NextTimeout) -> Result<usize, Error> {
+fn map_io<T>(result: io::Result<T>, timeout: NextTimeout) -> Result<T, Error> {
     match result {
         Ok(amount) => Ok(amount),
         Err(e)

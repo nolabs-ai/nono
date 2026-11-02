@@ -629,6 +629,30 @@ async fn unix_webhook_missing_or_dead_socket_denies() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn unix_webhook_full_listener_queue_does_not_block_connect() {
+    use socket2::{Domain, SockAddr, Socket, Type};
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("approval.sock");
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    listener.bind(&SockAddr::unix(&socket).unwrap()).unwrap();
+    listener.listen(0).unwrap();
+    // Linux permits backlog + 1 queued connections. Never accept this one.
+    let queued = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let (http, url) =
+        agent_for_target(WebhookTarget::Unix { socket }, Duration::from_millis(50)).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || tx.send(http.get(&url).call().is_err()).unwrap());
+    let result = rx.recv_timeout(Duration::from_secs(1));
+    // Also unblock the old connector on failure, so the regression cannot hang CI.
+    drop(listener);
+    drop(queued);
+    worker.join().unwrap();
+    assert!(result.expect("connect must finish while the listener queue is full"));
+}
+
 #[tokio::test]
 async fn chain_mixing_unix_and_http_webhooks_asks_both() {
     let mut unix = WebhookServer::start_unix().await;

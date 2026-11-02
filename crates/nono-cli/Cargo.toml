@@ -76,6 +76,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 futures-util = "0.3"
 
 ureq = { version = "~3.5", features = ["platform-verifier", "socks-proxy"] }
+socket2 = "0.6"
 semver = "1"
 
 zeroize.workspace = true

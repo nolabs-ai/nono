@@ -2714,6 +2714,7 @@ dependencies = [
  "shlex",
  "sigstore-sign",
  "similar",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-tungstenite",

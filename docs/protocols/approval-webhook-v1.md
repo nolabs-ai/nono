@@ -31,13 +31,55 @@ There are two variants of the contract:
 
 | Field | Meaning |
 | --- | --- |
-| `url` | Endpoint to call. Required for unsigned backends. With `auth: "platform"` it defaults to `<enrolled platform URL>/api/v1/approvals`, and if given must be `https://`, or `http://` to a loopback host. |
+| `url` | Endpoint to call. Required for unsigned backends. An `http(s)://` URL, or `unix:///abs/path.sock` for a [Unix-socket](#unix-socket-transport) helper. With `auth: "platform"` it defaults to `<enrolled platform URL>/api/v1/approvals`, and if given must be `https://`, or `http://` to a loopback host. |
 | `auth` | Omit for unsigned. `"platform"` selects the signed variant and fails closed if the client is not enrolled. |
 | `timeout_secs` | Total time this backend waits for a decision (default 60). It is also sent to the server as the hold hint. |
 
+### Unix-socket transport
+
+A local approval helper, such as a dialog drawn next to the session, should
+listen on a Unix socket rather than a loopback TCP port. A sandboxed child that
+may listen on TCP ports, or signal the helper, can take a loopback port over
+whenever the helper is not holding it, and then answer every approval itself.
+A socket in a directory the child cannot write to cannot be replaced that way.
+
+```json
+{
+  "network": {
+    "approval_backends": {
+      "dialog": { "type": "webhook", "url": "unix:///Users/me/.myhelper/s/approval.sock", "timeout_secs": 120 }
+    },
+    "approval_defaults": { "backend": "dialog" }
+  }
+}
+```
+
+- The request is the same unsigned exchange as over HTTP: HTTP/1.1
+  `POST /` with `Host: localhost`, and the same headers, body, and response
+  handling. The URL names only the socket; it has no host, request path,
+  query, or fragment.
+- The path must be absolute and must not contain `..`. `.` segments and
+  repeated `/` are normalized away. A path too long for the platform's
+  `sun_path` is rejected.
+- `auth: "platform"` cannot use a Unix socket.
+- The transport belongs to the backend, so it works for `network`,
+  `command_policies`, and `security` backends and inside `chain` backends.
+- A missing socket, a refused connection, and any other connect error deny
+  the request, like every other webhook failure.
+
+`nono run` and `nono shell` refuse to launch when the sandbox could replace a
+configured socket: when it has write access to the socket path, to any
+directory above it, or to a symlink on the way to it, or when it holds a
+`bind` grant for the socket. Each mediated command's sandbox under
+`command_policies` gets the same check before the command runs. Raw
+`unsafe_seatbelt_rules` on a macOS command are not inspected; do not use them
+to grant writes near the socket. Runtime capability expansion in supervised
+mode only hands the child a descriptor for an existing file, so it cannot
+create, remove, or bind the socket either.
+
 ### Approval-only network configuration
 
-For sandboxed `run` and `shell` launches, `network.approval_backends`
+For `run`, `shell`, and standalone `proxy`, `network.approval_backends`
 also activates the proxy: no static `allow_domain` entry, credential route, or
 upstream proxy is required. `network.block` must be false or omitted, and
 `--block-net` must be absent. For example:
@@ -70,7 +112,7 @@ approval-only mode, remove the hard block; to keep networking blocked, remove
 the approval backends. An inherited block also remains a hard block; adding
 approvals in a child profile cannot loosen it. The explicit `--allow-net`
 override clears a profile block and its approval backends along with its static
-proxy settings; this is an explicit unrestricted grant, not an approval. The standalone `nono proxy` command does not currently load network approval backends.
+proxy settings; this is an explicit unrestricted grant, not an approval.
 `nono wrap` cannot host an approval proxy and rejects active network approval
 backends rather than silently ignoring them; use `nono run` instead.
 Runtime network approvals currently apply to CONNECT tunnels handled directly

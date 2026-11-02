@@ -2276,7 +2276,20 @@ fn validate_approval_backend(
                     format!("approval backend '{name}' type webhook must define url"),
                 );
             }
-            if platform_auth && !url.is_empty() && !is_platform_grade_url(url) {
+            let target = parse_webhook_target(url);
+            if let Err(reason) = &target {
+                report.error(
+                    "invalid_approval_backend",
+                    format!("approval backend '{name}' {reason}"),
+                );
+            } else if platform_auth && matches!(target, Ok(WebhookTarget::Unix { .. })) {
+                report.error(
+                    "invalid_approval_backend",
+                    format!(
+                        "approval backend '{name}' with auth platform cannot use a unix socket url"
+                    ),
+                );
+            } else if platform_auth && !url.is_empty() && !is_platform_grade_url(url) {
                 report.error(
                     "invalid_approval_backend",
                     format!(
@@ -2589,6 +2602,71 @@ fn validate_endpoint_policy(
             }
         }
     }
+}
+
+/// Where an approval webhook is delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WebhookTarget {
+    /// An `http(s)://` URL, passed to the HTTP client as is.
+    Http(String),
+    /// `unix:///abs/path.sock`: HTTP/1.1 `POST /` over a Unix stream socket.
+    Unix { socket: std::path::PathBuf },
+}
+
+const UNIX_WEBHOOK_PREFIX: &str = "unix://";
+/// Longest socket path `sockaddr_un.sun_path` holds, leaving room for the NUL.
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
+
+/// Classify a webhook `url`. Anything that names the `unix:` scheme (in any
+/// case) must be exactly `unix://` followed by an absolute socket path, so a
+/// typo can never fall through to the HTTP client as a different endpoint.
+/// The path takes no host, query, or fragment; `.` and repeated `/` are
+/// normalized away and `..` is rejected.
+pub(crate) fn parse_webhook_target(value: &str) -> std::result::Result<WebhookTarget, String> {
+    if !value
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"unix:"))
+    {
+        return Ok(WebhookTarget::Http(value.to_string()));
+    }
+    let Some(raw_path) = value.strip_prefix(UNIX_WEBHOOK_PREFIX) else {
+        return Err("unix socket url must start with 'unix://'".to_string());
+    };
+    if raw_path.is_empty() {
+        return Err("unix socket url must name a socket path".to_string());
+    }
+    if !raw_path.starts_with('/') {
+        return Err(
+            "unix socket url must use an absolute path with no host (unix:///path/to.sock)"
+                .to_string(),
+        );
+    }
+    if raw_path.contains(['\0', '?', '#']) {
+        return Err("unix socket url path cannot contain NUL, '?', or '#'".to_string());
+    }
+    let mut socket = std::path::PathBuf::from("/");
+    for component in Path::new(raw_path).components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => socket.push(part),
+            std::path::Component::ParentDir => {
+                return Err("unix socket url path cannot contain '..'".to_string());
+            }
+            std::path::Component::Prefix(_) => {
+                return Err("unix socket url path is not a Unix path".to_string());
+            }
+        }
+    }
+    if socket.parent().is_none() {
+        return Err("unix socket url must name a socket path".to_string());
+    }
+    if socket.as_os_str().len() > MAX_UNIX_SOCKET_PATH_BYTES {
+        return Err(format!(
+            "unix socket url path is longer than {MAX_UNIX_SOCKET_PATH_BYTES} bytes"
+        ));
+    }
+    Ok(WebhookTarget::Unix { socket })
 }
 
 /// Signed platform requests carry an enrolled identity; they never travel over
@@ -6379,6 +6457,73 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("must define url"), "{err}");
+    }
+
+    #[test]
+    fn parse_webhook_target_classifies_and_normalizes_unix_urls() {
+        assert_eq!(
+            parse_webhook_target("https://approval.example/hook"),
+            Ok(WebhookTarget::Http(
+                "https://approval.example/hook".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_webhook_target("unix:///run/helper//./s/approval.sock"),
+            Ok(WebhookTarget::Unix {
+                socket: PathBuf::from("/run/helper/s/approval.sock")
+            })
+        );
+
+        let too_long = format!("unix:///{}", "a".repeat(MAX_UNIX_SOCKET_PATH_BYTES));
+        for (url, expected) in [
+            ("unix://", "must name a socket path"),
+            ("unix:///", "must name a socket path"),
+            (
+                "unix://host/run/approval.sock",
+                "absolute path with no host",
+            ),
+            ("unix://run/approval.sock", "absolute path with no host"),
+            ("unix:/run/approval.sock", "must start with 'unix://'"),
+            ("UNIX:///run/approval.sock", "must start with 'unix://'"),
+            ("unix:///run/../approval.sock", "cannot contain '..'"),
+            ("unix:///run/approval.sock#/approvals", "cannot contain"),
+            ("unix:///run/approval.sock?x=1", "cannot contain"),
+            (too_long.as_str(), "longer than"),
+        ] {
+            match parse_webhook_target(url) {
+                Ok(target) => panic!("{url} must be rejected, got {target:?}"),
+                Err(err) => assert!(err.contains(expected), "{url}: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn security_approval_backends_unix_socket_url_matrix() {
+        let validate = |url: &str, auth: Option<ApprovalBackendAuth>| {
+            let mut backends = BTreeMap::new();
+            backends.insert(
+                "dialog".to_string(),
+                ApprovalBackendConfig {
+                    url: Some(url.to_string()),
+                    auth,
+                    ..security_backend(ApprovalBackendType::Webhook)
+                },
+            );
+            validate_security_approval_backends(&backends, None)
+                .err()
+                .map(|e| e.to_string())
+        };
+
+        assert_eq!(validate("unix:///run/helper/approval.sock", None), None);
+        let err = validate("unix://relative.sock", None).unwrap_or_default();
+        assert!(err.contains("absolute path"), "{err}");
+        // The platform contract signs requests for an https origin only.
+        let err = validate(
+            "unix:///run/helper/approval.sock",
+            Some(ApprovalBackendAuth::Platform),
+        )
+        .unwrap_or_default();
+        assert!(err.contains("cannot use a unix socket url"), "{err}");
     }
 
     #[test]

@@ -353,6 +353,8 @@ Endpoint policy uses the same decision order as invocation policy: `deny`, then 
 | `process_info_mode`   | string          | `"isolated"` | One of: `"isolated"`, `"allow_same_sandbox"`, `"allow_all"`. |
 | `ipc_mode`            | string          | `"shared_memory_only"` | One of: `"shared_memory_only"`, `"full"`. Use `"full"` for multiprocessing (enables POSIX semaphores). macOS only. |
 | `capability_elevation`| boolean         | `false`      | Enable runtime capability elevation via seccomp-notify. Linux only. |
+| `approval_backends`   | map of string to backend | `{}` | Named backends that answer supervised-mode file and capability prompts instead of the terminal. Same shape as `network.approval_backends` (see [Network approvals](#network-approvals)). |
+| `approval_defaults`   | object          | `null`       | `{ "backend": "<name>" }`: which `approval_backends` entry answers by default. |
 | `wsl2_proxy_policy`  | string          | `"error"`    | WSL2 only. Controls behavior when proxy-only network mode cannot be kernel-enforced. `"error"`: refuse to run (fail-secure). `"insecure_proxy"`: allow degraded execution where credential proxy runs but child is not prevented from bypassing it. See [WSL2 docs](https://nono.sh/docs/cli/internals/wsl2). |
 
 ### filesystem
@@ -449,6 +451,37 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 | `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). Defines the route only — the proxy does not activate unless the service name also appears in `credentials`. |
 | `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). |
 | `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. |
+| `approval_backends`     | map of string to backend          | `{}`     | Named backends that are asked before connecting to a host outside the allowlist (see [Network approvals](#network-approvals)). A non-empty map turns on the proxy and makes an empty allowlist ask for every host. |
+| `approval_defaults`     | object                            | `null`   | `{ "backend": "<name>" }`: which `approval_backends` entry answers host approvals. |
+
+#### Network approvals
+
+With `approval_backends`, a host outside `allow_domain` is sent for approval instead of denied. Used by `nono run`, `nono shell`, and `nono proxy`. A backend is one of:
+
+- `{ "type": "terminal" }`: ask on the terminal.
+- `{ "type": "webhook", "url": "..." }`: ask an HTTP endpoint (`https://...`), or a local helper on a Unix socket (`unix:///abs/path.sock`).
+- `{ "type": "chain", "mode": "all" | "any", "backends": [...] }`: combine other backends.
+
+Each backend takes an optional `timeout_secs`.
+
+```json
+{
+  "network": {
+    "allow_domain": ["github.com"],
+    "approval_backends": {
+      "prompt": { "type": "terminal", "timeout_secs": 120 },
+      "dialog": { "type": "webhook", "url": "unix:///Users/me/.myhelper/s/approval.sock" },
+      "either": { "type": "chain", "mode": "any", "backends": ["dialog", "prompt"] }
+    },
+    "approval_defaults": { "backend": "either" }
+  }
+}
+```
+
+- `network.block: true` and `--block-net` cannot be combined with approval backends.
+- Explicit `deny_domain` entries and metadata/link-local addresses are never sent for approval.
+- With a `unix://` webhook, the launch is refused if the sandbox could write to the socket or a directory above it. Keep the socket in a directory the sandbox can't write.
+- `security.approval_backends` and `command_policies.approval_backends` take the same backend shapes.
 
 #### Hostname wildcard patterns
 

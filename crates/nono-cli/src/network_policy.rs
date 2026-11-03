@@ -434,8 +434,12 @@ pub fn partition_allow_domain(
                 let expanded = expand_proxy_allow(policy, std::slice::from_ref(host));
                 plain_hosts.extend(expanded);
             }
-            crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
-                if endpoints.is_empty() {
+            crate::profile::AllowDomainEntry::WithEndpoints {
+                domain,
+                endpoints,
+                endpoint_policy,
+            } => {
+                if !entry.has_endpoint_restrictions() {
                     let expanded = expand_proxy_allow(policy, std::slice::from_ref(domain));
                     plain_hosts.extend(expanded);
                 } else {
@@ -444,6 +448,11 @@ pub fn partition_allow_domain(
                             "allow_domain entry with endpoints must have a non-empty domain"
                                 .to_string(),
                         ));
+                    }
+                    if !endpoints.is_empty() && endpoint_policy.is_some() {
+                        return Err(NonoError::ConfigParse(format!(
+                            "allow_domain entry '{domain}' sets both endpoints and endpoint_policy; use one"
+                        )));
                     }
                     let prefix = format!("_ep_{}", domain);
                     let scheme = if is_loopback_domain(domain) {
@@ -465,7 +474,7 @@ pub fn partition_allow_domain(
                         proxy: None,
                         env_var: None,
                         endpoint_rules: endpoints.clone(),
-                        endpoint_policy: None,
+                        endpoint_policy: endpoint_policy.clone(),
                         tls_ca: None,
                         tls_client_cert: None,
                         tls_client_key: None,
@@ -1336,6 +1345,7 @@ mod tests {
             crate::profile::AllowDomainEntry::Plain("api.openai.com".to_string()),
             crate::profile::AllowDomainEntry::WithEndpoints {
                 domain: "api.github.com".to_string(),
+                endpoint_policy: None,
                 endpoints: vec![
                     EndpointRule {
                         method: "GET".to_string(),
@@ -1372,6 +1382,7 @@ mod tests {
 
         let entries = vec![crate::profile::AllowDomainEntry::WithEndpoints {
             domain: "api.example.com".to_string(),
+            endpoint_policy: None,
             endpoints: vec![],
         }];
 
@@ -1382,12 +1393,60 @@ mod tests {
     }
 
     #[test]
+    fn test_partition_allow_domain_with_endpoint_policy() {
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+        let entries: Vec<crate::profile::AllowDomainEntry> = serde_json::from_str(
+            r#"[{
+                "domain": "github.com",
+                "endpoint_policy": {
+                    "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }],
+                    "approve": [{ "method": "*", "path": "/*/*/**", "reason": "outside the org" }],
+                    "default": { "decision": "deny" }
+                }
+            }]"#,
+        )
+        .unwrap();
+
+        let (plain_hosts, routes) = partition_allow_domain(&policy, &entries).unwrap();
+
+        assert!(plain_hosts.is_empty());
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix, "_ep_github.com");
+        assert!(routes[0].endpoint_rules.is_empty());
+        let route_policy = routes[0].endpoint_policy.as_ref().unwrap();
+        assert_eq!(route_policy.approve[0].path, "/*/*/**");
+        assert_eq!(route_policy.deny.len(), 1);
+    }
+
+    #[test]
+    fn test_partition_allow_domain_rejects_endpoints_with_endpoint_policy() {
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+        let entries: Vec<crate::profile::AllowDomainEntry> = serde_json::from_str(
+            r#"[{
+                "domain": "github.com",
+                "endpoints": [{ "method": "GET", "path": "/my-org/**" }],
+                "endpoint_policy": { "approve": [{ "method": "*", "path": "/**" }] }
+            }]"#,
+        )
+        .unwrap();
+
+        let err = partition_allow_domain(&policy, &entries).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("both endpoints and endpoint_policy")
+        );
+    }
+
+    #[test]
     fn test_partition_allow_domain_rejects_empty_domain() {
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).unwrap();
 
         let entries = vec![crate::profile::AllowDomainEntry::WithEndpoints {
             domain: String::new(),
+            endpoint_policy: None,
             endpoints: vec![EndpointRule {
                 method: "GET".to_string(),
                 path: "/**".to_string(),

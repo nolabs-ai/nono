@@ -1508,7 +1508,7 @@ pub(crate) fn prepare_proxy_launch_options(
 
     let (plain_entries, endpoint_entries): (Vec<_>, Vec<_>) = allow_domain
         .into_iter()
-        .partition(|e| !matches!(e, crate::profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
+        .partition(|e| !e.has_endpoint_restrictions());
 
     let domain_filter =
         if network_profile.is_some() || !plain_entries.is_empty() || !deny_domain.is_empty() {
@@ -1525,8 +1525,8 @@ pub(crate) fn prepare_proxy_launch_options(
         debug_assert!(
             endpoint_entries
                 .iter()
-                .all(|e| matches!(e, crate::profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty())),
-            "EndpointFilterIntent invariant violated: all entries must have non-empty endpoints"
+                .all(crate::profile::AllowDomainEntry::has_endpoint_restrictions),
+            "EndpointFilterIntent invariant violated: all entries must restrict endpoints"
         );
         Some(EndpointFilterIntent {
             routes: endpoint_entries,
@@ -2305,6 +2305,7 @@ pub(crate) fn parse_allow_domain_arg(input: &str) -> crate::profile::AllowDomain
                     method: "*".to_string(),
                     path: path.to_string(),
                 }],
+                endpoint_policy: None,
             }
         }
     } else {
@@ -3843,7 +3844,9 @@ mod tests {
     fn test_parse_allow_domain_arg_url_with_path() {
         let entry = parse_allow_domain_arg("https://github.com/atko-cic/**");
         match entry {
-            crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+            crate::profile::AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } => {
                 assert_eq!(domain, "github.com");
                 assert_eq!(endpoints.len(), 1);
                 assert_eq!(endpoints[0].method, "*");
@@ -3875,7 +3878,9 @@ mod tests {
     fn test_parse_allow_domain_arg_deep_path() {
         let entry = parse_allow_domain_arg("https://github.com/org/repo/tree/**");
         match entry {
-            crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+            crate::profile::AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } => {
                 assert_eq!(domain, "github.com");
                 assert_eq!(endpoints[0].path, "/org/repo/tree/**");
             }
@@ -4210,13 +4215,15 @@ mod tests {
         let entries: Vec<AllowDomainEntry> = serde_json::from_str(r#"[
             "plain.example.com",
             { "domain": "object.example.com" },
-            { "domain": "filtered.example.com", "endpoints": [{ "method": "GET", "path": "/v1/**" }] }
+            { "domain": "filtered.example.com", "endpoints": [{ "method": "GET", "path": "/v1/**" }] },
+            { "domain": "policy.example.com", "endpoint_policy": { "approve": [{ "method": "*", "path": "/**" }] } }
         ]"#)
         .expect("deserialize allow_domain entries");
 
         let (plain, endpoint): (Vec<_>, Vec<_>) = entries
             .into_iter()
-            .partition(|e| !matches!(e, AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
+            .partition(|e| !e.has_endpoint_restrictions());
+        assert!(endpoint.iter().any(|e| e.domain() == "policy.example.com"));
 
         assert_eq!(
             plain.len(),
@@ -4225,8 +4232,8 @@ mod tests {
         );
         assert_eq!(
             endpoint.len(),
-            1,
-            "only the entry with actual endpoint rules goes to endpoint bucket"
+            2,
+            "only entries with endpoint rules or a policy go to the endpoint bucket"
         );
 
         assert!(

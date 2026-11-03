@@ -83,6 +83,12 @@ pub enum ApprovalRequest {
         request_id: String,
         /// Stable configured route identifier, e.g. `"github-api"`
         route_id: String,
+        /// Credential route that will inject a credential into the approved
+        /// request, or `None` when the request is forwarded without one.
+        /// Equals `route_id` when the approval comes from a credential
+        /// route's own policy.
+        #[serde(default)]
+        credential_route: Option<String>,
         /// Upstream URL for the route, without credentials
         upstream: String,
         /// HTTP method being requested

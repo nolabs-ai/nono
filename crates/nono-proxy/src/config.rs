@@ -1328,7 +1328,11 @@ impl CompiledEndpointPolicy {
                 backend: rule.backend.as_deref(),
                 reason: rule.reason.as_deref(),
                 timeout_secs: rule.timeout_secs,
-                rule_label: format!("endpoint_policy.approve[{} {}]", rule.method, rule.path),
+                rule_label: format!(
+                    "endpoint_policy.approve[{} {}]",
+                    rule.method,
+                    approval_scope_path(&rule.path, &normalized)
+                ),
             };
         }
         if let Some(rule) = first_policy_match(&self.allow, method, &normalized) {
@@ -1372,6 +1376,80 @@ fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPoli
         });
     }
     Ok(compiled)
+}
+
+/// The part of an `approve` rule that one session answer covers: the rule
+/// `pattern` with every wildcard segment before the first `**` replaced by the
+/// request segment it matched. The first `**` and everything after it stay as
+/// written, so `/*/*/**` on `/torvalds/linux/info/refs` yields
+/// `/torvalds/linux/**`.
+///
+/// The result is both the approval `rule_label` shown to the backend and the
+/// session-cache key, so it must never cover more than the rule matched. When
+/// the pattern segments cannot be aligned with the request segments (a brace
+/// or class spanning `/`), the whole normalized request path is the scope.
+/// Filled-in values have glob metacharacters escaped so a request segment
+/// named `*` cannot read as a wildcard.
+fn approval_scope_path(pattern: &str, normalized_path: &str) -> String {
+    let mut request_segments = normalized_path.split('/').skip(1);
+    let mut scoped = Vec::new();
+    let mut pattern_segments = pattern.split('/');
+    if pattern_segments.next() != Some("") {
+        return escape_glob(normalized_path);
+    }
+    while let Some(segment) = pattern_segments.next() {
+        if segment == "**" {
+            scoped.push(segment.to_string());
+            scoped.extend(pattern_segments.map(str::to_string));
+            return format!("/{}", scoped.join("/"));
+        }
+        if !segment_is_balanced(segment) {
+            return escape_glob(normalized_path);
+        }
+        let Some(value) = request_segments.next() else {
+            return escape_glob(normalized_path);
+        };
+        if segment.contains(GLOB_METACHARACTERS) {
+            scoped.push(escape_glob(value));
+        } else {
+            scoped.push(segment.to_string());
+        }
+    }
+    format!("/{}", scoped.join("/"))
+}
+
+const GLOB_METACHARACTERS: [char; 7] = ['*', '?', '[', ']', '{', '}', '\\'];
+
+fn segment_is_balanced(segment: &str) -> bool {
+    let mut braces = 0usize;
+    let mut brackets = 0usize;
+    for ch in segment.chars() {
+        match ch {
+            '{' => braces = braces.saturating_add(1),
+            '}' => match braces.checked_sub(1) {
+                Some(depth) => braces = depth,
+                None => return false,
+            },
+            '[' => brackets = brackets.saturating_add(1),
+            ']' => match brackets.checked_sub(1) {
+                Some(depth) => brackets = depth,
+                None => return false,
+            },
+            _ => {}
+        }
+    }
+    braces == 0 && brackets == 0
+}
+
+fn escape_glob(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if GLOB_METACHARACTERS.contains(&ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn first_policy_match<'a>(
@@ -2660,5 +2738,65 @@ mod tests {
         // the raw form elsewhere (GHSA-8r33-hr9m-69wh).
         assert!(!compiled.matches("/backend-api/%2e%2e/backend-api/codex/responses"));
         assert!(!compiled.matches("/backend-api/codex/responses;v=1"));
+    }
+
+    #[test]
+    fn approval_scope_fills_wildcards_before_the_first_double_star() {
+        let cases = [
+            ("/*/*/**", "/torvalds/linux/info/refs", "/torvalds/linux/**"),
+            (
+                "/*/*/**",
+                "/torvalds/linux/git-upload-pack",
+                "/torvalds/linux/**",
+            ),
+            ("/**", "/torvalds/linux/info/refs", "/**"),
+            (
+                "/repos/*/issues",
+                "/repos/acme/issues",
+                "/repos/acme/issues",
+            ),
+            ("/v*/items/**", "/v2/items/1", "/v2/items/**"),
+            ("/**/admin/*", "/a/admin/b", "/**/admin/*"),
+            ("/", "/", "/"),
+        ];
+        for (pattern, path, expected) in cases {
+            assert_eq!(
+                approval_scope_path(pattern, path),
+                expected,
+                "{pattern} on {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_scope_escapes_values_and_falls_back_to_the_full_path() {
+        assert_eq!(approval_scope_path("/*/**", "/*/x"), "/\\*/**");
+        // A brace spanning `/` cannot be aligned with request segments.
+        assert_eq!(approval_scope_path("/{a/b,c}/**", "/a/b/x"), "/a/b/x");
+        assert_eq!(approval_scope_path("relative/*", "/a/b"), "/a/b");
+    }
+
+    #[test]
+    fn approve_rule_label_shows_the_scope() {
+        let policy = CompiledEndpointPolicy::compile(
+            Some(&EndpointPolicyConfig {
+                approve: vec![EndpointPolicyRule {
+                    method: "*".to_string(),
+                    path: "/*/*/**".to_string(),
+                    backend: None,
+                    reason: None,
+                    timeout_secs: None,
+                }],
+                ..EndpointPolicyConfig::default()
+            }),
+            &[],
+        )
+        .unwrap();
+        match policy.evaluate("GET", "/torvalds/linux/info/refs?service=git-upload-pack") {
+            EndpointPolicyOutcome::Approve { rule_label, .. } => {
+                assert_eq!(rule_label, "endpoint_policy.approve[* /torvalds/linux/**]");
+            }
+            other => panic!("expected approve, got {other:?}"),
+        }
     }
 }

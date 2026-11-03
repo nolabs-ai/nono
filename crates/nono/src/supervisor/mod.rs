@@ -236,6 +236,7 @@ mod tests {
         let endpoint = ApprovalRequest::Endpoint {
             request_id: "endpoint-001".to_string(),
             route_id: "internal-api".to_string(),
+            credential_route: None,
             upstream: "https://api.internal.example".to_string(),
             method: "POST".to_string(),
             path: "/v1/tasks/1/comments".to_string(),
@@ -259,6 +260,32 @@ mod tests {
         };
         assert_eq!(cmd.request_id(), "cmd-001");
         assert_eq!(cmd.session_id(), "sess-003");
+    }
+
+    #[test]
+    fn endpoint_request_credential_route_is_null_or_named() {
+        let json = serde_json::json!({
+            "capability_type": "endpoint",
+            "request_id": "endpoint-002",
+            "route_id": "_ep_github.com",
+            "upstream": "https://github.com",
+            "method": "GET",
+            "path": "/torvalds/linux/info/refs",
+            "rule_label": "endpoint_policy.approve[* /torvalds/linux/**]",
+            "reason": null,
+            "child_pid": 0,
+            "session_id": "sess-005"
+        });
+        let request: ApprovalRequest =
+            serde_json::from_value(json).expect("endpoint request deserializes");
+        match &request {
+            ApprovalRequest::Endpoint {
+                credential_route, ..
+            } => assert_eq!(credential_route, &None),
+            other => panic!("expected endpoint request, got {other:?}"),
+        }
+        let encoded = serde_json::to_value(&request).expect("endpoint request serializes");
+        assert_eq!(encoded["credential_route"], serde_json::Value::Null);
     }
 
     #[test]

@@ -1443,3 +1443,36 @@ fn test_schema_validates_profile_authoring_guide_environment_example() {
         .validate(&profile)
         .expect("profile-authoring-guide.md environment example should validate");
 }
+
+#[test]
+fn test_schema_allow_domain_endpoint_policy_excludes_endpoints() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let with_policy = json!({
+        "network": {
+            "allow_domain": [{
+                "domain": "github.com",
+                "endpoint_policy": {
+                    "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }],
+                    "approve": [{ "method": "*", "path": "/*/*/**", "reason": "outside the org" }],
+                    "default": { "decision": "deny" }
+                }
+            }]
+        }
+    });
+    assert!(validator.validate(&with_policy).is_ok());
+
+    let with_both = json!({
+        "network": {
+            "allow_domain": [{
+                "domain": "github.com",
+                "endpoints": [{ "method": "GET", "path": "/my-org/**" }],
+                "endpoint_policy": { "approve": [{ "method": "*", "path": "/**" }] }
+            }]
+        }
+    });
+    assert!(
+        validator.validate(&with_both).is_err(),
+        "endpoints and endpoint_policy are mutually exclusive"
+    );
+}

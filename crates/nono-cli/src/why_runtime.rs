@@ -95,23 +95,7 @@ fn resolve_domain_endpoints(profile: &profile::Profile) -> Vec<sandbox_state::Do
         .network
         .allow_domain
         .iter()
-        .filter_map(|e| match e {
-            profile::AllowDomainEntry::WithEndpoints { domain, endpoints }
-                if !endpoints.is_empty() =>
-            {
-                Some(sandbox_state::DomainEndpointState {
-                    domain: domain.clone(),
-                    endpoints: endpoints
-                        .iter()
-                        .map(|r| sandbox_state::EndpointRuleState {
-                            method: r.method.clone(),
-                            path: r.path.clone(),
-                        })
-                        .collect(),
-                })
-            }
-            _ => None,
-        })
+        .filter_map(sandbox_state::DomainEndpointState::from_allow_domain)
         .collect()
 }
 

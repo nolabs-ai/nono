@@ -91,6 +91,50 @@ When `--allow-domain` is given a URL with a path (e.g., `https://github.com/org/
 
 Use `nono why --self --host https://github.com/some/path` inside the sandbox to check whether a specific URL is permitted and see the configured endpoint rules.
 
+### Endpoint Approvals
+
+In a profile, an `allow_domain` entry can carry an `endpoint_policy` instead of
+`endpoints`, with the same shape credential routes use. Requests matching an
+`approve` rule ask the approval backend instead of being refused:
+
+```json
+{
+  "network": {
+    "allow_domain": [
+      {
+        "domain": "github.com",
+        "endpoint_policy": {
+          "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }],
+          "approve": [{ "method": "*", "path": "/*/*/**", "reason": "repository access" }],
+          "default": { "decision": "deny" }
+        }
+      }
+    ],
+    "approval_backends": { "review": { "type": "terminal" } },
+    "approval_defaults": { "backend": "review" }
+  }
+}
+```
+
+- `endpoints` stays the shorthand: an allow list with default deny. An entry
+  sets one or the other, not both.
+- Rules are checked `deny`, then `approve`, then `allow`, then `default`. A
+  path matching both an `approve` and an `allow` rule asks, so keep `allow`
+  rules out of the `approve` patterns.
+- `deny` rules never reach the backend, and a credential route on the same host
+  cannot allow what this policy denies.
+- An approved request is handled like an allowed one: a credential route that
+  covers it injects its credential under its own rules; otherwise the request
+  goes out unchanged. When this policy and the credential route would both
+  ask, nono asks once.
+- An "always" answer lasts for the proxy session and covers the matched rule
+  with its `*` segments filled in. For `/*/*/**`, approving
+  `GET /torvalds/linux/info/refs` also covers
+  `POST /torvalds/linux/git-upload-pack` but asks again for
+  `/torvalds/other/...`. The prompt's rule label shows that scope
+  (`* /torvalds/linux/**`). A session answer never overrides a `deny` rule or
+  the `default`.
+
 ![Proxy architecture flow](/assets/proxy-flow.png)
 
 ### Runtime Host Approval

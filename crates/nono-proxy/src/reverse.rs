@@ -1125,276 +1125,36 @@ async fn enforce_endpoint_policy(
             timeout_secs,
             rule_label,
         } => {
-            let Some(approval_backends) = ctx.approval_backends.clone() else {
-                let deny_reason = format!(
-                    "endpoint approval required by {} but no approval backend is configured",
-                    rule_label
-                );
-                warn!("{}", deny_reason);
-                let deny_ctx = audit::EventContext {
-                    denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
-                    endpoint_policy_action: Some("approve"),
-                    endpoint_policy_rule: Some(&rule_label),
-                    upstream: Some(&route.upstream),
-                    ..route_ctx.clone()
-                };
-                audit::log_l7_policy_decision(
-                    ctx.audit_log,
-                    audit::ProxyMode::Reverse,
-                    &deny_ctx,
-                    service,
-                    None,
-                    method,
-                    upstream_path,
-                    nono::undo::NetworkAuditDecision::ApproveError,
-                    "approve",
-                    &rule_label,
-                    Some(&deny_reason),
-                );
-                send_error(stream, 403, "Forbidden").await?;
-                return Ok(false);
-            };
-            let (backend_name, backend) = match approval_backends.resolve(backend) {
-                Ok(resolved) => resolved,
-                Err(err) => {
-                    let deny_reason = format!("endpoint approval backend resolution failed: {err}");
-                    warn!("{}", deny_reason);
-                    let deny_ctx = audit::EventContext {
-                        denial_category: Some(
-                            nono::undo::NetworkAuditDenialCategory::EndpointPolicy,
-                        ),
-                        endpoint_policy_action: Some("approve"),
-                        endpoint_policy_rule: Some(&rule_label),
-                        upstream: Some(&route.upstream),
-                        ..route_ctx.clone()
-                    };
-                    audit::log_l7_policy_decision(
-                        ctx.audit_log,
-                        audit::ProxyMode::Reverse,
-                        &deny_ctx,
-                        service,
-                        None,
-                        method,
-                        upstream_path,
-                        nono::undo::NetworkAuditDecision::ApproveError,
-                        "approve",
-                        &rule_label,
-                        Some(&deny_reason),
-                    );
-                    send_error(stream, 403, "Forbidden").await?;
-                    return Ok(false);
-                }
-            };
-            let request_reason = reason.map(str::to_string).unwrap_or_else(|| {
-                format!(
-                    "endpoint approval required by {} for {} {}",
-                    rule_label, method, upstream_path
-                )
-            });
-            let approval_ctx = audit::EventContext {
-                endpoint_policy_action: Some("approve"),
-                endpoint_policy_rule: Some(&rule_label),
-                approval_backend: Some(&backend_name),
-                upstream: Some(&route.upstream),
-                ..route_ctx.clone()
-            };
-            audit::log_l7_policy_decision(
-                ctx.audit_log,
-                audit::ProxyMode::Reverse,
-                &approval_ctx,
-                service,
-                None,
+            let pending = [crate::endpoint_approval::PendingApproval {
+                route_id: service,
+                upstream: &route.upstream,
+                backend,
+                reason,
+                timeout_secs,
+                rule_label,
+            }];
+            let target = crate::endpoint_approval::ApprovalTarget {
                 method,
-                upstream_path,
-                nono::undo::NetworkAuditDecision::ApproveRequested,
-                "approve",
-                &rule_label,
-                Some(&request_reason),
-            );
-            let request = nono::supervisor::ApprovalRequest::Endpoint {
-                request_id: endpoint_approval_request_id(service),
-                route_id: service.to_string(),
-                upstream: route.upstream.clone(),
-                method: method.to_string(),
-                path: upstream_path.to_string(),
-                rule_label: rule_label.clone(),
-                reason: Some(request_reason),
-                child_pid: 0,
-                session_id: approval_backends.session_id().to_string(),
+                path: upstream_path,
+                credential_route: route.requires_managed_credential.then_some(service),
+                audit_log: ctx.audit_log,
+                mode: audit::ProxyMode::Reverse,
+                audit_ctx: route_ctx,
+                audit_target: service,
+                audit_port: None,
+                request_id_scope: service,
             };
-            let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(60));
-            let deadline = std::time::Instant::now()
-                .checked_add(timeout)
-                .unwrap_or_else(std::time::Instant::now);
-            let decision = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                tokio::task::spawn_blocking(move || {
-                    backend.request_approval_with_deadline(&request, deadline)
-                }),
+            if crate::endpoint_approval::authorize(
+                ctx.approval_backends.as_ref(),
+                &pending,
+                &target,
             )
-            .await;
-            // L7 endpoint approval has no per-connection session cache, so
-            // collapse the session-scoped decision variants to their one-shot
-            // equivalents and keep the match below total.
-            let decision = decision.map(|joined| {
-                joined.map(|approved| {
-                    approved.map(nono::supervisor::ApprovalDecision::without_session_scope)
-                })
-            });
-            match decision {
-                Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Granted))) => {
-                    audit::log_l7_policy_decision(
-                        ctx.audit_log,
-                        audit::ProxyMode::Reverse,
-                        &approval_ctx,
-                        service,
-                        None,
-                        method,
-                        upstream_path,
-                        nono::undo::NetworkAuditDecision::ApproveGranted,
-                        "approve",
-                        &rule_label,
-                        None,
-                    );
-                    Ok(true)
-                }
-                Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Denied { reason }))) => {
-                    let backend_reason = if reason.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {reason}")
-                    };
-                    let deny_reason = format!(
-                        "endpoint approval denied by {}: {} {} on service '{}'{}",
-                        rule_label, method, upstream_path, service, backend_reason
-                    );
-                    warn!("{}", crate::approval::sanitize_reason_for_log(&deny_reason));
-                    audit::log_l7_policy_decision(
-                        ctx.audit_log,
-                        audit::ProxyMode::Reverse,
-                        &approval_ctx,
-                        service,
-                        None,
-                        method,
-                        upstream_path,
-                        nono::undo::NetworkAuditDecision::ApproveDenied,
-                        "approve",
-                        &rule_label,
-                        Some(&deny_reason),
-                    );
-                    send_error(stream, 403, "Forbidden").await?;
-                    Ok(false)
-                }
-                Ok(Ok(Ok(
-                    nono::supervisor::ApprovalDecision::GrantedForSession
-                    | nono::supervisor::ApprovalDecision::DeniedForSession,
-                ))) => {
-                    // Unreachable: without_session_scope() above collapses these
-                    // to Granted/Denied before this match. Kept for exhaustiveness
-                    // and fail-secure if that normalization is ever removed.
-                    let deny_reason = format!(
-                        "endpoint approval returned an unexpected session-scoped decision for {} {} on service '{}'",
-                        method, upstream_path, service
-                    );
-                    warn!("{}", deny_reason);
-                    audit::log_l7_policy_decision(
-                        ctx.audit_log,
-                        audit::ProxyMode::Reverse,
-                        &approval_ctx,
-                        service,
-                        None,
-                        method,
-                        upstream_path,
-                        nono::undo::NetworkAuditDecision::ApproveDenied,
-                        "approve",
-                        &rule_label,
-                        Some(&deny_reason),
-                    );
-                    send_error(stream, 403, "Forbidden").await?;
-                    Ok(false)
-                }
-                Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Timeout))) => {
-                    let deny_reason = format!(
-                        "endpoint approval backend reported timeout for {} {} on service '{}'",
-                        method, upstream_path, service
-                    );
-                    warn!("{}", deny_reason);
-                    audit::log_l7_policy_decision(
-                        ctx.audit_log,
-                        audit::ProxyMode::Reverse,
-                        &approval_ctx,
-                        service,
-                        None,
-                        method,
-                        upstream_path,
-                        nono::undo::NetworkAuditDecision::ApproveTimeout,
-                        "approve",
-                        &rule_label,
-                        Some(&deny_reason),
-                    );
-                    send_error(stream, 403, "Forbidden").await?;
-                    Ok(false)
-                }
-                Ok(Ok(Err(err))) => {
-                    let deny_reason = format!("endpoint approval backend error: {err}");
-                    audit::log_l7_policy_decision(
-                        ctx.audit_log,
-                        audit::ProxyMode::Reverse,
-                        &approval_ctx,
-                        service,
-                        None,
-                        method,
-                        upstream_path,
-                        nono::undo::NetworkAuditDecision::ApproveError,
-                        "approve",
-                        &rule_label,
-                        Some(&deny_reason),
-                    );
-                    warn!("{}", deny_reason);
-                    send_error(stream, 403, "Forbidden").await?;
-                    Ok(false)
-                }
-                Ok(Err(err)) => {
-                    let deny_reason = format!("endpoint approval task failed: {err}");
-                    audit::log_l7_policy_decision(
-                        ctx.audit_log,
-                        audit::ProxyMode::Reverse,
-                        &approval_ctx,
-                        service,
-                        None,
-                        method,
-                        upstream_path,
-                        nono::undo::NetworkAuditDecision::ApproveError,
-                        "approve",
-                        &rule_label,
-                        Some(&deny_reason),
-                    );
-                    warn!("{}", deny_reason);
-                    send_error(stream, 403, "Forbidden").await?;
-                    Ok(false)
-                }
-                Err(_) => {
-                    let deny_reason = format!(
-                        "endpoint approval timed out by {}: {} {} on service '{}'",
-                        rule_label, method, upstream_path, service
-                    );
-                    audit::log_l7_policy_decision(
-                        ctx.audit_log,
-                        audit::ProxyMode::Reverse,
-                        &approval_ctx,
-                        service,
-                        None,
-                        method,
-                        upstream_path,
-                        nono::undo::NetworkAuditDecision::ApproveTimeout,
-                        "approve",
-                        &rule_label,
-                        Some(&deny_reason),
-                    );
-                    warn!("{}", deny_reason);
-                    send_error(stream, 403, "Forbidden").await?;
-                    Ok(false)
-                }
+            .await
+            {
+                Ok(true)
+            } else {
+                send_error(stream, 403, "Forbidden").await?;
+                Ok(false)
             }
         }
     }

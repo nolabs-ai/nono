@@ -392,7 +392,7 @@ pub fn query_network(
 
                     match (matching_endpoints, &url_path) {
                         (Some(de), Some(path)) => {
-                            if path_matches_endpoint_rules(path, &de.endpoints) {
+                            if endpoint_state_allows(de, path) {
                                 QueryResult::Allowed {
                                     reason: "proxy_allowed".to_string(),
                                     granted_path: None,
@@ -408,10 +408,7 @@ pub fn query_network(
                             } else {
                                 QueryResult::Denied {
                                     reason: "endpoint_restricted".to_string(),
-                                    details: Some(format!(
-                                        "{} is allowed but {} does not match any endpoint rule",
-                                        domain, path,
-                                    )),
+                                    details: Some(endpoint_denied_details(de, &domain, path)),
                                     policy_source: Some("endpoint rules".to_string()),
                                     matching_capability: None,
                                     suggested_flag: Some(format!(
@@ -502,7 +499,7 @@ pub fn query_network(
 
                         match (matching_endpoints, &url_path) {
                             (Some(de), Some(path)) => {
-                                if path_matches_endpoint_rules(path, &de.endpoints) {
+                                if endpoint_state_allows(de, path) {
                                     QueryResult::Allowed {
                                         reason: "proxy_allowed".to_string(),
                                         granted_path: None,
@@ -518,10 +515,7 @@ pub fn query_network(
                                 } else {
                                     QueryResult::Denied {
                                         reason: "endpoint_restricted".to_string(),
-                                        details: Some(format!(
-                                            "{} is allowed but {} does not match any endpoint rule",
-                                            domain, path,
-                                        )),
+                                        details: Some(endpoint_denied_details(de, &domain, path)),
                                         policy_source: Some("endpoint rules".to_string()),
                                         matching_capability: None,
                                         suggested_flag: Some(format!(
@@ -627,6 +621,30 @@ fn normalize_path(path: &str) -> String {
 }
 
 /// Check if a path matches any endpoint rule using glob matching.
+fn endpoint_denied_details(
+    de: &crate::sandbox_state::DomainEndpointState,
+    domain: &str,
+    path: &str,
+) -> String {
+    if de.endpoint_policy {
+        format!(
+            "{domain} is allowed but {path} does not match an endpoint_policy allow rule; \
+             it is denied or needs approval"
+        )
+    } else {
+        format!("{domain} is allowed but {path} does not match any endpoint rule")
+    }
+}
+
+/// Whether `path` is allowed without asking by a domain's endpoint state.
+/// An `endpoint_policy` entry with no `allow` rules allows nothing outright.
+fn endpoint_state_allows(de: &crate::sandbox_state::DomainEndpointState, path: &str) -> bool {
+    if de.endpoint_policy && de.endpoints.is_empty() {
+        return false;
+    }
+    path_matches_endpoint_rules(path, &de.endpoints)
+}
+
 fn path_matches_endpoint_rules(
     path: &str,
     rules: &[crate::sandbox_state::EndpointRuleState],
@@ -1540,6 +1558,7 @@ mod tests {
         let allowed = vec!["github.com".to_string()];
         let endpoints = vec![crate::sandbox_state::DomainEndpointState {
             domain: "github.com".to_string(),
+            endpoint_policy: false,
             endpoints: vec![
                 crate::sandbox_state::EndpointRuleState {
                     method: "*".to_string(),
@@ -1572,6 +1591,7 @@ mod tests {
         let allowed = vec!["github.com".to_string()];
         let endpoints = vec![crate::sandbox_state::DomainEndpointState {
             domain: "github.com".to_string(),
+            endpoint_policy: false,
             endpoints: vec![crate::sandbox_state::EndpointRuleState {
                 method: "*".to_string(),
                 path: "/atko-cic/**".to_string(),
@@ -1608,6 +1628,82 @@ mod tests {
     }
 
     #[test]
+    fn test_query_network_reports_endpoint_policy_entries() {
+        let caps = CapabilitySet::new().set_network_mode(nono::NetworkMode::ProxyOnly {
+            port: 0,
+            bind_ports: vec![],
+        });
+        let allowed = vec!["github.com".to_string()];
+        let entry: crate::profile::AllowDomainEntry = serde_json::from_value(serde_json::json!({
+            "domain": "github.com",
+            "endpoint_policy": {
+                "approve": [{ "method": "*", "path": "/*/*/**" }],
+                "allow": [{ "method": "GET", "path": "/login" }]
+            }
+        }))
+        .expect("entry");
+        let endpoints = vec![
+            crate::sandbox_state::DomainEndpointState::from_allow_domain(&entry).expect("state"),
+        ];
+        assert!(endpoints[0].endpoint_policy);
+
+        let result = query_network(
+            "https://github.com/login",
+            443,
+            &caps,
+            &allowed,
+            &[],
+            &endpoints,
+        );
+        assert!(matches!(result, QueryResult::Allowed { .. }), "{result:?}");
+
+        let result = query_network(
+            "https://github.com/torvalds/linux",
+            443,
+            &caps,
+            &allowed,
+            &[],
+            &endpoints,
+        );
+        match result {
+            QueryResult::Denied {
+                reason, details, ..
+            } => {
+                assert_eq!(reason, "endpoint_restricted");
+                assert!(details.is_some_and(|d| d.contains("needs approval")));
+            }
+            other => panic!("expected endpoint_restricted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_network_endpoint_policy_without_allow_rules_allows_nothing_outright() {
+        let caps = CapabilitySet::new().set_network_mode(nono::NetworkMode::ProxyOnly {
+            port: 0,
+            bind_ports: vec![],
+        });
+        let allowed = vec!["github.com".to_string()];
+        let entry: crate::profile::AllowDomainEntry = serde_json::from_value(serde_json::json!({
+            "domain": "github.com",
+            "endpoint_policy": { "approve": [{ "method": "*", "path": "/**" }] }
+        }))
+        .expect("entry");
+        let endpoints = vec![
+            crate::sandbox_state::DomainEndpointState::from_allow_domain(&entry).expect("state"),
+        ];
+
+        let result = query_network(
+            "https://github.com/torvalds/linux",
+            443,
+            &caps,
+            &allowed,
+            &[],
+            &endpoints,
+        );
+        assert!(matches!(result, QueryResult::Denied { .. }), "{result:?}");
+    }
+
+    #[test]
     fn test_query_network_bare_domain_with_endpoint_rules_shows_allowed() {
         let caps = CapabilitySet::new().set_network_mode(nono::NetworkMode::ProxyOnly {
             port: 0,
@@ -1616,6 +1712,7 @@ mod tests {
         let allowed = vec!["github.com".to_string()];
         let endpoints = vec![crate::sandbox_state::DomainEndpointState {
             domain: "github.com".to_string(),
+            endpoint_policy: false,
             endpoints: vec![crate::sandbox_state::EndpointRuleState {
                 method: "*".to_string(),
                 path: "/atko-cic/**".to_string(),

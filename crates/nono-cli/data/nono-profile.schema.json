@@ -922,7 +922,7 @@
               { "$ref": "#/$defs/AllowDomainWithEndpoints" }
             ]
           },
-          "description": "Additional domains to allow through the proxy. Entries can be plain hostname strings (CONNECT tunnel, no L7 filtering) or objects with endpoint rules (TLS-intercepted method+path filtering). When endpoints are present, only matching requests are allowed (default-deny)."
+          "description": "Additional domains to allow through the proxy. Entries can be plain hostname strings (CONNECT tunnel, no L7 filtering) or objects with endpoint rules (TLS-intercepted method+path filtering). When endpoints are present, only matching requests are allowed (default-deny). endpoint_policy adds deny and approve rules."
         },
         "credentials": {
           "type": "array",
@@ -1254,9 +1254,14 @@
     },
     "AllowDomainWithEndpoints": {
       "type": "object",
-      "description": "Domain with fine-grained method+path endpoint restrictions. Requires TLS interception for L7 filtering. When endpoints is non-empty, only matching method+path combinations are allowed (default-deny).",
+      "description": "Domain with fine-grained method+path endpoint restrictions. Requires TLS interception for L7 filtering. Set either endpoints (an allow list; everything else is denied) or endpoint_policy (allow/deny/approve rules), not both.",
       "additionalProperties": false,
-      "required": ["domain", "endpoints"],
+      "required": ["domain"],
+      "anyOf": [
+        { "required": ["endpoints"] },
+        { "required": ["endpoint_policy"] }
+      ],
+      "not": { "required": ["endpoints", "endpoint_policy"] },
       "properties": {
         "domain": {
           "type": "string",
@@ -1266,6 +1271,10 @@
           "type": "array",
           "items": { "$ref": "#/$defs/EndpointRule" },
           "description": "L7 method+path rules. Only requests matching at least one rule are allowed."
+        },
+        "endpoint_policy": {
+          "$ref": "#/$defs/EndpointPolicyConfig",
+          "description": "L7 policy checked deny, then approve, then allow, then default. A request matching an approve rule asks the approval backend; a session answer covers the rule with its * segments filled in."
         }
       }
     },

@@ -110,6 +110,51 @@ pub struct DomainEndpointState {
     pub domain: String,
     /// Allowed method+path rules (default-deny when non-empty)
     pub endpoints: Vec<EndpointRuleState>,
+    /// `true` when the entry uses `endpoint_policy`. `endpoints` then holds
+    /// only its `allow` rules: other paths may be denied or need approval,
+    /// and an empty list allows nothing without asking.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub endpoint_policy: bool,
+}
+
+impl DomainEndpointState {
+    /// Endpoint state for an `allow_domain` entry, or `None` when the entry
+    /// does not restrict endpoints.
+    pub fn from_allow_domain(entry: &crate::profile::AllowDomainEntry) -> Option<Self> {
+        if !entry.has_endpoint_restrictions() {
+            return None;
+        }
+        let crate::profile::AllowDomainEntry::WithEndpoints {
+            domain,
+            endpoints,
+            endpoint_policy,
+        } = entry
+        else {
+            return None;
+        };
+        let rules: Vec<EndpointRuleState> = match endpoint_policy {
+            Some(policy) => policy
+                .allow
+                .iter()
+                .map(|r| EndpointRuleState {
+                    method: r.method.clone(),
+                    path: r.path.clone(),
+                })
+                .collect(),
+            None => endpoints
+                .iter()
+                .map(|r| EndpointRuleState {
+                    method: r.method.clone(),
+                    path: r.path.clone(),
+                })
+                .collect(),
+        };
+        Some(Self {
+            domain: domain.clone(),
+            endpoints: rules,
+            endpoint_policy: endpoint_policy.is_some(),
+        })
+    }
 }
 
 /// Serializable endpoint rule
@@ -1394,9 +1439,11 @@ mod cap_file_validation_tests {
         let path = write_cap_file(file_dir.path());
         let path_str = path.to_str().expect("utf8 path").to_string();
 
-        // Point $TMPDIR at a *different* existing directory.
-        let other_dir = tempfile::tempdir_in("/tmp").expect("other tempdir");
-        let other = other_dir.path().to_str().expect("utf8 other");
+        // Point $TMPDIR at a *different* existing directory. Kept, not
+        // deleted: tests running in parallel may create temp dirs under it
+        // while it is set, and deleting it would make those fail.
+        let other_dir = tempfile::tempdir_in("/tmp").expect("other tempdir").keep();
+        let other = other_dir.to_str().expect("utf8 other");
         let _env = EnvVarGuard::set_all(&[("TMPDIR", other)]);
 
         // The cap file's canonical path is not under the overridden $TMPDIR, but
@@ -1568,5 +1615,45 @@ mod cap_file_validation_tests {
         // the field to None via #[serde(default)] — the back-compat guarantee.
         let reloaded: SandboxState = serde_json::from_str(&json).expect("loads");
         assert!(reloaded.resource_limits.is_none());
+    }
+
+    #[test]
+    fn domain_endpoint_state_from_allow_domain_entries() {
+        use crate::profile::AllowDomainEntry;
+        let entries: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[
+                "plain.example.com",
+                { "domain": "object.example.com" },
+                { "domain": "rules.example.com", "endpoints": [{ "method": "GET", "path": "/v1/**" }] },
+                { "domain": "policy.example.com", "endpoint_policy": {
+                    "approve": [{ "method": "*", "path": "/**" }],
+                    "allow": [{ "method": "GET", "path": "/health" }]
+                } },
+                { "domain": "open.example.com", "endpoint_policy": { "default": { "decision": "allow" } } }
+            ]"#,
+        )
+        .expect("entries");
+        let states: Vec<DomainEndpointState> = entries
+            .iter()
+            .filter_map(DomainEndpointState::from_allow_domain)
+            .collect();
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].domain, "rules.example.com");
+        assert!(!states[0].endpoint_policy);
+        assert_eq!(states[1].domain, "policy.example.com");
+        assert!(states[1].endpoint_policy);
+        assert_eq!(states[1].endpoints.len(), 1);
+        assert_eq!(states[1].endpoints[0].path, "/health");
+
+        // Entries without a policy keep the existing state-file shape.
+        let encoded = serde_json::to_value(&states[0]).expect("encode");
+        assert!(encoded.get("endpoint_policy").is_none());
+        let decoded: DomainEndpointState = serde_json::from_value(serde_json::json!({
+            "domain": "old.example.com",
+            "endpoints": []
+        }))
+        .expect("old state files still load");
+        assert!(!decoded.endpoint_policy);
     }
 }

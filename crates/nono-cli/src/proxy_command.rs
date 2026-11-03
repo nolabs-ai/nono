@@ -326,7 +326,7 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
     // `prepare_proxy_launch_options` on the sandboxed path.
     let (plain_entries, endpoint_entries): (Vec<_>, Vec<_>) = allow_domain
         .into_iter()
-        .partition(|e| !matches!(e, profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
+        .partition(|e| !e.has_endpoint_restrictions());
 
     let domain_filter =
         if network_profile.is_some() || !plain_entries.is_empty() || !deny_domain.is_empty() {

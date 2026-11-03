@@ -474,7 +474,9 @@ pub fn partition_allow_domain(
                         proxy: None,
                         env_var: None,
                         endpoint_rules: endpoints.clone(),
-                        endpoint_policy: endpoint_policy.clone(),
+                        endpoint_policy: endpoint_policy
+                            .as_ref()
+                            .map(crate::profile::AllowDomainEndpointPolicy::to_proxy),
                         tls_ca: None,
                         tls_client_cert: None,
                         tls_client_key: None,

@@ -506,6 +506,8 @@ pub(crate) async fn select_intercept_route<'a>(
                     reason,
                     timeout_secs,
                     rule_label,
+                    // Credential-route approvals stay one-shot.
+                    session_scope: !route.requires_managed_credential,
                 };
                 if route.requires_managed_credential {
                     credential_approvals.push(approval);
@@ -645,10 +647,16 @@ pub(crate) async fn select_intercept_route<'a>(
             .filter(|(_, route)| route.requires_managed_credential)
             .map(|(prefix, _)| prefix);
         let request_id_scope = format!("{host}-{port}");
+        let upstream = if port == 443 {
+            format!("https://{}", host.to_lowercase())
+        } else {
+            format!("https://{}:{}", host.to_lowercase(), port)
+        };
         let audit_ctx = audit::EventContext::default();
         let target = crate::endpoint_approval::ApprovalTarget {
             method,
             path,
+            upstream: &upstream,
             credential_route,
             audit_log,
             mode: audit::ProxyMode::ConnectIntercept,
@@ -882,6 +890,28 @@ where
         None => return Ok(()),
     };
     debug!("tls_intercept: inner request {} {}", req.method, req.path);
+
+    // Endpoint policy matches origin-form paths. An absolute-form target
+    // (`GET https://host/a/b`) would normalize to `/https:/host/a/b` and miss
+    // fixed-depth rules while the upstream still serves `/a/b`, so refuse
+    // anything but origin-form and `OPTIONS *`.
+    if !is_origin_form_target(&req.method, &req.path) {
+        let reason = "request target is not in origin form";
+        warn!("tls_intercept: {}: {} {}", reason, req.method, req.path);
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
+                ..audit::EventContext::default()
+            },
+            ctx.host,
+            ctx.port,
+            reason,
+        );
+        reverse::send_error_generic(tls_stream, 400, "Bad Request").await?;
+        return Ok(());
+    }
 
     // Detect and validate an HTTP `Upgrade` attempt before any route lookup,
     // credential resolution, or upstream connection. Malformed attempts fail
@@ -2091,6 +2121,12 @@ fn build_websocket_upstream_request(
 }
 
 /// Parse a request line into (method, path, version).
+/// `true` for an origin-form request target (`/path?query`) or the
+/// asterisk form of `OPTIONS`.
+fn is_origin_form_target(method: &str, target: &str) -> bool {
+    target.starts_with('/') || (target == "*" && method.eq_ignore_ascii_case("OPTIONS"))
+}
+
 fn parse_request_line(line: &str) -> Result<(String, String, String)> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 3 {
@@ -3159,6 +3195,7 @@ mod tests {
             nono::ApprovalRequest::Endpoint {
                 route_id,
                 credential_route,
+                upstream,
                 rule_label,
                 reason,
                 method,
@@ -3167,7 +3204,11 @@ mod tests {
             } => {
                 assert_eq!(route_id, "_ep_example.com");
                 assert_eq!(credential_route, None);
-                assert_eq!(rule_label, "endpoint_policy.approve[* /torvalds/linux/**]");
+                assert_eq!(upstream, "https://example.com");
+                assert_eq!(
+                    rule_label,
+                    "endpoint_policy.approve[GET /torvalds/linux/**]"
+                );
                 assert_eq!(
                     reason.as_deref(),
                     Some("repository outside the allowed orgs")
@@ -3222,7 +3263,7 @@ mod tests {
                 .is_ok()
         );
         assert!(
-            select(&store, &registry, "POST", "/torvalds/linux/git-upload-pack")
+            select(&store, &registry, "GET", "/torvalds/linux/HEAD")
                 .await
                 .is_ok()
         );
@@ -3233,11 +3274,18 @@ mod tests {
         );
 
         assert!(
+            select(&store, &registry, "POST", "/torvalds/linux/git-upload-pack")
+                .await
+                .is_ok()
+        );
+        assert_eq!(backend.calls(), 2, "another method must ask again");
+
+        assert!(
             select(&store, &registry, "GET", "/torvalds/other/info/refs")
                 .await
                 .is_ok()
         );
-        assert_eq!(backend.calls(), 2, "a different repository must ask again");
+        assert_eq!(backend.calls(), 3, "a different repository must ask again");
 
         assert_eq!(
             select(
@@ -3250,7 +3298,7 @@ mod tests {
             Err(403),
             "a session grant must not override a deny rule"
         );
-        assert_eq!(backend.calls(), 2);
+        assert_eq!(backend.calls(), 3);
     }
 
     #[tokio::test]
@@ -3316,7 +3364,7 @@ mod tests {
 
         let (first, second, third) = tokio::join!(
             select(&store, &registry, "GET", "/torvalds/linux/info/refs"),
-            select(&store, &registry, "POST", "/torvalds/linux/git-upload-pack"),
+            select(&store, &registry, "GET", "/torvalds/linux/objects/pack"),
             select(&store, &registry, "GET", "/torvalds/linux/HEAD"),
         );
 
@@ -3356,7 +3404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_answer_for_both_layers_is_cached_for_each() {
+    async fn session_answer_for_both_layers_caches_only_the_shown_scope() {
         let store = RouteStore::load(&[
             ep_policy_route(),
             credential_route_with(crate::config::EndpointPolicyConfig {
@@ -3374,20 +3422,28 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert_eq!(backend.calls(), 1);
+        // The prompt showed only the `_ep_` scope, so only it is cached. The
+        // credential route's approval stays one-shot: it asks again, naming
+        // itself.
         assert!(
             select(&store, &registry, "GET", "/torvalds/linux/HEAD")
                 .await
                 .is_ok()
         );
-        assert_eq!(backend.calls(), 1);
-        // The credential route's `/**` scope is cached, but the `_ep_` scope
-        // for another repository is not: it still asks, once.
-        assert!(
-            select(&store, &registry, "GET", "/torvalds/other/HEAD")
-                .await
-                .is_ok()
-        );
         assert_eq!(backend.calls(), 2);
+        match backend.last() {
+            nono::ApprovalRequest::Endpoint { route_id, .. } => {
+                assert_eq!(route_id, "example_https");
+            }
+            other => panic!("expected an endpoint request, got {other:?}"),
+        }
+        // A path only the credential route asks for is never covered by the
+        // earlier session answer.
+        for _ in 0..2 {
+            assert!(select(&store, &registry, "GET", "/login").await.is_ok());
+        }
+        assert_eq!(backend.calls(), 4);
     }
 
     #[tokio::test]
@@ -4309,6 +4365,33 @@ mod tests {
             response.extend_from_slice(&buf[..n]);
         }
         String::from_utf8_lossy(&response).to_string()
+    }
+
+    #[tokio::test]
+    async fn absolute_form_request_target_is_refused() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let store = Arc::new(OAuthCaptureStore::load(&[]).unwrap());
+        let ctx = oauth_intercept_ctx(ca, &connector, &filter, &session_token, store, 443);
+
+        let response = drive_token_endpoint_request(
+            &ctx,
+            "POST https://localhost/acme/repo/git-receive-pack HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "got {response:?}");
+    }
+
+    #[test]
+    fn origin_form_targets_are_recognized() {
+        assert!(is_origin_form_target("GET", "/a/b?c=d"));
+        assert!(is_origin_form_target("options", "*"));
+        assert!(!is_origin_form_target("GET", "*"));
+        assert!(!is_origin_form_target("GET", "https://host/a"));
+        assert!(!is_origin_form_target("CONNECT", "host:443"));
     }
 
     #[tokio::test]

@@ -1077,6 +1077,49 @@ pub struct EndpointPolicyConfig {
     pub allow: Vec<EndpointPolicyRule>,
 }
 
+impl EndpointPolicyConfig {
+    /// The policy a legacy `endpoint_rules` allow-list stands for: allow the
+    /// listed rules and deny everything else, or allow everything when the
+    /// list is empty.
+    #[must_use]
+    pub fn from_legacy_rules(rules: &[EndpointRule]) -> Self {
+        let allow = rules
+            .iter()
+            .map(|rule| EndpointPolicyRule {
+                method: rule.method.clone(),
+                path: rule.path.clone(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            })
+            .collect::<Vec<_>>();
+        let default = if allow.is_empty() {
+            EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            }
+        } else {
+            EndpointPolicyDefault::default()
+        };
+        Self {
+            default,
+            deny: Vec::new(),
+            approve: Vec::new(),
+            allow,
+        }
+    }
+
+    /// `true` when the policy does not require L7 visibility.
+    #[must_use]
+    pub fn allows_all_without_l7(&self) -> bool {
+        self.deny.is_empty()
+            && self.approve.is_empty()
+            && self.allow.is_empty()
+            && self.default.decision == EndpointPolicyDecision::Allow
+    }
+}
+
 /// Pre-compiled endpoint rules for the request hot path.
 ///
 /// Built once at proxy startup from `EndpointRule` definitions. Holds
@@ -1245,35 +1288,12 @@ impl CompiledEndpointPolicy {
             return Self::compile_explicit(policy);
         }
 
-        let allow = legacy_rules
-            .iter()
-            .map(|rule| EndpointPolicyRule {
-                method: rule.method.clone(),
-                path: rule.path.clone(),
-                backend: None,
-                reason: None,
-                timeout_secs: None,
-            })
-            .collect::<Vec<_>>();
-        let default = if allow.is_empty() {
-            EndpointPolicyDefault {
-                decision: EndpointPolicyDecision::Allow,
-                backend: None,
-                timeout_secs: None,
-            }
-        } else {
-            EndpointPolicyDefault::default()
-        };
-        Self::compile_explicit(&EndpointPolicyConfig {
-            default,
-            deny: Vec::new(),
-            approve: Vec::new(),
-            allow,
-        })
-        .map(|mut compiled| {
-            compiled.explicit = false;
-            compiled
-        })
+        Self::compile_explicit(&EndpointPolicyConfig::from_legacy_rules(legacy_rules)).map(
+            |mut compiled| {
+                compiled.explicit = false;
+                compiled
+            },
+        )
     }
 
     fn compile_explicit(policy: &EndpointPolicyConfig) -> Result<Self, String> {
@@ -1330,7 +1350,7 @@ impl CompiledEndpointPolicy {
                 timeout_secs: rule.timeout_secs,
                 rule_label: format!(
                     "endpoint_policy.approve[{} {}]",
-                    rule.method,
+                    approval_scope_method(method),
                     approval_scope_path(&rule.path, &normalized)
                 ),
             };
@@ -1349,11 +1369,17 @@ impl CompiledEndpointPolicy {
                 reason: None,
                 rule_label: "endpoint_policy.default".to_string(),
             },
+            // The default has no pattern to scope by, so an answer covers only
+            // the exact method and path that reached it.
             EndpointPolicyDecision::Approve => EndpointPolicyOutcome::Approve {
                 backend: self.default.backend.as_deref(),
                 reason: None,
                 timeout_secs: self.default.timeout_secs,
-                rule_label: "endpoint_policy.default".to_string(),
+                rule_label: format!(
+                    "endpoint_policy.default[{} {}]",
+                    approval_scope_method(method),
+                    escape_glob(&normalized)
+                ),
             },
         }
     }
@@ -1378,6 +1404,13 @@ fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPoli
     Ok(compiled)
 }
 
+/// The request method as it appears in an approval scope. Scopes always name
+/// the request's method, never a rule's `*`, so a session answer for `GET`
+/// does not cover `POST`.
+fn approval_scope_method(method: &str) -> String {
+    method.to_ascii_uppercase()
+}
+
 /// The part of an `approve` rule that one session answer covers: the rule
 /// `pattern` with every wildcard segment before the first `**` replaced by the
 /// request segment it matched. The first `**` and everything after it stay as
@@ -1387,7 +1420,8 @@ fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPoli
 /// The result is both the approval `rule_label` shown to the backend and the
 /// session-cache key, so it must never cover more than the rule matched. When
 /// the pattern segments cannot be aligned with the request segments (a brace
-/// or class spanning `/`), the whole normalized request path is the scope.
+/// spanning `/`, or any class, which may match `/`), the whole normalized
+/// request path is the scope.
 /// Filled-in values have glob metacharacters escaped so a request segment
 /// named `*` cannot read as a wildcard.
 fn approval_scope_path(pattern: &str, normalized_path: &str) -> String {
@@ -1403,7 +1437,9 @@ fn approval_scope_path(pattern: &str, normalized_path: &str) -> String {
             scoped.extend(pattern_segments.map(str::to_string));
             return format!("/{}", scoped.join("/"));
         }
-        if !segment_is_balanced(segment) {
+        // A class can match `/` even with `literal_separator` (`[!x]`,
+        // `[.-0]`), so a segment holding one may span request segments.
+        if !segment_is_balanced(segment) || segment.contains('[') {
             return escape_glob(normalized_path);
         }
         let Some(value) = request_segments.next() else {
@@ -2774,6 +2810,50 @@ mod tests {
         // A brace spanning `/` cannot be aligned with request segments.
         assert_eq!(approval_scope_path("/{a/b,c}/**", "/a/b/x"), "/a/b/x");
         assert_eq!(approval_scope_path("relative/*", "/a/b"), "/a/b");
+        // A class can match `/`, so its segment cannot be aligned either.
+        assert_eq!(approval_scope_path("/a[!x]b/**", "/a/b/c/d"), "/a/b/c/d");
+    }
+
+    #[test]
+    fn default_approve_label_covers_the_exact_request_only() {
+        let policy = CompiledEndpointPolicy::compile(
+            Some(&EndpointPolicyConfig {
+                default: EndpointPolicyDefault {
+                    decision: EndpointPolicyDecision::Approve,
+                    backend: None,
+                    timeout_secs: None,
+                },
+                ..EndpointPolicyConfig::default()
+            }),
+            &[],
+        )
+        .unwrap();
+        let label = |method: &str, path: &str| match policy.evaluate(method, path) {
+            EndpointPolicyOutcome::Approve { rule_label, .. } => rule_label,
+            other => panic!("expected approve, got {other:?}"),
+        };
+        assert_eq!(
+            label("post", "/v1/comments?x=1"),
+            "endpoint_policy.default[POST /v1/comments]"
+        );
+        assert_ne!(
+            label("POST", "/v1/comments"),
+            label("DELETE", "/v1/comments")
+        );
+        assert_ne!(label("POST", "/v1/comments"), label("POST", "/v1/other"));
+        assert_eq!(label("GET", "/a*b"), "endpoint_policy.default[GET /a\\*b]");
+    }
+
+    #[test]
+    fn policy_config_shares_the_l7_predicate_and_legacy_conversion() {
+        assert!(EndpointPolicyConfig::from_legacy_rules(&[]).allows_all_without_l7());
+        let legacy = EndpointPolicyConfig::from_legacy_rules(&[EndpointRule {
+            method: "GET".to_string(),
+            path: "/a/**".to_string(),
+        }]);
+        assert!(!legacy.allows_all_without_l7());
+        assert_eq!(legacy.default.decision, EndpointPolicyDecision::Deny);
+        assert_eq!(legacy.allow.len(), 1);
     }
 
     #[test]
@@ -2794,7 +2874,10 @@ mod tests {
         .unwrap();
         match policy.evaluate("GET", "/torvalds/linux/info/refs?service=git-upload-pack") {
             EndpointPolicyOutcome::Approve { rule_label, .. } => {
-                assert_eq!(rule_label, "endpoint_policy.approve[* /torvalds/linux/**]");
+                assert_eq!(
+                    rule_label,
+                    "endpoint_policy.approve[GET /torvalds/linux/**]"
+                );
             }
             other => panic!("expected approve, got {other:?}"),
         }

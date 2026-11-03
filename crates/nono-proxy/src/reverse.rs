@@ -1056,6 +1056,103 @@ pub(crate) async fn capture_cmd_credential(
     }
 }
 
+/// Evaluate the explicit endpoint policies of the credential-less routes on the
+/// credential route's upstream (the `_ep_<domain>` routes built from
+/// `allow_domain`), as the CONNECT-intercept path does, so a credential route
+/// cannot allow what those policies deny. A `deny` refuses; `approve` outcomes
+/// are returned for [`enforce_endpoint_policy`] to ask. A legacy `endpoints`
+/// allow-list keeps its reverse-proxy behavior and does not gate here.
+fn host_endpoint_policies<'a>(
+    route: &crate::route::LoadedRoute,
+    service: &str,
+    method: &str,
+    upstream_path: &str,
+    route_ctx: &audit::EventContext<'_>,
+    route_store: &'a RouteStore,
+    audit_log: Option<&audit::SharedAuditLog>,
+) -> std::result::Result<Vec<crate::endpoint_approval::PendingApproval<'a>>, String> {
+    let mut pending = Vec::new();
+    let Some(host_port) = route.upstream_host_port.as_deref() else {
+        return Ok(pending);
+    };
+    for (prefix, host_route) in route_store.lookup_all_by_upstream(host_port) {
+        if prefix == service
+            || host_route.requires_managed_credential
+            || !host_route.endpoint_policy.is_explicit()
+            || host_route.endpoint_policy.allows_all_without_l7()
+        {
+            continue;
+        }
+        let outcome = host_route.endpoint_policy.evaluate(method, upstream_path);
+        let (action, decision, rule_label, reason) = match outcome {
+            EndpointPolicyOutcome::Allow { rule_label } => (
+                "allow",
+                nono::undo::NetworkAuditDecision::Allow,
+                rule_label,
+                None,
+            ),
+            EndpointPolicyOutcome::Deny { reason, rule_label } => {
+                let reason = reason.map(str::to_string).unwrap_or_else(|| {
+                    format!(
+                        "endpoint denied by {} on route '{}': {} {} for service '{}'",
+                        rule_label, prefix, method, upstream_path, service
+                    )
+                });
+                (
+                    "deny",
+                    nono::undo::NetworkAuditDecision::Deny,
+                    rule_label,
+                    Some(reason),
+                )
+            }
+            EndpointPolicyOutcome::Approve {
+                backend,
+                reason,
+                timeout_secs,
+                rule_label,
+            } => {
+                pending.push(crate::endpoint_approval::PendingApproval {
+                    route_id: prefix,
+                    upstream: &host_route.upstream,
+                    backend,
+                    reason,
+                    timeout_secs,
+                    rule_label,
+                    session_scope: true,
+                });
+                continue;
+            }
+        };
+        let policy_ctx = audit::EventContext {
+            route_id: Some(prefix),
+            denial_category: reason
+                .is_some()
+                .then_some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
+            endpoint_policy_action: Some(action),
+            endpoint_policy_rule: Some(&rule_label),
+            upstream: Some(&host_route.upstream),
+            ..route_ctx.clone()
+        };
+        audit::log_l7_policy_decision(
+            audit_log,
+            audit::ProxyMode::Reverse,
+            &policy_ctx,
+            service,
+            None,
+            method,
+            upstream_path,
+            decision,
+            action,
+            &rule_label,
+            reason.as_deref(),
+        );
+        if let Some(reason) = reason {
+            return Err(reason);
+        }
+    }
+    Ok(pending)
+}
+
 async fn enforce_endpoint_policy(
     route: &crate::route::LoadedRoute,
     service: &str,
@@ -1065,6 +1162,22 @@ async fn enforce_endpoint_policy(
     ctx: &ReverseProxyCtx<'_>,
     stream: &mut TcpStream,
 ) -> Result<bool> {
+    let mut pending = match host_endpoint_policies(
+        route,
+        service,
+        method,
+        upstream_path,
+        route_ctx,
+        ctx.route_store,
+        ctx.audit_log,
+    ) {
+        Ok(pending) => pending,
+        Err(reason) => {
+            warn!("{}", reason);
+            send_error(stream, 403, "Forbidden").await?;
+            return Ok(false);
+        }
+    };
     match route.endpoint_policy.evaluate(method, upstream_path) {
         EndpointPolicyOutcome::Allow { rule_label } => {
             let policy_ctx = audit::EventContext {
@@ -1086,7 +1199,6 @@ async fn enforce_endpoint_policy(
                 &rule_label,
                 None,
             );
-            Ok(true)
         }
         EndpointPolicyOutcome::Deny { reason, rule_label } => {
             let reason = reason.map(str::to_string).unwrap_or_else(|| {
@@ -1117,7 +1229,7 @@ async fn enforce_endpoint_policy(
                 Some(&reason),
             );
             send_error(stream, 403, "Forbidden").await?;
-            Ok(false)
+            return Ok(false);
         }
         EndpointPolicyOutcome::Approve {
             backend,
@@ -1125,38 +1237,40 @@ async fn enforce_endpoint_policy(
             timeout_secs,
             rule_label,
         } => {
-            let pending = [crate::endpoint_approval::PendingApproval {
+            // Credential-route approvals stay one-shot: the answer covers
+            // this request only.
+            pending.push(crate::endpoint_approval::PendingApproval {
                 route_id: service,
                 upstream: &route.upstream,
                 backend,
                 reason,
                 timeout_secs,
                 rule_label,
-            }];
-            let target = crate::endpoint_approval::ApprovalTarget {
-                method,
-                path: upstream_path,
-                credential_route: route.requires_managed_credential.then_some(service),
-                audit_log: ctx.audit_log,
-                mode: audit::ProxyMode::Reverse,
-                audit_ctx: route_ctx,
-                audit_target: service,
-                audit_port: None,
-                request_id_scope: service,
-            };
-            if crate::endpoint_approval::authorize(
-                ctx.approval_backends.as_ref(),
-                &pending,
-                &target,
-            )
-            .await
-            {
-                Ok(true)
-            } else {
-                send_error(stream, 403, "Forbidden").await?;
-                Ok(false)
-            }
+                session_scope: false,
+            });
         }
+    }
+    if pending.is_empty() {
+        return Ok(true);
+    }
+    let target = crate::endpoint_approval::ApprovalTarget {
+        method,
+        path: upstream_path,
+        upstream: &route.upstream,
+        credential_route: route.requires_managed_credential.then_some(service),
+        audit_log: ctx.audit_log,
+        mode: audit::ProxyMode::Reverse,
+        audit_ctx: route_ctx,
+        audit_target: service,
+        audit_port: None,
+        request_id_scope: service,
+    };
+    if crate::endpoint_approval::authorize(ctx.approval_backends.as_ref(), &pending, &target).await
+    {
+        Ok(true)
+    } else {
+        send_error(stream, 403, "Forbidden").await?;
+        Ok(false)
     }
 }
 
@@ -3280,6 +3394,81 @@ mod tests {
         let header = b" : nope\r\nAccept: */*\r\n\r\n";
         let filtered = filter_headers(header, "");
         assert_eq!(filtered, vec![("Accept".to_string(), "*/*".to_string())]);
+    }
+
+    fn host_policy_routes() -> Vec<crate::config::RouteConfig> {
+        let rule = |method: &str, path: &str| crate::config::EndpointPolicyRule {
+            method: method.to_string(),
+            path: path.to_string(),
+            backend: None,
+            reason: None,
+            timeout_secs: None,
+        };
+        let base = |prefix: &str| crate::config::RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: None,
+            redeem_phantoms: Vec::new(),
+            inject_mode: InjectMode::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: Vec::new(),
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+            upgrades: vec![],
+            rate_limit: None,
+        };
+        vec![
+            crate::config::RouteConfig {
+                endpoint_policy: Some(crate::config::EndpointPolicyConfig {
+                    deny: vec![rule("*", "/*/*/git-receive-pack")],
+                    approve: vec![rule("*", "/*/*/**")],
+                    allow: vec![rule("GET", "/login")],
+                    ..crate::config::EndpointPolicyConfig::default()
+                }),
+                ..base("_ep_api.example.com")
+            },
+            // A legacy allow-list does not gate reverse-proxy traffic.
+            crate::config::RouteConfig {
+                endpoint_rules: vec![crate::config::EndpointRule {
+                    method: "GET".to_string(),
+                    path: "/only/**".to_string(),
+                }],
+                ..base("legacy")
+            },
+            base("github"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_applies_host_endpoint_policies() {
+        let store = RouteStore::load(&host_policy_routes()).await.unwrap();
+        let route = store.get("github").unwrap();
+        let ctx = audit::EventContext::default();
+        let eval = |method: &'static str, path: &'static str| {
+            host_endpoint_policies(route, "github", method, path, &ctx, &store, None)
+        };
+
+        assert!(
+            eval("POST", "/acme/repo/git-receive-pack").is_err(),
+            "an _ep_ deny must refuse a credential route request"
+        );
+        assert!(eval("DELETE", "/admin").is_err(), "the _ep_ default denies");
+        assert!(eval("GET", "/login").unwrap().is_empty());
+        let pending = eval("GET", "/acme/repo/info/refs").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].route_id, "_ep_api.example.com");
+        assert!(pending[0].session_scope);
     }
 
     #[tokio::test]

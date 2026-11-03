@@ -271,7 +271,7 @@ mod tests {
             "upstream": "https://github.com",
             "method": "GET",
             "path": "/torvalds/linux/info/refs",
-            "rule_label": "endpoint_policy.approve[* /torvalds/linux/**]",
+            "rule_label": "endpoint_policy.approve[GET /torvalds/linux/**]",
             "reason": null,
             "child_pid": 0,
             "session_id": "sess-005"

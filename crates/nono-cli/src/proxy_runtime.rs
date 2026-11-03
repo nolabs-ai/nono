@@ -1732,8 +1732,15 @@ pub(crate) fn resolve_effective_proxy_settings(
         .network_profile
         .clone()
         .or_else(|| prepared.network_profile.clone());
-    let mut allow_domain = prepared.allow_domain.clone();
-    allow_domain.extend(args.allow_proxy.iter().map(|s| parse_allow_domain_arg(s)));
+    // Merge so a CLI entry for a profile domain adds to its rules instead of
+    // producing a second route that replaces them.
+    let cli_allow_domain: Vec<_> = args
+        .allow_proxy
+        .iter()
+        .map(|s| parse_allow_domain_arg(s))
+        .collect();
+    let allow_domain =
+        crate::profile::merge_allow_domain(&prepared.allow_domain, &cli_allow_domain);
     let mut deny_domain = prepared.deny_domain.clone();
     deny_domain.extend(args.deny_proxy.iter().cloned());
     let mut credentials = prepared.credentials.clone();
@@ -3829,6 +3836,33 @@ mod tests {
         assert!(matches!(err, NonoError::SandboxInit(_)));
         assert!(err.to_string().contains("TLS-intercept dir"));
         Ok(())
+    }
+
+    #[test]
+    fn test_cli_allow_domain_merges_into_profile_endpoint_policy() {
+        let profile: Vec<crate::profile::AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }],
+                "approve": [{ "method": "*", "path": "/*/*/**" }]
+            } }]"#,
+        )
+        .expect("profile entries");
+        let cli = vec![parse_allow_domain_arg("https://github.com/acme")];
+        let merged = crate::profile::merge_allow_domain(&profile, &cli);
+
+        let json = crate::config::embedded::embedded_network_policy_json();
+        let policy = crate::network_policy::load_network_policy(json).expect("network policy");
+        let (_, routes) =
+            crate::network_policy::partition_allow_domain(&policy, &merged).expect("partition");
+        assert_eq!(routes.len(), 1, "one route per domain");
+        let route_policy = routes[0].endpoint_policy.as_ref().expect("policy");
+        assert_eq!(
+            route_policy.deny.len(),
+            1,
+            "profile deny rules must survive"
+        );
+        assert_eq!(route_policy.approve.len(), 1);
+        assert_eq!(route_policy.allow.len(), 1);
     }
 
     #[test]

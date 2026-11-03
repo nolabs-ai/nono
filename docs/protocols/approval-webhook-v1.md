@@ -169,10 +169,14 @@ credential route, or `_ep_<domain>` for an `allow_domain` entry with an
 `endpoint_policy`. `credential_route` names the credential route that will
 inject a credential into the approved request, or is `null` when the request
 goes out without one; it equals `route_id` when a credential route's own policy
-asks. When both routes would ask, one request is sent, naming the `_ep_` route.
-`rule_label` shows the matched rule with its `*` path segments filled in from
-the request (`endpoint_policy.approve[* /torvalds/linux/**]` for the rule
-`* /*/*/**`); this is the scope a session answer covers.
+asks. When both routes would ask, one request is sent, naming the `_ep_` route;
+its `reason` joins both routes' reasons. `upstream` is the host the request
+goes to, never a wildcard pattern. `rule_label` shows the request method and
+the matched rule with its `*` path segments filled in from the request
+(`endpoint_policy.approve[GET /torvalds/linux/**]` for the rule `* /*/*/**`).
+When the policy `default` asks, it shows the exact path
+(`endpoint_policy.default[GET /v1/items]`). This is the scope a session
+answer covers.
 
 Endpoint requests are answered by the `command_policies` approval backends
 when the profile declares them, otherwise by the `network` approval backends,
@@ -254,13 +258,18 @@ treat a session grant as an ordinary grant.
 
 ### Endpoint grant scope and local caching
 
-L7 endpoint approvals cache `allow_session` and `deny_session` for the rest of
-the proxy session, keyed by `route_id` and `rule_label`. The `**` part of a rule
-is what one answer covers; `*` segments are part of the key. Concurrent
-requests with the same key share one request; as for CONNECT, only a session
-answer authorizes the waiting requests. Ordinary grants and denials are not
-cached. `deny` rules, `allow` rules, and the policy `default` are evaluated
-before the cache, so a cached grant never overrides a deny.
+Endpoint approvals for an `allow_domain` route (`_ep_<domain>`) cache
+`allow_session` and `deny_session` for the rest of the proxy session, keyed by
+`route_id`, `upstream`, `credential_route`, and `rule_label`. The `**` part of
+a rule is what one answer covers; the method and `*` segments are part of the
+key. Only the approval the request shows is cached. Approvals asked by a
+credential route's own policy treat a session answer as an ordinary one.
+Concurrent requests with the same key share one request; as for CONNECT, only
+a session answer authorizes the waiting requests, and any other outcome makes
+each waiting request ask on its own, within its own timeout. Ordinary grants
+and denials are not cached, and a proxy session caches at most 1024 answers.
+`deny` rules, `allow` rules, and the policy `default` are evaluated before the
+cache, so a cached grant never overrides a deny.
 These session response spellings apply to the unsigned response contract;
 the signed `state: "granted"` contract below grants only the current attempt.
 

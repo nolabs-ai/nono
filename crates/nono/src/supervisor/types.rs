@@ -195,9 +195,10 @@ pub enum ApprovalDecision {
     /// approvals this explicitly permits local reuse without consulting the
     /// backend again; each connection still undergoes its own address checks.
     ///
-    /// Callers that do not implement session caching (e.g. the L7 endpoint
-    /// approval path) MUST treat this exactly as [`ApprovalDecision::Granted`];
-    /// see [`ApprovalDecision::without_session_scope`].
+    /// Callers that do not implement session caching (e.g. L7 endpoint
+    /// approvals for credential routes) MUST treat this exactly as
+    /// [`ApprovalDecision::Granted`]; see
+    /// [`ApprovalDecision::without_session_scope`].
     GrantedForSession,
     /// Access was denied with a reason.
     Denied {
@@ -236,10 +237,11 @@ impl ApprovalDecision {
 
     /// Collapse the session-scoped variants to their one-shot equivalents.
     ///
-    /// Session caching is only implemented on the network CONNECT path, which
-    /// keys decisions by `(host, port)`. Every other approval consumer treats a
-    /// decision as a single yes/no; calling this keeps those `match` sites total
-    /// and fail-secure without teaching them about session persistence.
+    /// Session caching is implemented on the network CONNECT path, keyed by
+    /// `(host, port)`, and for `allow_domain` endpoint approvals, keyed by the
+    /// approval scope. Every other approval consumer treats a decision as a
+    /// single yes/no; calling this keeps those `match` sites total and
+    /// fail-secure without teaching them about session persistence.
     #[must_use]
     pub fn without_session_scope(self) -> Self {
         match self {

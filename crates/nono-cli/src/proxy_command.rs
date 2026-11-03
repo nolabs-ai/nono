@@ -255,13 +255,16 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         .clone()
         .or_else(|| network.and_then(|n| n.resolved_network_profile().map(String::from)));
 
-    let mut allow_domain: Vec<profile::AllowDomainEntry> =
+    let profile_allow_domain: Vec<profile::AllowDomainEntry> =
         network.map(|n| n.allow_domain.clone()).unwrap_or_default();
-    allow_domain.extend(
-        args.allow_proxy
-            .iter()
-            .map(|s| crate::proxy_runtime::parse_allow_domain_arg(s)),
-    );
+    let cli_allow_domain: Vec<profile::AllowDomainEntry> = args
+        .allow_proxy
+        .iter()
+        .map(|s| crate::proxy_runtime::parse_allow_domain_arg(s))
+        .collect();
+    // Merge so a CLI entry for a profile domain adds to its rules instead of
+    // producing a second route that replaces them.
+    let allow_domain = profile::merge_allow_domain(&profile_allow_domain, &cli_allow_domain);
 
     let mut deny_domain: Vec<String> = network.map(|n| n.deny_domain.clone()).unwrap_or_default();
     deny_domain.extend(args.deny_proxy.iter().cloned());

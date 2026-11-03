@@ -110,11 +110,11 @@ pub struct DomainEndpointState {
     pub domain: String,
     /// Allowed method+path rules (default-deny when non-empty)
     pub endpoints: Vec<EndpointRuleState>,
-    /// `true` when the entry uses `endpoint_policy`. `endpoints` then holds
-    /// only its `allow` rules: other paths may be denied or need approval,
-    /// and an empty list allows nothing without asking.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub endpoint_policy: bool,
+    /// The entry's `endpoint_policy` as the proxy enforces it. `endpoints`
+    /// then lists only its `allow` rules, for display; `nono why` evaluates
+    /// this policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_policy: Option<nono_proxy::config::EndpointPolicyConfig>,
 }
 
 impl DomainEndpointState {
@@ -152,7 +152,9 @@ impl DomainEndpointState {
         Some(Self {
             domain: domain.clone(),
             endpoints: rules,
-            endpoint_policy: endpoint_policy.is_some(),
+            endpoint_policy: endpoint_policy
+                .as_ref()
+                .map(crate::profile::AllowDomainEndpointPolicy::to_proxy),
         })
     }
 }
@@ -1640,9 +1642,14 @@ mod cap_file_validation_tests {
 
         assert_eq!(states.len(), 2);
         assert_eq!(states[0].domain, "rules.example.com");
-        assert!(!states[0].endpoint_policy);
+        assert!(states[0].endpoint_policy.is_none());
         assert_eq!(states[1].domain, "policy.example.com");
-        assert!(states[1].endpoint_policy);
+        let policy = states[1].endpoint_policy.as_ref().expect("policy");
+        assert_eq!(policy.approve.len(), 1);
+        assert_eq!(
+            policy.default.decision,
+            nono_proxy::config::EndpointPolicyDecision::Deny
+        );
         assert_eq!(states[1].endpoints.len(), 1);
         assert_eq!(states[1].endpoints[0].path, "/health");
 
@@ -1654,6 +1661,6 @@ mod cap_file_validation_tests {
             "endpoints": []
         }))
         .expect("old state files still load");
-        assert!(!decoded.endpoint_policy);
+        assert!(decoded.endpoint_policy.is_none());
     }
 }

@@ -1056,12 +1056,13 @@ pub(crate) async fn capture_cmd_credential(
     }
 }
 
-/// Evaluate the explicit endpoint policies of the credential-less routes on the
+/// Evaluate the endpoint policies of the credential-less routes on the
 /// credential route's upstream (the `_ep_<domain>` routes built from
 /// `allow_domain`), as the CONNECT-intercept path does, so a credential route
-/// cannot allow what those policies deny. A `deny` refuses; `approve` outcomes
-/// are returned for [`enforce_endpoint_policy`] to ask. A legacy `endpoints`
-/// allow-list keeps its reverse-proxy behavior and does not gate here.
+/// cannot allow what those policies deny. An explicit `deny` refuses; `approve`
+/// outcomes are returned for [`enforce_endpoint_policy`] to ask. An
+/// `endpoints` allow-list gates the request: when one exists, some such route
+/// must allow or ask for it, or it is refused.
 fn host_endpoint_policies<'a>(
     route: &crate::route::LoadedRoute,
     service: &str,
@@ -1075,15 +1076,29 @@ fn host_endpoint_policies<'a>(
     let Some(host_port) = route.upstream_host_port.as_deref() else {
         return Ok(pending);
     };
+    // Mirrors `has_endpoint_only_route`/`endpoint_authorized` in
+    // `tls_intercept::handle::select_intercept_route`.
+    let mut gated = false;
+    let mut authorized = false;
     for (prefix, host_route) in route_store.lookup_all_by_upstream(host_port) {
         if prefix == service
             || host_route.requires_managed_credential
-            || !host_route.endpoint_policy.is_explicit()
             || host_route.endpoint_policy.allows_all_without_l7()
         {
             continue;
         }
         let outcome = host_route.endpoint_policy.evaluate(method, upstream_path);
+        if let EndpointPolicyOutcome::Deny { .. } = outcome
+            && !host_route.endpoint_policy.is_explicit()
+        {
+            // An `endpoints` allow-list miss: this route does not apply, but
+            // the request needs another endpoint route to authorize it.
+            gated = true;
+            continue;
+        }
+        if !matches!(outcome, EndpointPolicyOutcome::Deny { .. }) {
+            authorized = true;
+        }
         let (action, decision, rule_label, reason) = match outcome {
             EndpointPolicyOutcome::Allow { rule_label } => (
                 "allow",
@@ -1149,6 +1164,31 @@ fn host_endpoint_policies<'a>(
         if let Some(reason) = reason {
             return Err(reason);
         }
+    }
+    if gated && !authorized {
+        let reason = format!(
+            "endpoint rules denied {} {} for service '{}': no allow_domain endpoint rule matched on {}",
+            method, upstream_path, service, host_port
+        );
+        audit::log_l7_policy_decision(
+            audit_log,
+            audit::ProxyMode::Reverse,
+            &audit::EventContext {
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
+                endpoint_policy_action: Some("deny"),
+                endpoint_policy_rule: Some("endpoint_rules"),
+                ..route_ctx.clone()
+            },
+            service,
+            None,
+            method,
+            upstream_path,
+            nono::undo::NetworkAuditDecision::Deny,
+            "deny",
+            "endpoint_rules",
+            Some(&reason),
+        );
+        return Err(reason);
     }
     Ok(pending)
 }
@@ -3438,16 +3478,22 @@ mod tests {
                 }),
                 ..base("_ep_api.example.com")
             },
-            // A legacy allow-list does not gate reverse-proxy traffic.
-            crate::config::RouteConfig {
-                endpoint_rules: vec![crate::config::EndpointRule {
-                    method: "GET".to_string(),
-                    path: "/only/**".to_string(),
-                }],
-                ..base("legacy")
-            },
             base("github"),
         ]
+    }
+
+    fn legacy_routes() -> Vec<crate::config::RouteConfig> {
+        let mut routes = host_policy_routes();
+        routes.remove(0);
+        routes.push(crate::config::RouteConfig {
+            prefix: "_ep_api.example.com".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/acme/**".to_string(),
+            }],
+            ..routes[0].clone()
+        });
+        routes
     }
 
     #[tokio::test]
@@ -3469,6 +3515,26 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].route_id, "_ep_api.example.com");
         assert!(pending[0].session_scope);
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_applies_host_endpoints_allow_list() {
+        let store = RouteStore::load(&legacy_routes()).await.unwrap();
+        let route = store.get("github").unwrap();
+        let ctx = audit::EventContext::default();
+        let eval = |method: &'static str, path: &'static str| {
+            host_endpoint_policies(route, "github", method, path, &ctx, &store, None)
+        };
+
+        assert!(eval("GET", "/acme/repo").unwrap().is_empty());
+        assert!(
+            eval("GET", "/other/repo").is_err(),
+            "a path outside the allow-list must be refused"
+        );
+        assert!(
+            eval("POST", "/acme/repo").is_err(),
+            "the method must match too"
+        );
     }
 
     #[tokio::test]

@@ -31,7 +31,6 @@
       cargoLock.lockFile = "${self}/Cargo.lock";
 
       nativeBuildInputs = [ pkgs.pkg-config ];
-      buildInputs = [ pkgs.dbus ];
 
       # Tests require /bin/pwd, /usr/bin/env, git, /var/folders, network, etc.
       # and fail in the Nix sandbox. The project's own CI covers testing.
@@ -58,10 +57,10 @@
     # Auto-updated by the `update-nix-hashes` job in release.yml
     # after each release — no manual maintenance needed.
     prebuiltHashes = {
-      "x86_64-linux" = "sha256-baZlthmZVwwQ3/x9p4go/h+388rFMxnlBc6+yu8XA38=";
-      "aarch64-linux" = "sha256-0qJMjDdxT4XIKbVYb/2B/CrPM2yVNy2IG6YhQIhPIss=";
-      "x86_64-darwin" = "sha256-s1TmdOa0ZDrVxXLRSK42e7DFwQNBD7wikjxVk6b30LI=";
-      "aarch64-darwin" = "sha256-roJBZ7PZBTG4MEKbqSt3gTebHC15+bEf3Yiw/SZ+TjI=";
+      "x86_64-linux" = "sha256-fswz/5w0m9+oS0SW56dVX2e8wz8eElx9+e+2U8bE5Wk=";
+      "aarch64-linux" = "sha256-pNh92wkX75YiS8xBolhzGNfQ6SRB5/9FRpblmAyfeSQ=";
+      "x86_64-darwin" = "sha256-95WqiPqvdZdf/GAOuHDnyfK1K6IDXfUIfslyoCUq/UA=";
+      "aarch64-darwin" = "sha256-cosd7vv2OQybdPyYLvve0eHEs3uZ3N76Lgcmbf702ek=";
     };
 
     prebuiltFor = system: let pkgs = pkgsFor system; in pkgs.stdenv.mkDerivation {
@@ -122,6 +121,8 @@
     devShells = forAllSystems (system: let pkgs = pkgsFor system; in {
       default = pkgs.mkShell {
         nativeBuildInputs = [ pkgs.pkg-config ];
+        # Keep D-Bus tools in the development shell for manual Secret Service
+        # testing; the package build itself uses the pure-Rust zbus client.
         buildInputs = [ pkgs.dbus pkgs.rustc pkgs.cargo ];
       };
     });

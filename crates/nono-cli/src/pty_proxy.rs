@@ -23,6 +23,7 @@ use nix::unistd::{Pid, tcgetpgrp};
 use nono::{NonoError, Result};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::num::NonZeroU16;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -219,19 +220,27 @@ struct ScreenState {
     parser: vt100::Parser,
 }
 
+fn nonzero_screen_dimension(value: usize) -> NonZeroU16 {
+    let bounded = value.clamp(1, u16::MAX as usize) as u16;
+    NonZeroU16::new(bounded).unwrap_or(NonZeroU16::MIN)
+}
+
 impl ScreenState {
     fn new(rows: usize, cols: usize) -> Self {
-        let rows = rows.max(1).min(u16::MAX as usize) as u16;
-        let cols = cols.max(1).min(u16::MAX as usize) as u16;
         Self {
-            parser: vt100::Parser::new(rows, cols, VT_SCROLLBACK_ROWS),
+            parser: vt100::Parser::new(
+                nonzero_screen_dimension(rows),
+                nonzero_screen_dimension(cols),
+                VT_SCROLLBACK_ROWS,
+            ),
         }
     }
 
     fn resize(&mut self, rows: usize, cols: usize) {
-        let rows = rows.max(1).min(u16::MAX as usize) as u16;
-        let cols = cols.max(1).min(u16::MAX as usize) as u16;
-        self.parser.screen_mut().set_size(rows, cols);
+        self.parser.screen_mut().set_size(
+            nonzero_screen_dimension(rows),
+            nonzero_screen_dimension(cols),
+        );
     }
 
     fn apply_bytes(&mut self, bytes: &[u8]) {
@@ -239,7 +248,7 @@ impl ScreenState {
     }
 
     fn render(&self) -> Vec<u8> {
-        self.parser.screen().state_formatted()
+        self.parser.screen().state_formatted().into_bytes()
     }
 
     fn render_plaintext(&self) -> String {
@@ -247,7 +256,8 @@ impl ScreenState {
     }
 
     fn size(&self) -> (u16, u16) {
-        self.parser.screen().size()
+        let (rows, cols) = self.parser.screen().size();
+        (rows.get(), cols.get())
     }
 
     fn cursor_position(&self) -> (u16, u16) {
@@ -972,6 +982,22 @@ impl PtyProxy {
         true
     }
 
+    /// Run a supervisor-owned prompt with the relay paused.
+    ///
+    /// While a terminal client is attached, the real terminal is in raw mode
+    /// and its keystrokes are relayed to the child, so a prompt would render
+    /// garbled and compete with the child for the user's answer. Restore
+    /// cooked mode for the duration of `prompt`, then re-enter relay mode.
+    /// Runs `prompt` unchanged when no terminal-backed client is attached.
+    pub fn run_with_terminal_paused<T>(&mut self, prompt: impl FnOnce() -> T) -> T {
+        let paused = self.pause_terminal_for_prompt();
+        let result = prompt();
+        if paused {
+            self.resume_terminal_after_prompt();
+        }
+        result
+    }
+
     /// Re-enter relay terminal mode after a supervisor-owned prompt.
     ///
     /// Returns true when a terminal-backed client was resumed.
@@ -1365,7 +1391,16 @@ impl PtyProxy {
                     );
                 }
             }
-            EnhancedKeyMatch::Invalid => self.flush_pending_detach_escape(forwarded),
+            EnhancedKeyMatch::Invalid => {
+                if self.detach_sequence[..self.pending_detach_match_len]
+                    .iter()
+                    .any(|&key| is_enhanced_key_echo(&self.pending_detach_escape, key))
+                {
+                    self.pending_detach_escape.clear();
+                } else {
+                    self.flush_pending_detach_escape(forwarded);
+                }
+            }
         }
 
         true
@@ -1414,25 +1449,14 @@ pub(crate) fn match_enhanced_key_sequence(bytes: &[u8], expected_key: u8) -> Enh
     };
 
     if last == b'u' {
-        if body.is_empty()
-            || !body
-                .iter()
-                .all(|b| b.is_ascii_digit() || matches!(b, b';' | b':'))
+        let Some(report) = parse_csi_u_key_report(body) else {
+            return EnhancedKeyMatch::Invalid;
+        };
+        // Only a press advances a detach match. Repeat and release reports
+        // (kitty "report event types") are handled by is_enhanced_key_echo.
+        return if report.event_type == KITTY_EVENT_PRESS
+            && enhanced_key_matches(expected_key, report.codepoint, report.modifiers)
         {
-            return EnhancedKeyMatch::Invalid;
-        }
-        let mut fields = body.split(|b| matches!(b, b';' | b':'));
-        let Some(first_field) = fields.next() else {
-            return EnhancedKeyMatch::Invalid;
-        };
-        if first_field.is_empty() {
-            return EnhancedKeyMatch::Invalid;
-        }
-        let Some(codepoint) = parse_ascii_u32(first_field) else {
-            return EnhancedKeyMatch::Invalid;
-        };
-        let modifiers = fields.find_map(parse_ascii_u32).unwrap_or(1);
-        return if enhanced_key_matches(expected_key, codepoint, modifiers) {
             EnhancedKeyMatch::Matched
         } else {
             EnhancedKeyMatch::Invalid
@@ -1469,6 +1493,75 @@ pub(crate) fn match_enhanced_key_sequence(bytes: &[u8], expected_key: u8) -> Enh
     }
 
     EnhancedKeyMatch::Invalid
+}
+
+/// Returns true when `bytes` is a complete kitty CSI-u repeat or release
+/// report for `key`.
+///
+/// Applications that enable kitty event reporting (e.g. pi pushes flags 7)
+/// make the terminal send `\x1b[93;5:3u` after the `\x1b[93;5u` press of
+/// Ctrl-]. Detach matchers use this to swallow those reports for keys already
+/// matched instead of letting them reset a partial detach sequence.
+pub(crate) fn is_enhanced_key_echo(bytes: &[u8], key: u8) -> bool {
+    let Some(body) = bytes
+        .strip_prefix(b"\x1b[")
+        .and_then(|rest| rest.strip_suffix(b"u"))
+    else {
+        return false;
+    };
+    parse_csi_u_key_report(body).is_some_and(|report| {
+        report.event_type != KITTY_EVENT_PRESS
+            && enhanced_key_matches(key, report.codepoint, report.modifiers)
+    })
+}
+
+const KITTY_EVENT_PRESS: u32 = 1;
+/// Caps Lock and Num Lock bits of a kitty modifier mask; they do not change
+/// which key was pressed.
+const KITTY_LOCK_MODIFIER_BITS: u32 = 64 | 128;
+
+struct CsiUKeyReport {
+    codepoint: u32,
+    modifiers: u32,
+    event_type: u32,
+}
+
+/// Parse the body of `CSI key[:shifted[:base]] [; modifiers[:event] [; text]] u`.
+fn parse_csi_u_key_report(body: &[u8]) -> Option<CsiUKeyReport> {
+    if body.is_empty()
+        || !body
+            .iter()
+            .all(|b| b.is_ascii_digit() || matches!(b, b';' | b':'))
+    {
+        return None;
+    }
+    let mut fields = body.split(|b| *b == b';');
+    let codepoint = parse_ascii_u32(fields.next()?.split(|b| *b == b':').next()?)?;
+
+    let (modifiers, event_type) = match fields.next() {
+        None => (1, KITTY_EVENT_PRESS),
+        Some(field) => {
+            let mut parts = field.split(|b| *b == b':');
+            let modifiers = match parts.next() {
+                Some(m) if !m.is_empty() => parse_ascii_u32(m)?,
+                _ => 1,
+            };
+            let event_type = match parts.next() {
+                Some(e) if !e.is_empty() => parse_ascii_u32(e)?,
+                _ => KITTY_EVENT_PRESS,
+            };
+            (modifiers, event_type)
+        }
+    };
+    let modifiers = modifiers
+        .checked_sub(1)
+        .map(|bits| (bits & !KITTY_LOCK_MODIFIER_BITS).saturating_add(1))?;
+
+    Some(CsiUKeyReport {
+        codepoint,
+        modifiers,
+        event_type,
+    })
 }
 
 fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
@@ -1589,6 +1682,13 @@ fn select_attach_replay_bytes(
     rendered_snapshot: Vec<u8>,
     rendered_plaintext: &str,
 ) -> Vec<u8> {
+    let raw_replay_restores_alternate_screen = if alternate_screen_active {
+        let mut tracker = AltScreenTracker::default();
+        tracker.observe(&raw_scrollback);
+        tracker.in_alt_screen
+    } else {
+        false
+    };
     let body = compose_replay_body(
         alternate_screen_active,
         raw_scrollback,
@@ -1596,16 +1696,21 @@ fn select_attach_replay_bytes(
         rendered_plaintext,
     );
     if alternate_screen_active {
-        // Only force the outer terminal into the alternate screen when the
-        // child is currently using it (vim, htop, etc.). For normal-mode
-        // sessions (shells, Claude Code) we stay in normal screen so the
-        // user's terminal-emulator scrollback and mouse-wheel behavior are
-        // preserved.
-        let mut out =
-            Vec::with_capacity(ATTACH_SCREEN_ENTER_ESCAPE.len().saturating_add(body.len()));
-        out.extend_from_slice(ATTACH_SCREEN_ENTER_ESCAPE);
-        out.extend_from_slice(&body);
-        out
+        if raw_replay_restores_alternate_screen {
+            body
+        } else {
+            // Force the outer terminal into the alternate screen only when the
+            // retained raw history was truncated past the child's active
+            // alternate-screen entry. When the history still contains that entry,
+            // replay it from the normal screen so the terminal saves the rebuilt
+            // child shell buffer. Otherwise leaving the TUI later would restore
+            // the host's pre-attach buffer instead of the child's normal screen.
+            let mut out =
+                Vec::with_capacity(ATTACH_SCREEN_ENTER_ESCAPE.len().saturating_add(body.len()));
+            out.extend_from_slice(ATTACH_SCREEN_ENTER_ESCAPE);
+            out.extend_from_slice(&body);
+            out
+        }
     } else if raw_scrollback_present {
         // Normal-screen, session has produced output: wipe the outer
         // terminal's native scrollback before replaying so the user doesn't
@@ -2764,7 +2869,8 @@ mod tests {
         AltScreenTracker, AttachedClient, CprReplyParse, DEFAULT_DETACH_SEQUENCE,
         ERASE_NATIVE_SCROLLBACK, PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_NORMAL,
         decode_attach_handshake, discard_late_terminal_input, encode_attach_request_frame,
-        read_fd_once, select_attach_replay_bytes, terminal_restore_escape, write_all_fd,
+        nonzero_screen_dimension, read_fd_once, select_attach_replay_bytes,
+        terminal_restore_escape, write_all_fd,
     };
     use nix::libc;
     use nix::pty::{OpenptyResult, Winsize, openpty};
@@ -2978,7 +3084,11 @@ mod tests {
 
     #[test]
     fn remote_restore_clears_normal_viewport_and_retains_scrollback() {
-        let mut parser = vt100::Parser::new(6, 30, 30);
+        let mut parser = vt100::Parser::new(
+            nonzero_screen_dimension(6),
+            nonzero_screen_dimension(30),
+            30,
+        );
         parser.process(b"foo\r\nbar\x1b[41m\x1b[2;4r\x1b[?6h");
         parser.process(&remote_terminal_restore_escape(false, 6));
         assert_eq!(parser.screen().contents(), "");
@@ -2993,7 +3103,11 @@ mod tests {
 
     #[test]
     fn remote_restore_moves_saved_banner_out_of_the_prompt_area() {
-        let mut parser = vt100::Parser::new(6, 30, 30);
+        let mut parser = vt100::Parser::new(
+            nonzero_screen_dimension(6),
+            nonzero_screen_dimension(30),
+            30,
+        );
         parser.process(b"$ nono connect\r\nconnected\r\ndetach keys\r\n");
         // Reproduce a saved cursor above the connection banner. Restoring only
         // the alternate buffer would put the next prompt over that banner.
@@ -3178,6 +3292,23 @@ mod tests {
         );
         assert_eq!(replay, with_alt_prefix(b"rawrendered"));
         assert!(!replay.starts_with(ERASE_NATIVE_SCROLLBACK));
+    }
+
+    #[test]
+    fn attach_replay_uses_retained_alt_entry_to_save_the_child_normal_screen() {
+        let raw = b"shell prompt\r\n\x1b[?1049hless contents";
+        let replay = select_attach_replay_bytes(
+            true,
+            true,
+            raw.to_vec(),
+            b"rendered less".to_vec(),
+            "less contents",
+        );
+
+        let mut expected = raw.to_vec();
+        expected.extend_from_slice(b"rendered less");
+        assert_eq!(replay, expected);
+        assert!(!replay.starts_with(ATTACH_SCREEN_ENTER_ESCAPE));
     }
 
     #[test]
@@ -3417,6 +3548,38 @@ mod tests {
         let forwarded = proxy.filter_client_input(b"\x1b[93;5u\x1b[100;1u");
         assert!(forwarded.is_empty());
         assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_detaches_with_kitty_event_type_reports() {
+        // pi pushes kitty flags 7, so Ctrl-] arrives as a press then a release
+        // (and repeats when held). These must not reset the partial match.
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5u");
+        assert!(forwarded.is_empty());
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5:2u\x1b[93;5:3u");
+        assert!(forwarded.is_empty());
+        assert_eq!(proxy.pending_detach_match_len, 1);
+        let forwarded = proxy.filter_client_input(b"d");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_detaches_with_explicit_press_alternate_keys_and_locks() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        // Alternate base-layout key, Caps Lock (bit 64) and explicit press.
+        let forwarded = proxy.filter_client_input(b"\x1b[93::93;69:1u\x1b[100;1:1u");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_does_not_match_detach_on_release_only() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5:3ud");
+        assert_eq!(forwarded, b"\x1b[93;5:3ud");
+        assert!(!proxy.take_detach_request());
     }
 
     #[test]

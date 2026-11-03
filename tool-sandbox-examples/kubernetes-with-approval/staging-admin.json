@@ -38,7 +38,7 @@
       "~/.local/bin"
     ],
     "read": [
-      "~/nono-gateway/.config/nono/packages/always-further/claude"
+      "~/nono-gateway/.config/nono/packages/nolabs-ai/claude"
     ],
     "suppress_save_prompt": [
       "~/",
@@ -49,7 +49,7 @@
       "~/Library/Application Support/Microsoft Edge",
       "~/Library/Application Support/Vivaldi",
       "~/Library/Application Support/com.operasoftware.Opera",
-      "~/nono-gateway/.config/nono/packages/always-further/claude",
+      "~/nono-gateway/.config/nono/packages/nolabs-ai/claude",
       "~/.local/bin",
       "~/dev/nono-workspace/tool-sandbox-package/.git"
     ]

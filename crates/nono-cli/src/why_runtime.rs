@@ -1,5 +1,5 @@
 use crate::capability_ext::CapabilitySetExt;
-use crate::cli::{SandboxArgs, WhyArgs, WhyOp, WhyScope};
+use crate::cli::{SandboxArgs, WhyArgs, WhyOp, WhyScope, WhySocketOp};
 use crate::command_policy::{
     CommandFromConfig, CommandPoliciesConfig, CommandSandboxConfig, InvocationPolicyConfig,
 };
@@ -10,6 +10,7 @@ use nono::{AccessMode, CapabilitySet, NonoError, Result};
 struct WhyContext {
     caps: CapabilitySet,
     deny_policy: policy::EffectiveDenyPolicy,
+    pathname_socket_enforcement: Option<sandbox_state::PathnameSocketEnforcement>,
     allowed_domains: Vec<String>,
     denied_domains: Vec<String>,
     domain_endpoints: Vec<sandbox_state::DomainEndpointState>,
@@ -114,6 +115,26 @@ fn resolve_domain_endpoints(profile: &profile::Profile) -> Vec<sandbox_state::Do
         .collect()
 }
 
+fn sandbox_args_from_why(args: &WhyArgs) -> SandboxArgs {
+    SandboxArgs {
+        allow: args.allow.clone(),
+        read: args.read.clone(),
+        write: args.write.clone(),
+        allow_file: args.allow_file.clone(),
+        read_file: args.read_file.clone(),
+        write_file: args.write_file.clone(),
+        allow_unix_socket: args.allow_unix_socket.clone(),
+        allow_unix_socket_bind: args.allow_unix_socket_bind.clone(),
+        allow_unix_socket_dir: args.allow_unix_socket_dir.clone(),
+        allow_unix_socket_dir_bind: args.allow_unix_socket_dir_bind.clone(),
+        allow_unix_socket_subtree: args.allow_unix_socket_subtree.clone(),
+        allow_unix_socket_subtree_bind: args.allow_unix_socket_subtree_bind.clone(),
+        block_net: args.block_net,
+        workdir: args.workdir.clone(),
+        ..SandboxArgs::default()
+    }
+}
+
 pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
     use query_ext::{QueryResult, print_result, query_network, query_path, query_scope};
     use sandbox_state::load_sandbox_state;
@@ -167,12 +188,14 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         match sandbox_state {
             Some(state) => {
                 let domain_endpoints = state.domain_endpoints.clone();
+                let pathname_socket_enforcement = state.pathname_socket_enforcement;
                 WhyContext {
                     caps: state.to_caps()?,
                     deny_policy: policy::EffectiveDenyPolicy::from_applied_bypasses(
                         &state.deny_paths_as_paths(),
                         &state.applied_bypasses,
                     ),
+                    pathname_socket_enforcement,
                     allowed_domains: state.allowed_domains.clone(),
                     denied_domains: state.denied_domains.clone(),
                     domain_endpoints,
@@ -202,17 +225,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        let sandbox_args = SandboxArgs {
-            allow: args.allow.clone(),
-            read: args.read.clone(),
-            write: args.write.clone(),
-            allow_file: args.allow_file.clone(),
-            read_file: args.read_file.clone(),
-            write_file: args.write_file.clone(),
-            block_net: args.block_net,
-            workdir: args.workdir.clone(),
-            ..SandboxArgs::default()
-        };
+        let sandbox_args = sandbox_args_from_why(&args);
 
         let allowed_domains =
             merge_cli_allow_domains(resolve_allowed_domains(&profile)?, &args.allow_proxy)?;
@@ -220,6 +233,13 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             merge_cli_deny_domains(resolve_denied_domains(&profile)?, &args.deny_proxy)?;
         let domain_endpoints = resolve_domain_endpoints(&profile);
         let command_policies = profile.command_policies.clone();
+        let pathname_socket_enforcement = sandbox_state::pathname_socket_enforcement(
+            profile
+                .linux
+                .af_unix_mediation
+                .unwrap_or_default()
+                .is_pathname(),
+        );
 
         let prepared = CapabilitySet::from_profile(&profile, &workdir, &sandbox_args)?;
         let mut caps = prepared.caps;
@@ -232,23 +252,14 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
                 &prepared.deny_paths,
                 &prepared.applied_bypass_paths,
             ),
+            pathname_socket_enforcement,
             allowed_domains,
             denied_domains,
             domain_endpoints,
             command_policies,
         }
     } else {
-        let sandbox_args = SandboxArgs {
-            allow: args.allow.clone(),
-            read: args.read.clone(),
-            write: args.write.clone(),
-            allow_file: args.allow_file.clone(),
-            read_file: args.read_file.clone(),
-            write_file: args.write_file.clone(),
-            block_net: args.block_net,
-            workdir: args.workdir.clone(),
-            ..SandboxArgs::default()
-        };
+        let sandbox_args = sandbox_args_from_why(&args);
 
         let prepared = CapabilitySet::from_args(&sandbox_args)?;
         let mut caps = prepared.caps;
@@ -261,6 +272,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
                 &prepared.deny_paths,
                 &[],
             ),
+            pathname_socket_enforcement: sandbox_state::pathname_socket_enforcement(false),
             allowed_domains: merge_cli_allow_domains(Vec::new(), &args.allow_proxy)?,
             denied_domains: merge_cli_deny_domains(Vec::new(), &args.deny_proxy)?,
             domain_endpoints: vec![],
@@ -296,14 +308,35 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             },
             None => query_path(path, op, &ctx.caps, ctx.deny_policy.bypass_paths())?,
         };
-        apply_file_grant_staleness(
+        let result = apply_file_grant_staleness(
             result,
             path,
             op,
             &ctx.caps,
             ctx.deny_policy.bypass_paths(),
             &stale_file_grants,
-        )?
+        )?;
+        annotate_unix_socket_path_query(result, path)
+    } else if let Some(ref path) = args.unix_socket {
+        let op = match args.socket_op.unwrap_or(WhySocketOp::Connect) {
+            WhySocketOp::Connect => nono::UnixSocketOp::Connect,
+            WhySocketOp::Bind => nono::UnixSocketOp::Bind,
+        };
+        let deny_access = match op {
+            nono::UnixSocketOp::Connect | nono::UnixSocketOp::Send => AccessMode::Read,
+            nono::UnixSocketOp::Bind => AccessMode::ReadWrite,
+        };
+        let denied_by_filesystem_policy = ctx
+            .deny_policy
+            .matching_deny_for_access(path, deny_access)
+            .is_some();
+        query_ext::query_unix_socket(
+            path,
+            op,
+            &ctx.caps,
+            ctx.pathname_socket_enforcement,
+            denied_by_filesystem_policy,
+        )
     } else if let Some(ref host) = args.host {
         query_network(
             host,
@@ -317,7 +350,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         query_scope(scope_query(scope), &ctx.caps)
     } else {
         return Err(NonoError::ConfigParse(
-            "--command, --path, --host, or --scope is required".to_string(),
+            "--command, --path, --unix-socket, --host, or --scope is required".to_string(),
         ));
     };
 
@@ -330,6 +363,46 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn annotate_unix_socket_path_query(
+    mut result: query_ext::QueryResult,
+    path: &std::path::Path,
+) -> query_ext::QueryResult {
+    #[cfg(unix)]
+    let is_socket = {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(path)
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)
+    };
+    #[cfg(not(unix))]
+    let is_socket = false;
+
+    if !is_socket {
+        return result;
+    }
+
+    let caveat = format!(
+        "This is a pathname Unix socket. The result above covers filesystem access only; query connect access with: nono why --unix-socket {}",
+        path.display()
+    );
+    match &mut result {
+        query_ext::QueryResult::Allowed { warning, .. } => {
+            *warning = Some(match warning.take() {
+                Some(existing) => format!("{existing} {caveat}"),
+                None => caveat,
+            });
+        }
+        query_ext::QueryResult::Denied { details, .. } => {
+            *details = Some(match details.take() {
+                Some(existing) => format!("{existing}. {caveat}"),
+                None => caveat,
+            });
+        }
+        _ => {}
+    }
+    result
 }
 
 /// Evaluate literal filesystem rules without resolving any path on this host.
@@ -925,6 +998,32 @@ mod tests {
         InvocationRuleConfig, PolicyDecision, PolicyDecisionConfig,
     };
     use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    #[cfg(unix)]
+    fn path_query_on_unix_socket_explains_separate_connect_surface() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("service.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let result = query_ext::QueryResult::Denied {
+            reason: "path_not_granted".to_string(),
+            details: Some("Path is not covered by any capability".to_string()),
+            policy_source: None,
+            matching_capability: None,
+            suggested_flag: Some(format!("--read-file {}", socket_path.display())),
+            endpoint_rules: None,
+        };
+
+        let annotated = annotate_unix_socket_path_query(result, &socket_path);
+        let query_ext::QueryResult::Denied { details, .. } = annotated else {
+            panic!("expected denied result");
+        };
+        let details = details.expect("details");
+        assert!(details.contains("filesystem access only"));
+        assert!(details.contains("nono why --unix-socket"));
+    }
 
     fn profile_from_json(json: &str) -> profile::Profile {
         serde_json::from_str(json).expect("parse profile")

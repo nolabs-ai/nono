@@ -1,7 +1,8 @@
 use crate::command_policy::{
     ApprovalBackendConfig, ApprovalBackendType, ApprovalChainMode, CommandPoliciesConfig,
+    WebhookTarget, parse_webhook_target,
 };
-use crate::terminal_approval::TerminalApproval;
+use crate::terminal_approval::{TERMINAL_APPROVAL_TIMEOUT, TerminalApproval};
 use nono::{ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,20 +11,39 @@ use std::time::{Duration, Instant};
 
 const WEBHOOK_RESPONSE_LIMIT_BYTES: u64 = 64 * 1024;
 
+#[cfg(unix)]
+#[path = "approval_unix_transport.rs"]
+mod unix_transport;
+
+/// Build the endpoint-approval registry for a session's proxy. Requests routed
+/// through it carry `session_id`, so a backend can attribute them to the
+/// sandbox session rather than to the proxy.
+///
+/// `command_policies` backends answer endpoint `approve` decisions when the
+/// profile declares them. Otherwise `network_fallback` (the profile's
+/// `network.approval_backends` and default) does, so a credential endpoint
+/// policy on `network.custom_credentials` can ask without a command policy,
+/// which nono only accepts when it names a command.
 pub(crate) fn build_proxy_approval_registry(
     config: Option<&CommandPoliciesConfig>,
+    network_fallback: Option<(&BTreeMap<String, ApprovalBackendConfig>, Option<String>)>,
+    session_id: &str,
 ) -> Result<Option<nono_proxy::approval::ApprovalBackendRegistry>> {
-    let Some(config) = config else {
-        return Ok(None);
+    let (backends, default_backend) = match config {
+        Some(config) if !config.approval_backends.is_empty() => (
+            &config.approval_backends,
+            config.approval_defaults.backend.clone(),
+        ),
+        _ => match network_fallback {
+            Some((backends, default_backend)) if !backends.is_empty() => {
+                (backends, default_backend)
+            }
+            _ => return Ok(None),
+        },
     };
-    if config.approval_backends.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(build_approval_registry_from(
-        &config.approval_backends,
-        config.approval_defaults.backend.clone(),
-    )?))
+    Ok(Some(
+        build_approval_registry_from(backends, default_backend)?.with_session_id(session_id),
+    ))
 }
 
 pub(crate) fn build_approval_registry(
@@ -69,6 +89,79 @@ pub(crate) fn resolve_supervised_approval_backend(
     Ok(Some(backend))
 }
 
+/// Whether the backend `name` is the terminal prompt or a chain that can
+/// reach it. Used to warn when there is no terminal to prompt on.
+pub(crate) fn backend_reaches_terminal(
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
+    name: &str,
+) -> bool {
+    let mut pending = vec![name];
+    let mut seen = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        match backends.get(current) {
+            Some(backend) if backend.backend_type == ApprovalBackendType::Terminal => {
+                return true;
+            }
+            Some(backend) => pending.extend(backend.backends.iter().map(String::as_str)),
+            None => {}
+        }
+    }
+    false
+}
+
+/// Every `unix://` webhook socket configured in `backend_maps`, as
+/// `(backend name, socket path)`. Malformed URLs are skipped here; profile
+/// validation and the backend builder reject them.
+pub(crate) fn approval_socket_paths<'a>(
+    backend_maps: impl IntoIterator<Item = &'a BTreeMap<String, ApprovalBackendConfig>>,
+) -> Vec<(String, std::path::PathBuf)> {
+    let mut sockets = Vec::new();
+    for backends in backend_maps {
+        for (name, backend) in backends {
+            if backend.backend_type != ApprovalBackendType::Webhook {
+                continue;
+            }
+            if let Some(Ok(WebhookTarget::Unix { socket })) =
+                backend.url.as_deref().map(parse_webhook_target)
+            {
+                sockets.push((name.clone(), socket));
+            }
+        }
+    }
+    sockets
+}
+
+/// Refuse to launch when the sandboxed child could stand in for a `unix://`
+/// approval helper: by writing to the socket or any directory above it
+/// (replacing or recreating the socket), or by holding a grant to bind it.
+/// An impostor socket would answer every approval itself.
+///
+/// `sockets` comes from [`approval_socket_paths`]. The same check applies to
+/// the agent's sandbox at launch and to each mediated command's sandbox.
+pub(crate) fn reject_child_replaceable_approval_sockets(
+    caps: &nono::CapabilitySet,
+    sockets: &[(String, std::path::PathBuf)],
+) -> Result<()> {
+    for (name, socket) in sockets {
+        let canonical = nono::try_canonicalize(socket);
+        let bindable = [socket, &canonical]
+            .into_iter()
+            .any(|path| caps.unix_socket_allowed(path, nono::UnixSocketOp::Bind));
+        if bindable || nono::path_writable_by(socket, caps) {
+            return Err(NonoError::ConfigParse(format!(
+                "approval backend '{name}' uses unix socket {} but the sandbox could {} it; \
+                 move the socket to a directory the sandbox cannot write to",
+                socket.display(),
+                if bindable { "bind" } else { "replace" },
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn build_approval_backends_from(
     backends: &BTreeMap<String, ApprovalBackendConfig>,
 ) -> Result<BTreeMap<String, Arc<dyn ApprovalBackend>>> {
@@ -101,6 +194,10 @@ fn build_approval_backend(
     let backend: Arc<dyn ApprovalBackend> = match backend_config.backend_type {
         ApprovalBackendType::Terminal => Arc::new(NamedTerminalApproval {
             name: name.to_string(),
+            timeout: backend_config
+                .timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(TERMINAL_APPROVAL_TIMEOUT),
         }),
         ApprovalBackendType::Webhook => Arc::new(WebhookApproval::new(name, backend_config)?),
         ApprovalBackendType::Chain => {
@@ -126,15 +223,28 @@ fn build_approval_backend(
 
 struct NamedTerminalApproval {
     name: String,
+    timeout: Duration,
 }
 
 impl ApprovalBackend for NamedTerminalApproval {
+    fn request_approval_with_deadline(
+        &self,
+        request: &ApprovalRequest,
+        deadline: Instant,
+    ) -> Result<ApprovalDecision> {
+        TerminalApproval.request_approval_with_timeout(request, self.timeout, Some(deadline))
+    }
+
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
-        TerminalApproval.request_approval(request)
+        TerminalApproval.request_approval_with_timeout(request, self.timeout, None)
     }
 
     fn backend_name(&self) -> &str {
         &self.name
+    }
+
+    fn approval_timeout(&self) -> Option<Duration> {
+        Some(self.timeout)
     }
 }
 
@@ -197,6 +307,10 @@ struct HttpReply {
 /// that host answer `granted`. A 3xx therefore surfaces as a non-2xx status
 /// and is treated as a denial.
 fn build_agent(timeout: Duration) -> ureq::Agent {
+    agent_config(timeout).new_agent()
+}
+
+fn agent_config(timeout: Duration) -> ureq::config::Config {
     let tls_config = ureq::tls::TlsConfig::builder()
         .root_certs(ureq::tls::RootCerts::PlatformVerifier)
         .build();
@@ -206,7 +320,26 @@ fn build_agent(timeout: Duration) -> ureq::Agent {
         .max_redirects_will_error(false)
         .tls_config(tls_config)
         .build()
-        .new_agent()
+}
+
+/// Request URL for a `unix://` webhook. The connector dials the socket and
+/// ignores the host, so this only fixes the request line and `Host` header.
+const UNIX_WEBHOOK_REQUEST_URL: &str = "http://localhost/";
+
+/// Agent and request URL for a webhook target.
+fn agent_for_target(target: WebhookTarget, timeout: Duration) -> Result<(ureq::Agent, String)> {
+    match target {
+        WebhookTarget::Http(url) => Ok((build_agent(timeout), url)),
+        #[cfg(unix)]
+        WebhookTarget::Unix { socket } => Ok((
+            unix_transport::build_agent(agent_config(timeout), socket),
+            UNIX_WEBHOOK_REQUEST_URL.to_string(),
+        )),
+        #[cfg(not(unix))]
+        WebhookTarget::Unix { .. } => Err(NonoError::ConfigParse(
+            "unix socket approval webhooks are not supported on this platform".to_string(),
+        )),
+    }
 }
 
 impl WebhookApproval {
@@ -232,13 +365,23 @@ impl WebhookApproval {
                 )));
             }
         };
-        if platform.is_some() && !crate::command_policy::is_platform_grade_url(&url) {
-            return Err(NonoError::ConfigParse(format!(
-                "approval backend '{name}' with auth platform must use an https URL (plain http is allowed only for loopback)"
-            )));
+        let target = parse_webhook_target(&url).map_err(|reason| {
+            NonoError::ConfigParse(format!("approval backend '{name}' {reason}"))
+        })?;
+        if platform.is_some() {
+            if matches!(target, WebhookTarget::Unix { .. }) {
+                return Err(NonoError::ConfigParse(format!(
+                    "approval backend '{name}' with auth platform cannot use a unix socket url"
+                )));
+            }
+            if !crate::command_policy::is_platform_grade_url(&url) {
+                return Err(NonoError::ConfigParse(format!(
+                    "approval backend '{name}' with auth platform must use an https URL (plain http is allowed only for loopback)"
+                )));
+            }
         }
         let timeout = Duration::from_secs(config.timeout_secs.unwrap_or(60));
-        let http = build_agent(timeout);
+        let (http, url) = agent_for_target(target, timeout)?;
         Ok(Self {
             name: name.to_string(),
             url,
@@ -264,12 +407,18 @@ impl WebhookApproval {
             "grant" | "granted" | "approve" | "approved" | "allow" | "allowed" => {
                 Ok(ApprovalDecision::Granted)
             }
+            "grant_session" | "granted_session" | "allow_session" | "always_allow" => {
+                Ok(ApprovalDecision::GrantedForSession)
+            }
             "deny" | "denied" | "reject" | "rejected" | "block" | "blocked" => {
                 Ok(ApprovalDecision::Denied {
                     reason: response.reason.unwrap_or_else(|| {
                         format!("approval webhook '{}' denied request", self.name)
                     }),
                 })
+            }
+            "deny_session" | "denied_session" | "always_deny" => {
+                Ok(ApprovalDecision::DeniedForSession)
             }
             "timeout" | "timed_out" => Ok(ApprovalDecision::Timeout),
             other => Err(NonoError::SandboxInit(format!(
@@ -538,6 +687,10 @@ impl ApprovalBackend for WebhookApproval {
     fn backend_name(&self) -> &str {
         &self.name
     }
+
+    fn approval_timeout(&self) -> Option<Duration> {
+        Some(self.timeout)
+    }
 }
 
 struct ChainApproval {
@@ -547,23 +700,71 @@ struct ChainApproval {
 }
 
 impl ApprovalBackend for ChainApproval {
+    fn request_approval_with_deadline(
+        &self,
+        request: &ApprovalRequest,
+        deadline: Instant,
+    ) -> Result<ApprovalDecision> {
+        if Instant::now() >= deadline {
+            return Ok(ApprovalDecision::Timeout);
+        }
+        match self.mode {
+            ApprovalChainMode::All => self.request_all(request, Some(deadline)),
+            ApprovalChainMode::Any => Ok(self.request_any(request, Some(deadline))),
+        }
+    }
+
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
         match self.mode {
-            ApprovalChainMode::All => self.request_all(request),
-            ApprovalChainMode::Any => Ok(self.request_any(request)),
+            ApprovalChainMode::All => self.request_all(request, None),
+            ApprovalChainMode::Any => Ok(self.request_any(request, None)),
         }
     }
 
     fn backend_name(&self) -> &str {
         &self.name
     }
+
+    fn approval_timeout(&self) -> Option<Duration> {
+        // Backends are consulted sequentially in both modes, so the worst-case
+        // wall-clock is the sum of their timeouts. Terminal prompts include
+        // their queue wait in this bound. If any child is unbounded, so is
+        // the chain — the caller applies its
+        // own floor. Saturating on overflow keeps the hint total.
+        let mut total = Duration::ZERO;
+        for backend in &self.backends {
+            total = total.saturating_add(backend.approval_timeout()?);
+        }
+        Some(total)
+    }
 }
 
 impl ChainApproval {
-    fn request_all(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+    fn request_child(
+        backend: &Arc<dyn ApprovalBackend>,
+        request: &ApprovalRequest,
+        deadline: Option<Instant>,
+    ) -> Result<ApprovalDecision> {
+        match deadline {
+            Some(end) if Instant::now() >= end => Ok(ApprovalDecision::Timeout),
+            Some(end) => backend.request_approval_with_deadline(request, end),
+            None => backend.request_approval(request),
+        }
+    }
+
+    fn request_all(
+        &self,
+        request: &ApprovalRequest,
+        deadline: Option<Instant>,
+    ) -> Result<ApprovalDecision> {
+        // A unanimous grant carries session scope only if every backend grants
+        // for the session. A single-use grant must never be widened. A session
+        // denial short-circuits and propagates so the denial is cached too.
+        let mut grant_for_session = !self.backends.is_empty();
         for backend in &self.backends {
-            match backend.request_approval(request)? {
-                ApprovalDecision::Granted => {}
+            match Self::request_child(backend, request, deadline)? {
+                ApprovalDecision::Granted => grant_for_session = false,
+                ApprovalDecision::GrantedForSession => {}
                 ApprovalDecision::Denied { reason } => {
                     return Ok(ApprovalDecision::Denied {
                         reason: format!(
@@ -573,6 +774,9 @@ impl ChainApproval {
                         ),
                     });
                 }
+                ApprovalDecision::DeniedForSession => {
+                    return Ok(ApprovalDecision::DeniedForSession);
+                }
                 ApprovalDecision::Timeout => {
                     return Ok(ApprovalDecision::Denied {
                         reason: format!("{} timed out via {}", self.name, backend.backend_name()),
@@ -580,16 +784,30 @@ impl ChainApproval {
                 }
             }
         }
-        Ok(ApprovalDecision::Granted)
+        Ok(if grant_for_session {
+            ApprovalDecision::GrantedForSession
+        } else {
+            ApprovalDecision::Granted
+        })
     }
 
-    fn request_any(&self, request: &ApprovalRequest) -> ApprovalDecision {
+    fn request_any(
+        &self,
+        request: &ApprovalRequest,
+        deadline: Option<Instant>,
+    ) -> ApprovalDecision {
         let mut reasons = Vec::new();
         for backend in &self.backends {
-            match backend.request_approval(request) {
+            match Self::request_child(backend, request, deadline) {
                 Ok(ApprovalDecision::Granted) => return ApprovalDecision::Granted,
+                Ok(ApprovalDecision::GrantedForSession) => {
+                    return ApprovalDecision::GrantedForSession;
+                }
                 Ok(ApprovalDecision::Denied { reason }) => {
                     reasons.push(format!("{} denied: {reason}", backend.backend_name()));
+                }
+                Ok(ApprovalDecision::DeniedForSession) => {
+                    reasons.push(format!("{} denied for session", backend.backend_name()));
                 }
                 Ok(ApprovalDecision::Timeout) => {
                     reasons.push(format!("{} timed out", backend.backend_name()));
@@ -614,6 +832,110 @@ impl ChainApproval {
 mod tests {
     use super::*;
     use sha2::Digest as _;
+
+    fn webhook_backends(url: &str) -> BTreeMap<String, ApprovalBackendConfig> {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "dialog".to_string(),
+            ApprovalBackendConfig {
+                backend_type: ApprovalBackendType::Webhook,
+                url: Some(url.to_string()),
+                timeout_secs: None,
+                mode: None,
+                backends: Vec::new(),
+                auth: None,
+            },
+        );
+        backends
+    }
+
+    #[test]
+    fn backend_reaches_terminal_follows_chains() {
+        let mut backends = webhook_backends("unix:///run/helper/approval.sock");
+        let backend = |backend_type, children: &[&str]| ApprovalBackendConfig {
+            backend_type,
+            url: None,
+            timeout_secs: None,
+            mode: (backend_type == ApprovalBackendType::Chain).then_some(ApprovalChainMode::Any),
+            backends: children.iter().map(|c| c.to_string()).collect(),
+            auth: None,
+        };
+        backends.insert(
+            "prompt".to_string(),
+            backend(ApprovalBackendType::Terminal, &[]),
+        );
+        backends.insert(
+            "either".to_string(),
+            backend(ApprovalBackendType::Chain, &["dialog", "prompt"]),
+        );
+        backends.insert(
+            "remote".to_string(),
+            backend(ApprovalBackendType::Chain, &["dialog"]),
+        );
+        assert!(backend_reaches_terminal(&backends, "prompt"));
+        assert!(backend_reaches_terminal(&backends, "either"));
+        assert!(!backend_reaches_terminal(&backends, "dialog"));
+        assert!(!backend_reaches_terminal(&backends, "remote"));
+    }
+
+    #[test]
+    fn approval_socket_paths_collects_unix_webhooks_only() {
+        let unix = webhook_backends("unix:///run/helper/approval.sock");
+        let http = webhook_backends("http://127.0.0.1:9000/hook");
+        assert_eq!(
+            approval_socket_paths([&unix, &http]),
+            vec![(
+                "dialog".to_string(),
+                std::path::PathBuf::from("/run/helper/approval.sock")
+            )]
+        );
+    }
+
+    #[test]
+    fn approval_socket_check_refuses_sockets_the_sandbox_could_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("helper").join("s");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let socket = socket_dir.join("approval.sock");
+        let backends = webhook_backends(&format!("unix://{}", socket.display()));
+        let sockets = approval_socket_paths([&backends]);
+        let check = |caps: &nono::CapabilitySet| {
+            reject_child_replaceable_approval_sockets(caps, &sockets)
+                .err()
+                .map(|e| e.to_string())
+        };
+
+        // Read-only access to the helper's directory is fine.
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_fs(nono::FsCapability::new_dir(dir.path(), nono::AccessMode::Read).unwrap());
+        assert_eq!(check(&caps), None);
+
+        // Write access to the socket's directory, or any directory above it,
+        // would let the sandbox put its own socket in the helper's place.
+        for writable in [socket_dir.as_path(), dir.path()] {
+            let mut caps = nono::CapabilitySet::new();
+            caps.add_fs(nono::FsCapability::new_dir(writable, nono::AccessMode::Write).unwrap());
+            let err = check(&caps).unwrap_or_default();
+            assert!(err.contains("'dialog'") && err.contains("replace"), "{err}");
+        }
+
+        // So would a grant to bind the socket path itself.
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_unix_socket(
+            nono::UnixSocketCapability::new_file(&socket, nono::UnixSocketMode::ConnectBind)
+                .unwrap(),
+        );
+        let err = check(&caps).unwrap_or_default();
+        assert!(err.contains("bind"), "{err}");
+
+        // Connecting to the socket is what the helper is for; that's allowed.
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_unix_socket(
+            nono::UnixSocketCapability::new_dir(&socket_dir, nono::UnixSocketMode::Connect)
+                .unwrap(),
+        );
+        assert_eq!(check(&caps), None);
+    }
 
     struct StaticBackend {
         name: &'static str,
@@ -645,6 +967,110 @@ mod tests {
     }
 
     #[test]
+    fn chain_preserves_the_callers_absolute_deadline() {
+        struct DeadlineBackend {
+            seen: Arc<std::sync::Mutex<Vec<Instant>>>,
+            decision: ApprovalDecision,
+        }
+        impl ApprovalBackend for DeadlineBackend {
+            fn request_approval(&self, _: &ApprovalRequest) -> Result<ApprovalDecision> {
+                panic!("chain must forward caller deadline")
+            }
+            fn request_approval_with_deadline(
+                &self,
+                _: &ApprovalRequest,
+                deadline: Instant,
+            ) -> Result<ApprovalDecision> {
+                self.seen.lock().unwrap().push(deadline);
+                Ok(self.decision.clone())
+            }
+            fn backend_name(&self) -> &str {
+                "deadline-child"
+            }
+        }
+        for mode in [ApprovalChainMode::All, ApprovalChainMode::Any] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let first = match mode {
+                ApprovalChainMode::All => ApprovalDecision::GrantedForSession,
+                ApprovalChainMode::Any => ApprovalDecision::Denied {
+                    reason: "next".to_string(),
+                },
+            };
+            let chain = ChainApproval {
+                name: "deadline-chain".to_string(),
+                mode,
+                backends: vec![
+                    Arc::new(DeadlineBackend {
+                        seen: seen.clone(),
+                        decision: first,
+                    }),
+                    Arc::new(DeadlineBackend {
+                        seen: seen.clone(),
+                        decision: ApprovalDecision::GrantedForSession,
+                    }),
+                ],
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            assert!(
+                chain
+                    .request_approval_with_deadline(&request(), deadline)
+                    .unwrap()
+                    .is_granted()
+            );
+            assert_eq!(*seen.lock().unwrap(), [deadline, deadline]);
+            assert!(matches!(
+                chain
+                    .request_approval_with_deadline(&request(), Instant::now())
+                    .unwrap(),
+                ApprovalDecision::Timeout
+            ));
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                2,
+                "expired chain starts no child prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_named_terminal_does_not_open_a_prompt() {
+        let backend = NamedTerminalApproval {
+            name: "terminal".to_string(),
+            timeout: Duration::from_secs(600),
+        };
+        assert!(matches!(
+            backend
+                .request_approval_with_deadline(&request(), Instant::now())
+                .unwrap(),
+            ApprovalDecision::Timeout
+        ));
+    }
+
+    #[test]
+    fn terminal_and_chain_advertise_their_enforced_timeouts() {
+        let backends: BTreeMap<String, ApprovalBackendConfig> = serde_json::from_value(
+            serde_json::json!({
+                "default-terminal": {"type": "terminal"},
+                "short-terminal": {"type": "terminal", "timeout_secs": 2},
+                "chain": {"type": "chain", "mode": "all", "backends": ["default-terminal", "short-terminal"]}
+            }),
+        ).unwrap();
+        let built = build_approval_backends_from(&backends).unwrap();
+        assert_eq!(
+            built["default-terminal"].approval_timeout(),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            built["short-terminal"].approval_timeout(),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            built["chain"].approval_timeout(),
+            Some(Duration::from_secs(602))
+        );
+    }
+
+    #[test]
     fn chain_all_requires_every_backend_to_grant() {
         let chain = ChainApproval {
             name: "all".to_string(),
@@ -667,6 +1093,98 @@ mod tests {
     }
 
     #[test]
+    fn chain_all_uses_the_narrowest_grant_scope_in_either_order() {
+        for decisions in [
+            [ApprovalDecision::Granted, ApprovalDecision::Granted],
+            [
+                ApprovalDecision::Granted,
+                ApprovalDecision::GrantedForSession,
+            ],
+            [
+                ApprovalDecision::GrantedForSession,
+                ApprovalDecision::Granted,
+            ],
+            [
+                ApprovalDecision::GrantedForSession,
+                ApprovalDecision::GrantedForSession,
+            ],
+        ] {
+            let all_session = decisions
+                .iter()
+                .all(|d| matches!(d, ApprovalDecision::GrantedForSession));
+            let chain = ChainApproval {
+                name: "all".to_string(),
+                mode: ApprovalChainMode::All,
+                backends: decisions
+                    .into_iter()
+                    .map(|decision| {
+                        Arc::new(StaticBackend {
+                            name: "child",
+                            decision,
+                        }) as Arc<dyn ApprovalBackend>
+                    })
+                    .collect(),
+            };
+            let decision = chain.request_approval(&request()).unwrap();
+            assert!(decision.is_granted());
+            assert_eq!(
+                matches!(decision, ApprovalDecision::GrantedForSession),
+                all_session
+            );
+        }
+    }
+
+    #[test]
+    fn chain_all_propagates_session_denial() {
+        // A session-scoped denial short-circuits and propagates so the caller
+        // caches the deny for the rest of the session.
+        let chain = ChainApproval {
+            name: "all".to_string(),
+            mode: ApprovalChainMode::All,
+            backends: vec![
+                Arc::new(StaticBackend {
+                    name: "a",
+                    decision: ApprovalDecision::Granted,
+                }),
+                Arc::new(StaticBackend {
+                    name: "b",
+                    decision: ApprovalDecision::DeniedForSession,
+                }),
+            ],
+        };
+
+        assert!(matches!(
+            chain.request_approval(&request()).unwrap(),
+            ApprovalDecision::DeniedForSession
+        ));
+    }
+
+    #[test]
+    fn chain_any_returns_first_session_grant() {
+        let chain = ChainApproval {
+            name: "any".to_string(),
+            mode: ApprovalChainMode::Any,
+            backends: vec![
+                Arc::new(StaticBackend {
+                    name: "a",
+                    decision: ApprovalDecision::Denied {
+                        reason: "no".to_string(),
+                    },
+                }),
+                Arc::new(StaticBackend {
+                    name: "b",
+                    decision: ApprovalDecision::GrantedForSession,
+                }),
+            ],
+        };
+
+        assert!(matches!(
+            chain.request_approval(&request()).unwrap(),
+            ApprovalDecision::GrantedForSession
+        ));
+    }
+
+    #[test]
     fn chain_any_grants_if_one_backend_grants() {
         let chain = ChainApproval {
             name: "any".to_string(),
@@ -686,6 +1204,51 @@ mod tests {
         };
 
         assert!(chain.request_approval(&request()).unwrap().is_granted());
+    }
+
+    fn webhook(url: &str) -> ApprovalBackendConfig {
+        ApprovalBackendConfig {
+            backend_type: ApprovalBackendType::Webhook,
+            url: Some(url.to_string()),
+            timeout_secs: Some(5),
+            mode: None,
+            backends: Vec::new(),
+            auth: None,
+        }
+    }
+
+    #[test]
+    fn endpoint_registry_prefers_command_policies_then_network_backends() {
+        let network = BTreeMap::from([("net".to_string(), webhook("https://net.example"))]);
+        let fallback = Some((&network, Some("net".to_string())));
+
+        let registry = build_proxy_approval_registry(None, fallback.clone(), "sess-1")
+            .unwrap()
+            .expect("network backends answer endpoint approvals without command policies");
+        let (name, _) = registry.resolve(None).unwrap();
+        assert_eq!(name, "net");
+        assert_eq!(registry.session_id(), "sess-1");
+
+        let mut commands = CommandPoliciesConfig::default();
+        commands
+            .approval_backends
+            .insert("cmd".to_string(), webhook("https://cmd.example"));
+        commands.approval_defaults.backend = Some("cmd".to_string());
+        let registry = build_proxy_approval_registry(Some(&commands), fallback, "sess-1")
+            .unwrap()
+            .expect("command policy backends");
+        assert_eq!(registry.resolve(None).unwrap().0, "cmd");
+
+        assert!(
+            build_proxy_approval_registry(None, None, "sess-1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            build_proxy_approval_registry(None, Some((&BTreeMap::new(), None)), "sess-1")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -784,6 +1347,30 @@ mod tests {
                 .unwrap()
                 .is_denied()
         );
+    }
+
+    #[test]
+    fn webhook_response_parser_accepts_session_scoped_decisions() {
+        let backend = test_webhook(Duration::from_secs(1));
+
+        // Friendly aliases map to the session-scoped variants.
+        assert!(matches!(
+            backend
+                .parse_response(r#"{"decision":"allow_session"}"#)
+                .unwrap(),
+            ApprovalDecision::GrantedForSession
+        ));
+        assert!(matches!(
+            backend
+                .parse_response(r#"{"decision":"always_deny"}"#)
+                .unwrap(),
+            ApprovalDecision::DeniedForSession
+        ));
+        // The raw serde enum form also round-trips.
+        assert!(matches!(
+            backend.parse_response(r#""GrantedForSession""#).unwrap(),
+            ApprovalDecision::GrantedForSession
+        ));
     }
 
     fn test_webhook(timeout: Duration) -> WebhookApproval {
@@ -1041,8 +1628,8 @@ mod tests {
 
     fn decision_name(decision: &ApprovalDecision) -> &'static str {
         match decision {
-            ApprovalDecision::Granted => "granted",
-            ApprovalDecision::Denied { .. } => "denied",
+            ApprovalDecision::Granted | ApprovalDecision::GrantedForSession => "granted",
+            ApprovalDecision::Denied { .. } | ApprovalDecision::DeniedForSession => "denied",
             ApprovalDecision::Timeout => "timeout",
         }
     }
@@ -1138,3 +1725,7 @@ mod tests {
         assert_eq!(fixture.body_digest, empty_digest);
     }
 }
+
+#[cfg(test)]
+#[path = "approval_runtime_network_tests.rs"]
+mod network_tests;

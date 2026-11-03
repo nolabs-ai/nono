@@ -189,6 +189,18 @@ impl SetupRunner {
         println!("  * Landlock enabled (syscall probe)");
 
         println!("  * {}", detected);
+        if let Some(kernel) = nono::kernel_abi_version()
+            && kernel > detected.abi as u32
+        {
+            println!(
+                "  * Kernel reports Landlock ABI V{kernel}; this nono build recognises up to {}",
+                detected.version_string()
+            );
+        }
+        println!(
+            "  * Enforcing Landlock {} access rights and scopes",
+            detected.enforced_version_string()
+        );
         println!("  * Available features:");
 
         for feature in detected.feature_names() {

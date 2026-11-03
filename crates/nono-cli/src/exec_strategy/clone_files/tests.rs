@@ -117,11 +117,22 @@ fn supervise(
     port: u16,
     bind: u16,
 ) -> Result<i32> {
+    supervise_with_backend(bootstrap, caps, policy, port, bind, &Deny)
+}
+
+fn supervise_with_backend(
+    bootstrap: &Bootstrap,
+    caps: &CapabilitySet,
+    policy: SeccompPolicy,
+    port: u16,
+    bind: u16,
+    backend: &dyn nono::ApprovalBackend,
+) -> Result<i32> {
     let scrub = nono::ScrubPolicy::secure_default();
     let config = SupervisorConfig {
         protected_roots: &[],
         deny_paths: &[],
-        approval_backend: &Deny,
+        approval_backend: backend,
         session_id: "clone-test",
         attach_initial_client: false,
         detach_sequence: None,
@@ -195,12 +206,85 @@ fn supervise(
                     denials: &mut denials,
                     trust_interceptor: None,
                     pty: None,
+                    unix_socket_decisions: &mut Default::default(),
                 },
                 &mut network_throttle,
                 &mut ipc_denials,
             )?;
         }
     }
+}
+
+#[test]
+fn expired_unix_socket_approval_is_discarded() -> Result<()> {
+    isolated("expired_unix_socket_approval_is_discarded", || {
+        use nix::sys::signal::{Signal, kill};
+        use nix::sys::wait::{Id, WaitPidFlag, waitid};
+        use nono::{ApprovalBackend, ApprovalDecision, ApprovalRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CancelRequest {
+            decision: ApprovalDecision,
+            calls: AtomicUsize,
+        }
+        impl ApprovalBackend for CancelRequest {
+            fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+                let ApprovalRequest::UnixSocket { child_pid, .. } = request else {
+                    return Err(failure("expected socket approval"));
+                };
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let child = nix::unistd::Pid::from_raw(*child_pid as i32);
+                kill(child, Signal::SIGKILL).map_err(|e| failure(&e.to_string()))?;
+                waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT)
+                    .map_err(|e| failure(&e.to_string()))?;
+                Ok(self.decision.clone())
+            }
+
+            fn backend_name(&self) -> &str {
+                "cancel-request"
+            }
+        }
+
+        let _lock = lock_listener_ownership()?;
+        let dir = tempfile::tempdir().map_err(NonoError::Io)?;
+        let path = dir.path().join("test.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).map_err(NonoError::Io)?;
+        let caps = capabilities(34567, 34568)?;
+        let exec = config(&caps, false, false);
+        for decision in [
+            ApprovalDecision::Granted,
+            ApprovalDecision::Denied {
+                reason: "denied".into(),
+            },
+            ApprovalDecision::Timeout,
+        ] {
+            let backend = CancelRequest {
+                decision,
+                calls: AtomicUsize::new(0),
+            };
+            let script = format!(
+                "import socket; socket.socket(socket.AF_UNIX).connect({:?})",
+                path.to_string_lossy()
+            );
+            let bootstrap = run(
+                &exec,
+                &script,
+                landlock::ABI::V4,
+                Fault::None,
+                None,
+                None,
+                None,
+            )?;
+            let mut policy = exec.seccomp_policy;
+            policy.capability_elevation = true;
+            assert_eq!(
+                supervise_with_backend(&bootstrap, &caps, policy, 34567, 34568, &backend)?,
+                128 + libc::SIGKILL
+            );
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        }
+        Ok(())
+    })
 }
 
 fn run(
@@ -870,6 +954,7 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
                 blocked_commands: &[],
                 outer_caps: &caps,
                 deny_paths: &[],
+                approval_sockets: &[],
                 policy_root: directory.path(),
                 proxy_credentials: &credentials,
                 reserved_proxy_ports: &Default::default(),

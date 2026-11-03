@@ -1,17 +1,14 @@
 # Workspace cargo-audit configuration.
 #
-# These ignores are limited to AWS-LC X.509 validation advisories which do not
-# affect the code paths used in this workspace:
-# - `nono-proxy` uses the `ring` rustls provider for TLS, not AWS-LC.
-# - Sigstore certificate parsing/chain validation goes through `x509-cert` and
-#   `rustls-webpki`, not AWS-LC X.509 validation APIs.
-# - We do not enable CRL checking in the rustls or sigstore paths we use.
+# Temporary exception: `aws-config`'s required `credentials-login` feature
+# pins `p256` 0.13 and therefore vulnerable `crypto-bigint` 0.5.5.
+# Remove once AWS adopts `p256` 0.14. Review by 2026-11-10.
 #
-# Revisit these ignores if we add any direct use of AWS-LC X.509 hostname
-# validation, name constraints, or CRL-based revocation checks.
+# Upstream: https://github.com/smithy-lang/smithy-rs/tree/main/aws/rust-runtime/aws-config
+# Crate: https://crates.io/crates/aws-config
+# Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0387.html
 
 [advisories]
 ignore = [
-    "RUSTSEC-2026-0044", # AWS-LC X.509 CN/name-constraints bypass
-    "RUSTSEC-2026-0048", # AWS-LC CRL distribution point scope check bypass
+    "RUSTSEC-2026-0387",
 ]

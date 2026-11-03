@@ -517,41 +517,51 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
     if !capability_decisions.is_empty() {
         eprintln!();
         eprintln!("  Capability Decisions: {}", capability_decisions.len());
-        for record in &capability_decisions {
-            print_capability_decision(record);
+        for line in capability_decisions
+            .iter()
+            .filter_map(format_capability_decision)
+        {
+            eprintln!("{line}");
         }
     }
 
     Ok(())
 }
 
-fn print_capability_decision(entry: &nono::supervisor::AuditEntry) {
+fn format_capability_decision(entry: &nono::supervisor::AuditEntry) -> Option<String> {
     use nono::supervisor::{ApprovalDecision, ApprovalRequest};
 
-    let ApprovalRequest::Capability { path, access, .. } = &entry.request else {
-        return;
+    let (path, operation) = match &entry.request {
+        ApprovalRequest::Capability { path, access, .. } => (path, access.to_string()),
+        ApprovalRequest::UnixSocket { path, op, .. } => (path, format!("unix socket {op}")),
+        _ => return None,
     };
     let decision = match &entry.decision {
         ApprovalDecision::Granted => "granted".green(),
+        ApprovalDecision::GrantedForSession => "granted (session)".green(),
         ApprovalDecision::Denied { .. } => "denied".red(),
+        ApprovalDecision::DeniedForSession => "denied (session)".red(),
         ApprovalDecision::Timeout => "timeout".red(),
     };
     let reason = match &entry.decision {
         ApprovalDecision::Denied { reason } => {
             format!(" reason={}", sanitize_reason_for_terminal(reason))
         }
-        ApprovalDecision::Granted | ApprovalDecision::Timeout => String::new(),
+        ApprovalDecision::Granted
+        | ApprovalDecision::GrantedForSession
+        | ApprovalDecision::DeniedForSession
+        | ApprovalDecision::Timeout => String::new(),
     };
 
-    eprintln!(
+    Some(format!(
         "    {} {} {} backend={} duration={}ms{}",
         decision,
-        access,
+        operation,
         sanitize_for_terminal(&path.display().to_string()),
         sanitize_for_terminal(&entry.backend),
         entry.duration_ms,
         reason,
-    );
+    ))
 }
 
 fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
@@ -1303,7 +1313,80 @@ mod tool_summary_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{max_total_size_split_at, sanitize_for_terminal, sanitize_reason_for_terminal};
+    use super::{
+        format_capability_decision, max_total_size_split_at, sanitize_for_terminal,
+        sanitize_reason_for_terminal,
+    };
+
+    #[test]
+    fn capability_decision_formats_files_and_unix_sockets() {
+        use nono::supervisor::AuditEntry;
+        use nono::{AccessMode, ApprovalDecision, ApprovalRequest, UnixSocketOp};
+
+        for (request, operation) in [
+            (
+                ApprovalRequest::Capability {
+                    request_id: "file".into(),
+                    path: "/tmp/test".into(),
+                    access: AccessMode::Read,
+                    reason: None,
+                    child_pid: 1,
+                    session_id: "session".into(),
+                },
+                "read",
+            ),
+            (
+                ApprovalRequest::UnixSocket {
+                    request_id: "socket".into(),
+                    path: "/tmp/test".into(),
+                    op: UnixSocketOp::Connect,
+                    reason: None,
+                    child_pid: 1,
+                    session_id: "session".into(),
+                },
+                "unix socket connect",
+            ),
+            (
+                ApprovalRequest::UnixSocket {
+                    request_id: "socket".into(),
+                    path: "/tmp/test".into(),
+                    op: UnixSocketOp::Bind,
+                    reason: None,
+                    child_pid: 1,
+                    session_id: "session".into(),
+                },
+                "unix socket bind",
+            ),
+        ] {
+            for (decision, label) in [
+                (ApprovalDecision::Granted, "granted"),
+                (ApprovalDecision::GrantedForSession, "granted (session)"),
+                (
+                    ApprovalDecision::Denied {
+                        reason: "blocked\x1b[2K\n".into(),
+                    },
+                    "denied",
+                ),
+                (ApprovalDecision::DeniedForSession, "denied (session)"),
+                (ApprovalDecision::Timeout, "timeout"),
+            ] {
+                let entry = AuditEntry {
+                    timestamp: std::time::SystemTime::now(),
+                    request: request.clone(),
+                    decision,
+                    backend: "test\x1b[2K\n".into(),
+                    duration_ms: 12,
+                };
+                let line = format_capability_decision(&entry).expect("decision line");
+                assert!(line.contains(&format!("{operation} /tmp/test")), "{line}");
+                assert!(line.contains("backend=test"));
+                assert!(line.contains("duration=12ms"));
+                assert!(!line.contains('\n'));
+                assert!(!line.contains("2K"));
+                assert!(line.contains(label), "{line}");
+            }
+        }
+    }
 
     #[test]
     fn max_total_size_split_at_noop_when_under_budget() {

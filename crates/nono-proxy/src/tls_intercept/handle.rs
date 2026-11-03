@@ -584,14 +584,27 @@ pub(crate) async fn select_intercept_route<'a>(
                     rule_label: rule_label.clone(),
                     reason: Some(request_reason),
                     child_pid: 0,
-                    session_id: "proxy".to_string(),
+                    session_id: approval_backends.session_id().to_string(),
                 };
                 let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(60));
-                let decision = tokio::time::timeout(
-                    timeout,
-                    tokio::task::spawn_blocking(move || backend.request_approval(&request)),
+                let deadline = std::time::Instant::now()
+                    .checked_add(timeout)
+                    .unwrap_or_else(std::time::Instant::now);
+                let decision = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    tokio::task::spawn_blocking(move || {
+                        backend.request_approval_with_deadline(&request, deadline)
+                    }),
                 )
                 .await;
+                // L7 endpoint approval has no per-connection session cache, so
+                // collapse the session-scoped decision variants to their
+                // one-shot equivalents and keep the match below total.
+                let decision = decision.map(|joined| {
+                    joined.map(|approved| {
+                        approved.map(nono::supervisor::ApprovalDecision::without_session_scope)
+                    })
+                });
                 match decision {
                     Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Granted))) => {
                         audit::log_l7_policy_decision(
@@ -640,6 +653,34 @@ pub(crate) async fn select_intercept_route<'a>(
                             "tls_intercept: {}",
                             crate::approval::sanitize_reason_for_log(&deny_reason)
                         );
+                        return RouteSelection::Rejected(403);
+                    }
+                    Ok(Ok(Ok(
+                        nono::supervisor::ApprovalDecision::GrantedForSession
+                        | nono::supervisor::ApprovalDecision::DeniedForSession,
+                    ))) => {
+                        // Unreachable: without_session_scope() above collapses
+                        // these to Granted/Denied before this match. Kept for
+                        // exhaustiveness and fail-secure if that normalization is
+                        // ever removed.
+                        let deny_reason = format!(
+                            "endpoint approval returned an unexpected session-scoped decision for {} {} on route '{}'",
+                            method, path, prefix
+                        );
+                        audit::log_l7_policy_decision(
+                            audit_log,
+                            audit::ProxyMode::ConnectIntercept,
+                            &approval_ctx,
+                            host,
+                            Some(port),
+                            method,
+                            path,
+                            nono::undo::NetworkAuditDecision::ApproveDenied,
+                            "approve",
+                            &rule_label,
+                            Some(&deny_reason),
+                        );
+                        warn!("tls_intercept: {}", deny_reason);
                         return RouteSelection::Rejected(403);
                     }
                     Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Timeout))) => {
@@ -1290,7 +1331,7 @@ where
         {
             continue;
         }
-        let resolved_value = nonce_consumer
+        let mut resolved_value = nonce_consumer
             .as_deref()
             .and_then(|consumer| {
                 ctx.nonce_resolver.as_deref().and_then(|resolver| {
@@ -1304,8 +1345,52 @@ where
                     ctx.oauth_capture_store
                         .rewrite_request_header_value(endpoint, value)
                 })
-            })
-            .unwrap_or_else(|| value.clone());
+            });
+        // A DCR client sends its phantom client_secret inside Basic
+        // credentials, where the raw marker scan cannot see it.
+        if resolved_value.is_none() && name.eq_ignore_ascii_case("authorization") {
+            let basic = if let Some(endpoint) = oauth_endpoint {
+                ctx.oauth_capture_store
+                    .rewrite_request_basic_authorization(endpoint, value)
+            } else if ctx
+                .oauth_capture_store
+                .basic_authorization_hides_phantom(value)
+            {
+                // Off the token endpoint there is nothing to redeem
+                // against, so reject rather than forward the phantom.
+                Err(ProxyError::Credential(
+                    "Basic authorization carries a phantom with no token endpoint \
+                     to redeem it"
+                        .to_string(),
+                ))
+            } else {
+                Ok(None)
+            };
+            match basic {
+                Ok(Some(rewritten)) => resolved_value = Some(rewritten),
+                Ok(None) => {}
+                Err(error) => {
+                    warn!("tls_intercept: {}", error);
+                    audit::log_denied(
+                        ctx.audit_log,
+                        audit::ProxyMode::ConnectIntercept,
+                        &audit::EventContext {
+                            route_id: service,
+                            denial_category: Some(
+                                nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                            ),
+                            ..audit::EventContext::default()
+                        },
+                        ctx.host,
+                        ctx.port,
+                        &error.to_string(),
+                    );
+                    reverse::send_error_generic(tls_stream, 403, "Forbidden").await?;
+                    return Ok(());
+                }
+            }
+        }
+        let resolved_value = resolved_value.unwrap_or_else(|| value.clone());
         request.push_str(&format!("{}: {}\r\n", name, resolved_value));
     }
     request.push_str("Connection: close\r\n");
@@ -1381,10 +1466,10 @@ where
     let response_rewrite: Option<InterceptResponseRewrite<'_>> =
         if let Some(endpoint) = oauth_endpoint {
             Some(Box::new(
-                move |status: u16, _headers: &[(String, String)], body: &[u8]| {
+                move |status: u16, headers: &[(String, String)], body: &[u8]| {
                     if (200..300).contains(&status) {
                         ctx.oauth_capture_store
-                            .rewrite_response_body(endpoint, body)
+                            .rewrite_response_body(endpoint, headers, body)
                     } else {
                         ctx.oauth_capture_store
                             .inspect_capture_host_response(&host_port, &path, status, body)
@@ -1653,7 +1738,9 @@ pub(crate) fn resolve_nonce_in_header_value(
     if end > value.len() {
         return None;
     }
-    let nonce = &value[start..end];
+    // The fixed byte window may end inside a UTF-8 codepoint. Treat malformed
+    // candidates as non-matches instead of panicking.
+    let nonce = value.get(start..end)?;
     if !nonce[NONCE_PREFIX.len()..]
         .bytes()
         .all(|b| b.is_ascii_hexdigit())
@@ -2993,6 +3080,66 @@ mod tests {
         }
     }
 
+    /// Records the session each endpoint approval request names.
+    struct SessionRecordingBackend {
+        sessions: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl nono::ApprovalBackend for SessionRecordingBackend {
+        fn request_approval(
+            &self,
+            request: &nono::ApprovalRequest,
+        ) -> nono::Result<nono::ApprovalDecision> {
+            if let nono::ApprovalRequest::Endpoint { session_id, .. } = request {
+                self.sessions
+                    .lock()
+                    .map_err(|_| nono::NonoError::SandboxInit("poisoned".to_string()))?
+                    .push(session_id.clone());
+            }
+            Ok(nono::ApprovalDecision::Denied {
+                reason: "recorded".to_string(),
+            })
+        }
+
+        fn backend_name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    /// An endpoint approval names the sandbox session that owns the proxy, so
+    /// a backend can attribute it rather than seeing the literal "proxy".
+    #[tokio::test]
+    async fn endpoint_approval_request_names_the_registry_session() {
+        let store = RouteStore::load(&[approval_gated_route("gated")])
+            .await
+            .unwrap();
+        let backend = std::sync::Arc::new(SessionRecordingBackend {
+            sessions: std::sync::Mutex::new(Vec::new()),
+        });
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone())
+            .with_session_id("sess-intercept");
+
+        let selection = select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            InterceptRouteRequest {
+                method: "GET",
+                path: "/gated",
+                websocket_path: None,
+            },
+            None,
+            Some(&registry),
+        )
+        .await;
+
+        assert!(matches!(selection, RouteSelection::Rejected(403)));
+        assert_eq!(
+            *backend.sessions.lock().unwrap(),
+            vec!["sess-intercept".to_string()]
+        );
+    }
+
     /// An approval backend failure must fail closed, mirroring the reverse
     /// proxy path, not forward the request without its credential.
     #[tokio::test]
@@ -3285,6 +3432,32 @@ mod tests {
         let result =
             resolve_nonce_in_header_value(&value, "proxy.anthropic", CONSUMER_PATH, &resolver);
         assert_eq!(result, Some(format!("é{filler}REAL")));
+    }
+
+    #[test]
+    fn multibyte_nonce_candidate_does_not_panic() {
+        // The 69-byte nonce window ends inside the final euro sign.
+        let value = format!("nono_{}", "€".repeat(22));
+        assert_eq!(value.len(), 71);
+        let resolver = test_resolver(&make_nonce(), b"REAL");
+
+        assert!(
+            resolve_nonce_in_header_value(&value, "proxy.anthropic", CONSUMER_PATH, &resolver)
+                .is_none(),
+            "a non-ASCII nonce candidate must fail closed"
+        );
+    }
+
+    #[test]
+    fn valid_nonce_surrounded_by_multibyte_text_resolves() {
+        let nonce = make_nonce();
+        let resolver = test_resolver(&nonce, b"REAL");
+        let value = format!("préfix-{nonce}-süffix");
+
+        assert_eq!(
+            resolve_nonce_in_header_value(&value, "proxy.anthropic", CONSUMER_PATH, &resolver),
+            Some("préfix-REAL-süffix".to_string())
+        );
     }
 
     #[test]
@@ -3732,6 +3905,7 @@ mod tests {
                     },
                 ],
                 request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.github_oauth".to_string()],
@@ -3747,6 +3921,7 @@ mod tests {
         let rewritten = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"gho_real_access","refresh_token":"gho_real_refresh"}"#,
             )
             .unwrap();
@@ -4072,6 +4247,380 @@ mod tests {
         assert!(
             !response.contains("gho_new_upstream_token"),
             "the new upstream token must not reach the client, got: {response}"
+        );
+    }
+
+    // --- Authorization: Basic phantoms on token endpoints (DCR) ---
+
+    /// DCR shape: registration mints the client_secret phantom; the token
+    /// endpoint receives it inside Basic credentials.
+    fn dcr_oauth_capture_configs(port: u16) -> Vec<crate::config::OAuthCaptureConfig> {
+        use crate::config::{
+            OAuthCaptureConfig, OAuthTokenEndpointConfig, OAuthTokenRequestBodyFormat,
+            OAuthTokenResponseFieldConfig, OAuthTokenResponseFieldKind,
+        };
+
+        vec![OAuthCaptureConfig {
+            provider: "example_mcp".to_string(),
+            token_endpoints: vec![
+                OAuthTokenEndpointConfig {
+                    host: format!("https://localhost:{port}"),
+                    path: "/oauth/register".to_string(),
+                    response_fields: vec![OAuthTokenResponseFieldConfig {
+                        path: "client_secret".to_string(),
+                        kind: OAuthTokenResponseFieldKind::Opaque,
+                        format: None,
+                    }],
+                    request_body: OAuthTokenRequestBodyFormat::Json,
+                    response_body: OAuthTokenRequestBodyFormat::Json,
+                    request_nonce_fields: vec!["client_secret".to_string()],
+                },
+                OAuthTokenEndpointConfig {
+                    host: format!("https://localhost:{port}"),
+                    path: "/oauth/token".to_string(),
+                    response_fields: vec![OAuthTokenResponseFieldConfig {
+                        path: "access_token".to_string(),
+                        kind: OAuthTokenResponseFieldKind::Opaque,
+                        format: None,
+                    }],
+                    request_body: OAuthTokenRequestBodyFormat::Form,
+                    response_body: OAuthTokenRequestBodyFormat::Json,
+                    request_nonce_fields: vec![
+                        "refresh_token".to_string(),
+                        "client_secret".to_string(),
+                    ],
+                },
+            ],
+            admitted_consumers: vec!["proxy.example_mcp".to_string()],
+        }]
+    }
+
+    /// Mint a client_secret phantom the way the registration capture would,
+    /// and return the string the DCR client would hold afterwards.
+    fn mint_dcr_client_secret_phantom(store: &OAuthCaptureStore, port: u16) -> String {
+        let endpoint = store
+            .lookup(&format!("localhost:{port}"), "/oauth/register")
+            .unwrap();
+        let rewritten = store
+            .rewrite_response_body(
+                endpoint,
+                &[],
+                br#"{"client_id":"nono-client-id","client_secret":"real-dcr-secret"}"#,
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        json["client_secret"].as_str().unwrap().to_string()
+    }
+
+    fn basic_credentials(username: &str, password: &str) -> String {
+        use base64::Engine as _;
+
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        )
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_request_rewrites_basic_authorization_phantom() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, upstream_rx) = spawn_mock_https_upstream(&ca, r#"{"ok":true}"#).await;
+        let store = Arc::new(OAuthCaptureStore::load(&dcr_oauth_capture_configs(port)).unwrap());
+        let client_secret_phantom = mint_dcr_client_secret_phantom(&store, port);
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+
+        let body = "grant_type=refresh_token&refresh_token=real-refresh";
+        let request = format!(
+            "POST /oauth/token HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: {}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            basic_credentials("nono-client-id", &client_secret_phantom),
+            body.len(),
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.contains("200"),
+            "upstream call should succeed: {response}"
+        );
+
+        let upstream_received = upstream_rx.await.unwrap();
+        assert!(
+            upstream_received.contains(&format!(
+                "Authorization: {}\r\n",
+                basic_credentials("nono-client-id", "real-dcr-secret")
+            )),
+            "upstream must receive the real client secret, got: {upstream_received}"
+        );
+        assert!(
+            !upstream_received.contains(&client_secret_phantom),
+            "the phantom must not reach the upstream, got: {upstream_received}"
+        );
+    }
+
+    /// A phantom in the user-id slot of Basic credentials has no redemption
+    /// meaning and must fail closed, never be forwarded.
+    #[tokio::test]
+    async fn token_endpoint_request_rejects_basic_authorization_username_phantom() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, _upstream_rx) = spawn_mock_https_upstream(&ca, r#"{"ok":true}"#).await;
+        let store = Arc::new(OAuthCaptureStore::load(&dcr_oauth_capture_configs(port)).unwrap());
+        let client_secret_phantom = mint_dcr_client_secret_phantom(&store, port);
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+
+        let request = format!(
+            "POST /oauth/token HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: {}\r\n\r\n",
+            basic_credentials(&client_secret_phantom, "whatever"),
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.contains("403"),
+            "a phantom username must fail closed, got: {response}"
+        );
+        assert!(
+            !response.contains(&client_secret_phantom),
+            "the phantom must not be echoed to the client, got: {response}"
+        );
+    }
+
+    /// A provider that never receives a client_secret (the github copilot
+    /// shape) has no way to redeem one hidden in Basic credentials.
+    #[tokio::test]
+    async fn token_endpoint_request_rejects_basic_phantom_without_client_secret_redemption() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, _upstream_rx) = spawn_mock_https_upstream(&ca, r#"{"ok":true}"#).await;
+        let store = Arc::new(OAuthCaptureStore::load(&[oauth_capture_config(port)]).unwrap());
+        let (phantom, _) = mint_oauth_phantoms(&store, port);
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+
+        let request = format!(
+            "POST /copilot_internal/v2/token HTTP/1.1\r\nHost: localhost:{port}\r\n\
+             Authorization: {}\r\n\r\n",
+            basic_credentials("client-id", &phantom),
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.contains("403"),
+            "a Basic phantom without client_secret redemption must fail closed, got: {response}"
+        );
+        assert!(
+            !response.contains(&phantom),
+            "the phantom must not be echoed to the client, got: {response}"
+        );
+    }
+
+    /// A phantom minted by another provider's capture must not redeem as
+    /// this provider's client secret.
+    #[tokio::test]
+    async fn token_endpoint_request_rejects_cross_provider_basic_phantom() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, _upstream_rx) = spawn_mock_https_upstream(&ca, r#"{"ok":true}"#).await;
+        let mut configs = dcr_oauth_capture_configs(port);
+        configs.push(oauth_capture_config(port));
+        let store = Arc::new(OAuthCaptureStore::load(&configs).unwrap());
+        let (foreign_phantom, _) = mint_oauth_phantoms(&store, port);
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+
+        let request = format!(
+            "POST /oauth/token HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: {}\r\n\r\n",
+            basic_credentials("nono-client-id", &foreign_phantom),
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.contains("403"),
+            "a cross-provider phantom must fail closed, got: {response}"
+        );
+        assert!(
+            !response.contains(&foreign_phantom),
+            "the phantom must not be echoed to the client, got: {response}"
+        );
+    }
+
+    /// Real Basic credentials with no phantom inside must pass through
+    /// byte-identical, like plain Bearer values do.
+    #[tokio::test]
+    async fn token_endpoint_request_forwards_plain_basic_credentials() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, upstream_rx) = spawn_mock_https_upstream(&ca, r#"{"ok":true}"#).await;
+        let store = Arc::new(OAuthCaptureStore::load(&dcr_oauth_capture_configs(port)).unwrap());
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+
+        let request = format!(
+            "POST /oauth/token HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: {}\r\n\
+             User-Agent: dcr-test/1.0\r\n\r\n",
+            basic_credentials("nono-client-id", "real-known-secret"),
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.contains("200"),
+            "upstream call should succeed: {response}"
+        );
+
+        let upstream_received = upstream_rx.await.unwrap();
+        assert!(
+            upstream_received.contains(&format!(
+                "Authorization: {}\r\n",
+                basic_credentials("nono-client-id", "real-known-secret")
+            )),
+            "plain Basic credentials must pass through byte-identical, got: {upstream_received}"
+        );
+        assert!(
+            upstream_received.contains("User-Agent: dcr-test/1.0\r\n"),
+            "unrelated headers must pass through unchanged, got: {upstream_received}"
+        );
+    }
+
+    /// Each Authorization header is resolved independently, so a phantom
+    /// hidden in the second of two duplicate headers cannot slip through.
+    #[tokio::test]
+    async fn token_endpoint_request_rewrites_each_duplicate_authorization_header() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, upstream_rx) = spawn_mock_https_upstream(&ca, r#"{"ok":true}"#).await;
+        let store = Arc::new(OAuthCaptureStore::load(&dcr_oauth_capture_configs(port)).unwrap());
+        let client_secret_phantom = mint_dcr_client_secret_phantom(&store, port);
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+
+        let request = format!(
+            "POST /oauth/token HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: {}\r\n\
+             Authorization: {}\r\n\r\n",
+            basic_credentials("nono-client-id", "real-known-secret"),
+            basic_credentials("nono-client-id", &client_secret_phantom),
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.contains("200"),
+            "upstream call should succeed: {response}"
+        );
+
+        let upstream_received = upstream_rx.await.unwrap();
+        assert!(
+            upstream_received.contains(&format!(
+                "Authorization: {}\r\n",
+                basic_credentials("nono-client-id", "real-known-secret")
+            )),
+            "the plain duplicate must pass through, got: {upstream_received}"
+        );
+        assert!(
+            upstream_received.contains(&format!(
+                "Authorization: {}\r\n",
+                basic_credentials("nono-client-id", "real-dcr-secret")
+            )),
+            "the phantom-bearing duplicate must be redeemed, got: {upstream_received}"
+        );
+        assert!(
+            !upstream_received.contains(&client_secret_phantom),
+            "the phantom must not reach the upstream, got: {upstream_received}"
+        );
+    }
+
+    /// Not a token endpoint: nothing to redeem against, and the raw scan
+    /// cannot see through base64, so the request must fail closed.
+    #[tokio::test]
+    async fn non_token_endpoint_path_rejects_basic_phantom() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, _upstream_rx) = spawn_mock_https_upstream(&ca, r#"{"ok":true}"#).await;
+        let store = Arc::new(OAuthCaptureStore::load(&dcr_oauth_capture_configs(port)).unwrap());
+        let client_secret_phantom = mint_dcr_client_secret_phantom(&store, port);
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let mut ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+        // A catch-all passthrough route so the non-token path reaches the
+        // header loop instead of being rejected by route selection.
+        ctx.route_store = Arc::new(
+            RouteStore::load(&[crate::config::RouteConfig {
+                prefix: "example_api".to_string(),
+                upstream: format!("https://localhost:{port}"),
+                ..Default::default()
+            }])
+            .await
+            .unwrap(),
+        );
+
+        let request = format!(
+            "GET /unrelated/path HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: {}\r\n\r\n",
+            basic_credentials("nono-client-id", &client_secret_phantom),
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.contains("403"),
+            "a Basic phantom off the token endpoint must fail closed, got: {response}"
+        );
+        assert!(
+            !response.contains(&client_secret_phantom),
+            "the phantom must not be echoed to the client, got: {response}"
         );
     }
 }

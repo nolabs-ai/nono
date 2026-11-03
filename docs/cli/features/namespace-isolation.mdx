@@ -40,7 +40,11 @@ Every request also creates a **user namespace**. It maps your own uid and gid to
 Network isolation closes some of the same classes as Landlock's scoping and network rules, but it does so on every kernel nono supports. Landlock abstract-socket scoping needs ABI V6 (Linux 6.12), and Landlock network rules cover TCP only.
 
 <Note>
-  Pathname Unix sockets (such as `/run/user/1000/bus` or `/var/run/docker.sock`) are reached through the filesystem, so a network namespace does **not** block them. Use [`linux.af_unix_mediation`](/cli/features/networking) to control them today.
+  Pathname Unix sockets (such as `/run/user/1000/bus` or
+  `/var/run/docker.sock`) use filesystem paths as addresses, but they are not
+  part of the IP network namespace. Use
+  [`linux.af_unix_mediation`](/cli/internals/landlock#pathname-unix-socket-mediation)
+  to control them.
 </Note>
 
 ## Local servers on loopback

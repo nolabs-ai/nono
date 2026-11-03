@@ -7,7 +7,7 @@
 //! [`ApprovalRequest`] is the generalised form consumed by [`crate::supervisor::ApprovalBackend`].
 //! It covers file capability, network, and command-policy launch requests.
 
-use crate::capability::AccessMode;
+use crate::capability::{AccessMode, UnixSocketOp};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -117,6 +117,22 @@ pub enum ApprovalRequest {
         /// Session identifier
         session_id: String,
     },
+    /// A pathname unix socket `connect` or `bind` outside the granted socket
+    /// set (Linux seccomp-notify, `linux.af_unix_mediation: pathname`).
+    UnixSocket {
+        /// Unique identifier for this request
+        request_id: String,
+        /// Canonical socket path
+        path: PathBuf,
+        /// `connect` or `bind`; datagram sends are never escalated
+        op: UnixSocketOp,
+        /// Human-readable reason
+        reason: Option<String>,
+        /// PID of the requesting child process
+        child_pid: u32,
+        /// Session identifier
+        session_id: String,
+    },
 }
 
 impl ApprovalRequest {
@@ -127,7 +143,8 @@ impl ApprovalRequest {
             ApprovalRequest::Capability { request_id, .. }
             | ApprovalRequest::Network { request_id, .. }
             | ApprovalRequest::Endpoint { request_id, .. }
-            | ApprovalRequest::Command { request_id, .. } => request_id,
+            | ApprovalRequest::Command { request_id, .. }
+            | ApprovalRequest::UnixSocket { request_id, .. } => request_id,
         }
     }
 
@@ -138,7 +155,8 @@ impl ApprovalRequest {
             ApprovalRequest::Capability { session_id, .. }
             | ApprovalRequest::Network { session_id, .. }
             | ApprovalRequest::Endpoint { session_id, .. }
-            | ApprovalRequest::Command { session_id, .. } => session_id,
+            | ApprovalRequest::Command { session_id, .. }
+            | ApprovalRequest::UnixSocket { session_id, .. } => session_id,
         }
     }
 }
@@ -159,28 +177,72 @@ impl From<CapabilityRequest> for ApprovalRequest {
 /// The supervisor's response to a [`CapabilityRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ApprovalDecision {
-    /// Access was granted. The supervisor will pass an fd via `SCM_RIGHTS`.
+    /// Access was granted for this request. The supervisor will pass an fd via
+    /// `SCM_RIGHTS` for capability requests.
+    ///
+    /// For network connections this is single-use: never cache it locally or
+    /// share it with concurrent waiting connections. Each new connection must
+    /// consult the backend again, allowing remote policy changes or revocations.
     Granted,
+    /// Access was granted, and the grant should persist for the remainder of
+    /// the session so equivalent later requests are not re-prompted. For network
+    /// approvals this explicitly permits local reuse without consulting the
+    /// backend again; each connection still undergoes its own address checks.
+    ///
+    /// Callers that do not implement session caching (e.g. the L7 endpoint
+    /// approval path) MUST treat this exactly as [`ApprovalDecision::Granted`];
+    /// see [`ApprovalDecision::without_session_scope`].
+    GrantedForSession,
     /// Access was denied with a reason.
     Denied {
         /// Why the request was denied
         reason: String,
     },
+    /// Access was denied, and the denial should persist for the remainder of
+    /// the session so equivalent later requests are not re-prompted.
+    ///
+    /// Callers that do not implement session caching MUST treat this exactly as
+    /// [`ApprovalDecision::Denied`]; see
+    /// [`ApprovalDecision::without_session_scope`].
+    DeniedForSession,
     /// The approval request timed out without a decision.
     Timeout,
 }
 
 impl ApprovalDecision {
-    /// Returns true if access was granted.
+    /// Returns true if access was granted (once or for the session).
     #[must_use]
     pub fn is_granted(&self) -> bool {
-        matches!(self, ApprovalDecision::Granted)
+        matches!(
+            self,
+            ApprovalDecision::Granted | ApprovalDecision::GrantedForSession
+        )
     }
 
-    /// Returns true if access was denied.
+    /// Returns true if access was denied (once or for the session).
     #[must_use]
     pub fn is_denied(&self) -> bool {
-        matches!(self, ApprovalDecision::Denied { .. })
+        matches!(
+            self,
+            ApprovalDecision::Denied { .. } | ApprovalDecision::DeniedForSession
+        )
+    }
+
+    /// Collapse the session-scoped variants to their one-shot equivalents.
+    ///
+    /// Session caching is only implemented on the network CONNECT path, which
+    /// keys decisions by `(host, port)`. Every other approval consumer treats a
+    /// decision as a single yes/no; calling this keeps those `match` sites total
+    /// and fail-secure without teaching them about session persistence.
+    #[must_use]
+    pub fn without_session_scope(self) -> Self {
+        match self {
+            ApprovalDecision::GrantedForSession => ApprovalDecision::Granted,
+            ApprovalDecision::DeniedForSession => ApprovalDecision::Denied {
+                reason: "denied for this session".to_string(),
+            },
+            other => other,
+        }
     }
 }
 

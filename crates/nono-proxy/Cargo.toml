@@ -1,6 +1,6 @@
 [package]
 name = "nono-proxy"
-version = "0.80.0"
+version = "0.81.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -18,7 +18,7 @@ default = ["system-keyring"]
 system-keyring = ["nono/system-keyring"]
 
 [dependencies]
-nono = { version = "0.80.0", path = "../nono", default-features = false }
+nono = { version = "0.81.0", path = "../nono", default-features = false }
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -31,12 +31,15 @@ zeroize.workspace = true
 sha2.workspace = true
 sha1.workspace = true
 getrandom.workspace = true
-base64 = "0.23"
+uuid = { workspace = true, features = ["v4"] }
+base64.workspace = true
 regex = "1"
 subtle = "2"
 url.workspace = true
 urlencoding = "2"
 globset.workspace = true
+# Keepalive and TCP_USER_TIMEOUT on upstream sockets (upstream_socket.rs).
+socket2 = { version = "0.6", features = ["all"] }
 
 # AWS SigV4 signing support (smithy-rs, no service SDK required)
 # `credentials-login` is required to resolve an active `aws login` session
@@ -65,8 +68,8 @@ webpki-roots = "1.0.10"
 
 # TLS interception (CONNECT-mode L7 filtering and credential injection):
 # ephemeral session CA + per-host leaf certificate generation. `ring` matches
-# the rustls crypto provider used elsewhere; `aws_lc_rs` is disabled to avoid
-# a second, redundant crypto stack in the dependency tree.
+# the provider explicitly selected for proxy TLS. The AWS SDK separately uses
+# AWS-LC for its own HTTPS client.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
 x509-parser = "0.18"
 # Read the host's system trust store (used to compose the trust bundle that

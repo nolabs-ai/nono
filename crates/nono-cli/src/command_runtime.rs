@@ -334,6 +334,22 @@ fn reject_resource_limits_under_wrap(caps: &CapabilitySet) -> Result<()> {
     Ok(())
 }
 
+/// Direct exec cannot host the network approval proxy. Refuse active approval
+/// policy instead of silently running with the profile's base network grants.
+fn reject_network_approvals_under_wrap(
+    args: &SandboxArgs,
+    backends: &std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
+) -> Result<()> {
+    if !args.allow_net && !backends.is_empty() {
+        return Err(NonoError::ConfigParse(
+            "nono wrap does not support network.approval_backends because direct exec \
+             cannot run the network approval proxy. Use `nono run` instead."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     let args: SandboxArgs = wrap_args.sandbox.into();
     let command = wrap_args.command;
@@ -348,6 +364,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     if args.dry_run {
         let prepared = prepare_sandbox(&args, silent)?;
         reject_resource_limits_under_wrap(&prepared.caps)?;
+        reject_network_approvals_under_wrap(&args, &prepared.network_approval_backends)?;
         reject_run_only_sandbox_policy("wrap", &args, &prepared)?;
         if !prepared.secrets.is_empty() && !silent {
             eprintln!(
@@ -365,6 +382,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
 
     let prepared = prepare_sandbox(&args, silent)?;
     reject_resource_limits_under_wrap(&prepared.caps)?;
+    reject_network_approvals_under_wrap(&args, &prepared.network_approval_backends)?;
     reject_run_only_sandbox_policy("wrap", &args, &prepared)?;
 
     if prepared.upstream_proxy.is_some()
@@ -432,7 +450,9 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{reject_resource_limits_under_wrap, run_shell};
+    use super::{
+        reject_network_approvals_under_wrap, reject_resource_limits_under_wrap, run_shell,
+    };
     use crate::cli::{SandboxArgs, ShellArgs};
     use nono::{CapabilitySet, ResourceLimits};
     use std::path::PathBuf;
@@ -461,6 +481,33 @@ mod tests {
             err.to_string().contains("--block-net") && err.to_string().contains("--upstream-proxy"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn wrap_rejects_network_approvals_unless_explicitly_disabled() {
+        let backends = std::collections::BTreeMap::from([(
+            "terminal".to_string(),
+            serde_json::from_str(r#"{"type":"terminal"}"#).expect("terminal backend"),
+        )]);
+        let args = SandboxArgs::default();
+        let error = reject_network_approvals_under_wrap(&args, &backends)
+            .expect_err("wrap must not silently drop network approval policy");
+        assert!(error.to_string().contains("network.approval_backends"));
+        assert!(error.to_string().contains("nono run"));
+        assert!(reject_network_approvals_under_wrap(&args, &Default::default()).is_ok());
+
+        // Hard blocks conflict with configured approvals; they cannot make
+        // an otherwise unsupported approval policy valid under wrap.
+        let blocked = SandboxArgs {
+            block_net: true,
+            ..Default::default()
+        };
+        assert!(reject_network_approvals_under_wrap(&blocked, &backends).is_err());
+        let unrestricted = SandboxArgs {
+            allow_net: true,
+            ..Default::default()
+        };
+        assert!(reject_network_approvals_under_wrap(&unrestricted, &backends).is_ok());
     }
 
     #[test]

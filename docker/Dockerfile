@@ -22,7 +22,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 
-LABEL org.opencontainers.image.source="https://github.com/always-further/nono"
+LABEL org.opencontainers.image.source="https://github.com/nolabs-ai/nono"
 LABEL org.opencontainers.image.description="Capability-based sandboxing for untrusted AI agents"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 

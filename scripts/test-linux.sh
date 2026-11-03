@@ -301,7 +301,7 @@ fi
 print_header "Claude Code Profile"
 
 # Test: Profile should load (dry-run to avoid modifying system)
-PROFILE_OUTPUT=$(echo "n" | $NONO run --profile always-further/claude --allow-cwd --dry-run -- echo test 2>&1 || true)
+PROFILE_OUTPUT=$(echo "n" | $NONO run --profile nolabs-ai/claude --allow-cwd --dry-run -- echo test 2>&1 || true)
 if echo "$PROFILE_OUTPUT" | grep -qiE "claude|profile|hook"; then
     pass "Claude Code profile loads"
 else

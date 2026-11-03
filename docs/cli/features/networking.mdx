@@ -61,11 +61,11 @@ In a profile, set `network.block` to `true`:
 Neither `--block-net` nor `network.block: true` can be lifted by a runtime
 approval. Configuring `network.approval_backends` together with either effective
 hard block is rejected before launch. For approval-only networking with an empty
-`allow_domain`, omit the hard block (or set `network.block: false`); the configured
-backend activates a strict proxy and otherwise eligible, directly handled
-CONNECT and plain-HTTP targets need approval. Inherited profile blocks remain hard blocks. The explicit `--allow-net`
-CLI override instead clears the profile block and approval settings and grants
-unrestricted networking.
+`allow_domain`, omit the hard block (or set `network.block: false`); the
+configured backend activates a strict proxy and otherwise eligible, directly
+handled CONNECT and plain-HTTP targets need approval. Inherited profile blocks
+remain hard blocks. The explicit `--allow-net` CLI override instead clears the
+profile block and approval settings and grants unrestricted networking.
 
 ## CONNECT Tunnel (Domain Filtering)
 
@@ -119,13 +119,13 @@ Save this as `approval-only.json` and launch it with:
 nono run --profile ./approval-only.json --allow-cwd -- my-agent
 ```
 
-A non-empty backend map activates a strict proxy:
-an empty allowlist means eligible CONNECT and plain-HTTP destinations require approval, not
-unrestricted networking. Direct outbound traffic remains blocked. Static
-allowlist grants do not prompt; explicit host denies and metadata/link-local
-SSRF protections cannot be approved. Approved destinations are resolved and
-checked again before each connection. Without a backend map, static-policy
-behavior is unchanged; `approval_defaults` alone does not activate the proxy.
+A non-empty backend map activates a strict proxy: an empty allowlist means
+eligible CONNECT and plain-HTTP destinations require approval, not unrestricted
+networking. Direct outbound traffic remains blocked. Static allowlist grants do
+not prompt; explicit host denies and metadata/link-local SSRF protections cannot
+be approved. Approved destinations are resolved and checked again before each
+connection. Without a backend map, static-policy behavior is unchanged;
+`approval_defaults` alone does not activate the proxy.
 
 `--block-net` and `network.block: true` are hard blocks, not approval triggers.
 They cannot be combined with approval backends, including when a block is

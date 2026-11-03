@@ -2033,72 +2033,68 @@ fn validate_phantom_token_basic(
 
 /// Filter headers, removing hop-by-hop and proxy-internal headers.
 ///
+/// Names are split on `:` and trimmed, the same match used by
+/// [`has_chunked_transfer_encoding`] and [`extract_content_length`].
+/// A space or tab before the colon is still that header.
+///
 /// Always strips:
 /// - `Host` (rewritten to upstream)
 /// - `Content-Length` (re-added after body is read)
 /// - `Transfer-Encoding` (body is decoded and re-framed upstream)
+/// - `Connection` and `Proxy-Connection`
 /// - `Proxy-Authorization` (hop-by-hop, contains session token)
 ///
-/// When `cred_header` is non-empty, also strips that header (it contains
-/// the phantom token that must not be forwarded alongside the real credential).
-/// When `cred_header` is empty (no-credential route), all other headers
-/// including `Authorization` are passed through to the upstream.
+/// `strip` names are removed the same way. A line with no colon, or an
+/// empty name, is not forwarded.
 pub(crate) fn filter_headers_multi(header_bytes: &[u8], strip: &[&str]) -> Vec<(String, String)> {
-    let prefixes: Vec<String> = strip
-        .iter()
-        .filter(|h| !h.is_empty())
-        .map(|h| format!("{}:", h.to_lowercase()))
-        .collect();
+    collect_forwarded_headers(header_bytes, strip)
+}
+
+/// Same stripping as [`filter_headers_multi`] for one credential header.
+///
+/// When `cred_header` is non-empty, that header is removed. It carries the
+/// phantom token and must not be forwarded next to the real credential.
+/// When `cred_header` is empty, other headers, including `Authorization`,
+/// are passed through.
+pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(String, String)> {
+    if cred_header.is_empty() {
+        collect_forwarded_headers(header_bytes, &[])
+    } else {
+        collect_forwarded_headers(header_bytes, &[cred_header])
+    }
+}
+
+fn collect_forwarded_headers(header_bytes: &[u8], extra: &[&str]) -> Vec<(String, String)> {
     let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
     let mut headers = Vec::new();
     for line in header_str.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("host:")
-            || lower.starts_with("content-length:")
-            || lower.starts_with("transfer-encoding:")
-            || lower.starts_with("connection:")
-            || lower.starts_with("proxy-connection:")
-            || lower.starts_with("proxy-authorization:")
-            || prefixes.iter().any(|p| lower.starts_with(p.as_str()))
-            || line.trim().is_empty()
-        {
+        if line.trim().is_empty() {
             continue;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_string(), value.trim().to_string()));
+        let Some((name, value)) = split_header_name_value(line) else {
+            continue;
+        };
+        if is_stripped_request_header(name, extra) {
+            continue;
         }
+        headers.push((name.to_string(), value.trim().to_string()));
     }
     headers
 }
 
-pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(String, String)> {
-    let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
-    let cred_header_lower = if cred_header.is_empty() {
-        String::new()
-    } else {
-        format!("{}:", cred_header.to_lowercase())
-    };
-    let mut headers = Vec::new();
-
-    for line in header_str.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("host:")
-            || lower.starts_with("content-length:")
-            || lower.starts_with("transfer-encoding:")
-            || lower.starts_with("connection:")
-            || lower.starts_with("proxy-connection:")
-            || lower.starts_with("proxy-authorization:")
-            || (!cred_header_lower.is_empty() && lower.starts_with(&cred_header_lower))
-            || line.trim().is_empty()
-        {
-            continue;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_string(), value.trim().to_string()));
-        }
-    }
-
-    headers
+fn is_stripped_request_header(name: &str, extra: &[&str]) -> bool {
+    const HOP: &[&str] = &[
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "proxy-connection",
+        "proxy-authorization",
+    ];
+    HOP.iter().any(|hop| name.eq_ignore_ascii_case(hop))
+        || extra
+            .iter()
+            .any(|item| !item.is_empty() && name.eq_ignore_ascii_case(item))
 }
 
 /// Filter headers for an outbound WebSocket upgrade request.
@@ -3459,6 +3455,71 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
         );
+    }
+
+    #[test]
+    fn test_filter_headers_strips_spaced_framing_headers() {
+        let header = b"Transfer-Encoding : chunked\r\nContent-Length : 5\r\nContent-Type : text/plain\r\n\r\n";
+        let filtered = filter_headers(header, "");
+        assert!(
+            !filtered
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding")),
+            "spaced transfer-encoding must be stripped, got {filtered:?}"
+        );
+        assert!(
+            !filtered
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-length")),
+            "spaced content-length must be stripped, got {filtered:?}"
+        );
+        assert_eq!(
+            filtered,
+            vec![("Content-Type".to_string(), "text/plain".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_filter_headers_strips_tab_before_colon_on_transfer_encoding() {
+        let header = b"Transfer-Encoding\t: chunked\r\nAccept: */*\r\n\r\n";
+        let filtered = filter_headers(header, "");
+        assert!(
+            !filtered
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding")),
+            "tab before colon must be stripped, got {filtered:?}"
+        );
+        assert_eq!(filtered, vec![("Accept".to_string(), "*/*".to_string())]);
+    }
+
+    #[test]
+    fn test_filter_headers_strips_spaced_credential_header() {
+        let header = b"Authorization : Bearer phantom\r\nContent-Type: application/json\r\n\r\n";
+        let filtered = filter_headers(header, "Authorization");
+        assert!(
+            !filtered
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+            "spaced credential header must be stripped, got {filtered:?}"
+        );
+        assert_eq!(
+            filtered,
+            vec![("Content-Type".to_string(), "application/json".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_filter_headers_multi_strips_spaced_hop_headers() {
+        let header = b"Host : example.test\r\nConnection : keep-alive\r\nProxy-Authorization : Basic abc\r\nX-Api-Key : phantom\r\nAccept : */*\r\n\r\n";
+        let filtered = filter_headers_multi(header, &["X-Api-Key"]);
+        assert_eq!(filtered, vec![("Accept".to_string(), "*/*".to_string())]);
+    }
+
+    #[test]
+    fn test_filter_headers_drops_empty_header_name() {
+        let header = b" : nope\r\nAccept: */*\r\n\r\n";
+        let filtered = filter_headers(header, "");
+        assert_eq!(filtered, vec![("Accept".to_string(), "*/*".to_string())]);
     }
 
     #[tokio::test]

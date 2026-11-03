@@ -355,6 +355,14 @@ mod tests {
     use nono::{AccessMode, ApprovalRequest};
     use std::io::IsTerminal;
 
+    /// Serializes tests that reach `TerminalApproval::prompt`: they share the
+    /// process-wide `APPROVAL_PROMPT_LOCK`, and one test asserts it is free.
+    static PROMPT_TESTS: Mutex<()> = Mutex::new(());
+
+    fn prompt_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        PROMPT_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     fn capability_request() -> ApprovalRequest {
@@ -452,6 +460,7 @@ mod tests {
 
     #[test]
     fn timed_out_terminal_attempt_finishes_before_another_prompt_starts() {
+        let _serial = prompt_test_guard();
         use crate::terminal_prompt::read_consent_line_from;
         use nix::pty::{OpenptyResult, openpty};
         use std::sync::mpsc;
@@ -519,6 +528,7 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_capability_request() {
+        let _serial = prompt_test_guard();
         if std::io::stderr().is_terminal() {
             return;
         }
@@ -534,6 +544,7 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_network_request() {
+        let _serial = prompt_test_guard();
         if std::io::stderr().is_terminal() {
             return;
         }
@@ -546,6 +557,7 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_command_request() {
+        let _serial = prompt_test_guard();
         if std::io::stderr().is_terminal() {
             return;
         }
@@ -558,6 +570,7 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_endpoint_request() {
+        let _serial = prompt_test_guard();
         if std::io::stderr().is_terminal() {
             return;
         }
@@ -570,6 +583,7 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_unix_socket_request() {
+        let _serial = prompt_test_guard();
         if std::io::stderr().is_terminal() {
             return;
         }
@@ -583,6 +597,7 @@ mod tests {
 
     #[test]
     fn endpoint_prompt_supports_session_answers() {
+        let _serial = prompt_test_guard();
         for (input, expected) in [
             ("1", ApprovalDecision::Granted),
             ("2", ApprovalDecision::GrantedForSession),
@@ -615,6 +630,7 @@ mod tests {
 
     #[test]
     fn unix_socket_prompt_supports_once_session_and_default_denial() {
+        let _serial = prompt_test_guard();
         for (input, expected) in [
             ("1", ApprovalDecision::Granted),
             ("2", ApprovalDecision::GrantedForSession),
@@ -651,6 +667,7 @@ mod tests {
 
     #[test]
     fn non_tty_denial_carries_reason() {
+        let _serial = prompt_test_guard();
         if std::io::stderr().is_terminal() {
             return;
         }

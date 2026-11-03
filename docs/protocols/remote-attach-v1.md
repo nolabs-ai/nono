@@ -59,6 +59,12 @@ explicit development and support override.
 
 ## Human device authorization
 
+A person signed in with `nono login` uses OAuth instead of this flow: the CLI
+presents a DPoP-bound access token (`Authorization: DPoP <token>` plus a
+`DPoP` proof) obtained as specified in [cli-login-v1](cli-login-v1.md), and
+needs no device enrollment. The flow below remains for enrolled devices without
+a `nono login` session.
+
 When no explicit human token is configured, an enrolled device obtains a
 revocable CLI authorization without copying the browser session cookie. All
 CLI requests below use the same enrolled-request signature headers as console

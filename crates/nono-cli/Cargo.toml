@@ -73,6 +73,10 @@ keyring = { version = "4", features = ["v1"], optional = true, default-features 
 sigstore-sign.workspace = true
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "signal"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+# Explicit provider for the terminal WebSocket: both rustls providers are in
+# the graph, so rustls has no process default (see connect_client.rs).
+rustls = { version = "0.23.46", features = ["ring"] }
+rustls-native-certs = "0.8.5"
 futures-util = "0.3"
 
 ureq = { version = "~3.5", features = ["platform-verifier", "socks-proxy"] }
@@ -96,11 +100,11 @@ shlex = "2"
 jsonc-parser = { version = "0.34", features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }
+nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir", "hostname"] }
 landlock.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }
+nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir", "hostname"] }
 security-framework = "3"
 security-framework-sys = "2"
 core-foundation = "0.10"

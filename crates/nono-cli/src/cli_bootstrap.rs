@@ -136,6 +136,8 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::Trust(_)
         | Commands::Audit(_)
         | Commands::Platform(_)
+        | Commands::Login(_)
+        | Commands::Logout(_)
         | Commands::Connect(_)
         | Commands::Pull(_)
         | Commands::Remove(_)

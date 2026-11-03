@@ -36,6 +36,7 @@ mod jsonc;
 mod launch_runtime;
 #[cfg(target_os = "linux")]
 mod lineage_cgroup;
+mod login_cmd;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
@@ -49,6 +50,7 @@ mod package_cmd;
 mod package_status;
 mod platform;
 mod platform_client;
+mod platform_oauth;
 mod policy;
 mod profile;
 mod profile_cmd;
@@ -122,6 +124,14 @@ fn main() {
         return;
     }
     tool_sandbox::record_main_start();
+
+    // Both rustls providers are in the dependency graph (ring via ureq,
+    // aws-lc-rs via the AWS SDK in nono-proxy), so rustls cannot infer a
+    // process default and any dependency that builds a TLS config without
+    // naming a provider panics. Choose ring, which nono's own TLS code names
+    // explicitly. This only fills the default: code that selects a provider
+    // keeps it. `Err` means a default is already installed, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());

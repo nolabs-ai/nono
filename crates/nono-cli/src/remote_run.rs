@@ -8,6 +8,8 @@ use serde::{Deserialize, de::DeserializeOwned};
 use url::Url;
 use zeroize::Zeroizing;
 
+use crate::platform_oauth::ApiCredential;
+
 use crate::cli::{ConnectArgs, RunArgs};
 use crate::{connect_client, platform_client};
 
@@ -116,44 +118,68 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         .agent
         .as_deref()
         .ok_or_else(|| action("--agent is required"))?;
-    let platform = match options.platform_url.as_deref() {
-        Some(value) => connect_client::validate_console_url(value)?,
-        None => {
+    // Run API credential: an explicit personal access token, else the
+    // `nono login` session for the organization NONO_ORG names (or the
+    // active one).
+    let (run_token, session_platform) = match options.run_token_file.as_deref() {
+        Some(path) => (connect_client::load_token(Some(path))?, None),
+        None => match std::env::var("NONO_RUN_TOKEN") {
+            Ok(value) => {
+                let token = Zeroizing::new(value);
+                if token.is_empty()
+                    || token.chars().any(char::is_whitespace)
+                    || token.len() > 64 * 1024
+                {
+                    return Err(action(
+                        "NONO_RUN_TOKEN must be a nonempty bearer token without whitespace",
+                    ));
+                }
+                (ApiCredential::Bearer(token), None)
+            }
+            Err(_) => match crate::platform_oauth::session_access()? {
+                Some(access) => (access.credential, Some(access.platform_url)),
+                None => {
+                    return Err(action(
+                        "sign in with `nono login`, or set NONO_RUN_TOKEN or --run-token-file to a \
+                         personal access token with runs:create and runs:read",
+                    ));
+                }
+            },
+        },
+    };
+    let platform = match (options.platform_url.as_deref(), &session_platform) {
+        (Some(value), Some(signed_in)) => {
+            let requested = platform_client::validate_platform_url(value)?;
+            // Never hand the session's credential to another platform.
+            if &requested != signed_in {
+                return Err(action(&format!(
+                    "you are signed in to {signed_in}, not {requested}; drop --platform-url or \
+                     sign in to that platform"
+                )));
+            }
+            connect_client::validate_console_url(&requested)?
+        }
+        (Some(value), None) => connect_client::validate_console_url(value)?,
+        (None, Some(signed_in)) => connect_client::validate_console_url(signed_in)?,
+        (None, None) => {
             let state = platform_client::load_state()?.ok_or_else(|| {
-                action("remote launch requires platform enrollment or --platform-url")
+                action("remote launch requires `nono login`, platform enrollment or --platform-url")
             })?;
             connect_client::validate_console_url(&state.platform_url)?
-        }
-    };
-    let run_token = match options.run_token_file.as_deref() {
-        Some(path) => connect_client::load_token(Some(path))?,
-        None => {
-            let token = Zeroizing::new(std::env::var("NONO_RUN_TOKEN").map_err(|_| {
-                action("set NONO_RUN_TOKEN or --run-token-file to a personal access token with runs:create and runs:read")
-            })?);
-            if token.is_empty() || token.chars().any(char::is_whitespace) || token.len() > 64 * 1024
-            {
-                return Err(action(
-                    "NONO_RUN_TOKEN must be a nonempty bearer token without whitespace",
-                ));
-            }
-            token
         }
     };
     let console_override = options
         .console
         .clone()
         .or_else(|| std::env::var("NONO_CONSOLE_URL").ok());
-    let console = match console_override.as_deref() {
-        Some(value) => connect_client::validate_console_url(value)?,
-        None => connect_client::discover_console()?,
-    };
     let connect_token_file = options
         .connect_token_file
         .clone()
         .or_else(|| std::env::var_os("NONO_CONNECT_TOKEN_FILE").map(std::path::PathBuf::from));
-    let console_token = connect_client::load_token(connect_token_file.as_deref())?;
-    let workspaces: WorkspaceList = get(&console, "/api/v1/workspaces", &console_token)?;
+    let console_access = connect_client::console_access(connect_token_file.as_deref())?;
+    let console = connect_client::resolve_console(console_override.as_deref(), &console_access)?;
+    let workspaces: WorkspaceList =
+        get(&console, "/api/v1/workspaces", &console_access.credential)?;
     let workspace = select_workspace(&workspaces.workspaces, options.workspace.as_deref())?;
     let payload = serde_json::json!({
         "agent_id": agent,
@@ -169,9 +195,18 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
     );
     eprintln!("Submission key: {idempotency_key}");
     let endpoint = platform_client::endpoint_url(platform.as_str(), "/api/v1/runs")?;
-    let mut response = platform_client::http_agent(Duration::from_secs(15)).post(&endpoint)
-        .config().max_redirects(0).http_status_as_error(false).build()
-        .header("Authorization", &format!("Bearer {}", run_token.as_str()))
+    let endpoint_url =
+        Url::parse(&endpoint).map_err(|_| action("could not construct the Runs endpoint"))?;
+    let mut request = platform_client::http_agent(Duration::from_secs(15))
+        .post(&endpoint)
+        .config()
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build();
+    for (name, value) in run_token.headers("POST", &endpoint_url)? {
+        request = request.header(name, value.as_str());
+    }
+    let mut response = request
         .header("Idempotency-Key", &idempotency_key)
         .header("Content-Type", "application/json")
         .send(payload.to_string().as_bytes())
@@ -299,17 +334,25 @@ fn resolve_workspace<'a>(workspaces: &'a [Workspace], selector: &str) -> Result<
     }
 }
 
-fn get<T: DeserializeOwned>(origin: &Url, path: &str, token: &str) -> Result<T> {
+fn get<T: DeserializeOwned>(origin: &Url, path: &str, token: &ApiCredential) -> Result<T> {
     let endpoint = platform_client::endpoint_url(origin.as_str(), path)?;
-    let mut response = platform_client::http_agent(Duration::from_secs(15))
+    let endpoint_url =
+        Url::parse(&endpoint).map_err(|_| action("could not construct the remote API URL"))?;
+    let mut request = platform_client::http_agent(Duration::from_secs(15))
         .get(&endpoint)
         .config()
         .max_redirects(0)
         .http_status_as_error(false)
-        .build()
-        .header("Authorization", &format!("Bearer {token}"))
-        .call()
-        .map_err(|_| action("remote API request failed; any accepted Run remains active"))?;
+        .build();
+    for (name, value) in token.headers("GET", &endpoint_url)? {
+        request = request.header(name, value.as_str());
+    }
+    let mut response = request.call().map_err(|error| {
+        action(&format!(
+            "remote API request to {} failed: {error}; any accepted Run remains active",
+            origin.origin().ascii_serialization()
+        ))
+    })?;
     decode(&mut response)
 }
 

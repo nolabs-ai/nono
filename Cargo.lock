@@ -2704,6 +2704,8 @@ dependencies = [
  "proptest",
  "rand 0.10.3",
  "regex",
+ "rustls",
+ "rustls-native-certs",
  "security-framework",
  "security-framework-sys",
  "semver",

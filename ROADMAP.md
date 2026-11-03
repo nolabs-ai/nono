@@ -44,5 +44,5 @@ _Under active authoring; not yet ready for a decision._
   Extend the Tool Sandbox policy model so that a sandboxed command can request a narrowly scoped filesystem capability for one invocation without escaping the filesystem policy selected for that invocation.
 - **[NEP-0005: Windows enforcement backend](neps/0005-windows-enforcement-backend.md)** — _Non-breaking_
   Add a third OS enforcement backend to nono for Windows, alongside Linux (Landlock) and macOS (Seatbelt).
-- **[NEP-0009: OAuth 2.0 login and device enrollment from the CLI (`nono login`)](neps/0009-cli-login.md)** — _Non-breaking_
-  Add `nono login`, which signs a developer in to a nono platform through a standard OAuth 2.0 flow and, on first use, enrolls the machine in the same round trip.
+- **[NEP-0009: Account sign-in from the CLI (`nono login`)](neps/0009-cli-login.md)** — _Non-breaking_
+  Add `nono login`, which signs a person in to a nono platform from the terminal.

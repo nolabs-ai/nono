@@ -732,6 +732,23 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
                 ev, name
             )));
         }
+        let token_var = nono_proxy::config::phantom_token_env_var(
+            name,
+            cred.env_var.as_deref(),
+            cred.credential_key.as_deref(),
+            cred.spiffe.is_some(),
+            cred.auth
+                .as_ref()
+                .and_then(|a| a.client_assertion.as_ref())
+                .is_some(),
+        );
+        if token_var.as_deref() == Some(ev.as_str()) {
+            return Err(NonoError::ProfileParse(format!(
+                "base_url_env_var '{}' for custom credential '{}' is also the variable that \
+                 carries the phantom token (env_var / credential_key); the two must differ",
+                ev, name
+            )));
+        }
     }
 
     // Validate upstream URL (HTTPS required, HTTP only for loopback)
@@ -6538,6 +6555,63 @@ mod tests {
         let err = validate_custom_credential("test", &cred)
             .expect_err("base_url_env_var with '=' should be rejected");
         assert!(err.to_string().contains("alphanumeric"));
+    }
+
+    #[test]
+    fn test_validate_base_url_env_var_colliding_with_env_var_rejected() {
+        let mut cred = header_cred_builder();
+        cred.env_var = Some("LANGFUSE_API_KEY".to_string());
+        cred.base_url_env_var = Some("LANGFUSE_API_KEY".to_string());
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("base_url_env_var equal to env_var should be rejected");
+        assert!(err.to_string().contains("phantom token"));
+    }
+
+    #[test]
+    fn test_validate_base_url_env_var_colliding_with_derived_token_var_rejected() {
+        let mut cred = header_cred_builder();
+        cred.env_var = None;
+        let derived = cred
+            .credential_key
+            .clone()
+            .expect("builder sets credential_key")
+            .to_uppercase();
+        cred.base_url_env_var = Some(derived);
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("base_url_env_var equal to the derived token var should be rejected");
+        assert!(err.to_string().contains("phantom token"));
+    }
+
+    #[test]
+    fn test_validate_base_url_env_var_colliding_with_env_uri_env_var_rejected() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("env://LANGFUSE_SECRET".to_string());
+        cred.env_var = Some("LANGFUSE_API_KEY".to_string());
+        cred.base_url_env_var = Some("LANGFUSE_API_KEY".to_string());
+        let err = validate_custom_credential("langfuse", &cred)
+            .expect_err("env:// credential whose token var is the base URL var should be rejected");
+        assert!(err.to_string().contains("phantom token"));
+    }
+
+    #[test]
+    fn test_validate_base_url_env_var_with_env_uri_and_no_env_var_ok() {
+        // Without env_var an env:// route exports no phantom token var, so
+        // even the URI's own variable name cannot collide.
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("env://LANGFUSE_SECRET".to_string());
+        cred.env_var = None;
+        cred.base_url_env_var = Some("LANGFUSE_ENDPOINT".to_string());
+        assert!(validate_custom_credential("langfuse", &cred).is_ok());
+        cred.base_url_env_var = Some("LANGFUSE_SECRET".to_string());
+        assert!(validate_custom_credential("langfuse", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_base_url_env_var_distinct_from_token_var_ok() {
+        let mut cred = header_cred_builder();
+        cred.env_var = Some("LANGFUSE_API_KEY".to_string());
+        cred.base_url_env_var = Some("LANGFUSE_ENDPOINT".to_string());
+        assert!(validate_custom_credential("test", &cred).is_ok());
     }
 
     #[test]

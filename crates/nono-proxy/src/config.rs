@@ -899,6 +899,47 @@ pub struct RouteConfig {
     pub rate_limit: Option<RouteRateLimitConfig>,
 }
 
+impl RouteConfig {
+    /// Name of the env var that carries this route's phantom session token.
+    #[must_use]
+    pub fn phantom_token_env_var(&self) -> Option<String> {
+        phantom_token_env_var(
+            &self.prefix,
+            self.env_var.as_deref(),
+            self.credential_key.as_deref(),
+            self.spiffe.is_some(),
+            self.oauth2
+                .as_ref()
+                .and_then(|o| o.client_assertion.as_ref())
+                .is_some(),
+        )
+    }
+}
+
+/// Env var a route's phantom session token is exported as, if any.
+///
+/// Shared by the proxy (which sets it) and profile validation (which must
+/// keep `base_url_env_var` from colliding with it).
+#[must_use]
+pub fn phantom_token_env_var(
+    prefix: &str,
+    env_var: Option<&str>,
+    credential_key: Option<&str>,
+    has_spiffe: bool,
+    has_client_assertion: bool,
+) -> Option<String> {
+    let prefix = prefix.trim_matches('/');
+    if let Some(env_var) = env_var {
+        return Some(env_var.to_string());
+    }
+    if let Some(cred_key) = credential_key {
+        // Uppercasing a URI (env://, op://, ...) yields no usable name; those
+        // routes must declare env_var to get a phantom token.
+        return (!cred_key.contains("://")).then(|| cred_key.to_uppercase());
+    }
+    (has_spiffe || has_client_assertion).then(|| format!("{}_API_KEY", prefix.to_uppercase()))
+}
+
 /// A WebSocket path allow-listed on one concrete upstream route.
 ///
 /// Origin selection belongs to the profile layer that expands a credential
@@ -1655,6 +1696,35 @@ pub struct AwsAuthConfig {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phantom_token_env_var_follows_runtime_derivation() {
+        use super::phantom_token_env_var;
+        assert_eq!(
+            phantom_token_env_var(
+                "svc",
+                Some("SVC_TOKEN"),
+                Some("env://HOST_SECRET"),
+                false,
+                false
+            ),
+            Some("SVC_TOKEN".to_string())
+        );
+        assert_eq!(
+            phantom_token_env_var("svc", None, Some("svc_api_key"), false, false),
+            Some("SVC_API_KEY".to_string())
+        );
+        // A URI key without env_var exports no phantom token, so nothing can
+        // collide with it.
+        assert_eq!(
+            phantom_token_env_var("svc", None, Some("env://HOST_SECRET"), false, false),
+            None
+        );
+        assert_eq!(
+            phantom_token_env_var("/svc/", None, None, true, false),
+            Some("SVC_API_KEY".to_string())
+        );
+    }
 
     #[test]
     fn test_http_header_token_char_alphanumeric() {

@@ -723,33 +723,7 @@ impl ProxyHandle {
             }
 
             // API key set to session token (phantom token pattern).
-            // Use explicit env_var if set (required for URI manager refs), otherwise
-            // fall back to uppercasing the credential_key (e.g., "openai_api_key" -> "OPENAI_API_KEY").
-            if let Some(ref env_var) = route.env_var {
-                vars.push((env_var.clone(), self.token.to_string()));
-            } else if let Some(ref cred_key) = route.credential_key {
-                // Skip URI-format keys (e.g. env://, op://, apple-password://) —
-                // uppercasing a URI produces a nonsensical env var name. These
-                // routes must declare an explicit env_var to get phantom token injection.
-                if !cred_key.contains("://") {
-                    let api_key_name = cred_key.to_uppercase();
-                    vars.push((api_key_name, self.token.to_string()));
-                }
-            } else if route.spiffe.is_some() {
-                // SPIFFE routes use the same phantom token pattern for SDK-style
-                // `*_BASE_URL` clients even though upstream auth is SPIFFE.
-                let api_key_name = format!("{}_API_KEY", prefix.to_uppercase());
-                vars.push((api_key_name, self.token.to_string()));
-            } else if route
-                .oauth2
-                .as_ref()
-                .and_then(|o| o.client_assertion.as_ref())
-                .is_some()
-            {
-                // OAuth2 jwt-bearer assertion routes need the same phantom token
-                // pattern — the proxy validates session integrity before injecting
-                // the exchanged access token, so the child process must present it.
-                let api_key_name = format!("{}_API_KEY", prefix.to_uppercase());
+            if let Some(api_key_name) = route.phantom_token_env_var() {
                 vars.push((api_key_name, self.token.to_string()));
             }
         }

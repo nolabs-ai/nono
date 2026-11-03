@@ -1297,6 +1297,29 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
     for (name, cred) in &profile.network.custom_credentials {
         validate_custom_credential(name, cred)?;
     }
+    // Same exported-name check the proxy runs, so `nono profile validate`
+    // reports a clash without starting a session. Only naming fields matter.
+    let routes: Vec<nono_proxy::config::RouteConfig> = profile
+        .network
+        .custom_credentials
+        .iter()
+        .map(|(name, cred)| nono_proxy::config::RouteConfig {
+            prefix: name.clone(),
+            upstream: cred.upstream.clone(),
+            credential_key: cred.credential_key.clone(),
+            env_var: cred.env_var.clone(),
+            base_url_env_var: cred.base_url_env_var.clone(),
+            phantom_format: cred.phantom_format.clone(),
+            oauth2: cred.auth.clone(),
+            spiffe: cred.spiffe.clone(),
+            ..Default::default()
+        })
+        .collect();
+    nono_proxy::server::validate_base_url_env_names(
+        &routes,
+        &nono_proxy::config::default_intercept_ca_env_vars(),
+    )
+    .map_err(|e| NonoError::ProfileParse(e.to_string()))?;
     Ok(())
 }
 
@@ -6175,6 +6198,35 @@ mod tests {
     // - credential_key (alphanumeric + underscore)
     // - upstream URL (HTTPS required, HTTP only for loopback)
     // ============================================================================
+
+    #[test]
+    fn test_validate_profile_rejects_custom_credentials_sharing_base_url_env_var() {
+        let mut profile = Profile::default();
+        let mut a = header_cred_builder();
+        a.env_var = Some("A_KEY".to_string());
+        a.base_url_env_var = Some("SHARED_ENDPOINT".to_string());
+        let mut b = header_cred_builder();
+        b.env_var = Some("B_KEY".to_string());
+        b.base_url_env_var = Some("SHARED_ENDPOINT".to_string());
+        profile
+            .network
+            .custom_credentials
+            .insert("a".to_string(), a);
+        profile
+            .network
+            .custom_credentials
+            .insert("b".to_string(), b.clone());
+        let err = validate_profile_custom_credentials(&profile)
+            .expect_err("two credentials exporting one base URL var must be rejected");
+        assert!(err.to_string().contains("SHARED_ENDPOINT"), "{err}");
+
+        b.base_url_env_var = Some("B_ENDPOINT".to_string());
+        profile
+            .network
+            .custom_credentials
+            .insert("b".to_string(), b);
+        assert!(validate_profile_custom_credentials(&profile).is_ok());
+    }
 
     fn header_cred_builder() -> CustomCredentialDef {
         CustomCredentialDef {

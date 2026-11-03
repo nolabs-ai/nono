@@ -171,8 +171,8 @@ impl SnapshotManager {
 
     /// Create an incremental snapshot by comparing current state to previous.
     ///
-    /// Uses mtime/size as a fast check to skip unchanged files, then hashes
-    /// changed files. Detects created, modified, and deleted files.
+    /// Re-reads and hashes every tracked file, then diffs against `previous`.
+    /// Detects created, modified, and deleted files.
     pub fn create_incremental(
         &mut self,
         previous: &SnapshotManifest,
@@ -1016,8 +1016,8 @@ fn compute_changes(
     changes
 }
 
-/// Get file state from metadata (hash is zeroed - used for walk_current where
-/// we only need to track which files exist for deletion during restore).
+/// Get file state from metadata, including the content hash. Used by
+/// walk_current, which needs current hashes for restore and diff.
 fn file_state_from_metadata(path: &Path) -> Result<FileState> {
     let hash = hash_file(path)?;
 

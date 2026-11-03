@@ -2277,89 +2277,52 @@ async fn handle_forward_http(
 
     // A plain allowlist miss may still proceed if the operator approves the
     // host (or approved it earlier this session), exactly as on the CONNECT
-    // path. Hard denials (deny list, metadata, link-local) are never prompted;
-    // see `connect::maybe_approve_host`. An approved host is forwarded to the
-    // re-vetted addresses returned with the approval, never a fresh lookup.
-    let mut approved_backend: Option<String> = None;
-    let resolved_addrs: Vec<SocketAddr> = if check.result.is_allowed() {
-        check.resolved_addrs
+    // path; see `connect::authorize_host`. Approval is not offered when
+    // chaining through the external proxy.
+    let network_approval = if chain_external {
+        None
     } else {
-        let network_approval = if chain_external {
-            None
-        } else {
-            state.network_approval()
-        };
-        let approved = match connect::maybe_approve_host(
-            &host,
-            port,
-            &check.result,
-            network_approval.as_ref(),
-            &state.filter,
-        )
-        .await?
-        {
-            connect::ApprovalOutcome::Approved { addrs, backend } => {
-                // Host was authorized by a runtime approval decision, not the
-                // static allowlist — record it as such, with the deciding
-                // backend. Per-request L7 events follow from forward_request.
-                audit::log_host_approval(
-                    state.audit_log.as_ref(),
-                    audit::ProxyMode::Reverse,
-                    &audit::EventContext {
-                        approval_backend: Some(&backend),
-                        ..audit::EventContext::default()
-                    },
-                    &host,
-                    port,
-                    nono::undo::NetworkAuditDecision::ApproveGranted,
-                    None,
-                );
-                approved_backend = Some(backend);
-                Ok(addrs)
-            }
-            connect::ApprovalOutcome::Denied { backend, reason } => {
-                let reason = reason.unwrap_or_else(|| check.result.reason());
-                audit::log_host_approval(
-                    state.audit_log.as_ref(),
-                    audit::ProxyMode::Reverse,
-                    &audit::EventContext {
-                        denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
-                        approval_backend: Some(&backend),
-                        ..audit::EventContext::default()
-                    },
-                    &host,
-                    port,
-                    nono::undo::NetworkAuditDecision::ApproveDenied,
-                    Some(&reason),
-                );
-                Err(reason)
-            }
-            connect::ApprovalOutcome::NotApplicable => {
-                let reason = check.result.reason();
-                audit::log_denied(
-                    state.audit_log.as_ref(),
-                    audit::ProxyMode::Reverse,
-                    &audit::EventContext {
-                        denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
-                        ..audit::EventContext::default()
-                    },
-                    &host,
-                    port,
-                    &reason,
-                );
-                Err(reason)
-            }
-        };
-        match approved {
-            Ok(addrs) => addrs,
-            Err(reason) => {
-                let sanitised = reason.replace(['\r', '\n'], " ");
-                let response = format!("HTTP/1.1 403 Forbidden: {}\r\n\r\n", sanitised);
-                stream.write_all(response.as_bytes()).await?;
-                return Ok(());
-            }
+        state.network_approval()
+    };
+    let (resolved_addrs, approved_backend) = match connect::authorize_host(
+        audit::ProxyMode::Reverse,
+        &host,
+        port,
+        check,
+        network_approval.as_ref(),
+        &state.filter,
+        state.audit_log.as_ref(),
+    )
+    .await?
+    {
+        connect::HostAuthorization::Authorized {
+            addrs,
+            approval_backend,
+        } => (addrs, approval_backend),
+        connect::HostAuthorization::Denied { reason } => {
+            let sanitised = reason.replace(['\r', '\n'], " ");
+            let response = format!("HTTP/1.1 403 Forbidden: {}\r\n\r\n", sanitised);
+            stream.write_all(response.as_bytes()).await?;
+            return Ok(());
         }
     };
+    if let Some(backend) = approved_backend.as_deref() {
+        // Host was authorized by a runtime approval decision, not the static
+        // allowlist — record it as such, with the deciding backend. Per-request
+        // L7 events follow from forward_request.
+        audit::log_host_approval(
+            state.audit_log.as_ref(),
+            audit::ProxyMode::Reverse,
+            &audit::EventContext {
+                approval_backend: Some(backend),
+                ..audit::EventContext::default()
+            },
+            &host,
+            port,
+            nono::undo::NetworkAuditDecision::ApproveGranted,
+            None,
+        );
+    }
 
     // 3. Read the request body before building upstream headers so chunked
     //    framing can be decoded and re-written with Content-Length.
@@ -6812,26 +6775,6 @@ mod tests {
 
     // --- Network approval on the plain-HTTP forward path (issue #2261) ---
 
-    /// Approval backend with a fixed decision that counts consultations.
-    struct FixedDecisionBackend {
-        decision: nono::ApprovalDecision,
-        calls: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl nono::ApprovalBackend for FixedDecisionBackend {
-        fn request_approval(
-            &self,
-            _request: &nono::ApprovalRequest,
-        ) -> nono::Result<nono::ApprovalDecision> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(self.decision.clone())
-        }
-
-        fn backend_name(&self) -> &str {
-            "fixed"
-        }
-    }
-
     /// Start a proxy whose allowlist excludes `127.0.0.1`, with a network
     /// approval backend that always answers `decision`.
     async fn start_forward_approval_proxy(
@@ -6839,7 +6782,7 @@ mod tests {
         decision: nono::ApprovalDecision,
     ) -> (ProxyHandle, Arc<std::sync::atomic::AtomicUsize>) {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let backend: Arc<dyn nono::ApprovalBackend> = Arc::new(FixedDecisionBackend {
+        let backend: Arc<dyn nono::ApprovalBackend> = Arc::new(crate::test_env::CountingBackend {
             decision,
             calls: Arc::clone(&calls),
         });
@@ -6911,7 +6854,7 @@ mod tests {
             events.iter().any(
                 |e| e.decision == nono::undo::NetworkAuditDecision::ApproveGranted
                     && e.target == "127.0.0.1"
-                    && e.approval_backend.as_deref() == Some("fixed")
+                    && e.approval_backend.as_deref() == Some("counting")
             ),
             "expected an ApproveGranted audit event, got: {events:?}"
         );
@@ -6920,7 +6863,7 @@ mod tests {
                 .iter()
                 .any(|e| e.decision == nono::undo::NetworkAuditDecision::Allow
                     && e.status == Some(200)
-                    && e.approval_backend.as_deref() == Some("fixed")),
+                    && e.approval_backend.as_deref() == Some("counting")),
             "expected the L7 event to carry the approving backend, got: {events:?}"
         );
 
@@ -6951,7 +6894,7 @@ mod tests {
             events.iter().any(
                 |e| e.decision == nono::undo::NetworkAuditDecision::ApproveDenied
                     && e.target == "127.0.0.1"
-                    && e.approval_backend.as_deref() == Some("fixed")
+                    && e.approval_backend.as_deref() == Some("counting")
                     && e.denial_category
                         == Some(nono::undo::NetworkAuditDenialCategory::HostDenied)
             ),
@@ -7013,6 +6956,112 @@ mod tests {
             "chained allowlist miss must be denied, got: {response}"
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        handle.shutdown();
+    }
+
+    /// Origin that accepts any number of connections and answers each with
+    /// `200 OK`, so one test can open a CONNECT tunnel and send a forward
+    /// request to the same `host:port`.
+    async fn spawn_multi_origin() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    if sock.read(&mut buf).await.unwrap_or(0) > 0 {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Send a CONNECT for `authority` through the proxy and return the status
+    /// line of the proxy's reply.
+    async fn send_connect(handle: &ProxyHandle, authority: &str) -> String {
+        use base64::Engine;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = base64::engine::general_purpose::STANDARD
+            .encode(format!("nono:{}", handle.token.as_str()));
+        let request = format!(
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut status = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut status)
+            .await
+            .unwrap();
+        status
+    }
+
+    /// An "Always allow" given on a CONNECT tunnel also covers plain-HTTP
+    /// forward requests to the same `host:port`: both paths share the session
+    /// cache, so the backend is consulted only once.
+    #[tokio::test]
+    async fn forward_http_reuses_connect_session_grant() {
+        let origin_addr = spawn_multi_origin().await;
+        let (handle, calls) = start_forward_approval_proxy(
+            not_allowlisted_config(),
+            nono::ApprovalDecision::GrantedForSession,
+        )
+        .await;
+
+        let authority = format!("127.0.0.1:{}", origin_addr.port());
+        let status = send_connect(&handle, &authority).await;
+        assert!(
+            status.starts_with("HTTP/1.1 200"),
+            "approved CONNECT should be established, got: {status}"
+        );
+
+        let response =
+            send_forward_get(&handle, &format!("http://{authority}/hello"), &authority).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "session-granted host should be forwarded, got: {response}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        handle.shutdown();
+    }
+
+    /// An "Always deny" given on a plain-HTTP forward request also blocks a
+    /// CONNECT tunnel to the same `host:port` without re-prompting.
+    #[tokio::test]
+    async fn connect_reuses_forward_http_session_denial() {
+        let origin_addr = spawn_multi_origin().await;
+        let (handle, calls) = start_forward_approval_proxy(
+            not_allowlisted_config(),
+            nono::ApprovalDecision::DeniedForSession,
+        )
+        .await;
+
+        let authority = format!("127.0.0.1:{}", origin_addr.port());
+        let response =
+            send_forward_get(&handle, &format!("http://{authority}/hello"), &authority).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "session-denied host should 403, got: {response}"
+        );
+
+        let status = send_connect(&handle, &authority).await;
+        assert!(
+            status.starts_with("HTTP/1.1 403"),
+            "session-denied CONNECT should 403, got: {status}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         handle.shutdown();
     }

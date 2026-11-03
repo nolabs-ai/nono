@@ -63,7 +63,7 @@ approval. Configuring `network.approval_backends` together with either effective
 hard block is rejected before launch. For approval-only networking with an empty
 `allow_domain`, omit the hard block (or set `network.block: false`); the configured
 backend activates a strict proxy and otherwise eligible, directly handled
-CONNECT targets need approval. Inherited profile blocks remain hard blocks. The explicit `--allow-net`
+CONNECT and plain-HTTP targets need approval. Inherited profile blocks remain hard blocks. The explicit `--allow-net`
 CLI override instead clears the profile block and approval settings and grants
 unrestricted networking.
 
@@ -120,7 +120,7 @@ nono run --profile ./approval-only.json --allow-cwd -- my-agent
 ```
 
 A non-empty backend map activates a strict proxy:
-an empty allowlist means eligible CONNECT destinations require approval, not
+an empty allowlist means eligible CONNECT and plain-HTTP destinations require approval, not
 unrestricted networking. Direct outbound traffic remains blocked. Static
 allowlist grants do not prompt; explicit host denies and metadata/link-local
 SSRF protections cannot be approved. Approved destinations are resolved and
@@ -142,9 +142,11 @@ the answer. Expiry denies, restores terminal state, and releases the prompt
 reader; expired queued work cannot open a later prompt. Set this timeout on the
 backend itself. A terminal backend without an available terminal denies.
 
-Host approvals apply to direct CONNECT tunnels, including destinations that
-bypass an enterprise upstream proxy. CONNECTs forwarded to the enterprise
-proxy do not consult these backends and need static allowlist grants.
+Host approvals apply to direct CONNECT tunnels and plain-HTTP (`http://`)
+forward-proxy requests, including destinations that bypass an enterprise
+upstream proxy. Both paths share the same backend, "Always" decisions, and
+in-flight prompt. Requests forwarded to the enterprise proxy do not consult
+these backends and need static allowlist grants.
 `nono wrap` rejects them because it cannot host an approval proxy.
 
 For a local approval helper, point a `webhook` backend at a Unix socket
@@ -278,7 +280,7 @@ nono run --allow-cwd --network-profile enterprise \
   --upstream-proxy squid.corp:3128 -- my-agent
 ```
 
-CONNECT requests are chained through the corporate proxy. Cloud metadata endpoints are still denied regardless. Forwarded CONNECTs use static host policy, not runtime host approvals. When network approval backends are configured, forwarded destinations therefore need static allowlist grants; only direct/upstream-bypass CONNECTs can consult `network.approval_backends`.
+CONNECT requests are chained through the corporate proxy. Cloud metadata endpoints are still denied regardless. Forwarded CONNECTs and plain-HTTP requests use static host policy, not runtime host approvals. When network approval backends are configured, forwarded destinations therefore need static allowlist grants; only direct/upstream-bypass requests can consult `network.approval_backends`.
 
 ### Bypassing the External Proxy
 

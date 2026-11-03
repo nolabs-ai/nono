@@ -124,7 +124,8 @@ impl Drop for InFlightLeader<'_> {
     }
 }
 
-/// Interactive network-approval context threaded into the CONNECT handler.
+/// Interactive network-approval context threaded into the CONNECT and
+/// plain-HTTP forward-proxy handlers.
 ///
 /// Present only when the profile's `network:` section configures an approval
 /// backend. When absent, a host that is not on the allowlist is denied exactly
@@ -260,8 +261,9 @@ pub async fn handle_connect(
                 // this host, or the approved host was blocked by the SSRF guard.
                 // Record it as an approval denial, distinct from a static deny.
                 let reason = reason.unwrap_or_else(|| check.result.reason());
-                audit::log_connect_approval(
+                audit::log_host_approval(
                     audit_log,
+                    audit::ProxyMode::Connect,
                     &audit::EventContext {
                         denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
                         approval_backend: Some(&backend),
@@ -336,8 +338,9 @@ pub async fn handle_connect(
     if let Some(backend) = approved_backend.as_deref() {
         // Host was authorized by a runtime approval decision, not the static
         // allowlist — record it as such, with the deciding backend.
-        audit::log_connect_approval(
+        audit::log_host_approval(
             audit_log,
+            audit::ProxyMode::Connect,
             &audit::EventContext {
                 approval_backend: Some(backend),
                 ..audit::EventContext::default()
@@ -366,7 +369,7 @@ pub async fn handle_connect(
 }
 
 /// The result of evaluating a not-allowlisted host for interactive approval.
-enum ApprovalOutcome {
+pub(crate) enum ApprovalOutcome {
     /// Not approval-eligible (a hard SSRF/deny-list denial), or no approval
     /// backend is configured. The caller uses the historical static-deny path.
     NotApplicable,
@@ -388,8 +391,8 @@ enum ApprovalOutcome {
     },
 }
 
-/// Decide whether a not-allowed host may still be tunnelled, via the session
-/// cache or an interactive approval prompt.
+/// Decide whether a not-allowed host may still be reached (CONNECT tunnel or
+/// plain-HTTP forward), via the session cache or an interactive approval prompt.
 ///
 /// Only a plain allowlist miss ([`FilterResult::DenyNotAllowed`]) is eligible.
 /// A metadata / link-local / deny-list denial ([`FilterResult::DenyHost`] /
@@ -404,7 +407,7 @@ enum ApprovalOutcome {
 /// Every authorized connection independently re-resolves and re-vets the host
 /// (see [`resolve_approved`]), so coalescing the decision never widens the SSRF
 /// check.
-async fn maybe_approve_host(
+pub(crate) async fn maybe_approve_host(
     host: &str,
     port: u16,
     result: &FilterResult,

@@ -12,7 +12,7 @@
 
 use crate::audit;
 use crate::error::{ProxyError, Result};
-use crate::filter::ProxyFilter;
+use crate::filter::{ProxyFilter, ProxyFilterResult};
 use crate::token;
 use nono::net_filter::{FilterResult, HostFilter};
 use nono::supervisor::{ApprovalDecision, ApprovalRequest};
@@ -393,8 +393,9 @@ enum ApprovalOutcome {
 ///
 /// Only a plain allowlist miss ([`FilterResult::DenyNotAllowed`]) is eligible.
 /// A metadata / link-local / deny-list denial ([`FilterResult::DenyHost`] /
-/// [`FilterResult::DenyLinkLocal`]) is authoritative and never prompts —
-/// approval can never override an SSRF-guard denial.
+/// [`FilterResult::DenyLinkLocal`]) or a loopback-policy denial
+/// ([`ProxyFilterResult::DenyLoopback`]) is authoritative and never prompts —
+/// approval can never override an SSRF-guard or loopback denial.
 ///
 /// Concurrent first-touch connections to the same host coalesce onto a single
 /// prompt: the first (leader) prompts; the rest (followers) await its decision.
@@ -407,11 +408,16 @@ enum ApprovalOutcome {
 async fn maybe_approve_host(
     host: &str,
     port: u16,
-    result: &FilterResult,
+    result: &ProxyFilterResult,
     network_approval: Option<&NetworkApproval<'_>>,
     filter: &ProxyFilter,
 ) -> Result<ApprovalOutcome> {
-    if !matches!(result, FilterResult::DenyNotAllowed { .. }) {
+    // Only a plain allowlist miss is approval-eligible. A loopback-policy
+    // denial is as hard as a metadata / link-local one: never prompted.
+    if !matches!(
+        result,
+        ProxyFilterResult::Host(FilterResult::DenyNotAllowed { .. })
+    ) {
         return Ok(ApprovalOutcome::NotApplicable);
     }
     let Some(approval) = network_approval else {
@@ -570,11 +576,11 @@ async fn outcome_from_allow(
     match resolve_approved(filter, host, port).await? {
         Some(addrs) => Ok(ApprovalOutcome::Approved { addrs, backend }),
         None => {
-            warn!("network approval: {host}:{port} approved but blocked by SSRF guard");
+            warn!("network approval: {host}:{port} approved but blocked by SSRF/loopback guard");
             Ok(ApprovalOutcome::Denied {
                 backend,
                 reason: Some(
-                    "approved host resolved to a blocked address (cloud-metadata/link-local guard)"
+                    "approved host resolved to a blocked address (cloud-metadata/link-local/loopback guard)"
                         .to_string(),
                 ),
             })
@@ -586,8 +592,8 @@ async fn outcome_from_allow(
 ///
 /// Returns `Ok(Some(addrs))` when the addresses pass the guard (possibly empty,
 /// which the caller surfaces as a 502 upstream failure), or `Ok(None)` when a
-/// resolved IP is in a denied metadata / link-local range — approval never
-/// overrides that guard.
+/// resolved IP is in a denied metadata / link-local range or is refused by the
+/// loopback policy — approval never overrides either guard.
 async fn resolve_approved(
     filter: &ProxyFilter,
     host: &str,
@@ -937,10 +943,10 @@ mod tests {
         }
     }
 
-    fn deny_not_allowed(host: &str) -> FilterResult {
-        FilterResult::DenyNotAllowed {
+    fn deny_not_allowed(host: &str) -> ProxyFilterResult {
+        ProxyFilterResult::Host(FilterResult::DenyNotAllowed {
             host: host.to_string(),
-        }
+        })
     }
 
     fn empty_in_flight() -> InFlightMap {
@@ -1010,7 +1016,42 @@ mod tests {
         let out = maybe_approve_host(
             "api.example.com",
             443,
-            &FilterResult::Allow,
+            &ProxyFilterResult::Host(FilterResult::Allow),
+            Some(&approval),
+            &filter,
+        )
+        .await
+        .unwrap();
+        assert!(out.is_not_applicable());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn maybe_approve_never_prompts_for_loopback_denial() {
+        // A loopback-policy denial is hard: a granting backend must not even be
+        // consulted, or approval would become a way around `block_loopback`.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let decisions = Mutex::new(HashMap::new());
+        let backend: Arc<dyn nono::ApprovalBackend> = Arc::new(CountingBackend {
+            decision: ApprovalDecision::Granted,
+            calls: Arc::clone(&calls),
+        });
+        let in_flight = empty_in_flight();
+        let approval = NetworkApproval {
+            backend: &backend,
+            session_decisions: &decisions,
+            in_flight: &in_flight,
+            session_id: "test",
+        };
+        let filter =
+            ProxyFilter::allow_all().with_loopback_policy(crate::filter::LoopbackPolicy::new(&[]));
+
+        let out = maybe_approve_host(
+            "127.0.0.1",
+            8080,
+            &ProxyFilterResult::DenyLoopback {
+                destination: "127.0.0.1:8080".to_string(),
+            },
             Some(&approval),
             &filter,
         )

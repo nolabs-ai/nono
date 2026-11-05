@@ -2355,8 +2355,8 @@
         },
         "open_port": {
           "type": "array",
-          "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
-          "description": "Localhost ports this command may bind and connect to."
+          "items": { "type": "integer", "minimum": 0, "maximum": 65535 },
+          "description": "Localhost ports this command may bind and connect to. Port 0: macOS only (localhost:* outbound)."
         },
         "open_port_range": {
           "type": "array",

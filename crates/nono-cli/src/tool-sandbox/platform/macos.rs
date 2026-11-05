@@ -3131,6 +3131,7 @@ fn build_child_launch_spec_for_binary(
         stdio_mode: selected_stdio_mode(request).to_string(),
         stdio_limits: stdio_limits_from_policy(policy),
         caps: caps_to_spec(&caps),
+        session_netns: false,
         allowed_exec_paths: Vec::new(),
         expected_dev: binary.dev,
         expected_ino: binary.ino,

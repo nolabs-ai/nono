@@ -312,7 +312,8 @@ fn loopback_sockaddr(port: u16) -> libc::sockaddr_in {
     }
 }
 
-fn bridge_listener_raw(port: u16) -> std::result::Result<RawFd, RawSandboxError> {
+/// Create a close-on-exec TCP listener on `127.0.0.1:port` in the caller's network namespace, allocation-free.
+pub fn bridge_listener_raw(port: u16) -> std::result::Result<RawFd, RawSandboxError> {
     let fail = |errno| RawSandboxError::new(RawSandboxStage::BridgeListener, errno);
     // SAFETY: scalar raw syscall.
     let fd = unsafe {

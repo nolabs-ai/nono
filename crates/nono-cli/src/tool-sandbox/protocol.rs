@@ -91,6 +91,9 @@ pub(crate) struct ToolSandboxChildLaunchSpec {
     pub(crate) stdio_mode: String,
     pub(crate) stdio_limits: Option<StdioLimitSpec>,
     pub(crate) caps: ChildCapsSpec,
+    /// The launcher runs in the session's loopback-only network namespace, which confines UDP.
+    #[serde(default)]
+    pub(crate) session_netns: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allowed_exec_paths: Vec<Vec<u8>>,
     pub(crate) expected_dev: u64,

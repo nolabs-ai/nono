@@ -3,9 +3,9 @@ nep: 0010
 title: Session terminal capture
 authors:
   - lukehinds
-status: draft
+status: accepted
 created: 2026-11-03
-breaking:
+breaking: false
 superseded-by:
 ---
 

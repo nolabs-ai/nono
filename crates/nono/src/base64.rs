@@ -1,8 +1,9 @@
-//! Base64 encoding and decoding for trust attestation
+//! Base64 encoding and decoding.
 //!
 //! Provides both standard (RFC 4648 Section 4) and URL-safe (RFC 4648 Section 5)
-//! base64 encoding/decoding. Used throughout the trust pipeline for DSSE payloads,
-//! Sigstore bundles, and keystore serialization.
+//! base64 encoding/decoding. The trust pipeline uses it for DSSE payloads and
+//! Sigstore bundles. The `system-keyring` feature uses it to decode go-keyring
+//! values without compiling sigstore.
 
 /// Encode bytes as base64url (no padding, URL-safe alphabet).
 ///

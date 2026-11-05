@@ -2035,6 +2035,11 @@
           "items": { "type": "string" },
           "description": "Directory read grants in the selected command sandbox policy."
         },
+        "exec_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Extra files or directories this command may exec, such as helpers it runs by absolute path (Linux only)."
+        },
         "fs_read_file": {
           "type": "array",
           "items": { "type": "string" },
@@ -2347,6 +2352,21 @@
           "type": "array",
           "items": { "type": "integer", "minimum": 0, "maximum": 65535 },
           "description": "Raw TCP bind ports. Requires Landlock ABI v4+ TCP support."
+        },
+        "open_port": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "description": "Localhost ports this command may bind and connect to."
+        },
+        "open_port_range": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Inclusive localhost port ranges this command may bind and connect to, as [start, end] pairs."
         }
       }
     },

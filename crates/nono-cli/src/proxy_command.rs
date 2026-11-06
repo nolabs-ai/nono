@@ -416,6 +416,9 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
     // profile's `network.allow_http2`, mirroring the sandboxed `run` path.
     let enable_h2 = args.allow_http2 || network.map(|n| n.allow_http2).unwrap_or(false);
 
+    let aauth_identity = network.and_then(|n| n.aauth_identity.clone());
+    let aauth_sign_all_outbound = network.map(|n| n.aauth_sign_all_outbound).unwrap_or(false);
+
     Ok(ProxyLaunchOptions {
         domain_filter,
         endpoint_filter,
@@ -433,6 +436,8 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         // prompts for every host instead of allowing all of them.
         network_approval_backends,
         network_approval_defaults: network.and_then(|n| n.approval_defaults.clone()),
+        aauth_identity,
+        aauth_sign_all_outbound,
         ..ProxyLaunchOptions::default()
     })
 }

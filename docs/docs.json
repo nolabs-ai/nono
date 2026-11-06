@@ -74,7 +74,8 @@
         "pages": [
           "cli/features/credential-injection",
           "cli/features/sandboxed-oauth-logins",
-          "cli/features/spiffe"
+          "cli/features/spiffe",
+          "cli/features/aauth"
         ]
       },
       {

@@ -3759,6 +3759,7 @@ mod tests {
             credential_capture_stdin_mode: None,
             credential_capture_interactive: None,
             spiffe_context: None,
+            aauth_context: None,
             target: target.to_string(),
             upstream: None,
             port: Some(443),

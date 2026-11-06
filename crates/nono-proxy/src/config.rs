@@ -808,6 +808,14 @@ pub struct RouteConfig {
     #[serde(default)]
     pub env_var: Option<String>,
 
+    /// Template for the phantom token placed in `env_var`, with `{}` replaced by
+    /// the session token (e.g. `ghp_{}`), for clients that reject tokens lacking a
+    /// known prefix. When set, the route accepts only the rendered value, not the
+    /// bare token. A compatibility shim, not a per-route secret. Independent of
+    /// `credential_format`, which shapes the outbound real credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phantom_format: Option<String>,
+
     /// Optional L7 endpoint rules for method+path filtering.
     ///
     /// When non-empty, only requests matching at least one rule are allowed

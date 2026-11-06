@@ -668,6 +668,10 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         validate_aws_auth(name, aws)?;
     }
 
+    if let Some(ref policy) = cred.endpoint_policy {
+        validate_endpoint_policy_operations(name, policy, cred.aws_auth.is_some())?;
+    }
+
     // Validate credential_key if present
     if let Some(ref key) = cred.credential_key {
         validate_credential_key(name, key)?;
@@ -914,6 +918,56 @@ fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// `operations` rules are valid only on `aws_auth` credentials and must use
+/// the restricted glob charset. Warns when a default-allow policy has no
+/// deny/approve rule that matches `Unknown`, since an unidentifiable request
+/// would then be allowed.
+fn validate_endpoint_policy_operations(
+    name: &str,
+    policy: &nono_proxy::config::EndpointPolicyConfig,
+    has_aws_auth: bool,
+) -> Result<()> {
+    let mut has_operations = false;
+    for rule in policy
+        .deny
+        .iter()
+        .chain(&policy.approve)
+        .chain(&policy.allow)
+    {
+        let Some(ops) = &rule.operations else {
+            continue;
+        };
+        has_operations = true;
+        if !has_aws_auth {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{}' sets endpoint_policy 'operations', which requires 'aws_auth'",
+                name
+            )));
+        }
+        nono_proxy::config::compile_operation_globs(ops)
+            .map_err(|e| NonoError::ProfileParse(format!("custom credential '{}': {}", name, e)))?;
+    }
+    if has_operations
+        && policy.default.decision == nono_proxy::config::EndpointPolicyDecision::Allow
+    {
+        let unknown_restricted = policy
+            .deny
+            .iter()
+            .chain(&policy.approve)
+            .filter_map(|r| r.operations.as_ref())
+            .any(|ops| nono_proxy::config::operations_match_unknown(ops));
+        if !unknown_restricted {
+            tracing::warn!(
+                "custom credential '{}' uses default: allow with operations rules but nothing \
+                 denies or approves the 'Unknown' operation; requests whose operation cannot \
+                 be determined will be allowed. Prefer default: deny with allow rules.",
+                name
+            );
+        }
+    }
     Ok(())
 }
 
@@ -6001,6 +6055,47 @@ mod tests {
         let err = validate_custom_credential("test", &cred)
             .expect_err("redeem_phantoms + aws_auth must be rejected");
         assert!(err.to_string().contains("redeem_phantoms"));
+    }
+
+    fn ops_policy(ops: &[&str]) -> nono_proxy::config::EndpointPolicyConfig {
+        nono_proxy::config::EndpointPolicyConfig {
+            allow: vec![nono_proxy::config::EndpointPolicyRule {
+                method: "POST".to_string(),
+                path: "/".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+                operations: Some(ops.iter().map(|s| s.to_string()).collect()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_operations_requires_aws_auth() {
+        let mut cred = header_cred_builder();
+        cred.endpoint_policy = Some(ops_policy(&["Describe*"]));
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("operations without aws_auth must be rejected");
+        assert!(err.to_string().contains("aws_auth"));
+
+        cred.credential_key = None;
+        cred.aws_auth = Some(nono_proxy::config::AwsAuthConfig::default());
+        validate_custom_credential("test", &cred).expect("operations with aws_auth is valid");
+    }
+
+    #[test]
+    fn test_validate_operations_rejects_bad_patterns() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.aws_auth = Some(nono_proxy::config::AwsAuthConfig::default());
+        for bad in [vec![], vec!["Get[A]"], vec!["a.b"], vec!["{A,B}"]] {
+            cred.endpoint_policy = Some(ops_policy(&bad));
+            assert!(
+                validate_custom_credential("test", &cred).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]

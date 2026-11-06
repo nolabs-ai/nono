@@ -252,6 +252,8 @@ mod tests {
                 denial_category: None,
                 endpoint_policy_action: None,
                 endpoint_policy_rule: None,
+                endpoint_operation: None,
+                endpoint_protocol: None,
                 approval_backend: None,
                 credential_capture_action: None,
                 credential_capture_name: None,

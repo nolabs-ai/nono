@@ -2810,6 +2810,441 @@ mod tests {
         });
     }
 
+    enum AwsStep {
+        Send(Vec<u8>),
+        /// Read from the client side until the bytes seen so far contain this.
+        ExpectRead(&'static [u8]),
+    }
+
+    struct AwsCaseResult {
+        /// Raw bytes the client read back from the proxy.
+        client: Vec<u8>,
+        /// Raw request (head and body) the upstream received, if any.
+        upstream: Option<Vec<u8>>,
+    }
+
+    /// Run one request through the CONNECT-intercept AWS path against a mock
+    /// upstream. `steps` gets the upstream port for the Host header.
+    fn run_aws_case(
+        endpoint_policy: serde_json::Value,
+        steps: impl FnOnce(u16) -> Vec<AwsStep>,
+    ) -> AwsCaseResult {
+        run_aws_case_with_routes(endpoint_policy, |_, _| Vec::new(), steps)
+    }
+
+    /// Like [`run_aws_case`] with extra routes on the same upstream. The
+    /// closure gets the upstream port and the upstream CA file path.
+    fn run_aws_case_with_routes(
+        endpoint_policy: serde_json::Value,
+        extra_routes: impl FnOnce(u16, &std::path::Path) -> Vec<serde_json::Value>,
+        steps: impl FnOnce(u16) -> Vec<AwsStep>,
+    ) -> AwsCaseResult {
+        use base64::Engine;
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let empty_profile = dir.path().join("aws-empty");
+        std::fs::write(&empty_profile, "").unwrap();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+            (
+                "AWS_SECRET_ACCESS_KEY",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            ),
+            ("AWS_SESSION_TOKEN", "fake-session-token"),
+            ("AWS_REGION", "us-east-1"),
+            ("AWS_CONFIG_FILE", empty_profile.to_str().unwrap()),
+            (
+                "AWS_SHARED_CREDENTIALS_FILE",
+                empty_profile.to_str().unwrap(),
+            ),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let ca = Arc::new(EphemeralCa::generate().unwrap());
+                let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+                let acceptor = tokio_rustls::TlsAcceptor::from(
+                    tls_intercept::acceptor::build_server_config(cache, true).unwrap(),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream_port = listener.local_addr().unwrap().port();
+
+                let captured: Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let captured_task = Arc::clone(&captured);
+                let upstream = tokio::spawn(async move {
+                    let (sock, _) = listener.accept().await.unwrap();
+                    let mut tls = acceptor.accept(sock).await.unwrap();
+                    let mut request = Vec::new();
+                    let header_end = loop {
+                        let mut byte = [0];
+                        tls.read_exact(&mut byte).await.unwrap();
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break request.len();
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                    let mut body = vec![0; len];
+                    tls.read_exact(&mut body).await.unwrap();
+                    request.extend_from_slice(&body);
+                    // Whatever else the proxy sent counts as forwarded too.
+                    let mut extra = Vec::new();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        tls.read_buf(&mut extra),
+                    )
+                    .await;
+                    request.extend_from_slice(&extra);
+                    *captured_task.lock().unwrap() = Some(request);
+                    tls.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+                    tls.shutdown().await.unwrap();
+                });
+
+                let ca_file = dir.path().join("upstream-ca.pem");
+                std::fs::write(&ca_file, ca.cert_pem()).unwrap();
+                let mut route = serde_json::json!({
+                    "prefix": "aws",
+                    "upstream": format!("https://localhost:{upstream_port}"),
+                    "aws_auth": {"region": "us-east-1", "service": "ssm"},
+                    "tls_ca": ca_file,
+                });
+                if endpoint_policy.is_null() {
+                    // Legacy allow-list: non-explicit, so a miss lets other
+                    // routes on this host handle the request.
+                    route["endpoint_rules"] =
+                        serde_json::json!([{"method": "GET", "path": "/never"}]);
+                } else {
+                    route["endpoint_policy"] = endpoint_policy;
+                }
+                let route = serde_json::from_value(route).unwrap();
+                let mut routes = vec![route];
+                for extra in extra_routes(upstream_port, &ca_file) {
+                    routes.push(serde_json::from_value(extra).unwrap());
+                }
+                let handle = start(ProxyConfig {
+                    routes,
+                    enable_h2: true,
+                    intercept_ca_dir: Some(dir.path().to_path_buf()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+                let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+                    .await
+                    .unwrap();
+                let auth = base64::engine::general_purpose::STANDARD
+                    .encode(format!("nono:{}", handle.token.as_str()));
+                sock.write_all(
+                    format!(
+                        "CONNECT localhost:{upstream_port} HTTP/1.1\r\nHost: localhost:{upstream_port}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+                let mut response = Vec::new();
+                while !response.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    sock.read_exact(&mut byte).await.unwrap();
+                    response.push(byte[0]);
+                }
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+
+                let bundle = std::fs::read(handle.intercept_ca_path().unwrap()).unwrap();
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in CertificateDer::pem_slice_iter(&bundle) {
+                    roots.add(cert.unwrap()).unwrap();
+                }
+                let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+                client.alpn_protocols = vec![b"http/1.1".to_vec()];
+                let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+                    .connect(ServerName::try_from("localhost").unwrap(), sock)
+                    .await
+                    .unwrap();
+
+                let mut seen = Vec::new();
+                for step in steps(upstream_port) {
+                    match step {
+                        AwsStep::Send(bytes) => {
+                            tls.write_all(&bytes).await.unwrap();
+                            tls.flush().await.unwrap();
+                        }
+                        AwsStep::ExpectRead(needle) => {
+                            while !seen.windows(needle.len()).any(|w| w == needle) {
+                                let mut buf = [0u8; 1024];
+                                let n = tls.read(&mut buf).await.unwrap();
+                                assert!(n > 0, "closed before {:?}", String::from_utf8_lossy(needle));
+                                seen.extend_from_slice(&buf[..n]);
+                            }
+                        }
+                    }
+                }
+                let mut rest = Vec::new();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tls.read_to_end(&mut rest),
+                )
+                .await;
+                seen.extend_from_slice(&rest);
+
+                // Let an in-flight upstream finish capturing before aborting.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                upstream.abort();
+                handle.shutdown();
+                let upstream = captured.lock().unwrap().clone();
+                AwsCaseResult {
+                    client: seen,
+                    upstream,
+                }
+            })
+            .await
+            .unwrap()
+        })
+    }
+
+    fn allow_ops_policy(ops: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "default": {"decision": "deny"},
+            "allow": [{"method": "POST", "path": "/", "operations": ops}]
+        })
+    }
+
+    fn json_request(port: u16, target: &str, body: &[u8], extra: &str) -> Vec<u8> {
+        let mut req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: {target}\r\nAuthorization: agent-signature\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(body);
+        req
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Split an upstream capture into (lowercased head, body).
+    fn split_capture(raw: &[u8]) -> (String, Vec<u8>) {
+        let end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        (
+            String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase(),
+            raw[end..].to_vec(),
+        )
+    }
+
+    fn assert_signed_body(head: &str, body: &[u8]) {
+        assert!(head.contains(&format!("x-amz-content-sha256: {}", sha256_hex(body))));
+        assert!(head.contains("aws4-hmac-sha256 credential=akiaiosfodnn7example/"));
+        assert!(!head.contains("agent-signature"));
+    }
+
+    #[test]
+    fn aws_operations_allowed_op_is_signed_and_forwarded_verbatim() {
+        let body = br#"{"Path":"/prod"}"#;
+        let result = run_aws_case(allow_ops_policy(&["Describe*", "GetParameter"]), |port| {
+            vec![AwsStep::Send(json_request(
+                port,
+                "AmazonSSM.GetParameter",
+                body,
+                "",
+            ))]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 200"));
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert_signed_body(&head, body);
+        let signed = head
+            .lines()
+            .find(|l| l.starts_with("authorization:"))
+            .unwrap();
+        assert!(signed.contains("x-amz-target"));
+    }
+
+    #[test]
+    fn aws_operations_denied_op_gets_403_and_no_upstream() {
+        let result = run_aws_case(allow_ops_policy(&["Describe*"]), |port| {
+            vec![AwsStep::Send(json_request(
+                port,
+                "AmazonSSM.DeleteParameter",
+                b"{}",
+                "",
+            ))]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 403"));
+        assert!(result.upstream.is_none());
+    }
+
+    #[test]
+    fn aws_operations_cross_protocol_request_is_unknown_and_denied() {
+        let result = run_aws_case(allow_ops_policy(&["Describe*"]), |port| {
+            let mut req = json_request(port, "AmazonSSM.DescribeParameters", b"{}", "");
+            let line_end = req.windows(2).position(|w| w == b"\r\n").unwrap();
+            req.splice(
+                ..line_end,
+                b"POST /?Action=DeleteParameter HTTP/1.1".to_vec(),
+            );
+            vec![AwsStep::Send(req)]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 403"));
+        assert!(result.upstream.is_none());
+    }
+
+    #[test]
+    fn aws_operations_query_form_body_is_signed() {
+        let body = b"Action=DescribeInstances&Version=2016-11-15";
+        let result = run_aws_case(allow_ops_policy(&["DescribeInstances"]), |port| {
+            let mut req = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            vec![AwsStep::Send(req)]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 200"));
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert_signed_body(&head, body);
+    }
+
+    #[test]
+    fn aws_operations_query_gzip_body_is_unknown_and_denied() {
+        let result = run_aws_case(allow_ops_policy(&["DescribeInstances"]), |port| {
+            let body = b"Action=DescribeInstances";
+            let mut req = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            vec![AwsStep::Send(req)]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 403"));
+        assert!(result.upstream.is_none());
+    }
+
+    #[test]
+    fn aws_operations_chunked_body_is_decoded_once_and_signed() {
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let req = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+            );
+            vec![AwsStep::Send(req.into_bytes())]
+        });
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, b"hello world");
+        assert!(!head.contains("transfer-encoding"));
+        assert!(head.contains("content-length: 11"));
+        assert_signed_body(&head, b"hello world");
+    }
+
+    #[test]
+    fn aws_operations_expect_continue_is_answered_and_stripped() {
+        let body = br#"{"Name":"x"}"#;
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let head = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nExpect: 100-continue\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            vec![
+                AwsStep::Send(head.into_bytes()),
+                AwsStep::ExpectRead(b"HTTP/1.1 100 Continue\r\n\r\n"),
+                AwsStep::Send(body.to_vec()),
+            ]
+        });
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert!(!head.contains("expect:"));
+        assert_eq!(forwarded, body);
+        assert_signed_body(&head, body);
+    }
+
+    #[test]
+    fn aws_operations_pipelined_bytes_are_not_forwarded() {
+        let body = br#"{"Name":"x"}"#;
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let mut req = json_request(port, "AmazonSSM.GetParameter", body, "");
+            req.extend_from_slice(&json_request(port, "AmazonSSM.DeleteParameter", b"{}", ""));
+            vec![AwsStep::Send(req)]
+        });
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert!(!head.contains("deleteparameter"));
+    }
+
+    /// A non-AWS route sharing the AWS host reuses the pre-read body and is
+    /// forwarded unsigned.
+    #[test]
+    fn aws_host_non_aws_route_forwards_pre_read_body() {
+        let body = b"plain-body";
+        let result = run_aws_case_with_routes(
+            // AWS route with a legacy allow-list that misses, so it steps aside.
+            serde_json::Value::Null,
+            |port, ca| {
+                vec![serde_json::json!({
+                    "prefix": "plain",
+                    "upstream": format!("https://localhost:{port}"),
+                    "tls_ca": ca,
+                    "endpoint_rules": [{"method": "POST", "path": "/public"}]
+                })]
+            },
+            |port| {
+                let mut req = format!(
+                    "POST /public HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                req.extend_from_slice(body);
+                vec![AwsStep::Send(req)]
+            },
+        );
+        assert!(result.client.starts_with(b"HTTP/1.1 200"));
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert!(!head.contains("aws4-hmac-sha256"));
+    }
+
+    #[test]
+    fn aws_operations_oversized_body_gets_413() {
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let head = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                16 * 1024 * 1024 + 1
+            );
+            vec![AwsStep::Send(head.into_bytes())]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 413"));
+        assert!(result.upstream.is_none());
+    }
+
     #[test]
     fn normalize_authority_normalises_case_and_default_port() {
         assert_eq!(normalize_authority("API.OpenAI.com"), "api.openai.com:443");
@@ -3437,6 +3872,7 @@ mod tests {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
             ..EndpointPolicyConfig::default()
         });

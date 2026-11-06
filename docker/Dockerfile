@@ -26,7 +26,7 @@ LABEL org.opencontainers.image.source="https://github.com/nolabs-ai/nono"
 LABEL org.opencontainers.image.description="Capability-based sandboxing for untrusted AI agents"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
-RUN groupadd -r nono && useradd -r -g nono -s /usr/sbin/nologin nono && \
+RUN groupadd -r nono && useradd -r -m -g nono -s /usr/sbin/nologin nono && \
     apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     mkdir /work && \

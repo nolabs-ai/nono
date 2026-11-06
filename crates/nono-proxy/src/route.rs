@@ -213,8 +213,27 @@ impl RouteStore {
 
         let base_root_store = build_base_root_store();
 
+        // Two different routes under one prefix would leave only the last one
+        // loaded, silently dropping the other's endpoint policy. Identical
+        // repeats are harmless and skipped.
+        let mut seen: HashMap<String, serde_json::Value> = HashMap::new();
+
         for route in routes {
             let normalized_prefix = route.prefix.trim_matches('/').to_string();
+            let fingerprint = serde_json::to_value(route)
+                .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
+            match seen.get(&normalized_prefix) {
+                Some(existing) if *existing == fingerprint => continue,
+                Some(_) => {
+                    return Err(ProxyError::Config(format!(
+                        "route '{}' is configured more than once with different settings",
+                        normalized_prefix
+                    )));
+                }
+                None => {
+                    seen.insert(normalized_prefix.clone(), fingerprint);
+                }
+            }
 
             debug!(
                 "Loading route '{}' -> {}",
@@ -1824,6 +1843,28 @@ mod tests {
         assert!(hit.1.requires_intercept);
         assert!(hit.1.requires_managed_credential);
         assert!(store.lookup_by_upstream("api.example.com:443").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_load_rejects_conflicting_duplicate_prefixes() {
+        let route = |path: &str| RouteConfig {
+            prefix: "_ep_github.com".to_string(),
+            upstream: "https://github.com".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "*".to_string(),
+                path: path.to_string(),
+            }],
+            ..RouteConfig::default()
+        };
+        assert!(
+            RouteStore::load(&[route("/a/**"), route("/a/**")])
+                .await
+                .is_ok()
+        );
+        let err = RouteStore::load(&[route("/a/**"), route("/b/**")])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("more than once"), "{err}");
     }
 
     #[tokio::test]

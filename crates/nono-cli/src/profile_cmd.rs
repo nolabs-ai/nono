@@ -1092,7 +1092,14 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
                 .iter()
                 .map(|e| match e {
                     profile::AllowDomainEntry::Plain(s) => s.clone(),
-                    profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+                    profile::AllowDomainEntry::WithEndpoints {
+                        domain,
+                        endpoint_policy: Some(_),
+                        ..
+                    } => format!("{} (endpoint policy)", domain),
+                    profile::AllowDomainEntry::WithEndpoints {
+                        domain, endpoints, ..
+                    } => {
                         format!("{} ({} endpoint rules)", domain, endpoints.len())
                     }
                 })
@@ -3137,14 +3144,32 @@ fn resolve_to_manifest(
         manifest::NetworkMode::Unrestricted
     };
 
+    // Manifest export of network endpoints is left as is here; it already has
+    // known gaps. The manifest has no deny or approve rules, so entries with
+    // endpoint_policy are rejected rather than exported partially.
+    if let Some(entry) = prof.network.allow_domain.iter().find(|e| {
+        matches!(
+            e,
+            profile::AllowDomainEntry::WithEndpoints {
+                endpoint_policy: Some(_),
+                ..
+            }
+        )
+    }) {
+        return Err(NonoError::ProfileParse(format!(
+            "allow_domain entry '{}' uses endpoint_policy, which a capability manifest cannot represent",
+            entry.domain()
+        )));
+    }
+
     let manifest_endpoints: Vec<manifest::NetworkEndpoint> = prof
         .network
         .allow_domain
         .iter()
         .filter_map(|e| match e {
-            profile::AllowDomainEntry::WithEndpoints { domain, endpoints }
-                if !endpoints.is_empty() =>
-            {
+            profile::AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } if !endpoints.is_empty() => {
                 let host: manifest::NetworkEndpointHost = domain.as_str().try_into().ok()?;
                 let rules = endpoints
                     .iter()

@@ -1006,6 +1006,10 @@ global\tfile:/home/u/.gitconfig\tcore.attributesFile=/home/u/.gitattributes
 
     #[test]
     fn git_read_paths_excludes_per_repo_local_config_overrides() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::io::Write;
         use std::process::Command;
 
@@ -1084,6 +1088,10 @@ global\tfile:/home/u/.gitconfig\tcore.attributesFile=/home/u/.gitattributes
 
     #[test]
     fn git_read_paths_includeif_hasconfig_matches_remote() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::io::Write;
         use std::process::Command;
 
@@ -1152,6 +1160,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_common_dir_returns_dot_git_in_regular_repo() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::process::Command;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -1168,6 +1180,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_common_dir_returns_absolute_path_in_worktree() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::process::Command;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -1233,6 +1249,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_common_dir_rejects_forged_commondir_pointer_in_regular_repo() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // A forged `commondir` pointing at an arbitrary directory must not
         // resolve — that directory lacks the real worktrees/<name> backlink.
         use std::process::Command;
@@ -1264,6 +1284,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
     #[test]
     #[cfg(unix)]
     fn git_read_common_dir_rejects_commondir_pointer_with_mismatched_backlink() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // A worktrees/<name> entry that resolves to the wrong git-dir must
         // not count as a valid backlink.
         use std::process::Command;
@@ -1305,6 +1329,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_main_worktree_returns_empty_in_regular_repo() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::process::Command;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -1328,6 +1356,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_main_worktree_returns_main_repo_root_in_linked_worktree() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::process::Command;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -1394,6 +1426,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_fsmonitor_socket_returns_path_under_dot_git_in_regular_repo() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::process::Command;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -1418,6 +1454,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_fsmonitor_socket_returns_path_under_private_worktree_gitdir() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::process::Command;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -1574,6 +1614,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_toplevel_returns_absolute_path_in_regular_repo() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::process::Command;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -1600,6 +1644,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_toplevel_returns_worktree_root_in_linked_worktree() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::process::Command;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -1661,6 +1709,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_toplevel_parent_returns_parent_of_repo_root() {
+        // Spawns `git`: hold ENV_LOCK so a concurrent test cannot swap PATH.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::process::Command;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");

@@ -1733,8 +1733,15 @@ where
 /// Can be either a plain hostname string (backward compatible, CONNECT tunnel)
 /// or an object with a domain and endpoint rules (requires TLS interception
 /// for L7 method+path filtering).
+///
+/// Unknown keys are rejected, so a misspelled `endpoint_policy` cannot turn
+/// the entry into an unrestricted domain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(
+    untagged,
+    deny_unknown_fields,
+    expecting = "a domain string, or an object with `domain` and optionally one of `endpoints` or `endpoint_policy` (no other keys)"
+)]
 pub enum AllowDomainEntry {
     /// Plain hostname — allowed via CONNECT tunnel without L7 inspection.
     Plain(String),
@@ -1743,9 +1750,56 @@ pub enum AllowDomainEntry {
     /// are allowed (default-deny).
     WithEndpoints {
         domain: String,
-        #[serde(default)]
+        /// Allow-list shorthand: matching requests are allowed, everything
+        /// else is denied. Mutually exclusive with `endpoint_policy`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         endpoints: Vec<nono_proxy::config::EndpointRule>,
+        /// Explicit `allow`/`deny`/`approve` policy, the same shape credential
+        /// routes use. Mutually exclusive with `endpoints`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint_policy: Option<AllowDomainEndpointPolicy>,
     },
+}
+
+/// `endpoint_policy` on an `allow_domain` entry. The same shape as a credential
+/// route's policy, except that an omitted `default` stays unset so profile
+/// inheritance can tell it apart from an explicit one; it means `deny` when
+/// the policy is enforced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowDomainEndpointPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<nono_proxy::config::EndpointPolicyDefault>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<nono_proxy::config::EndpointPolicyRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approve: Vec<nono_proxy::config::EndpointPolicyRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<nono_proxy::config::EndpointPolicyRule>,
+}
+
+impl AllowDomainEndpointPolicy {
+    /// The policy the proxy enforces.
+    #[must_use]
+    pub fn to_proxy(&self) -> nono_proxy::config::EndpointPolicyConfig {
+        nono_proxy::config::EndpointPolicyConfig {
+            default: self.default.clone().unwrap_or_default(),
+            deny: self.deny.clone(),
+            approve: self.approve.clone(),
+            allow: self.allow.clone(),
+        }
+    }
+}
+
+impl From<nono_proxy::config::EndpointPolicyConfig> for AllowDomainEndpointPolicy {
+    fn from(policy: nono_proxy::config::EndpointPolicyConfig) -> Self {
+        Self {
+            default: Some(policy.default),
+            deny: policy.deny,
+            approve: policy.approve,
+            allow: policy.allow,
+        }
+    }
 }
 
 impl AllowDomainEntry {
@@ -1754,6 +1808,24 @@ impl AllowDomainEntry {
         match self {
             Self::Plain(s) => s,
             Self::WithEndpoints { domain, .. } => domain,
+        }
+    }
+
+    /// `true` when the entry restricts method+path and so needs TLS
+    /// interception.
+    pub fn has_endpoint_restrictions(&self) -> bool {
+        match self {
+            Self::Plain(_) => false,
+            Self::WithEndpoints {
+                endpoints,
+                endpoint_policy,
+                ..
+            } => {
+                !endpoints.is_empty()
+                    || endpoint_policy
+                        .as_ref()
+                        .is_some_and(|policy| !policy.to_proxy().allows_all_without_l7())
+            }
         }
     }
 }
@@ -3993,27 +4065,79 @@ pub(crate) fn dedup_append<T: Eq + std::hash::Hash + Clone>(base: &[T], child: &
     result
 }
 
-/// Merge `allow_domain` entries from base and child profiles.
+/// Merge `allow_domain` entries from base and child profiles, or any list in
+/// which a domain may appear more than once (a profile plus `--allow-domain`).
 ///
-/// For the same domain, endpoint rules are **appended** (child rules added to base).
-/// A plain entry upgraded with endpoints from the other side becomes `WithEndpoints`.
-/// Order: base domains first, then child-only domains.
+/// For the same domain, endpoint rules are **appended** (later rules added to
+/// earlier ones). A plain entry upgraded with endpoints from the other side
+/// becomes `WithEndpoints`. Once either side has an `endpoint_policy`, the
+/// `endpoints` allow-lists join its `allow` rules, and an `endpoints` list
+/// stands for an explicit `default: deny`. A later explicit `default` replaces
+/// an earlier one; an omitted `default` inherits.
+/// Order: first-seen domain order.
+///
+/// An entry that sets both `endpoints` and `endpoint_policy` is invalid and is
+/// kept as written, unmerged, so `partition_allow_domain` still rejects it.
 pub(crate) fn merge_allow_domain(
     base: &[AllowDomainEntry],
     child: &[AllowDomainEntry],
 ) -> Vec<AllowDomainEntry> {
+    let mut invalid: Vec<AllowDomainEntry> = Vec::new();
     let mut domains: Vec<String> = Vec::new();
     let mut rules: HashMap<String, Vec<nono_proxy::config::EndpointRule>> = HashMap::new();
+    let mut policies: HashMap<String, AllowDomainEndpointPolicy> = HashMap::new();
 
     for entry in base.iter().chain(child.iter()) {
-        let (domain, endpoints) = match entry {
-            AllowDomainEntry::Plain(d) => (d.clone(), &[][..]),
-            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
-                (domain.clone(), endpoints.as_slice())
+        let (domain, endpoints, policy) = match entry {
+            AllowDomainEntry::Plain(d) => (d.clone(), &[][..], None),
+            AllowDomainEntry::WithEndpoints {
+                domain,
+                endpoints,
+                endpoint_policy,
+            } => {
+                if !endpoints.is_empty() && endpoint_policy.is_some() {
+                    invalid.push(entry.clone());
+                    continue;
+                }
+                (
+                    domain.clone(),
+                    endpoints.as_slice(),
+                    endpoint_policy.as_ref(),
+                )
             }
         };
         if !domains.contains(&domain) {
             domains.push(domain.clone());
+        }
+        if let Some(policy) = policy {
+            match policies.entry(domain.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut merged) => {
+                    let merged = merged.get_mut();
+                    if policy.default.is_some() {
+                        merged.default = policy.default.clone();
+                    }
+                    merged.deny.extend_from_slice(&policy.deny);
+                    merged.approve.extend_from_slice(&policy.approve);
+                    merged.allow.extend_from_slice(&policy.allow);
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    // An earlier `endpoints` allow-list already denied
+                    // everything else; the policy inherits that default.
+                    let mut policy = policy.clone();
+                    if policy.default.is_none()
+                        && rules.get(&domain).is_some_and(|rules| !rules.is_empty())
+                    {
+                        policy.default = Some(nono_proxy::config::EndpointPolicyDefault::default());
+                    }
+                    slot.insert(policy);
+                }
+            }
+        } else if !endpoints.is_empty()
+            && let Some(merged) = policies.get_mut(&domain)
+        {
+            // A later `endpoints` allow-list denies everything it does not
+            // list, as it would on its own.
+            merged.default = Some(nono_proxy::config::EndpointPolicyDefault::default());
         }
         rules
             .entry(domain)
@@ -4021,17 +4145,38 @@ pub(crate) fn merge_allow_domain(
             .extend_from_slice(endpoints);
     }
 
-    domains
+    let mut merged: Vec<AllowDomainEntry> = domains
         .into_iter()
         .map(|domain| {
             let endpoints = rules.remove(&domain).unwrap_or_default();
-            if endpoints.is_empty() {
+            if let Some(mut policy) = policies.remove(&domain) {
+                policy.allow.extend(endpoints.into_iter().map(|rule| {
+                    nono_proxy::config::EndpointPolicyRule {
+                        method: rule.method,
+                        path: rule.path,
+                        backend: None,
+                        reason: None,
+                        timeout_secs: None,
+                    }
+                }));
+                AllowDomainEntry::WithEndpoints {
+                    domain,
+                    endpoints: Vec::new(),
+                    endpoint_policy: Some(policy),
+                }
+            } else if endpoints.is_empty() {
                 AllowDomainEntry::Plain(domain)
             } else {
-                AllowDomainEntry::WithEndpoints { domain, endpoints }
+                AllowDomainEntry::WithEndpoints {
+                    domain,
+                    endpoints,
+                    endpoint_policy: None,
+                }
             }
         })
-        .collect()
+        .collect();
+    merged.extend(invalid);
+    merged
 }
 
 /// Get the path to a user profile (default `.json` extension, used for writes).
@@ -9196,7 +9341,9 @@ mod tests {
             AllowDomainEntry::Plain("api.openai.com".to_string())
         );
         match &profile.network.allow_domain[1] {
-            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+            AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } => {
                 assert_eq!(domain, "api.github.com");
                 assert_eq!(endpoints.len(), 2);
                 assert_eq!(endpoints[0].method, "GET");
@@ -9212,6 +9359,7 @@ mod tests {
     fn test_merge_allow_domain_appends_endpoints_for_same_domain() {
         let base = vec![AllowDomainEntry::WithEndpoints {
             domain: "api.github.com".to_string(),
+            endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
                 path: "/repos/my-org/**".to_string(),
@@ -9219,6 +9367,7 @@ mod tests {
         }];
         let child = vec![AllowDomainEntry::WithEndpoints {
             domain: "api.github.com".to_string(),
+            endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "POST".to_string(),
                 path: "/repos/my-org/*/issues".to_string(),
@@ -9229,7 +9378,9 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         match &merged[0] {
-            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+            AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } => {
                 assert_eq!(domain, "api.github.com");
                 assert_eq!(endpoints.len(), 2);
                 assert_eq!(endpoints[0].method, "GET");
@@ -9244,6 +9395,7 @@ mod tests {
         let base = vec![AllowDomainEntry::Plain("api.github.com".to_string())];
         let child = vec![AllowDomainEntry::WithEndpoints {
             domain: "api.github.com".to_string(),
+            endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
                 path: "/repos/**".to_string(),
@@ -9254,7 +9406,9 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         match &merged[0] {
-            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+            AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } => {
                 assert_eq!(domain, "api.github.com");
                 assert_eq!(endpoints.len(), 1);
             }
@@ -9263,10 +9417,191 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_allow_domain_appends_endpoint_policy_rules() {
+        let base: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }],
+                "approve": [{ "method": "*", "path": "/*/*/**" }]
+            } }]"#,
+        )
+        .unwrap();
+        let child: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[
+                { "domain": "github.com", "endpoint_policy": {
+                    "allow": [{ "method": "GET", "path": "/login" }],
+                    "default": { "decision": "deny" }
+                } },
+                { "domain": "github.com", "endpoints": [{ "method": "GET", "path": "/favicon.ico" }] }
+            ]"#,
+        )
+        .unwrap();
+
+        let merged = merge_allow_domain(&base, &child);
+
+        assert_eq!(merged.len(), 1);
+        match &merged[0] {
+            AllowDomainEntry::WithEndpoints {
+                endpoints,
+                endpoint_policy: Some(policy),
+                ..
+            } => {
+                assert!(endpoints.is_empty());
+                assert_eq!(policy.deny.len(), 1, "base deny rules must survive");
+                assert_eq!(policy.approve.len(), 1);
+                let allowed: Vec<&str> = policy.allow.iter().map(|r| r.path.as_str()).collect();
+                assert_eq!(allowed, vec!["/login", "/favicon.ico"]);
+            }
+            other => panic!("expected an endpoint_policy entry, got {other:?}"),
+        }
+    }
+
+    fn merged_policy(merged: &[AllowDomainEntry]) -> nono_proxy::config::EndpointPolicyConfig {
+        match merged {
+            [
+                AllowDomainEntry::WithEndpoints {
+                    endpoint_policy: Some(policy),
+                    ..
+                },
+            ] => policy.to_proxy(),
+            other => panic!("expected one endpoint_policy entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_merge_allow_domain_omitted_child_default_inherits() {
+        use nono_proxy::config::EndpointPolicyDecision;
+        let base: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "default": { "decision": "approve" }
+            } }]"#,
+        )
+        .unwrap();
+        let child: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "allow": [{ "method": "GET", "path": "/login" }]
+            } }]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            merged_policy(&merge_allow_domain(&base, &child))
+                .default
+                .decision,
+            EndpointPolicyDecision::Approve,
+            "a child without default must keep the base's"
+        );
+
+        let explicit: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "default": { "decision": "deny" }
+            } }]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            merged_policy(&merge_allow_domain(&base, &explicit))
+                .default
+                .decision,
+            EndpointPolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn test_merge_allow_domain_endpoints_keep_their_default_deny() {
+        use nono_proxy::config::EndpointPolicyDecision;
+        let endpoints: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoints": [{ "method": "*", "path": "/acme/**" }] }]"#,
+        )
+        .unwrap();
+        // A policy that leaves `default` out must not turn the allow-list into
+        // allow-everything, in either order.
+        let policy: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }]
+            } }]"#,
+        )
+        .unwrap();
+        for merged in [
+            merge_allow_domain(&endpoints, &policy),
+            merge_allow_domain(&policy, &endpoints),
+        ] {
+            let merged = merged_policy(&merged);
+            assert_eq!(merged.default.decision, EndpointPolicyDecision::Deny);
+            assert_eq!(merged.allow.len(), 1);
+            assert_eq!(merged.deny.len(), 1);
+        }
+
+        // A later allow-list re-imposes default deny over an earlier allow.
+        let open: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "default": { "decision": "allow" }
+            } }]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            merged_policy(&merge_allow_domain(&open, &endpoints))
+                .default
+                .decision,
+            EndpointPolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn test_merge_allow_domain_keeps_entries_with_both_fields_for_rejection() {
+        let base: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "approve": [{ "method": "*", "path": "/**" }]
+            } }]"#,
+        )
+        .unwrap();
+        let invalid: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{
+                "domain": "github.com",
+                "endpoints": [{ "method": "*", "path": "/acme/**" }],
+                "endpoint_policy": { "allow": [{ "method": "*", "path": "/**" }] }
+            }]"#,
+        )
+        .unwrap();
+        let merged = merge_allow_domain(&base, &invalid);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[1], invalid[0],
+            "the invalid entry must survive as written"
+        );
+    }
+
+    #[test]
+    fn test_allow_domain_policy_entry_serializes_without_empty_endpoints() {
+        let entry: AllowDomainEntry = serde_json::from_str(
+            r#"{ "domain": "github.com", "endpoint_policy": { "approve": [{ "method": "*", "path": "/**" }] } }"#,
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&entry).unwrap();
+        assert!(encoded.get("endpoints").is_none(), "{encoded}");
+        assert!(encoded["endpoint_policy"].get("default").is_none());
+        let decoded: AllowDomainEntry = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn test_allow_domain_entry_rejects_unknown_keys() {
+        let err = serde_json::from_str::<AllowDomainEntry>(
+            r#"{ "domain": "github.com", "endpoint_polcy": { "approve": [] } }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no other keys"), "{err}");
+        assert!(
+            serde_json::from_str::<AllowDomainEntry>(
+                r#"{ "domain": "github.com", "endpoint_policy": { "deafult": {} } }"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_merge_allow_domain_preserves_distinct_domains() {
         let base = vec![AllowDomainEntry::Plain("api.openai.com".to_string())];
         let child = vec![AllowDomainEntry::WithEndpoints {
             domain: "api.github.com".to_string(),
+            endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
                 path: "/repos/**".to_string(),

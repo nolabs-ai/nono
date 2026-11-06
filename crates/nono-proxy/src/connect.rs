@@ -43,9 +43,10 @@ const NETWORK_APPROVAL_BACKSTOP_GRACE: Duration = Duration::from_secs(30);
 /// plus [`NETWORK_APPROVAL_BACKSTOP_GRACE`].
 const NETWORK_APPROVAL_UNBOUNDED_BACKSTOP: Duration = Duration::from_secs(600);
 
-/// Map coordinating in-flight approval prompts, keyed by `(host, port)`, so
-/// concurrent connections await the active prompt before attempting their own.
-pub type InFlightMap = Mutex<HashMap<(String, u16), Arc<InFlight>>>;
+/// Map coordinating in-flight approval prompts, keyed by `(host, port)` for
+/// CONNECT, so concurrent connections await the active prompt before
+/// attempting their own. L7 endpoint approvals key it by approval scope.
+pub type InFlightMap<K = (String, u16)> = Mutex<HashMap<K, Arc<InFlight>>>;
 
 /// Shared slot coordinating concurrent first-touch approval attempts for one
 /// `(host, port)`.
@@ -64,7 +65,7 @@ pub struct InFlight {
 }
 
 impl InFlight {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             tx: watch::channel(None).0,
         })
@@ -76,7 +77,7 @@ impl InFlight {
     }
 
     /// Await the leader's decision. Cancellation is published by its guard.
-    async fn await_decision(&self) -> ApprovalDecision {
+    pub(crate) async fn await_decision(&self) -> ApprovalDecision {
         let mut rx = self.tx.subscribe();
         loop {
             if let Some(decision) = rx.borrow_and_update().clone() {
@@ -84,7 +85,7 @@ impl InFlight {
             }
             if rx.changed().await.is_err() {
                 return ApprovalDecision::Denied {
-                    reason: "network approval leader disappeared".to_string(),
+                    reason: "approval leader disappeared".to_string(),
                 };
             }
         }
@@ -94,20 +95,31 @@ impl InFlight {
 /// Release the slot and wake followers even if the leader future is cancelled.
 /// Followers retain an Arc to the sender, so channel closure alone cannot
 /// detect a vanished leader.
-struct InFlightLeader<'a> {
-    map: &'a InFlightMap,
-    key: (String, u16),
+pub(crate) struct InFlightLeader<'a, K: Eq + std::hash::Hash = (String, u16)> {
+    map: &'a InFlightMap<K>,
+    key: K,
     shared: Arc<InFlight>,
     decision: Option<ApprovalDecision>,
 }
 
-impl InFlightLeader<'_> {
-    fn resolve(mut self, decision: ApprovalDecision) {
+impl<'a, K: Eq + std::hash::Hash> InFlightLeader<'a, K> {
+    /// Become the leader for `key`. The caller holds the `map` lock, checked
+    /// that `key` has no slot, and inserted `shared` under it.
+    pub(crate) fn new(map: &'a InFlightMap<K>, key: K, shared: Arc<InFlight>) -> Self {
+        Self {
+            map,
+            key,
+            shared,
+            decision: None,
+        }
+    }
+
+    pub(crate) fn resolve(mut self, decision: ApprovalDecision) {
         self.decision = Some(decision);
     }
 }
 
-impl Drop for InFlightLeader<'_> {
+impl<K: Eq + std::hash::Hash> Drop for InFlightLeader<'_, K> {
     fn drop(&mut self) {
         let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         // Remove before waking followers so a single-use grant cannot make
@@ -118,7 +130,7 @@ impl Drop for InFlightLeader<'_> {
             self.decision
                 .take()
                 .unwrap_or_else(|| ApprovalDecision::Denied {
-                    reason: "network approval leader cancelled".to_string(),
+                    reason: "approval leader cancelled".to_string(),
                 }),
         );
     }
@@ -441,12 +453,7 @@ async fn maybe_approve_host(
                 None => {
                     let shared = InFlight::new();
                     map.insert(key.clone(), Arc::clone(&shared));
-                    Ok(InFlightLeader {
-                        map: approval.in_flight,
-                        key: key.clone(),
-                        shared,
-                        decision: None,
-                    })
+                    Ok(InFlightLeader::new(approval.in_flight, key.clone(), shared))
                 }
             }
         };

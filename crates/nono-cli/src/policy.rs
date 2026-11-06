@@ -5793,12 +5793,10 @@ mod tests {
             "system_read_macos should still grant /System/Volumes for firmlink resolution: {read_paths:?}"
         );
         // Exec is scoped to the read set, so platform helper dirs must be readable.
-        for required in ["/usr/libexec", "/System/Applications", "/System/iOSSupport"] {
-            assert!(
-                read_paths.iter().any(|p| p == required),
-                "system_read_macos must grant {required}: {read_paths:?}"
-            );
-        }
+        assert!(
+            read_paths.iter().any(|p| p == "/usr/libexec"),
+            "system_read_macos must grant /usr/libexec: {read_paths:?}"
+        );
     }
 
     #[cfg(target_os = "macos")]

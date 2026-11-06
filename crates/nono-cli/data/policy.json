@@ -157,8 +157,6 @@
           "/usr/local/lib",
           "/usr/share",
           "/System/Library",
-          "/System/Applications",
-          "/System/iOSSupport",
           "/Library",
           "/Library/Frameworks",
           "/dev",

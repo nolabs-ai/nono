@@ -535,8 +535,13 @@ impl CredentialStore {
                 ) else {
                     continue;
                 };
+                let service_label =
+                    match crate::aws::endpoints::validate_aws_upstream(&route.upstream, aws_auth) {
+                        Ok(pattern) => pattern.map(|p| p.service_label),
+                        Err(_) => continue,
+                    };
                 debug!(
-                    "aws credential load: prefix='{}' region='{}' service='{}'",
+                    "aws credential load: prefix='{}' region={:?} service='{}'",
                     normalized_prefix, region, service
                 );
 
@@ -554,6 +559,7 @@ impl CredentialStore {
                         profile_opt,
                         route.upstream.clone(),
                         region,
+                        service_label,
                         service,
                     )
                     .await

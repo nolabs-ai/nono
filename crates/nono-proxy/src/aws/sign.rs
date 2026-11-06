@@ -62,6 +62,8 @@ pub fn is_aws_auth_header(name: &str) -> bool {
 ///
 /// # Parameters
 /// - `route`: the resolved `AwsRoute` for this upstream.
+/// - `region`: the SigV4 region for this request (the route's fixed region, or
+///   the one derived from the request host for wildcard-region routes).
 /// - `method`: HTTP method (e.g., `"POST"`).
 /// - `url`: full URL including scheme, host, path, and query string
 ///   (e.g., `"https://bedrock-runtime.us-east-1.amazonaws.com/model/.../invoke"`).
@@ -84,6 +86,7 @@ pub fn is_aws_auth_header(name: &str) -> bool {
 /// `ManagedCredentialUnavailable`.
 pub async fn sign_request(
     route: &AwsRoute,
+    region: &str,
     method: &str,
     url: &str,
     clean_headers: &[(String, String)],
@@ -100,7 +103,7 @@ pub async fn sign_request(
 
     debug!(
         "aws::sign: signing {} {} for service={} region={}",
-        method, url, route.service, route.region
+        method, url, route.service, region
     );
 
     // Build the signing identity from the resolved credentials.
@@ -134,7 +137,7 @@ pub async fn sign_request(
     // Build signing parameters with pinned behavior version.
     let params = v4::SigningParams::builder()
         .identity(&identity)
-        .region(&route.region)
+        .region(region)
         .name(&route.service)
         .time(SystemTime::now())
         .settings(settings)
@@ -183,6 +186,7 @@ pub async fn sign_request(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::aws::endpoints::SigningRegion;
     use aws_credential_types::Credentials;
     use aws_credential_types::provider::SharedCredentialsProvider;
 
@@ -255,7 +259,8 @@ mod tests {
 
         super::AwsRoute {
             upstream: format!("https://{}.{}.amazonaws.com", service, region),
-            region: region.to_string(),
+            region: SigningRegion::Fixed(region.to_string()),
+            service_label: None,
             service: service.to_string(),
             profile_key: None,
             provider,
@@ -275,7 +280,7 @@ mod tests {
         ];
         let body = b"{\"prompt\": \"hello\"}";
 
-        let result = sign_request(&route, "POST", url, &clean_headers, body).await;
+        let result = sign_request(&route, "us-east-1", "POST", url, &clean_headers, body).await;
 
         let headers = result.expect("signing should succeed with static creds");
 
@@ -327,7 +332,7 @@ mod tests {
         let clean_headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
         let body = b"hello world";
 
-        let headers = sign_request(&route, "PUT", url, &clean_headers, body)
+        let headers = sign_request(&route, "eu-west-1", "PUT", url, &clean_headers, body)
             .await
             .expect("signing should succeed");
 
@@ -353,7 +358,8 @@ mod tests {
         let provider = SharedCredentialsProvider::new(creds);
         let route = super::AwsRoute {
             upstream: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
-            region: "us-east-1".to_string(),
+            region: SigningRegion::Fixed("us-east-1".to_string()),
+            service_label: None,
             service: "bedrock".to_string(),
             profile_key: None,
             provider,
@@ -361,7 +367,7 @@ mod tests {
         let url = "https://bedrock-runtime.us-east-1.amazonaws.com/model/test/invoke";
         let clean_headers = vec![("Content-Type".to_string(), "application/json".to_string())];
 
-        let headers = sign_request(&route, "POST", url, &clean_headers, b"{}")
+        let headers = sign_request(&route, "us-east-1", "POST", url, &clean_headers, b"{}")
             .await
             .expect("signing should succeed");
 
@@ -372,5 +378,29 @@ mod tests {
             has_security_token,
             "X-Amz-Security-Token must be present when session token is provided"
         );
+    }
+
+    #[tokio::test]
+    async fn sign_request_scope_follows_supplied_region() {
+        let route = make_static_route("eks", "us-east-1");
+        let url = "https://eks.eu-central-1.amazonaws.com/clusters";
+        let auth = |h: Vec<(String, String)>| {
+            h.into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| v)
+                .unwrap()
+        };
+        let a = auth(
+            sign_request(&route, "eu-central-1", "GET", url, &[], b"")
+                .await
+                .unwrap(),
+        );
+        let b = auth(
+            sign_request(&route, "us-west-2", "GET", url, &[], b"")
+                .await
+                .unwrap(),
+        );
+        assert!(a.contains("/eu-central-1/eks/aws4_request"), "{a}");
+        assert!(b.contains("/us-west-2/eks/aws4_request"), "{b}");
     }
 }

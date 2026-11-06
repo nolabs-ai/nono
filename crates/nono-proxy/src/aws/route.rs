@@ -10,14 +10,20 @@ use std::collections::HashMap;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use tracing::debug;
 
+use super::endpoints::SigningRegion;
+
 /// A fully-resolved AWS SigV4 route entry.
 pub struct AwsRoute {
     /// The upstream URL (e.g., `https://bedrock-runtime.us-east-1.amazonaws.com`).
     /// Used to extract `Host` when building the signable URL.
     pub upstream: String,
 
-    /// SigV4 signing region (e.g., `"us-east-1"`).
-    pub region: String,
+    /// SigV4 signing region: fixed, or derived from each request's host.
+    pub region: SigningRegion,
+
+    /// Literal service label of a `{service}.*.amazonaws.com` upstream.
+    /// `Some` exactly when `region` is [`SigningRegion::FromRequestHost`].
+    pub service_label: Option<String>,
 
     /// SigV4 service name (e.g., `"bedrock"`).
     pub service: String,
@@ -37,6 +43,7 @@ impl std::fmt::Debug for AwsRoute {
         f.debug_struct("AwsRoute")
             .field("upstream", &self.upstream)
             .field("region", &self.region)
+            .field("service_label", &self.service_label)
             .field("service", &self.service)
             .field("profile_key", &self.profile_key)
             .field("provider", &"[SharedCredentialsProvider]")
@@ -98,7 +105,8 @@ impl AwsRouteTable {
         prefix: String,
         profile: Option<&str>,
         upstream: String,
-        region: String,
+        region: SigningRegion,
+        service_label: Option<String>,
         service: String,
     ) -> Result<(), String> {
         let profile_key: Option<String> = profile.map(str::to_owned);
@@ -120,6 +128,7 @@ impl AwsRouteTable {
             AwsRoute {
                 upstream,
                 region,
+                service_label,
                 service,
                 profile_key,
                 provider,

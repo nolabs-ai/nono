@@ -1041,6 +1041,8 @@ pub(crate) fn add_glob_deny_rules(
         let re = glob_to_seatbelt_regex_with_literal_prefix(&prefix_str, glob_suffix)?;
         caps.add_platform_rule(format!("(allow file-read-metadata (regex #\"{re}\"))"))?;
         caps.add_platform_rule(format!("(deny file-read-data (regex #\"{re}\"))"))?;
+        caps.add_platform_rule(format!("(deny process-exec* (regex #\"{re}\"))"))?;
+        caps.add_platform_rule(format!("(deny file-map-executable (regex #\"{re}\"))"))?;
         caps.add_platform_rule(format!("(deny file-write* (regex #\"{re}\"))"))?;
         // Unix socket connect(2) is mediated as network-outbound, not file I/O.
         caps.add_platform_rule(format!("(deny network-outbound (regex #\"{re}\"))"))?;
@@ -1175,6 +1177,9 @@ pub(crate) fn emit_macos_deny_rules_for_path(path: &Path, caps: &mut CapabilityS
 
     caps.add_platform_rule(format!("(allow file-read-metadata ({}))", file_filter))?;
     caps.add_platform_rule(format!("(deny file-read-data ({}))", file_filter))?;
+    // A denied read must not stay executable or mappable.
+    caps.add_platform_rule(format!("(deny process-exec* ({}))", file_filter))?;
+    caps.add_platform_rule(format!("(deny file-map-executable ({}))", file_filter))?;
     caps.add_platform_rule(format!("(deny file-write* ({}))", file_filter))?;
     caps.add_platform_rule(format!("(deny network-outbound ({}))", network_filter))?;
     Ok(())
@@ -1992,6 +1997,8 @@ pub fn apply_deny_overrides(
 
                 if grant_has_read {
                     caps.add_platform_rule(format!("(allow file-read-data ({}))", filter))?;
+                    caps.add_platform_rule(format!("(allow process-exec* ({}))", filter))?;
+                    caps.add_platform_rule(format!("(allow file-map-executable ({}))", filter))?;
                 }
                 if grant_has_write {
                     caps.add_platform_rule(format!("(allow file-write* ({}))", filter))?;
@@ -2917,13 +2924,15 @@ mod tests {
         if cfg!(target_os = "macos") {
             // On macOS, Seatbelt platform rules should be generated
             let rules = caps.platform_rules();
-            assert_eq!(rules.len(), 4);
+            assert_eq!(rules.len(), 6);
             assert!(rules[0].contains("allow file-read-metadata"));
             assert!(rules[1].contains("deny file-read-data"));
-            assert!(rules[2].contains("deny file-write*"));
+            assert!(rules[2].contains("deny process-exec*"));
+            assert!(rules[3].contains("deny file-map-executable"));
+            assert!(rules[4].contains("deny file-write*"));
             assert!(
-                rules[3].contains("deny network-outbound")
-                    && rules[3].contains("subpath \"/nonexistent/test/deny\"")
+                rules[5].contains("deny network-outbound")
+                    && rules[5].contains("subpath \"/nonexistent/test/deny\"")
             );
         } else {
             // On Linux, no platform rules generated (Landlock has no deny semantics)
@@ -3178,9 +3187,13 @@ mod tests {
         );
 
         if cfg!(target_os = "macos") {
-            // Should have 8 rules: 4 for symlink path + 4 for resolved target
+            // Should have 12 rules: 6 for symlink path + 6 for resolved target
             let rules = caps.platform_rules();
-            assert_eq!(rules.len(), 8, "expected 8 Seatbelt rules for symlink deny");
+            assert_eq!(
+                rules.len(),
+                12,
+                "expected 12 Seatbelt rules for symlink deny"
+            );
         }
     }
 
@@ -3315,8 +3328,8 @@ mod tests {
                 let rules = caps.platform_rules();
                 assert_eq!(
                     rules.len(),
-                    8,
-                    "expected 8 Seatbelt rules (4 original + 4 resolved); got: {:?}",
+                    12,
+                    "expected 12 Seatbelt rules (6 original + 6 resolved); got: {:?}",
                     rules
                 );
             }
@@ -5778,6 +5791,31 @@ mod tests {
         assert!(
             read_paths.iter().any(|p| p == "/System/Volumes"),
             "system_read_macos should still grant /System/Volumes for firmlink resolution: {read_paths:?}"
+        );
+        // Exec is scoped to the read set, so platform helper dirs must be readable.
+        for required in ["/usr/libexec", "/System/Applications", "/System/iOSSupport"] {
+            assert!(
+                read_paths.iter().any(|p| p == required),
+                "system_read_macos must grant {required}: {read_paths:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_deny_rules_also_deny_exec_and_map_executable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("bin");
+        std::fs::write(&file, b"x").expect("write");
+        let mut caps = CapabilitySet::new();
+        emit_macos_deny_rules_for_path(&file, &mut caps).expect("emit");
+        let rules = caps.platform_rules();
+        assert!(rules.iter().any(|r| r.contains("deny file-read-data")));
+        assert!(rules.iter().any(|r| r.contains("deny file-map-executable")));
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.contains("deny process-exec*") && r.contains("literal"))
         );
     }
 

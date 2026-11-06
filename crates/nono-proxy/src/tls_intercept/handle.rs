@@ -1797,10 +1797,43 @@ async fn handle_inner_request_aws<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let mut filtered_headers = reverse::filter_headers(&req.header_bytes, "");
+
+    // Pick the signing identity before the agent's auth headers are stripped:
+    // a multi-profile route selects it by the placeholder access key ID the
+    // agent signed with. Unknown or missing keys fail closed.
+    let provider = match aws.select_provider(&filtered_headers) {
+        Ok(provider) => provider,
+        Err(e) => {
+            let svc = service.unwrap_or("unknown");
+            let reason = format!("AWS signing profile not allowed for route '{}': {}", svc, e);
+            warn!("tls_intercept: {}", reason);
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::ConnectIntercept,
+                &audit::EventContext {
+                    route_id: service,
+                    auth_mechanism: route.and_then(|r| r.managed_auth_mechanism.clone()),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                    managed_credential_active: Some(false),
+                    injection_mode: route.and_then(|r| r.managed_injection_mode.clone()),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                    ),
+                    ..audit::EventContext::default()
+                },
+                ctx.host,
+                ctx.port,
+                &reason,
+            );
+            reverse::send_error_generic(tls_stream, 403, "Forbidden").await?;
+            return Ok(());
+        }
+    };
+
     // Strip the five auth-bearing headers so the agent's dummy credentials are
     // never forwarded or included in the canonical request. All other
     // x-amz-* headers (X-Amz-Target, meta, etc.) are preserved and signed.
-    let mut filtered_headers = reverse::filter_headers(&req.header_bytes, "");
     filtered_headers.retain(|(name, _)| !crate::aws::sign::is_aws_auth_header(name));
 
     let body =
@@ -1847,8 +1880,15 @@ where
         body.len(),
         filtered_headers.len(),
     );
-    match crate::aws::sign::sign_request(aws, &req.method, &full_url, &filtered_headers, &body)
-        .await
+    match crate::aws::sign::sign_request(
+        aws,
+        provider,
+        &req.method,
+        &full_url,
+        &filtered_headers,
+        &body,
+    )
+    .await
     {
         Ok(sign_headers) => {
             debug!(

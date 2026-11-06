@@ -2764,6 +2764,228 @@ mod tests {
         });
     }
 
+    /// Run one intercepted POST through the proxy and return the status line,
+    /// handing the request headers the upstream received to `on_upstream`.
+    /// `None` from the upstream side means the proxy never forwarded.
+    async fn aws_intercept_round_trip(
+        route: crate::config::RouteConfig,
+        ca: Arc<EphemeralCa>,
+        listener: tokio::net::TcpListener,
+        dir: &std::path::Path,
+        agent_authorization: &str,
+    ) -> (String, Option<String>) {
+        use base64::Engine;
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        let upstream_port = listener.local_addr().unwrap().port();
+        let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            tls_intercept::acceptor::build_server_config(cache, false).unwrap(),
+        );
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<String>();
+        let upstream = tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                tls.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 16384);
+            }
+            let mut body = [0; 2];
+            tls.read_exact(&mut body).await.unwrap();
+            let _ = seen_tx.send(String::from_utf8(request).unwrap());
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let handle = start(ProxyConfig {
+            routes: vec![route],
+            intercept_ca_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("nono:{}", handle.token.as_str()));
+        sock.write_all(
+            format!(
+                "CONNECT localhost:{upstream_port} HTTP/1.1\r\nHost: localhost:{upstream_port}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            sock.read_exact(&mut byte).await.unwrap();
+            response.push(byte[0]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+
+        let bundle = std::fs::read(handle.intercept_ca_path().unwrap()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(&bundle) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(ServerName::try_from("localhost").unwrap(), sock)
+            .await
+            .unwrap();
+        tls.write_all(
+            format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{upstream_port}\r\nAuthorization: {agent_authorization}\r\nX-Amz-Date: 20261105T000000Z\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut status = Vec::new();
+        while !status.ends_with(b"\r\n") {
+            let mut byte = [0];
+            tls.read_exact(&mut byte).await.unwrap();
+            status.push(byte[0]);
+        }
+
+        handle.shutdown();
+        upstream.abort();
+        (
+            String::from_utf8(status).unwrap().trim_end().to_string(),
+            seen_rx.await.ok(),
+        )
+    }
+
+    /// `aws_auth.profiles`: each request signs as the host profile mapped to
+    /// the placeholder access key ID in its own Authorization header, and an
+    /// unlisted key is refused without reaching the upstream.
+    #[test]
+    fn aws_intercept_selects_profile_by_placeholder_access_key_id() {
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("aws-config");
+        std::fs::write(
+            &config,
+            "[profile dev-ro]\nregion = us-east-1\n\n[profile staging-ro]\nregion = us-east-1\n",
+        )
+        .unwrap();
+        let credentials = dir.path().join("aws-credentials");
+        std::fs::write(
+            &credentials,
+            "[dev-ro]\naws_access_key_id = AKIAREALDEVRO000001\naws_secret_access_key = dev-secret\n\n\
+             [staging-ro]\naws_access_key_id = AKIAREALSTGRO000001\naws_secret_access_key = stg-secret\n",
+        )
+        .unwrap();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("AWS_CONFIG_FILE", config.to_str().unwrap()),
+            ("AWS_SHARED_CREDENTIALS_FILE", credentials.to_str().unwrap()),
+            ("AWS_ACCESS_KEY_ID", ""),
+            ("AWS_SECRET_ACCESS_KEY", ""),
+            ("AWS_SESSION_TOKEN", ""),
+            ("AWS_PROFILE", ""),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ]);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let ca = Arc::new(EphemeralCa::generate().unwrap());
+                let ca_file = dir.path().join("upstream-ca.pem");
+                std::fs::write(&ca_file, ca.cert_pem()).unwrap();
+                let agent = |akid: &str| {
+                    format!(
+                        "AWS4-HMAC-SHA256 Credential={akid}/20261105/us-east-1/sts/aws4_request, SignedHeaders=host;x-amz-date, Signature=agent-signature"
+                    )
+                };
+
+                for (placeholder, real) in [
+                    ("NONOPROFILE0DEVRO01", "AKIAREALDEVRO000001"),
+                    ("NONOPROFILE0STGRO01", "AKIAREALSTGRO000001"),
+                ] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    let route = serde_json::from_value(serde_json::json!({
+                        "prefix": "sts",
+                        "upstream": format!("https://localhost:{port}"),
+                        "aws_auth": {
+                            "region": "us-east-1",
+                            "service": "sts",
+                            "profiles": {
+                                "NONOPROFILE0DEVRO01": "dev-ro",
+                                "NONOPROFILE0STGRO01": "staging-ro"
+                            }
+                        },
+                        "tls_ca": ca_file,
+                    }))
+                    .unwrap();
+                    let (status, seen) = aws_intercept_round_trip(
+                        route,
+                        Arc::clone(&ca),
+                        listener,
+                        dir.path(),
+                        &agent(placeholder),
+                    )
+                    .await;
+                    assert!(status.starts_with("HTTP/1.1 200"), "{placeholder}: {status}");
+                    let headers = seen.unwrap();
+                    assert!(
+                        headers.contains(&format!("Credential={real}/")),
+                        "{placeholder} should sign as {real}: {headers}"
+                    );
+                    assert!(!headers.contains(placeholder), "{headers}");
+                    assert!(!headers.contains("agent-signature"), "{headers}");
+                }
+
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let route = serde_json::from_value(serde_json::json!({
+                    "prefix": "sts",
+                    "upstream": format!("https://localhost:{port}"),
+                    "aws_auth": {
+                        "region": "us-east-1",
+                        "service": "sts",
+                        "profiles": { "NONOPROFILE0DEVRO01": "dev-ro" }
+                    },
+                    "tls_ca": ca_file,
+                }))
+                .unwrap();
+                let (status, seen) = aws_intercept_round_trip(
+                    route,
+                    Arc::clone(&ca),
+                    listener,
+                    dir.path(),
+                    &agent("NONOPROFILE0STGRO01"),
+                )
+                .await;
+                assert!(status.starts_with("HTTP/1.1 403"), "{status}");
+                assert!(seen.is_none(), "unlisted key must not reach upstream");
+            })
+            .await
+            .unwrap();
+        });
+    }
+
     #[test]
     fn normalize_authority_normalises_case_and_default_port() {
         assert_eq!(normalize_authority("API.OpenAI.com"), "api.openai.com:443");

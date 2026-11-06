@@ -548,16 +548,31 @@ impl CredentialStore {
                     normalized_prefix, profile_opt
                 );
 
-                match aws_routes
-                    .insert_route(
-                        normalized_prefix.clone(),
-                        profile_opt,
-                        route.upstream.clone(),
-                        region,
-                        service,
-                    )
-                    .await
-                {
+                let inserted = match aws_auth.profiles {
+                    Some(ref profiles) => {
+                        aws_routes
+                            .insert_multi_profile_route(
+                                normalized_prefix.clone(),
+                                profiles,
+                                route.upstream.clone(),
+                                region,
+                                service,
+                            )
+                            .await
+                    }
+                    None => {
+                        aws_routes
+                            .insert_route(
+                                normalized_prefix.clone(),
+                                profile_opt,
+                                route.upstream.clone(),
+                                region,
+                                service,
+                            )
+                            .await
+                    }
+                };
+                match inserted {
                     Ok(()) => {
                         debug!(
                             "aws credential load: prefix='{}' route inserted (profile={:?})",

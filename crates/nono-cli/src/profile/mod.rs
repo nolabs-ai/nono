@@ -666,6 +666,8 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
     // Validate aws_auth if present
     if let Some(ref aws) = cred.aws_auth {
         validate_aws_auth(name, aws)?;
+        nono_proxy::aws::endpoints::validate_aws_upstream(&cred.upstream, aws)
+            .map_err(|e| NonoError::ProfileParse(format!("custom credential '{}': {}", name, e)))?;
     }
 
     // Validate credential_key if present
@@ -11377,6 +11379,37 @@ mod tests {
     fn test_aws_auth_minimal_valid() {
         let cred = aws_auth_cred_builder();
         assert!(validate_custom_credential("bedrock", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_aws_auth_wildcard_region_upstream() {
+        let aws = |region: Option<&str>, service: Option<&str>| {
+            Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: region.map(str::to_string),
+                service: service.map(str::to_string),
+            })
+        };
+        let cred = |upstream: &str, region, service| CustomCredentialDef {
+            upstream: upstream.to_string(),
+            aws_auth: aws(region, service),
+            ..aws_auth_cred_builder()
+        };
+        let ok = cred("https://eks.*.amazonaws.com", None, Some("eks"));
+        assert!(validate_custom_credential("eks", &ok).is_ok());
+
+        for (upstream, region) in [
+            ("https://eks.*.amazonaws.com", Some("us-east-1")),
+            ("https://eks.*.amazonaws.com.cn", None),
+            ("https://*.s3.*.amazonaws.com", None),
+            ("https://*.amazonaws.com", None),
+        ] {
+            let bad = cred(upstream, region, Some("eks"));
+            assert!(
+                validate_custom_credential("eks", &bad).is_err(),
+                "{upstream} {region:?}"
+            );
+        }
     }
 
     #[test]

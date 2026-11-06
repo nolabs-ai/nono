@@ -17,7 +17,7 @@
 
 use crate::error::{ProxyError, Result};
 use crate::tls_intercept::cert_cache::CertCache;
-use rustls::server::ServerConfig;
+use rustls::server::{ClientHello, ResolvesServerCert, ServerConfig};
 use std::sync::Arc;
 
 /// Build a [`ServerConfig`] suitable for terminating an intercepted CONNECT.
@@ -34,12 +34,68 @@ pub fn build_server_config(
     cert_cache: Arc<CertCache>,
     enable_h2: bool,
 ) -> Result<Arc<ServerConfig>> {
-    let mut config =
+    build_server_config_inner(cert_cache, None, enable_h2)
+}
+
+/// Cert resolver that answers SNI-less handshakes with a leaf minted for the
+/// CONNECT authority.
+///
+/// Clients dialing an IP literal send no SNI (RFC 6066 forbids addresses in
+/// the extension), and some legacy clients omit SNI for hostnames too. The
+/// outer CONNECT authority is the target the proxy already routed, so it is
+/// the correct mint target when `ClientHello::server_name()` is absent.
+#[derive(Debug)]
+struct FallbackResolveServerCert {
+    cache: Arc<CertCache>,
+    fallback_host: String,
+}
+
+impl ResolvesServerCert for FallbackResolveServerCert {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        match client_hello.server_name() {
+            Some(_) => self.cache.resolve(client_hello),
+            None => match self.cache.get_or_mint(&self.fallback_host) {
+                Ok(key) => Some(key),
+                Err(e) => {
+                    tracing::warn!(
+                        "tls_intercept: failed to mint leaf for CONNECT target '{}': {}",
+                        self.fallback_host,
+                        e
+                    );
+                    None
+                }
+            },
+        }
+    }
+}
+
+/// Like [`build_server_config`], but SNI-less inner handshakes fall back to a
+/// leaf minted for `connect_host` (the intercepted CONNECT authority).
+pub fn build_server_config_with_fallback(
+    cert_cache: Arc<CertCache>,
+    connect_host: &str,
+    enable_h2: bool,
+) -> Result<Arc<ServerConfig>> {
+    build_server_config_inner(cert_cache, Some(connect_host.to_string()), enable_h2)
+}
+
+fn build_server_config_inner(
+    cert_cache: Arc<CertCache>,
+    fallback_host: Option<String>,
+    enable_h2: bool,
+) -> Result<Arc<ServerConfig>> {
+    let builder =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .map_err(|e| ProxyError::Config(format!("tls_intercept TLS config error: {}", e)))?
-            .with_no_client_auth()
-            .with_cert_resolver(cert_cache);
+            .with_no_client_auth();
+    let mut config = match fallback_host {
+        Some(host) => builder.with_cert_resolver(Arc::new(FallbackResolveServerCert {
+            cache: cert_cache,
+            fallback_host: host,
+        })),
+        None => builder.with_cert_resolver(cert_cache),
+    };
     config.alpn_protocols = if enable_h2 {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     } else {
@@ -123,6 +179,44 @@ mod tests {
 
         let client_config = client_config_trusting(ca.cert_pem());
         let connector = tokio_rustls::TlsConnector::from(client_config);
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("api.example.com").unwrap();
+        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+        tls.write_all(b"hello").await.unwrap();
+        tls.flush().await.unwrap();
+        let mut buf = [0u8; 5];
+        tls.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+
+        server_task.await.unwrap();
+    }
+
+    /// SNI-less clients (legacy stacks, IP-literal dials per RFC 6066) must
+    /// still complete the handshake when the resolver knows the CONNECT
+    /// authority: the fallback mints a leaf for that target.
+    #[tokio::test]
+    async fn sni_less_handshake_falls_back_to_connect_authority() {
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let server_config =
+            build_server_config_with_fallback(Arc::clone(&cache), "api.example.com", true).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).await.unwrap();
+            tls.write_all(&buf[..n]).await.unwrap();
+            tls.flush().await.unwrap();
+        });
+
+        let mut client_config = rustls::ClientConfig::clone(&client_config_trusting(ca.cert_pem()));
+        client_config.enable_sni = false;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let server_name = ServerName::try_from("api.example.com").unwrap();
         let mut tls = connector.connect(server_name, tcp).await.unwrap();

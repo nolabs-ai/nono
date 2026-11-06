@@ -333,6 +333,12 @@ pub struct NetworkAuditEvent {
     /// Endpoint policy rule/default label that matched this L7 request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_policy_rule: Option<String>,
+    /// AWS operation name (or `Unknown`) resolved for an `aws_auth` route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_operation: Option<String>,
+    /// Wire protocol the AWS operation was read from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_protocol: Option<String>,
     /// Approval backend consulted for endpoint approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_backend: Option<String>,

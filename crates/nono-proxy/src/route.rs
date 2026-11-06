@@ -82,6 +82,10 @@ pub struct LoadedRoute {
     /// Retained even when credential loading fails.
     pub requires_http1: bool,
 
+    /// `true` if the route signs requests with AWS SigV4 (`aws_auth`). Only
+    /// these routes may use `operations` in their endpoint policy.
+    pub aws_auth: bool,
+
     /// Audit auth mechanism implied by the managed credential configuration.
     /// Kept even if credential material failed to load so fail-closed denial
     /// events can describe what auth shape the route expected.
@@ -116,6 +120,7 @@ impl std::fmt::Debug for LoadedRoute {
             .field("has_custom_tls_ca", &self.tls_connector.is_some())
             .field("requires_intercept", &self.requires_intercept)
             .field("requires_http1", &self.requires_http1)
+            .field("aws_auth", &self.aws_auth)
             .field(
                 "requires_managed_credential",
                 &self.requires_managed_credential,
@@ -228,6 +233,20 @@ impl RouteStore {
                 &route.endpoint_rules,
             )
             .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
+            if route.aws_auth.is_none()
+                && route.endpoint_policy.as_ref().is_some_and(|p| {
+                    p.deny
+                        .iter()
+                        .chain(&p.approve)
+                        .chain(&p.allow)
+                        .any(|r| r.operations.is_some())
+                })
+            {
+                return Err(ProxyError::Config(format!(
+                    "route '{}': endpoint_policy `operations` requires `aws_auth`",
+                    normalized_prefix
+                )));
+            }
             let upgrade_rules = CompiledUpgradeRules::compile(&route.upgrades)
                 .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
 
@@ -363,6 +382,7 @@ impl RouteStore {
                     requires_intercept,
                     requires_managed_credential,
                     requires_http1: route.aws_auth.is_some(),
+                    aws_auth: route.aws_auth.is_some(),
                     managed_auth_mechanism,
                     managed_injection_mode,
                     managed_auth,
@@ -1503,6 +1523,7 @@ mod tests {
             requires_intercept: false,
             requires_managed_credential: false,
             requires_http1: false,
+            aws_auth: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
@@ -1745,6 +1766,60 @@ mod tests {
         assert!(err.to_string().contains("redeem_phantoms"));
     }
 
+    fn operations_route(aws: bool) -> RouteConfig {
+        RouteConfig {
+            aws_auth: aws.then(crate::config::AwsAuthConfig::default),
+            prefix: "ssm".to_string(),
+            upstream: "https://ssm.us-east-1.amazonaws.com".to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: Some(crate::config::EndpointPolicyConfig {
+                allow: vec![crate::config::EndpointPolicyRule {
+                    method: "POST".to_string(),
+                    path: "/".to_string(),
+                    backend: None,
+                    reason: None,
+                    timeout_secs: None,
+                    operations: Some(vec!["Describe*".to_string()]),
+                }],
+                ..Default::default()
+            }),
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            spiffe: None,
+            rate_limit: None,
+            upgrades: vec![],
+            redeem_phantoms: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_operations_rejected_without_aws_auth() {
+        let err = RouteStore::load(&[operations_route(false)])
+            .await
+            .expect_err("operations without aws_auth must be rejected");
+        assert!(err.to_string().contains("operations"));
+    }
+
+    #[tokio::test]
+    async fn test_operations_loads_with_aws_auth() {
+        let store = RouteStore::load(&[operations_route(true)]).await.unwrap();
+        let (_, route) = store
+            .lookup_by_upstream("ssm.us-east-1.amazonaws.com:443")
+            .unwrap();
+        assert!(route.aws_auth);
+    }
+
     #[tokio::test]
     async fn test_missing_managed_credential_policy() {
         let managed = LoadedRoute {
@@ -1760,6 +1835,7 @@ mod tests {
             requires_intercept: true,
             requires_managed_credential: true,
             requires_http1: false,
+            aws_auth: false,
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
             managed_auth: None,
@@ -1784,6 +1860,7 @@ mod tests {
             requires_intercept: true,
             requires_managed_credential: false,
             requires_http1: false,
+            aws_auth: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,

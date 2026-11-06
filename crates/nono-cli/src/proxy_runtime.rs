@@ -2260,6 +2260,7 @@ fn endpoint_rule_to_proxy(
         backend: rule.backend.clone(),
         reason: rule.reason.clone(),
         timeout_secs: resolve_approval_timeout(config, rule.backend.as_deref(), rule.timeout_secs),
+        operations: rule.operations.clone(),
     }
 }
 
@@ -4551,6 +4552,7 @@ mod tests {
                                     backend: None,
                                     reason: None,
                                     timeout_secs: None,
+                                    operations: None,
                                 }],
                                 ..EndpointPolicyConfig::default()
                             }),
@@ -4776,6 +4778,7 @@ mod tests {
                 backend: None,
                 reason: Some("destructive endpoint".to_string()),
                 timeout_secs: None,
+                operations: None,
             }],
             approve: vec![EndpointRuleConfig {
                 method: "POST".to_string(),
@@ -4783,6 +4786,7 @@ mod tests {
                 backend: Some("terminal".to_string()),
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
             allow: vec![EndpointRuleConfig {
                 method: "GET".to_string(),
@@ -4790,6 +4794,7 @@ mod tests {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
         };
 
@@ -4805,6 +4810,20 @@ mod tests {
             Some("terminal".to_string())
         );
         assert_eq!(proxy_policy.allow.len(), 1);
+    }
+
+    #[test]
+    fn tool_sandbox_proxy_endpoint_rule_maps_operations() {
+        let rule = EndpointRuleConfig {
+            method: "POST".to_string(),
+            path: "/".to_string(),
+            backend: None,
+            reason: None,
+            timeout_secs: None,
+            operations: Some(vec!["Describe*".to_string()]),
+        };
+        let mapped = endpoint_rule_to_proxy(&CommandPoliciesConfig::default(), &rule);
+        assert_eq!(mapped.operations, Some(vec!["Describe*".to_string()]));
     }
 
     #[test]
@@ -4846,6 +4865,7 @@ mod tests {
                                     backend: None,
                                     reason: Some("comment write".to_string()),
                                     timeout_secs: Some(5),
+                                    operations: None,
                                 }],
                                 ..EndpointPolicyConfig::default()
                             }),

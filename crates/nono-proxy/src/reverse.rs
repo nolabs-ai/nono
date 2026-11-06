@@ -36,7 +36,7 @@ use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 /// Maximum request body size (16 MiB). Prevents DoS from malicious Content-Length.
-const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 
 pub(crate) fn auth_mechanism_for_inject_mode(
     mode: &InjectMode,
@@ -1218,6 +1218,11 @@ async fn enforce_endpoint_policy(
                 method: method.to_string(),
                 path: upstream_path.to_string(),
                 rule_label: rule_label.clone(),
+                // Reverse proxy cannot resolve AWS operations (it returns 501
+                // for `aws_auth` routes), so those evaluate as `Unknown`.
+                operation: route
+                    .aws_auth
+                    .then(|| crate::config::UNKNOWN_OPERATION.to_string()),
                 reason: Some(request_reason),
                 child_pid: 0,
                 session_id: approval_backends.session_id().to_string(),

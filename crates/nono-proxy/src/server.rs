@@ -2897,10 +2897,12 @@ mod tests {
         let _env = crate::test_env::EnvVarGuard::set_all(&[
             ("AWS_CONFIG_FILE", config.to_str().unwrap()),
             ("AWS_SHARED_CREDENTIALS_FILE", credentials.to_str().unwrap()),
-            ("AWS_ACCESS_KEY_ID", ""),
-            ("AWS_SECRET_ACCESS_KEY", ""),
-            ("AWS_SESSION_TOKEN", ""),
-            ("AWS_PROFILE", ""),
+            // Host env credentials must not shadow the mapped profiles: the
+            // default chain would try them before the named profile.
+            ("AWS_ACCESS_KEY_ID", "AKIAHOSTENVIRON0001"),
+            ("AWS_SECRET_ACCESS_KEY", "host-env-secret"),
+            ("AWS_SESSION_TOKEN", "host-env-session"),
+            ("AWS_PROFILE", "staging-ro"),
             ("AWS_EC2_METADATA_DISABLED", "true"),
         ]);
 
@@ -2954,6 +2956,8 @@ mod tests {
                         "{placeholder} should sign as {real}: {headers}"
                     );
                     assert!(!headers.contains(placeholder), "{headers}");
+                    assert!(!headers.contains("AKIAHOSTENVIRON0001"), "{headers}");
+                    assert!(!headers.contains("host-env-session"), "{headers}");
                     assert!(!headers.contains("agent-signature"), "{headers}");
                 }
 

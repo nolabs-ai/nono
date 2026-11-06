@@ -132,6 +132,9 @@ impl std::fmt::Debug for AwsRoute {
 pub struct AwsRouteTable {
     routes: HashMap<String, AwsRoute>,
     providers: HashMap<Option<String>, SharedCredentialsProvider>,
+    /// Profile-only providers for `aws_auth.profiles` entries, kept apart from
+    /// `providers` because those resolve through the default chain.
+    named_profile_providers: HashMap<String, SharedCredentialsProvider>,
 }
 
 impl AwsRouteTable {
@@ -141,6 +144,7 @@ impl AwsRouteTable {
         Self {
             routes: HashMap::new(),
             providers: HashMap::new(),
+            named_profile_providers: HashMap::new(),
         }
     }
 
@@ -186,6 +190,28 @@ impl AwsRouteTable {
         Ok(provider)
     }
 
+    /// Return the cached profile-only provider for `profile`, building it on
+    /// first use.
+    ///
+    /// Unlike [`Self::provider_for`], the provider never consults the default
+    /// chain, so host `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` cannot
+    /// shadow the profile an `aws_auth.profiles` entry names. The profile must
+    /// exist in the shared config files when the route loads.
+    async fn named_profile_provider(
+        &mut self,
+        profile: &str,
+    ) -> Result<SharedCredentialsProvider, String> {
+        if let Some(provider) = self.named_profile_providers.get(profile) {
+            debug!("aws::route: reusing named-profile provider for profile={profile}");
+            return Ok(provider.clone());
+        }
+        debug!("aws::route: building named-profile provider for profile={profile}");
+        let provider = new_named_profile_provider(profile).await?;
+        self.named_profile_providers
+            .insert(profile.to_string(), provider.clone());
+        Ok(provider)
+    }
+
     /// Build (or reuse) a provider for `profile`, then insert the route.
     ///
     /// # Errors
@@ -218,12 +244,14 @@ impl AwsRouteTable {
     /// Build (or reuse) one provider per entry of `profiles`, then insert a
     /// route that selects among them by placeholder access key ID.
     ///
-    /// All-or-nothing: if any profile's provider cannot be built, no route is
-    /// inserted, so the route is denied rather than silently narrowed.
+    /// Each provider resolves only its named profile, never host environment
+    /// credentials. All-or-nothing: if any profile is missing from the shared
+    /// config files, no route is inserted, so the route is denied rather than
+    /// silently narrowed. Credentials are still fetched per request.
     ///
     /// # Errors
     ///
-    /// Returns an error string naming the profile whose provider failed.
+    /// Returns an error string naming the profile that failed to load.
     pub(crate) async fn insert_multi_profile_route(
         &mut self,
         prefix: String,
@@ -235,7 +263,7 @@ impl AwsRouteTable {
         let mut by_key = BTreeMap::new();
         for (access_key_id, profile) in profiles {
             let provider = self
-                .provider_for(Some(profile))
+                .named_profile_provider(profile)
                 .await
                 .map_err(|e| format!("profile '{profile}': {e}"))?;
             by_key.insert(
@@ -279,6 +307,43 @@ async fn new_provider(profile: Option<&str>) -> Result<SharedCredentialsProvider
         })?
         .clone();
     Ok(provider)
+}
+
+/// Build a provider that resolves credentials only from the named profile in
+/// the shared config files (static keys, SSO, `credential_process`,
+/// `login_session`, `role_arn` chains), never from the environment or the
+/// rest of the default chain.
+///
+/// The profile files are parsed once here so a profile that does not exist
+/// fails the route at load time instead of on the first request.
+async fn new_named_profile_provider(profile: &str) -> Result<SharedCredentialsProvider, String> {
+    let env = aws_types::os_shim_internal::Env::real();
+    let fs = aws_types::os_shim_internal::Fs::real();
+    let profile_files = aws_runtime::env_config::file::EnvConfigFiles::default();
+    let profiles = aws_config::profile::load(&fs, &env, &profile_files, None)
+        .await
+        .map_err(|e| format!("could not load AWS shared config files: {e}"))?;
+    if profiles.get_profile(profile).is_none() {
+        return Err(format!(
+            "profile '{profile}' is not defined in the AWS shared config files"
+        ));
+    }
+
+    // Region feeds STS/SSO client calls inside the provider (assume-role, SSO
+    // portal). Take it from the profile itself before the default chain.
+    let region = aws_config::default_provider::region::DefaultRegionChain::builder()
+        .profile_name(profile)
+        .build()
+        .region()
+        .await;
+    let conf = aws_config::provider_config::ProviderConfig::without_region()
+        .with_region(region)
+        .with_behavior_version(Some(aws_config::BehaviorVersion::latest()));
+    let provider = aws_config::profile::ProfileFileCredentialsProvider::builder()
+        .configure(&conf)
+        .profile_name(profile)
+        .build();
+    Ok(SharedCredentialsProvider::new(provider))
 }
 
 #[cfg(test)]
@@ -394,5 +459,101 @@ mod tests {
         assert!(rendered.contains("dev-ro"), "{rendered}");
         assert!(rendered.contains("staging-ro"), "{rendered}");
         assert!(!rendered.contains("NONOPROFILE0DEVRO01"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod load_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn write_profiles(dir: &std::path::Path) -> (String, String) {
+        let config = dir.join("config");
+        std::fs::write(&config, "[profile dev-ro]\nregion = us-east-1\n").unwrap();
+        let credentials = dir.join("credentials");
+        std::fs::write(
+            &credentials,
+            "[dev-ro]\naws_access_key_id = AKIAREALDEVRO000001\naws_secret_access_key = s\n",
+        )
+        .unwrap();
+        (
+            config.to_str().unwrap().to_string(),
+            credentials.to_str().unwrap().to_string(),
+        )
+    }
+
+    #[test]
+    fn multi_profile_route_rejects_profile_missing_from_config_files() {
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (config, credentials) = write_profiles(dir.path());
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("AWS_CONFIG_FILE", &config),
+            ("AWS_SHARED_CREDENTIALS_FILE", &credentials),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut table = AwsRouteTable::empty();
+            let profiles: BTreeMap<String, String> = [
+                ("NONOPROFILE0DEVRO01".to_string(), "dev-ro".to_string()),
+                (
+                    "NONOPROFILE0NOPE001".to_string(),
+                    "does-not-exist".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect();
+            let err = table
+                .insert_multi_profile_route(
+                    "sts".to_string(),
+                    &profiles,
+                    "https://sts.us-east-1.amazonaws.com".to_string(),
+                    "us-east-1".to_string(),
+                    "sts".to_string(),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.contains("does-not-exist"), "{err}");
+            assert!(table.get("sts").is_none(), "route must not be inserted");
+        });
+    }
+
+    #[test]
+    fn multi_profile_route_loads_when_every_profile_exists() {
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (config, credentials) = write_profiles(dir.path());
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("AWS_CONFIG_FILE", &config),
+            ("AWS_SHARED_CREDENTIALS_FILE", &credentials),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut table = AwsRouteTable::empty();
+            let profiles: BTreeMap<String, String> =
+                [("NONOPROFILE0DEVRO01".to_string(), "dev-ro".to_string())]
+                    .into_iter()
+                    .collect();
+            table
+                .insert_multi_profile_route(
+                    "sts".to_string(),
+                    &profiles,
+                    "https://sts.us-east-1.amazonaws.com".to_string(),
+                    "us-east-1".to_string(),
+                    "sts".to_string(),
+                )
+                .await
+                .unwrap();
+            assert!(table.get("sts").is_some());
+        });
     }
 }

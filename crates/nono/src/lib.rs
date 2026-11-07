@@ -47,6 +47,7 @@
 
 pub mod audit;
 pub mod broker_path;
+pub mod build_info;
 pub mod capability;
 pub mod diagnostic;
 pub mod env_glob;

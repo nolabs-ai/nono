@@ -37,13 +37,13 @@ pub fn print_banner(silent: bool) {
     }
 
     let t = theme::current();
-    let version = env!("CARGO_PKG_VERSION");
+    let version = nono::build_info::VERSION_WITH_REVISION;
 
     eprintln!();
     eprintln!(
         "  {} {}",
         theme::fg("nono", t.brand).bold(),
-        theme::fg(&format!("v{version}"), t.subtext),
+        theme::fg(version, t.subtext),
     );
 }
 

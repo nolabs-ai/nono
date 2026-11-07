@@ -517,12 +517,31 @@ fn pid_liveness(pid: u32) -> ProcessLiveness {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
+    if pid == 0 || pid > i32::MAX as u32 {
+        return ProcessLiveness::NotRunning;
+    }
     let nix_pid = Pid::from_raw(pid as i32);
     match kill(nix_pid, None) {
         Ok(()) => ProcessLiveness::Running,
         Err(nix::errno::Errno::ESRCH) => ProcessLiveness::NotRunning,
         Err(nix::errno::Errno::EPERM) => ProcessLiveness::RunningNoPermission,
         _ => ProcessLiveness::Running,
+    }
+}
+
+/// Simple liveness check without start-time validation (for audit/rollback cleanup).
+///
+/// Returns `true` if the PID exists (including `EPERM` — process exists but
+/// caller lacks permission), `false` if `ESRCH` or PID is 0/invalid.
+/// Fail-secure: other errors return `true` to avoid deleting live data.
+/// Shared by `audit_session` and `rollback_session` to avoid duplication.
+pub(crate) fn is_pid_alive_simple(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    match pid_liveness(pid) {
+        ProcessLiveness::NotRunning => false,
+        ProcessLiveness::Running | ProcessLiveness::RunningNoPermission => true,
     }
 }
 

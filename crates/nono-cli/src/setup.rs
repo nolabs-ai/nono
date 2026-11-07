@@ -44,6 +44,12 @@ impl SetupRunner {
                 self.setup_profiles()?;
             }
 
+            // Offer to retire a leftover plaintext OAuth token store. Silent
+            // no-op when there is nothing to clean up. Gated on `!check_only`
+            // because this is the one part of setup that can delete a file, and
+            // `--check-only` must stay read-only.
+            crate::oauth_capture_legacy::check_and_offer_removal()?;
+
             // Shell integration
             if self.show_shell_integration {
                 self.show_shell_help();

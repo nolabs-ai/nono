@@ -460,6 +460,22 @@ fn is_network_platform_rule(rule: &str) -> bool {
     rule.starts_with("(allow network") || rule.starts_with("(deny network")
 }
 
+/// Append one rule. A deny rule gets `(with message "<tag>")` when the
+/// capability set carries a Seatbelt log tag, so the kernel's denial line in
+/// the unified log names the session.
+fn push_rule(profile: &mut String, rule: &str, caps: &CapabilitySet) {
+    if let Some(tag) = caps.seatbelt_log_tag()
+        && rule.starts_with("(deny")
+        && let Some(body) = rule.trim_end().strip_suffix(')')
+    {
+        profile.push_str(body);
+        profile.push_str(&format!(" (with message \"{tag}\"))\n"));
+        return;
+    }
+    profile.push_str(rule);
+    profile.push('\n');
+}
+
 fn push_localhost_tcp_outbound_seatbelt_rules(
     profile: &mut String,
     localhost_ports: &[u16],
@@ -520,7 +536,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     profile.push_str("(version 1)\n");
 
     // Start with deny default
-    profile.push_str("(deny default)\n");
+    push_rule(&mut profile, "(deny default)", caps);
     if caps.seatbelt_debug_deny() {
         profile.push_str("(debug deny)\n");
     }
@@ -562,24 +578,44 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // last-matching-rule semantics.
     profile.push_str("(allow mach-lookup)\n");
     // Legacy keychain daemon names (macOS < 13)
-    profile.push_str("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))\n");
-    profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd\"))\n");
+    push_rule(
+        &mut profile,
+        "(deny mach-lookup (global-name \"com.apple.SecurityServer\"))",
+        caps,
+    );
+    push_rule(
+        &mut profile,
+        "(deny mach-lookup (global-name \"com.apple.securityd\"))",
+        caps,
+    );
     // Modern keychain daemon (macOS 13 Ventura+). Legacy SecKeychain APIs
     // route here on Ventura and later, bypassing the legacy service denies above.
     // Without this deny, FFI/ctypes callers can read keychain entries despite
     // the file-level deny on ~/Library/Keychains.
-    profile.push_str("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))\n");
+    push_rule(
+        &mut profile,
+        "(deny mach-lookup (global-name \"com.apple.security.keychaind\"))",
+        caps,
+    );
     // Modern security daemon (macOS 10.10+). SecItem APIs ("Data Protection"
     // keychain) route through secd. Blocking this prevents access to iCloud
     // Keychain and modern keychain items that bypass the legacy daemon paths.
-    profile.push_str("(deny mach-lookup (global-name \"com.apple.secd\"))\n");
+    push_rule(
+        &mut profile,
+        "(deny mach-lookup (global-name \"com.apple.secd\"))",
+        caps,
+    );
     // Security agent: shows keychain authorization dialogs. Without this deny, the
     // agent can act as a proxy — presenting a user prompt and returning the credential
     // on behalf of the sandboxed process even when the direct daemon paths are blocked.
-    profile.push_str("(deny mach-lookup (global-name \"com.apple.security.agent\"))\n");
+    push_rule(
+        &mut profile,
+        "(deny mach-lookup (global-name \"com.apple.security.agent\"))",
+        caps,
+    );
     profile.push_str("(allow mach-per-user-lookup)\n");
     profile.push_str("(allow mach-task-name)\n");
-    profile.push_str("(deny mach-priv*)\n");
+    push_rule(&mut profile, "(deny mach-priv*)", caps);
 
     // IPC: always allow POSIX shared memory operations
     profile.push_str("(allow ipc-posix-shm-read-data)\n");
@@ -716,8 +752,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         .iter()
         .filter(|rule| !is_network_platform_rule(rule))
     {
-        profile.push_str(rule);
-        profile.push('\n');
+        push_rule(&mut profile, rule, caps);
     }
 
     // Lets libc command resolution get ENOENT (not a deny's EPERM, which aborts
@@ -835,7 +870,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     }
     match caps.network_mode() {
         NetworkMode::Blocked => {
-            profile.push_str("(deny network*)\n");
+            push_rule(&mut profile, "(deny network*)", caps);
             if caps.dns_enabled() {
                 profile.push_str(MDNS_RULES);
             }
@@ -865,7 +900,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         }
         NetworkMode::ProxyOnly { port, bind_ports } => {
             // Block all network, then allow only localhost TCP to the proxy port.
-            profile.push_str("(deny network*)\n");
+            push_rule(&mut profile, "(deny network*)", caps);
             if caps.dns_enabled() {
                 profile.push_str(MDNS_RULES);
             }
@@ -908,8 +943,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         .iter()
         .filter(|rule| is_network_platform_rule(rule))
     {
-        profile.push_str(rule);
-        profile.push('\n');
+        push_rule(&mut profile, rule, caps);
     }
 
     // Per-port TCP rules are not supported on macOS (Seatbelt cannot filter by port alone).
@@ -979,6 +1013,49 @@ mod tests {
     use super::*;
     use crate::capability::{CapabilitySource, FsCapability};
     use std::path::PathBuf;
+
+    #[test]
+    fn test_seatbelt_log_tag_marks_every_deny() {
+        let mut caps = CapabilitySet::new().block_network();
+        caps.set_seatbelt_log_tag("T").unwrap();
+        caps.add_platform_rule("(deny file-write* (subpath \"/p\"))")
+            .unwrap();
+        caps.add_platform_rule("(allow file-read* (subpath \"/usr/share\"))")
+            .unwrap();
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(deny default (with message \"T\"))\n"));
+        assert!(profile.contains(
+            "(deny mach-lookup (global-name \"com.apple.secd\") (with message \"T\"))\n"
+        ));
+        assert!(profile.contains("(deny network* (with message \"T\"))\n"));
+        assert!(profile.contains("(deny file-write* (subpath \"/p\") (with message \"T\"))\n"));
+        assert!(profile.contains("(allow file-read* (subpath \"/usr/share\"))\n"));
+        for line in profile.lines().filter(|l| l.starts_with("(deny")) {
+            assert!(
+                line.ends_with("(with message \"T\"))"),
+                "untagged deny: {line}"
+            );
+        }
+        assert_eq!(
+            profile.matches("(with message").count(),
+            profile.lines().filter(|l| l.starts_with("(deny")).count(),
+            "tag on a non-deny:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn test_no_seatbelt_log_tag_leaves_profile_unchanged() {
+        let bare = CapabilitySet::new().block_network();
+        let mut tagged = bare.clone();
+        tagged.set_seatbelt_log_tag("T").unwrap();
+        let tagged_profile = generate_profile(&tagged).unwrap();
+        assert!(tagged_profile.contains("(with message \"T\")"));
+        assert_eq!(
+            generate_profile(&bare).unwrap(),
+            tagged_profile.replace(" (with message \"T\")", "")
+        );
+    }
 
     #[test]
     fn test_generate_profile_empty() {

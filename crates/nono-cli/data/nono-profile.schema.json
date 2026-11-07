@@ -1449,7 +1449,7 @@
             },
             { "type": "null" }
           ],
-          "description": "Operator-approved signing profiles keyed by placeholder access key ID. Each request signs as the profile mapped to the access key ID in its own SigV4 Authorization header; a missing or unlisted key is rejected with 403. Give the sandboxed client one placeholder key per allowed profile. Mutually exclusive with profile."
+          "description": "Operator-approved signing profiles keyed by placeholder access key ID. Each request signs as the profile mapped to the access key ID in its own SigV4 Authorization header; a missing or unlisted key is rejected with 403. Give the sandboxed client one placeholder key per allowed profile. Each profile may be mapped at most once (checked at load; not expressible in this schema). Mutually exclusive with profile."
         },
         "region": {
           "oneOf": [

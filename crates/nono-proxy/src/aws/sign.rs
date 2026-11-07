@@ -19,10 +19,12 @@
 //!
 //! ## Caching & refresh
 //!
-//! Each `AwsRoute` holds a `SharedCredentialsProvider`. Smithy's internal
-//! `LazyCredentialsCache` caches resolved `Credentials` and refreshes ~5 min
-//! before expiry for STS/SSO/IMDS/web-identity. Static env creds are
-//! non-refreshable: on expiry AWS returns 403; user re-runs nono with fresh env.
+//! Each `AwsRoute` holds one `SharedCredentialsProvider`, or one per allowed
+//! profile. These providers are not wrapped in an identity cache, so every
+//! signed request resolves credentials again (re-running `credential_process`,
+//! STS AssumeRole, or SSO GetRoleCredentials as the profile requires). Static
+//! env creds are non-refreshable: on expiry AWS returns 403; user re-runs nono
+//! with fresh env.
 
 use super::route::AwsRoute;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
@@ -130,8 +132,7 @@ pub async fn sign_request(
     clean_headers: &[(String, String)],
     body: &[u8],
 ) -> Result<Vec<(String, String)>, String> {
-    // Resolve credentials from the provider.
-    // smithy's LazyCredentialsCache handles refresh for STS/SSO/IMDS/web-identity.
+    // Resolve credentials from the provider (uncached; see module docs).
     let credentials = provider.provide_credentials().await.map_err(|e| {
         format!(
             "AWS credential resolution failed for route '{}': {}",
@@ -361,6 +362,29 @@ mod tests {
     }
 
     #[test]
+    fn access_key_id_none_for_scheme_case_or_separator_variants() {
+        // Only the exact scheme token followed by a space is accepted, so
+        // case or whitespace games cannot reach a different parse.
+        for value in [
+            "aws4-hmac-sha256 Credential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=abc",
+            "AWS4-HMAC-SHA256\tCredential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=abc",
+            "AWS4-HMAC-SHA256Credential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request",
+        ] {
+            let h = headers(&[("Authorization", value)]);
+            assert_eq!(sigv4_access_key_id(&h), None, "value: {value:?}");
+        }
+    }
+
+    #[test]
+    fn access_key_id_none_for_obs_fold_header() {
+        // An obs-fold continuation is dropped by header parsing, leaving only
+        // the first physical line; the scheme alone must not select a key.
+        let raw = b"POST / HTTP/1.1\r\nHost: sts.amazonaws.com\r\nAuthorization: AWS4-HMAC-SHA256\r\n Credential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request\r\n\r\n";
+        let h = crate::reverse::filter_headers(raw, "");
+        assert_eq!(sigv4_access_key_id(&h), None, "headers: {h:?}");
+    }
+
+    #[test]
     fn access_key_id_none_when_authorization_repeated() {
         // Two Authorization headers are ambiguous: refuse to pick one.
         let value = "AWS4-HMAC-SHA256 Credential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=abc";
@@ -410,7 +434,7 @@ mod tests {
 
         let result = sign_request(
             &route,
-            route.select_provider(&[]).unwrap(),
+            route.select_provider(&[]).unwrap().provider,
             "POST",
             url,
             &clean_headers,
@@ -470,7 +494,7 @@ mod tests {
 
         let headers = sign_request(
             &route,
-            route.select_provider(&[]).unwrap(),
+            route.select_provider(&[]).unwrap().provider,
             "PUT",
             url,
             &clean_headers,
@@ -513,7 +537,7 @@ mod tests {
 
         let headers = sign_request(
             &route,
-            route.select_provider(&[]).unwrap(),
+            route.select_provider(&[]).unwrap().provider,
             "POST",
             url,
             &clean_headers,

@@ -27,6 +27,7 @@ pub struct AwsRoute {
 }
 
 /// How an `AwsRoute` chooses the credentials it signs with.
+#[non_exhaustive]
 pub enum AwsRouteCredentials {
     /// One provider for every request (`aws_auth.profile`, or the default
     /// chain when `profile_key` is `None`).
@@ -51,6 +52,16 @@ pub struct ProfileProvider {
     pub provider: SharedCredentialsProvider,
 }
 
+/// The identity chosen for one request by [`AwsRoute::select_provider`].
+#[derive(Clone, Copy)]
+pub struct SelectedProvider<'a> {
+    /// Host profile the request signs as, or `None` for the default chain.
+    /// Not secret; logged so operators can tell which identity signed.
+    pub profile: Option<&'a str>,
+    /// Credential provider to sign with.
+    pub provider: &'a SharedCredentialsProvider,
+}
+
 /// Why no provider could be selected for a request on a multi-profile route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderSelectionError {
@@ -64,7 +75,8 @@ impl std::fmt::Display for ProviderSelectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingAccessKeyId => f.write_str(
-                "request has no SigV4 Authorization header to select a signing profile from",
+                "request has no single well-formed SigV4 Authorization header \
+                 to select a signing profile from",
             ),
             Self::UnknownAccessKeyId => {
                 f.write_str("request access key ID is not mapped to an allowed signing profile")
@@ -88,15 +100,24 @@ impl AwsRoute {
     pub fn select_provider(
         &self,
         agent_headers: &[(String, String)],
-    ) -> Result<&SharedCredentialsProvider, ProviderSelectionError> {
+    ) -> Result<SelectedProvider<'_>, ProviderSelectionError> {
         match &self.credentials {
-            AwsRouteCredentials::Single { provider, .. } => Ok(provider),
+            AwsRouteCredentials::Single {
+                profile_key,
+                provider,
+            } => Ok(SelectedProvider {
+                profile: profile_key.as_deref(),
+                provider,
+            }),
             AwsRouteCredentials::ByAccessKeyId(profiles) => {
                 let access_key_id = super::sign::sigv4_access_key_id(agent_headers)
                     .ok_or(ProviderSelectionError::MissingAccessKeyId)?;
                 profiles
                     .get(&access_key_id)
-                    .map(|p| &p.provider)
+                    .map(|p| SelectedProvider {
+                        profile: Some(p.profile.as_str()),
+                        provider: &p.provider,
+                    })
                     .ok_or(ProviderSelectionError::UnknownAccessKeyId)
             }
         }
@@ -330,7 +351,8 @@ async fn new_named_profile_provider(profile: &str) -> Result<SharedCredentialsPr
     }
 
     // Region feeds STS/SSO client calls inside the provider (assume-role, SSO
-    // portal). Take it from the profile itself before the default chain.
+    // portal). Resolved like `aws_config::from_env().profile_name(..)`:
+    // AWS_REGION / AWS_DEFAULT_REGION, then this profile's `region`, then IMDS.
     let region = aws_config::default_provider::region::DefaultRegionChain::builder()
         .profile_name(profile)
         .build()
@@ -417,8 +439,9 @@ mod tests {
             provider: static_provider("AKIAREALDEFAULT0001"),
         });
         // No Authorization header at all: today's behaviour is preserved.
-        let provider = route.select_provider(&[]).unwrap();
-        assert_eq!(resolved_key(provider).await, "AKIAREALDEFAULT0001");
+        let selected = route.select_provider(&[]).unwrap();
+        assert_eq!(selected.profile, None);
+        assert_eq!(resolved_key(selected.provider).await, "AKIAREALDEFAULT0001");
     }
 
     #[tokio::test]
@@ -428,12 +451,14 @@ mod tests {
         let dev = route
             .select_provider(&agent_auth("NONOPROFILE0DEVRO01"))
             .unwrap();
-        assert_eq!(resolved_key(dev).await, "AKIAREALDEVRO000001");
+        assert_eq!(dev.profile, Some("dev-ro"));
+        assert_eq!(resolved_key(dev.provider).await, "AKIAREALDEVRO000001");
 
         let staging = route
             .select_provider(&agent_auth("NONOPROFILE0STGRO01"))
             .unwrap();
-        assert_eq!(resolved_key(staging).await, "AKIAREALSTGRO000001");
+        assert_eq!(staging.profile, Some("staging-ro"));
+        assert_eq!(resolved_key(staging.provider).await, "AKIAREALSTGRO000001");
     }
 
     #[test]
@@ -520,6 +545,54 @@ mod load_tests {
                 .unwrap_err();
             assert!(err.contains("does-not-exist"), "{err}");
             assert!(table.get("sts").is_none(), "route must not be inserted");
+        });
+    }
+
+    /// `credential_process` profiles resolve
+    /// through the profile-only provider, and host env credentials do not
+    /// shadow them.
+    #[test]
+    fn named_profile_provider_resolves_credential_process_over_host_env() {
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("creds.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho '{\"Version\":1,\"AccessKeyId\":\"AKIAPROCESS00000001\",\"SecretAccessKey\":\"s\",\"SessionToken\":\"t\"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let config = dir.path().join("config");
+        std::fs::write(
+            &config,
+            format!(
+                "[profile proc]\nregion = us-east-1\ncredential_process = {}\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        let empty = dir.path().join("credentials");
+        std::fs::write(&empty, "").unwrap();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("AWS_CONFIG_FILE", config.to_str().unwrap()),
+            ("AWS_SHARED_CREDENTIALS_FILE", empty.to_str().unwrap()),
+            ("AWS_ACCESS_KEY_ID", "AKIAHOSTENVIRON0001"),
+            ("AWS_SECRET_ACCESS_KEY", "host-env-secret"),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use aws_credential_types::provider::ProvideCredentials;
+            let provider = new_named_profile_provider("proc").await.unwrap();
+            let creds = provider.provide_credentials().await.unwrap();
+            assert_eq!(creds.access_key_id(), "AKIAPROCESS00000001");
         });
     }
 

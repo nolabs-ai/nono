@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 /// Header byte cap matching the outer proxy's `MAX_HEADER_SIZE` to keep the
@@ -1802,8 +1802,8 @@ where
     // Pick the signing identity before the agent's auth headers are stripped:
     // a multi-profile route selects it by the placeholder access key ID the
     // agent signed with. Unknown or missing keys fail closed.
-    let provider = match aws.select_provider(&filtered_headers) {
-        Ok(provider) => provider,
+    let selected = match aws.select_provider(&filtered_headers) {
+        Ok(selected) => selected,
         Err(e) => {
             let svc = service.unwrap_or("unknown");
             let reason = format!("AWS signing profile not allowed for route '{}': {}", svc, e);
@@ -1880,9 +1880,18 @@ where
         body.len(),
         filtered_headers.len(),
     );
+    // Record which host identity signs: on a multi-profile route this is the
+    // only trace of which allowed profile the agent selected.
+    info!(
+        target: audit::AUDIT_TARGET,
+        "aws sigv4 signing route={} target={} profile={}",
+        service.unwrap_or("unknown"),
+        ctx.host,
+        selected.profile.unwrap_or("<default chain>"),
+    );
     match crate::aws::sign::sign_request(
         aws,
-        provider,
+        selected.provider,
         &req.method,
         &full_url,
         &filtered_headers,

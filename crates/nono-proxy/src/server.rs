@@ -3030,6 +3030,32 @@ mod tests {
                 .await;
                 assert!(status.starts_with("HTTP/1.1 403"), "{status}");
                 assert!(seen.is_none(), "unlisted key must not reach upstream");
+
+                // A non-SigV4 Authorization (no access key ID to select by) is
+                // refused the same way and never falls back to any profile.
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let route = serde_json::from_value(serde_json::json!({
+                    "prefix": "sts",
+                    "upstream": format!("https://localhost:{port}"),
+                    "aws_auth": {
+                        "region": "us-east-1",
+                        "service": "sts",
+                        "profiles": { "NONOPROFILE0DEVRO01": "dev-ro" }
+                    },
+                    "tls_ca": ca_file,
+                }))
+                .unwrap();
+                let (status, seen) = aws_intercept_round_trip(
+                    route,
+                    Arc::clone(&ca),
+                    listener,
+                    dir.path(),
+                    "Bearer NONOPROFILE0DEVRO01",
+                )
+                .await;
+                assert!(status.starts_with("HTTP/1.1 403"), "{status}");
+                assert!(seen.is_none(), "unselectable request must not reach upstream");
             })
             .await
             .unwrap();

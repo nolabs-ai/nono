@@ -96,6 +96,21 @@ pub enum AuditEventPayload {
         /// Command policy decision event.
         event: Box<CommandPolicyAuditEvent>,
     },
+    /// A terminal recording chunk was closed (NEP-0010).
+    TerminalChunk {
+        /// Chunk reference and the window it covers.
+        chunk: Box<TerminalChunkEvent>,
+    },
+    /// Terminal capture events a sink failed to keep (NEP-0010).
+    RecordingLost {
+        /// Lost `seq` range and the reason.
+        event: RecordingLostEvent,
+    },
+    /// Terminal recording stopped at its size limit (NEP-0010).
+    TerminalRecordingTruncated {
+        /// Where recording stopped and why.
+        event: TerminalRecordingTruncatedEvent,
+    },
     /// A payload type this build does not know, written by a newer nono.
     ///
     /// Readers keep these records so that logs written by newer releases still
@@ -113,6 +128,75 @@ impl AuditEventPayload {
     pub fn is_unrecognized(&self) -> bool {
         matches!(self, Self::Unrecognized)
     }
+}
+
+/// Directory, inside an audit session directory, holding terminal chunks.
+pub const TERMINAL_RECORDING_DIRNAME: &str = "terminal";
+
+/// File name of terminal recording chunk `index` inside
+/// [`TERMINAL_RECORDING_DIRNAME`].
+///
+/// The name is derived from the index only, so a log record can never point
+/// a verifier at an arbitrary path.
+#[must_use]
+pub fn terminal_chunk_file_name(index: u64) -> String {
+    format!("chunk-{index:08}.cast.zst")
+}
+
+/// A closed terminal recording chunk (NEP-0010 §4).
+///
+/// Ranges are half-open: `[start, end)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalChunkEvent {
+    /// Chunk index, starting at 0, contiguous within a session.
+    pub index: u64,
+    /// First capture `seq` in the chunk.
+    pub seq_start: u64,
+    /// One past the last capture `seq` in the chunk.
+    pub seq_end: u64,
+    /// Offset of the first event from session start, in microseconds.
+    pub start_offset_us: u64,
+    /// Offset of the last event from session start, in microseconds.
+    pub end_offset_us: u64,
+    /// First audit record sequence number written during the chunk window.
+    pub audit_seq_start: u64,
+    /// One past the last audit record sequence number written during the
+    /// chunk window (this chunk's own record is not included).
+    pub audit_seq_end: u64,
+    /// Uncompressed chunk size in bytes.
+    pub raw_bytes: u64,
+    /// Stored (compressed) chunk size in bytes.
+    pub stored_bytes: u64,
+    /// SHA-256 of the stored chunk file, lowercase hex.
+    pub sha256: String,
+    /// Number of credential values replaced in this chunk.
+    pub credential_redactions: u64,
+    /// Number of input events whose content was not captured.
+    pub suppressed_inputs: u64,
+}
+
+/// Capture events a sink could not keep (NEP-0010 §5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingLostEvent {
+    /// Sink that lost the events.
+    pub sink: String,
+    /// First lost capture `seq`.
+    pub seq_start: u64,
+    /// One past the last lost capture `seq`.
+    pub seq_end: u64,
+    /// Why the events were lost.
+    pub reason: String,
+}
+
+/// Recording stopped at its configured size limit (NEP-0010 §4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalRecordingTruncatedEvent {
+    /// First capture `seq` not recorded.
+    pub seq: u64,
+    /// Configured limit in uncompressed bytes.
+    pub max_bytes: u64,
+    /// Uncompressed bytes recorded before the limit.
+    pub recorded_bytes: u64,
 }
 
 /// Sandbox runtime metadata captured in the audit log.
@@ -553,6 +637,32 @@ impl AuditRecorder {
     #[must_use]
     pub fn command_policy_summary(&self) -> Option<CommandPolicySummary> {
         self.command_policy_summary.clone().finish()
+    }
+
+    /// Record a closed terminal recording chunk.
+    pub fn record_terminal_chunk(&mut self, chunk: TerminalChunkEvent) -> Result<()> {
+        self.append_event(AuditEventPayload::TerminalChunk {
+            chunk: Box::new(chunk),
+        })
+    }
+
+    /// Record capture events a sink could not keep.
+    pub fn record_recording_lost(&mut self, event: RecordingLostEvent) -> Result<()> {
+        self.append_event(AuditEventPayload::RecordingLost { event })
+    }
+
+    /// Record that terminal recording stopped at its size limit.
+    pub fn record_terminal_recording_truncated(
+        &mut self,
+        event: TerminalRecordingTruncatedEvent,
+    ) -> Result<()> {
+        self.append_event(AuditEventPayload::TerminalRecordingTruncated { event })
+    }
+
+    /// Sequence number the next appended record will receive.
+    #[must_use]
+    pub fn next_sequence(&self) -> u64 {
+        self.next_sequence
     }
 
     /// Number of events appended by this recorder.
@@ -1798,6 +1908,67 @@ mod tests {
         assert!(verified.records_verified);
     }
 
+    fn sample_terminal_chunk() -> TerminalChunkEvent {
+        TerminalChunkEvent {
+            index: 2,
+            seq_start: 40,
+            seq_end: 75,
+            start_offset_us: 20_000_000,
+            end_offset_us: 29_500_000,
+            audit_seq_start: 6,
+            audit_seq_end: 9,
+            raw_bytes: 4096,
+            stored_bytes: 812,
+            sha256: "5d41402abc4b2a76b9719d911017c592aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            credential_redactions: 1,
+            suppressed_inputs: 2,
+        }
+    }
+
+    #[test]
+    fn verifier_round_trips_terminal_capture_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        assert_eq!(recorder.next_sequence(), 1);
+        recorder
+            .record_terminal_chunk(sample_terminal_chunk())
+            .unwrap();
+        recorder
+            .record_recording_lost(RecordingLostEvent {
+                sink: "recording".to_string(),
+                seq_start: 75,
+                seq_end: 90,
+                reason: "queue_full".to_string(),
+            })
+            .unwrap();
+        recorder
+            .record_terminal_recording_truncated(TerminalRecordingTruncatedEvent {
+                seq: 90,
+                max_bytes: 100,
+                recorded_bytes: 99,
+            })
+            .unwrap();
+        assert_eq!(recorder.next_sequence(), 4);
+
+        let summary = recorder.finalize().unwrap();
+        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert_eq!(verified.event_count, 4);
+        assert!(verified.records_verified);
+    }
+
+    #[test]
+    fn terminal_chunk_file_names_depend_only_on_index() {
+        assert_eq!(terminal_chunk_file_name(0), "chunk-00000000.cast.zst");
+        assert_eq!(terminal_chunk_file_name(12), "chunk-00000012.cast.zst");
+        assert_eq!(
+            terminal_chunk_file_name(u64::MAX),
+            "chunk-18446744073709551615.cast.zst"
+        );
+    }
+
     /// A payload a newer nono might write, unknown to this build.
     const FUTURE_EVENT_JSON: &str =
         r#"{"type":"future_kind","index":3,"detail":{"sha256":"abc","note":"x"}}"#;
@@ -2536,6 +2707,42 @@ mod tests {
                 "{label}: leaf hash mismatch"
             );
         }
+
+        check(
+            "TerminalChunk",
+            &AuditEventPayload::TerminalChunk {
+                chunk: Box::new(sample_terminal_chunk()),
+            },
+            r#"{"type":"terminal_chunk","chunk":{"index":2,"seq_start":40,"seq_end":75,"start_offset_us":20000000,"end_offset_us":29500000,"audit_seq_start":6,"audit_seq_end":9,"raw_bytes":4096,"stored_bytes":812,"sha256":"5d41402abc4b2a76b9719d911017c592aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","credential_redactions":1,"suppressed_inputs":2}}"#,
+            "58a3c2bb093ef3faf394eb0939ad58ce44fd870717c8f6765abf87390a3a26c6",
+        );
+
+        check(
+            "RecordingLost",
+            &AuditEventPayload::RecordingLost {
+                event: RecordingLostEvent {
+                    sink: "recording".to_string(),
+                    seq_start: 75,
+                    seq_end: 90,
+                    reason: "queue_full".to_string(),
+                },
+            },
+            r#"{"type":"recording_lost","event":{"sink":"recording","seq_start":75,"seq_end":90,"reason":"queue_full"}}"#,
+            "83698e8df2e8ac376e3e368467b98f5d53bd2cbaa2191793a3b0f02516320c90",
+        );
+
+        check(
+            "TerminalRecordingTruncated",
+            &AuditEventPayload::TerminalRecordingTruncated {
+                event: TerminalRecordingTruncatedEvent {
+                    seq: 90,
+                    max_bytes: 268_435_456,
+                    recorded_bytes: 268_435_000,
+                },
+            },
+            r#"{"type":"terminal_recording_truncated","event":{"seq":90,"max_bytes":268435456,"recorded_bytes":268435000}}"#,
+            "1871ac463e4cb49eb5094470648627f84959b932ecacc65108519cd5423eeacf",
+        );
 
         check(
             "SessionStarted",

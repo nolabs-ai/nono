@@ -143,6 +143,17 @@ pub async fn sign_request(
         )
     })?;
 
+    // Register before signing so the secret material is known to terminal
+    // redaction before it can influence any request. The access key ID is
+    // an identifier, not a secret, and is not registered.
+    if let Some(registry) = &route.secret_registry {
+        let name = route.registry_name();
+        registry.register(&name, credentials.secret_access_key());
+        if let Some(session_token) = credentials.session_token() {
+            registry.register(&name, session_token);
+        }
+    }
+
     debug!(
         "aws::sign: signing {} {} for service={} region={}",
         method, url, route.service, region
@@ -421,6 +432,7 @@ mod tests {
                 profile_key: None,
                 provider,
             },
+            secret_registry: None,
         }
     }
 
@@ -539,6 +551,7 @@ mod tests {
                 profile_key: None,
                 provider,
             },
+            secret_registry: None,
         };
         let url = "https://bedrock-runtime.us-east-1.amazonaws.com/model/test/invoke";
         let clean_headers = vec![("Content-Type".to_string(), "application/json".to_string())];
@@ -602,5 +615,52 @@ mod tests {
         );
         assert!(a.contains("/eu-central-1/eks/aws4_request"), "{a}");
         assert!(b.contains("/us-west-2/eks/aws4_request"), "{b}");
+    }
+
+    #[tokio::test]
+    async fn sign_request_registers_resolved_secrets() {
+        let creds = Credentials::new(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            Some("session-token-value".to_string()),
+            None,
+            "test",
+        );
+        let registry = crate::secret_registry::SecretRegistry::new();
+        let provider = SharedCredentialsProvider::new(creds);
+        let route = super::AwsRoute {
+            upstream: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            region: super::super::endpoints::SigningRegion::Fixed("us-east-1".to_string()),
+            service_label: None,
+            service: "bedrock".to_string(),
+            credentials: super::super::route::AwsRouteCredentials::Single {
+                profile_key: Some("work".to_string()),
+                provider: provider.clone(),
+            },
+            secret_registry: Some(registry.clone()),
+        };
+        sign_request(
+            &route,
+            "us-east-1",
+            &provider,
+            "POST",
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/test/invoke",
+            &[],
+            b"{}",
+        )
+        .await
+        .expect("signing should succeed");
+
+        let (_, entries) = registry.snapshot();
+        let values: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_str()))
+            .collect();
+        assert!(values.contains(&("aws:work", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")));
+        assert!(values.contains(&("aws:work", "session-token-value")));
+        assert!(
+            !values.iter().any(|(_, v)| *v == "AKIAIOSFODNN7EXAMPLE"),
+            "the access key ID is an identifier and is not registered"
+        );
     }
 }

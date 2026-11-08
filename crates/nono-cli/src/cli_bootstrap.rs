@@ -150,6 +150,8 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::Attach(_)
         | Commands::Logs(_)
         | Commands::Inspect(_)
+        | Commands::Replay(_)
+        | Commands::Transcript(_)
         | Commands::Session(_)
         | Commands::Profile(_)
         | Commands::Pin(_)

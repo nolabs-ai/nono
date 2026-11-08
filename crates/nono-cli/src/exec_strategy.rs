@@ -576,6 +576,9 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     on_fork: Option<&mut dyn FnMut(u32)>,
     pty_pair: Option<crate::pty_proxy::PtyPair>,
     pty_session_id: Option<&str>,
+    // Session terminal capture (NEP-0010), started before fork so a required
+    // recording that cannot start never runs the agent.
+    terminal_capture: Option<crate::terminal_capture::TerminalCapture>,
     // Write fd of the resource cgroup's `cgroup.procs`. The forked child attaches
     // itself through it before sandboxing or exec'ing. None off Linux.
     resource_procs_fd: Option<std::os::fd::RawFd>,
@@ -1366,7 +1369,12 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     attach_initial_client,
                     detach_sequence,
                 ) {
-                    Ok(proxy) => Some(proxy),
+                    Ok(mut proxy) => {
+                        if let Some(capture) = terminal_capture {
+                            proxy.set_capture(capture);
+                        }
+                        Some(proxy)
+                    }
                     Err(e) => {
                         let _ = signal::kill(child, Signal::SIGKILL);
                         let _ = waitpid(child, None);
@@ -1616,6 +1624,29 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 p.release_terminal_for_prompt();
             }
 
+            // Close the recording before the audit log records the session
+            // end, so every chunk record precedes `session_ended`.
+            let capture_summary = pty_proxy
+                .as_mut()
+                .and_then(|p| p.finish_capture(capture_exit_status(&status)));
+            if let Some(summary) = capture_summary.as_ref() {
+                info!(
+                    "Terminal recording closed: {} events, {} chunks, {} bytes raw, {} stored, \
+                     {} credential redactions, {} suppressed inputs, {} lost, truncated: {}, \
+                     unmatched credentials: {:?}",
+                    summary.events,
+                    summary.writer.chunks,
+                    summary.writer.raw_bytes,
+                    summary.writer.stored_bytes,
+                    summary.writer.redactions,
+                    summary.writer.suppressed_inputs,
+                    summary.writer.lost_events,
+                    summary.writer.truncated,
+                    summary.unmatched_credentials,
+                );
+            }
+            let capture_failed = capture_summary.as_ref().and_then(|s| s.fatal.clone());
+
             let exit_code = match status {
                 WaitStatus::Exited(_, code) => {
                     debug!("Supervised child exited with code {}", code);
@@ -1636,6 +1667,18 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     warn!("Unexpected wait status: {:?}", other);
                     1
                 }
+            };
+
+            // A required recording that failed fails the exit, whatever the
+            // agent's own status was (NEP-0010: fail closed).
+            let exit_code = match capture_failed {
+                Some(reason) => {
+                    print_terminal_safe_stderr(&format!(
+                        "[nono] Required session recording is incomplete: {reason}"
+                    ));
+                    crate::terminal_capture::RECORDING_FAILED_EXIT_CODE
+                }
+                None => exit_code,
             };
 
             // Let the caller explain this specific exit (e.g. the resource cgroup
@@ -2170,6 +2213,7 @@ fn wait_for_child_with_pty(
         handle_pty_detach_request(Some(pty), pause_requested, in_band_detach_requested);
         handle_pty_signal_relay(Some(pty));
         handle_pty_suspension(Some(pty), child);
+        handle_pty_capture(Some(pty), child);
         service_off_thread_prompts(Some(pty));
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -2524,6 +2568,34 @@ fn handle_pty_signal_relay(pty: Option<&mut crate::pty_proxy::PtyProxy>) {
 /// parent, nono, is elsewhere), so the kernel drops SIGTSTP and we must drive
 /// suspension manually: SIGSTOP, restore the terminal, raise(SIGTSTP) on nono
 /// itself, then SIGCONT on resume.
+/// How a session ended, as recorded in the `exited` lifecycle event.
+fn capture_exit_status(status: &WaitStatus) -> String {
+    match status {
+        WaitStatus::Exited(_, code) => format!("exited:{code}"),
+        WaitStatus::Signaled(_, sig, _) => format!("signaled:{}", sig.as_str()),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Service session terminal capture, and stop the session when a required
+/// recording destination fails (NEP-0010 §5: fail closed).
+fn handle_pty_capture(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pid) {
+    let Some(pty) = pty else {
+        return;
+    };
+    let Some(reason) = pty.service_capture() else {
+        return;
+    };
+    print_terminal_safe_stderr(&format!(
+        "[nono] Required session recording failed ({reason}); stopping the session."
+    ));
+    warn!("stopping session: required terminal recording failed: {reason}");
+    // The child leads its own process group under the PTY; stop the group,
+    // then the child itself in case it has left it.
+    let _ = signal::kill(Pid::from_raw(-child.as_raw()), Signal::SIGKILL);
+    let _ = signal::kill(child, Signal::SIGKILL);
+}
+
 fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pid) {
     let pty = match pty {
         Some(p) => p,
@@ -2573,6 +2645,8 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
         }
     }
 
+    pty.capture_lifecycle(crate::terminal_capture::events::Lifecycle::Suspended);
+
     // Save raw settings for restore-on-resume, and preserve the
     // cooked settings for later detach (restore_terminal consumes them).
     let raw_termios = nix::sys::termios::tcgetattr(std::io::stdin()).ok();
@@ -2602,6 +2676,8 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
     }
     // Restore cooked settings so detach works correctly later.
     pty.saved_termios = cooked_termios;
+
+    pty.capture_lifecycle(crate::terminal_capture::events::Lifecycle::Resumed);
 
     // Re-enter the alternate screen the child was using before resuming it.
     pty.reenter_screen_for_resume();
@@ -2832,6 +2908,7 @@ fn run_supervisor_loop(
         );
         handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
+        handle_pty_capture(pty.as_deref_mut(), child);
         service_off_thread_prompts(pty.as_deref_mut());
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -3300,6 +3377,7 @@ fn run_supervisor_loop_inner(
         );
         handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
+        handle_pty_capture(pty.as_deref_mut(), child);
         service_off_thread_prompts(pty.as_deref_mut());
 
         // Drain reparented orphans; if the primary child was among them,

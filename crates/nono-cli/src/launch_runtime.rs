@@ -275,6 +275,9 @@ pub(crate) struct ExecutionFlags {
     /// (CLI flag, then profile, then default).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) network_denial_audit: crate::profile::NetworkDenialAuditLimits,
+    /// Resolved session recording (NEP-0010): profile, then flags, which can
+    /// only raise it. `None` when recording is off.
+    pub(crate) session_recording: Option<crate::terminal_capture::RecordingSettings>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Command binaries already resolved while validating `command_policies`,
     /// reused when building the command-mediation plan instead of re-resolving.
@@ -298,6 +301,12 @@ impl ExecutionFlags {
     ) -> Result<Self> {
         let cwd = std::env::current_dir()
             .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?;
+        let session_recording = crate::terminal_capture::settings::resolve(
+            prepared.session_recording.as_ref(),
+            &crate::cli::RecordingArgs::default(),
+            &cwd,
+            &cwd,
+        )?;
         Ok(Self {
             strategy: exec_strategy::ExecStrategy::Supervised,
             workdir: cwd.clone(),
@@ -345,6 +354,7 @@ impl ExecutionFlags {
                 None,
                 None,
             )?,
+            session_recording,
             command_policies: prepared.command_policies.clone(),
             resolved_command_binaries: prepared.resolved_command_binaries.clone(),
             approval_backends: prepared.approval_backends.clone(),
@@ -463,9 +473,16 @@ pub(crate) fn prepare_run_launch_plan(
         run_args.detached,
     );
 
+    let workdir = resolve_requested_workdir(args.workdir.as_ref());
+    let session_recording = crate::terminal_capture::settings::resolve(
+        prepared.session_recording.as_ref(),
+        &run_args.recording,
+        &launch_dir()?,
+        &workdir,
+    )?;
     let flags = ExecutionFlags {
         strategy,
-        workdir: resolve_requested_workdir(args.workdir.as_ref()),
+        workdir,
         no_diagnostics,
         diagnostics_json,
         diagnostic_verbosity: args.verbose,
@@ -495,6 +512,7 @@ pub(crate) fn prepare_run_launch_plan(
             run_args.network_denial_audit_rate,
             run_args.network_denial_audit_burst,
         )?,
+        session_recording,
         ..ExecutionFlags::from_prepared(&prepared, silent)?
     };
     Ok(LaunchPlan {
@@ -505,6 +523,12 @@ pub(crate) fn prepare_run_launch_plan(
         loaded_secrets: prepared.secrets,
         flags,
     })
+}
+
+/// The directory nono was launched from; relative recording destinations
+/// resolve against it.
+pub(crate) fn launch_dir() -> Result<PathBuf> {
+    std::env::current_dir().map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))
 }
 
 pub(crate) fn load_configured_detach_sequence() -> Result<Option<Vec<u8>>> {
@@ -774,6 +798,7 @@ mod tests {
             trust_override: false,
             name: None,
             capability_elevation: false,
+            recording: Default::default(),
             command: Vec::new(),
             help: None,
         }

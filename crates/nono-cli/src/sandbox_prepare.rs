@@ -548,6 +548,8 @@ pub(crate) struct PreparedSandbox {
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
+    /// `session_recording` from the profile (NEP-0010).
+    pub(crate) session_recording: Option<profile::SessionRecordingConfig>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
     pub(crate) deny_domain: Vec<String>,
@@ -1569,6 +1571,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 session_hooks: profile::SessionHooks::default(),
                 rollback_exclude_patterns,
                 rollback_exclude_globs,
+                session_recording: None,
                 network_profile: None,
                 allow_domain,
                 deny_domain: Vec::new(),
@@ -1641,6 +1644,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         workdir_access: profile_workdir_access,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
+        session_recording: profile_session_recording,
         network_profile: profile_network_profile,
         allow_domain: profile_allow_domain,
         deny_domain: profile_deny_domain,
@@ -1685,6 +1689,15 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             command_policies.as_mut(),
             silent,
         );
+    }
+    // `session_recording.file` makes the supervisor create a file outside the
+    // sandbox, so it follows the same trust boundary. Recording itself stays
+    // on; only the extra destination is dropped.
+    let mut profile_session_recording = profile_session_recording;
+    if let (Some(profile_name), Some(recording)) =
+        (args.profile.as_deref(), profile_session_recording.as_mut())
+    {
+        crate::terminal_capture::settings::drop_untrusted_file(profile_name, recording, silent);
     }
 
     let session_hooks = loaded_profile
@@ -1982,6 +1995,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             session_hooks,
             rollback_exclude_patterns: profile_rollback_patterns,
             rollback_exclude_globs: profile_rollback_globs,
+            session_recording: profile_session_recording,
             network_profile: profile_network_profile,
             allow_domain: profile_allow_domain,
             deny_domain: profile_deny_domain,
@@ -3042,6 +3056,7 @@ mod tests {
             session_hooks: profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            session_recording: None,
             network_profile: None,
             allow_domain: Vec::new(),
             deny_domain: Vec::new(),

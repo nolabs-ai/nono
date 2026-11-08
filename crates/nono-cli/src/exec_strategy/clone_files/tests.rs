@@ -907,6 +907,7 @@ fn full_cli_supervisor_combined_path() -> Result<()> {
             None,
             None,
             None,
+            None,
             None::<fn(i32) -> bool>,
         )?;
         assert_eq!(code, 0);

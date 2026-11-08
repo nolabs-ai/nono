@@ -1,0 +1,189 @@
+---
+title: Session Recording
+description: Record a session's terminal into its audit log
+---
+
+Session recording keeps a replayable record of what happened in a sandboxed
+session's terminal: the output, the input sent to it, and terminal facts such
+as window size, terminal mode, the foreground process, and notifications. The
+recording is stored with the session's [audit trail](/cli/features/audit) and
+linked into its hash-chained event log, so `nono audit verify` can show that it
+has not been changed.
+
+Recording is off by default. Turn it on with a profile or a launch flag.
+
+```bash
+nono run --record --profile my-agent -- my-agent
+```
+
+When recording is on, the session starts with a one-line notice on the
+terminal (or on stderr when there is no terminal). A detached session shows it
+when it is launched, and `nono attach` shows it to everyone who joins.
+Profiles and `--silent` cannot suppress it.
+
+## Watching and reading recordings
+
+```bash
+nono replay my-session                    # play it back in the terminal
+nono replay --speed 2 --idle-limit 2 my-session
+nono replay --from 1:30 my-session        # or --from suspended, --from resize
+nono transcript my-session                # readable text
+nono transcript --format json my-session  # structured entries
+nono audit verify <audit-session>         # check the recording against the audit log
+nono inspect my-session                   # recording state, copies and any loss
+```
+
+Sessions can be named by ID, ID prefix or name.
+
+- **Replay** draws the recorded terminal through a terminal model. Sequences an
+  agent printed that act on your terminal itself, such as clipboard writes,
+  window titles or mode changes, are not passed on. Press Ctrl-C to stop.
+- **Transcript** prints text that scrolled by once, in order. A screen that was
+  redrawn in place, such as a full-screen interface, is shown as it stood at
+  pauses. It also notes when the session was suspended or ended, when password
+  input was not recorded, and which credentials were too short to remove.
+- Both refuse a recording that does not match the audit log. `nono audit
+  verify` reports missing or altered chunks, and gaps in the recording that no
+  recorded loss explains.
+
+## What is protected
+
+Two protections always apply. They have no settings and cannot be turned off.
+
+- **Known credentials are removed.** Credential values nono resolved for the
+  session are replaced with `[redacted:credential:<name>]` in both output and
+  input. This covers proxy-injected credentials, credentials loaded into the
+  environment from keyrings or providers, and credential capture outputs, as
+  well as tokens nono refreshes during the session. Values are also matched
+  base64-encoded and percent-encoded, and when they are split across reads.
+  Values shorter than 8 bytes are not matched; their names (never their values)
+  are listed in the recording so the gap is visible.
+- **Password input is never recorded.** While the terminal is in canonical mode
+  with echo off, which is how `sudo`, `ssh` and `getpass(3)` read passwords,
+  nono records only that input was typed, not what or how much. Full-screen
+  agent interfaces also turn echo off, but in raw mode, so their input is
+  recorded normally.
+
+Recording removes only what nono knows. Secrets that nono never held can still
+appear in a recording, so treat recordings as sensitive.
+
+## Where recordings are stored
+
+Recordings are written to the session's audit directory, under
+`$XDG_STATE_HOME/nono/audit/<session>/terminal/`, which the sandbox cannot read
+or write. The recording is a series of zstd-compressed
+[asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/) chunks. Each
+chunk closes after 10 seconds, at 1 MiB, when the session is suspended, or when
+it ends, and each closed chunk is recorded in the audit log with its SHA-256.
+
+Recording needs the audit log and the supervisor. The recording flags are
+rejected together with `--no-audit`. When a profile turns recording on but the
+session runs with `--no-audit` or under `nono wrap`, a required recording
+refuses to start, and an optional one is skipped with a warning.
+
+## Profile settings
+
+```json
+{
+  "session_recording": {
+    "enabled": true,
+    "required": false,
+    "input": "on",
+    "max_bytes": 268435456,
+    "file": "./artifacts/session.cast"
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `enabled` | Record the session's terminal. |
+| `required` | Stop the session rather than run it unrecorded. Implies `enabled`. |
+| `input` | `on` records typed input; `off` records only that input happened. Defaults to `on`. |
+| `max_bytes` | Uncompressed size at which the recording stops. Defaults to 256 MiB. |
+| `file` | Also write the recording to this file (see below). Implies `enabled`. |
+| `delivery` | Upload the recording as it is made (see below). Implies `enabled`. |
+
+Settings can only be raised. A profile that extends another, and the launch
+flags, can turn recording on, make it required, turn input recording on, raise
+`max_bytes`, or add a destination, but they cannot undo what a base profile
+set. For example, `enabled: false` in a child profile has no effect when its
+base sets `enabled: true`.
+
+## Launch flags
+
+| Flag | Environment variable | Effect |
+|------|----------------------|--------|
+| `--record` | `NONO_RECORD` | Turn recording on. |
+| `--record-required` | `NONO_RECORD_REQUIRED` | Make recording required. Implies `--record`. |
+| `--record-file <PATH>` | `NONO_RECORD_FILE` | Also write the recording to `PATH`. Implies `--record`. |
+| `--deliver-to platform` | `NONO_DELIVER_TO` | Upload the recording to the enrolled platform. Implies `--record`. |
+
+The flags are accepted by `nono run` and `nono shell`.
+
+## Required recording
+
+When recording is required, nono fails closed:
+
+- If recording cannot start, the agent does not run.
+- If recording fails while the session is running, for example because the
+  disk is full or the recording reached `max_bytes`, nono stops the session.
+- If the recording is incomplete when the session ends, nono exits with status
+  74, even if the agent succeeded, so a pipeline sees the failure.
+
+When recording is not required, a failure is recorded in the audit log and the
+session carries on.
+
+## Writing a copy for artifact collection
+
+`file` and `--record-file` write a copy of the recording to a path outside the
+sandbox, for hosts that collect job artifacts. The copy is a playable `.cast`
+file. Next to it, `<file>.manifest.json` lists each chunk with the hash recorded
+in the audit log and the hash of the bytes it added to the copy. The manifest
+is kept current while the session runs.
+
+- Relative paths resolve against the directory nono was launched from.
+  `$WORKDIR` and `~` are expanded in profile paths.
+- Both files are created when the session starts and must not already exist.
+  nono never overwrites a file or writes through a symlink.
+- `file` is honoured only in profiles you authored (a user profile or a profile
+  given by path). Package, registry and built-in profiles cannot choose where
+  nono writes; recording stays on without the copy.
+- A profile can set one `file`, and `--record-file` adds another.
+
+The copy in the audit directory remains the authoritative recording.
+
+## Delivering recordings to the platform
+
+On a host enrolled with a platform (`nono platform enroll`), recordings can be
+uploaded as they are made:
+
+```json
+{
+  "session_recording": {
+    "delivery": { "receiver": "platform", "required": false, "flush_timeout_secs": 30 }
+  }
+}
+```
+
+or `--deliver-to platform` for a single run.
+
+- Each chunk is uploaded when it closes, signed with the host's enrollment
+  key, so the platform can show a running session about 10 seconds behind.
+- Upload never slows the session down. Failed uploads are retried, and at
+  session end nono waits up to `flush_timeout_secs` for what is left.
+- With `required: true`, the session does not start unless the host is
+  enrolled, and nono exits with status 74 if any chunk could not be delivered.
+  It also makes the recording itself required.
+- The platform treats uploaded chunks as unverified until the session's audit
+  log arrives and matches them.
+- The only receiver so far is `platform`. Chunks that were not delivered stay in
+  the local recording.
+
+The wire format is specified in the
+[recording delivery protocol](https://github.com/nolabs-ai/nono/blob/main/docs/protocols/recording-delivery-v1.md).
+
+## Current limits
+
+- Only sessions with a terminal are recorded.
+- Input from `nono attach` clients is attributed as `attach:<n>`.

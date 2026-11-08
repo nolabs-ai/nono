@@ -358,6 +358,11 @@ pub fn run_attach(args: &AttachArgs) -> Result<()> {
 
     if !args.bridge_status {
         eprintln!("[nono] Attaching to session {}...", record.session_id);
+        // §7: everyone who joins a recorded session is told, not only the
+        // terminal that started it.
+        if let Some(notice) = crate::terminal_capture::session_notice(&record) {
+            eprintln!("{notice}");
+        }
     }
 
     if record.status == SessionStatus::Paused {
@@ -432,6 +437,14 @@ pub fn run_inspect(args: &InspectArgs) -> Result<()> {
             .map_err(|e| NonoError::ConfigParse(format!("JSON serialization failed: {e}")))?;
         if let Some(object) = value.as_object_mut() {
             tools.extend_json(object)?;
+            if let Some(report) = recording_report(&record) {
+                object.insert(
+                    "recording_check".to_string(),
+                    serde_json::to_value(report).map_err(|e| {
+                        NonoError::ConfigParse(format!("JSON serialization failed: {e}"))
+                    })?,
+                );
+            }
         }
         let json = serde_json::to_string_pretty(&value)
             .map_err(|e| NonoError::ConfigParse(format!("JSON serialization failed: {e}")))?;
@@ -465,8 +478,59 @@ pub fn run_inspect(args: &InspectArgs) -> Result<()> {
     if let Some(line) = tools.render() {
         println!("Tools:      {line}");
     }
+    if let Some(line) = recording_line(&record) {
+        println!("Recording:  {line}");
+    }
 
     Ok(())
+}
+
+/// Check a recorded session's stored recording against its audit log.
+fn recording_report(
+    record: &SessionRecord,
+) -> Option<crate::terminal_capture::recording::RecordingReport> {
+    record.recording.as_ref()?;
+    let dir =
+        crate::audit_session::resolve_session_dir(record.rollback_session.as_deref()?).ok()?;
+    crate::terminal_capture::recording::verify(&dir).ok()
+}
+
+/// The recording state, destinations and loss, as `nono inspect` shows them.
+fn recording_line(record: &SessionRecord) -> Option<String> {
+    let state = record.recording.as_ref()?;
+    let mut parts = vec![if state.required {
+        "required".to_string()
+    } else {
+        "on".to_string()
+    }];
+    parts.push(if state.input {
+        "input recorded".to_string()
+    } else {
+        "input not recorded".to_string()
+    });
+    if let Some(report) = recording_report(record).as_ref() {
+        parts.push(format!(
+            "{} chunk(s), {}",
+            report.chunks,
+            crate::audit_session::format_bytes(report.stored_bytes)
+        ));
+        parts.push(if report.verified() {
+            "verified".to_string()
+        } else {
+            "MISMATCH (run `nono audit verify`)".to_string()
+        });
+        if report.lost_events > 0 {
+            parts.push(format!("{} event(s) lost", report.lost_events));
+        }
+        if report.truncated {
+            parts.push("stopped at size limit".to_string());
+        }
+    }
+    let mut line = parts.join(", ");
+    for file in &state.files {
+        line.push_str(&format!("\n            copy: {}", file.display()));
+    }
+    Some(line)
 }
 
 /// A session's mediated-command rollup, as `nono inspect` reports it.
@@ -820,6 +884,7 @@ mod tests {
                 workdir: PathBuf::from("/work"),
                 network: "blocked".to_string(),
                 rollback_session: rollback_session.map(str::to_string),
+                recording: None,
             }
         }
 

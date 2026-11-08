@@ -32,7 +32,7 @@ pub(crate) struct CommandPolicyAuditRecord {
 /// "is this the last line?" against the live file instead would race a
 /// concurrent writer: a record completed after a torn read but before the
 /// check would turn the tolerated tail into a hard error.
-fn for_each_event_record(
+pub(crate) fn for_each_event_record(
     path: &Path,
     tolerate_partial_tail: bool,
     mut visit: impl FnMut(AuditEventRecord),

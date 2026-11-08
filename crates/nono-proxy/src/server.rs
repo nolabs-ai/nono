@@ -1224,7 +1224,7 @@ pub async fn start_with_network_approval(
     let route_store = if config.routes.is_empty() {
         RouteStore::empty()
     } else {
-        RouteStore::load(&config.routes).await?
+        RouteStore::load_with_registry(&config.routes, config.secret_registry.as_ref()).await?
     };
     let route_hosts = route_store.route_upstream_hosts();
     validate_no_proxy_route_conflicts(&config.no_proxy, &route_hosts)?;
@@ -1255,10 +1255,11 @@ pub async fn start_with_network_approval(
 
     info!("Proxy server listening on {}", local_addr);
 
-    let oauth_capture_store = OAuthCaptureStore::load_with_persistence(
+    let mut oauth_capture_store = OAuthCaptureStore::load_with_persistence(
         &config.oauth_capture,
         config.oauth_capture_store_path.clone(),
     )?;
+    oauth_capture_store.set_secret_registry(config.secret_registry.clone());
     let oauth_capture_store = Arc::new(oauth_capture_store);
     let effective_nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>> =
         if oauth_capture_store.is_empty() {
@@ -1314,10 +1315,11 @@ pub async fn start_with_network_approval(
     let (credential_store, proxy_diagnostics) = if config.routes.is_empty() {
         (CredentialStore::empty(), Vec::new())
     } else {
-        let outcome = CredentialStore::load_with_diagnostics(
+        let outcome = CredentialStore::load_with_registry(
             &config.routes,
             &tls_connector,
             config.outer_caps.as_ref(),
+            config.secret_registry.as_ref(),
         )
         .await?;
         (outcome.store, outcome.diagnostics)

@@ -5,9 +5,13 @@
 //! percent-encoded, with one linear-time Aho-Corasick automaton. Matches are
 //! replaced with `[redacted:credential:<name>]`.
 //!
-//! A value split across two reads is still matched: each stream holds back a
-//! tail one byte shorter than the longest pattern and releases it with the
-//! next read, or when the caller flushes (chunk close, suspend, session end).
+//! A value split across reads is still matched, however long the pause
+//! between them: each stream holds back only a tail that could start a
+//! value, never more than the longest pattern less one byte, and releases it
+//! with the next read. When a stream ends (session end, or input entering
+//! password mode), a held tail of [`MIN_MATCH_LEN`] bytes or more is replaced
+//! rather than released, so no more of a value is revealed than of a value
+//! too short to match.
 //!
 //! Values shorter than [`MIN_MATCH_LEN`] bytes are not matched, because they
 //! would match ordinary text. Their names (never their values) are reported
@@ -23,6 +27,9 @@ use zeroize::Zeroizing;
 
 /// Values shorter than this many bytes are not matched.
 pub(crate) const MIN_MATCH_LEN: usize = 8;
+
+/// Replaces the start of a value left unfinished when its stream ended.
+const PARTIAL_REPLACEMENT: &[u8] = b"[redacted:credential:partial]";
 
 /// The compiled matcher for one registry version.
 struct Matcher {
@@ -244,12 +251,24 @@ impl Redactor {
 
     /// Protect `input` on `stream`, holding back a possible partial match.
     pub(crate) fn process(&mut self, stream: usize, input: &[u8]) -> Redacted {
-        self.run(stream, input, false)
+        self.run(stream, input)
     }
 
-    /// Release everything held back on `stream`.
-    pub(crate) fn flush(&mut self, stream: usize) -> Redacted {
-        self.run(stream, &[], true)
+    /// End `stream`: nothing more can complete a match. The held tail is
+    /// released when shorter than [`MIN_MATCH_LEN`], and replaced otherwise.
+    pub(crate) fn end_stream(&mut self, stream: usize) -> Redacted {
+        let mut out = self.run(stream, &[]);
+        let Some(state) = self.streams.get_mut(stream) else {
+            return out;
+        };
+        let tail = std::mem::take(&mut state.pending);
+        if tail.len() >= MIN_MATCH_LEN {
+            out.bytes.extend_from_slice(PARTIAL_REPLACEMENT);
+            out.redactions = out.redactions.saturating_add(1);
+        } else {
+            out.bytes.extend_from_slice(&tail);
+        }
+        out
     }
 
     /// Whether `stream` holds back any bytes.
@@ -259,7 +278,7 @@ impl Redactor {
             .is_some_and(|s| !s.pending.is_empty())
     }
 
-    fn run(&mut self, stream: usize, input: &[u8], final_flush: bool) -> Redacted {
+    fn run(&mut self, stream: usize, input: &[u8]) -> Redacted {
         let Some(state) = self.streams.get_mut(stream) else {
             return Redacted::default();
         };
@@ -275,11 +294,7 @@ impl Redactor {
         let mut buf = Zeroizing::new(std::mem::take(&mut *state.pending));
         buf.extend_from_slice(input);
 
-        let safe = if final_flush {
-            buf.len()
-        } else {
-            self.matcher.hold_from(&buf)
-        };
+        let safe = self.matcher.hold_from(&buf);
 
         let mut out = Vec::with_capacity(buf.len());
         let mut cursor = 0usize;
@@ -331,7 +346,7 @@ mod tests {
             bytes.extend(out.bytes);
             count += out.redactions;
         }
-        let out = r.flush(stream);
+        let out = r.end_stream(stream);
         bytes.extend(out.bytes);
         (bytes, count + out.redactions)
     }
@@ -373,13 +388,47 @@ mod tests {
         let (a, b) = SECRET.split_at(10);
         let first = r.process(0, a.as_bytes());
         let other = r.process(1, b.as_bytes());
-        let rest = r.flush(0);
+        let rest = r.end_stream(0);
         let mut zero = first.bytes;
         zero.extend(rest.bytes);
-        assert_eq!(zero, a.as_bytes());
+        // Stream 0 ended on 10 bytes of the value: replaced, not released.
+        assert_eq!(zero, PARTIAL_REPLACEMENT);
         let mut one = other.bytes;
-        one.extend(r.flush(1).bytes);
+        one.extend(r.end_stream(1).bytes);
         assert_eq!(one, b.as_bytes());
+    }
+
+    #[test]
+    fn a_value_interrupted_by_a_pause_is_still_matched() {
+        let mut r = redactor_with(&[("tok", SECRET)]);
+        let (a, b) = SECRET.split_at(12);
+        let before = r.process(0, format!("x {a}").as_bytes());
+        // Nothing of the value is released while it could still complete.
+        assert_eq!(before.bytes, b"x ");
+        assert!(r.has_pending(0));
+        let after = r.process(0, format!("{b} y").as_bytes());
+        let mut out = before.bytes;
+        out.extend(after.bytes);
+        out.extend(r.end_stream(0).bytes);
+        assert_eq!(out, b"x [redacted:credential:tok] y");
+        assert_eq!(after.redactions, 1);
+    }
+
+    #[test]
+    fn an_unfinished_value_is_replaced_only_once_long_enough_to_matter() {
+        let mut r = redactor_with(&[("tok", SECRET)]);
+        let short = &SECRET[..MIN_MATCH_LEN - 1];
+        let mut out = r.process(0, format!("a {short}").as_bytes()).bytes;
+        out.extend(r.end_stream(0).bytes);
+        assert_eq!(out, format!("a {short}").as_bytes());
+
+        let long = &SECRET[..MIN_MATCH_LEN];
+        let mut out = r.process(0, format!("b {long}").as_bytes()).bytes;
+        let end = r.end_stream(0);
+        out.extend(end.bytes);
+        assert_eq!(out, [b"b ".as_slice(), PARTIAL_REPLACEMENT].concat());
+        assert_eq!(end.redactions, 1);
+        assert!(!r.has_pending(0));
     }
 
     #[test]

@@ -1370,8 +1370,23 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     detach_sequence,
                 ) {
                     Ok(mut proxy) => {
-                        if let Some(capture) = terminal_capture {
-                            proxy.set_capture(capture);
+                        if let Some(mut capture) = terminal_capture {
+                            // The recorder's threads start only now, in the
+                            // parent: the fork above needs a single-threaded
+                            // process (ThreadingContext::Strict).
+                            match capture.activate() {
+                                Ok(()) => proxy.set_capture(capture),
+                                Err(e) if capture.is_required() => {
+                                    let _ = signal::kill(child, Signal::SIGKILL);
+                                    let _ = waitpid(child, None);
+                                    return Err(NonoError::SandboxInit(format!(
+                                        "required session recording cannot start: {e}"
+                                    )));
+                                }
+                                Err(e) => eprintln!(
+                                    "[nono] Warning: session recording is off for this session: {e}"
+                                ),
+                            }
                         }
                         Some(proxy)
                     }

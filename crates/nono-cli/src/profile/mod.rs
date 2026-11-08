@@ -3724,6 +3724,8 @@ fn resolve_extends(
         // Pop to restore the stack to the pre-base state. On the error path
         // above (? propagation), visited is abandoned so the missing pop is harmless.
         visited.pop();
+        let mut resolved_base = resolved_base;
+        drop_inherited_recording_file(&mut resolved_base);
 
         accumulated_base = Some(match accumulated_base {
             Some(acc) => merge_profiles(acc, resolved_base),
@@ -3815,6 +3817,40 @@ fn load_base_profile_raw(
         "base profile '{}' not found",
         name
     )))
+}
+
+/// `session_recording.file` makes the unsandboxed supervisor create a file
+/// on the host, so it is honoured only from the profile selected for the
+/// session, which `sandbox_prepare` further limits to user-authored profiles.
+/// A base reached through `extends` may be a package or built-in profile,
+/// so its destination, including any in its `platform_overrides`, is
+/// dropped before it is merged. Recording that the destination turned on
+/// stays on.
+fn drop_inherited_recording_file(base: &mut Profile) {
+    fn strip(recording: Option<&mut SessionRecordingConfig>) {
+        if let Some(recording) = recording
+            && recording.file.is_some()
+        {
+            let enabled = recording.is_enabled();
+            recording.file = None;
+            if enabled {
+                recording.enabled = Some(true);
+            }
+        }
+    }
+    strip(base.session_recording.as_mut());
+    if let Some(overrides) = base.platform_overrides.as_mut() {
+        for platform in [
+            overrides.macos.as_mut(),
+            overrides.linux.as_mut(),
+            overrides.windows.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            strip(platform.0.session_recording.as_mut());
+        }
+    }
 }
 
 /// Merge a resolved base profile with a child profile.
@@ -12623,6 +12659,53 @@ mod tests {
         assert_eq!(merged.input, Some(SessionRecordingInput::On));
         assert_eq!(merged.max_bytes, Some(4096));
         assert_eq!(merged.file.as_deref(), Some("/artifacts/base.cast"));
+    }
+
+    #[test]
+    fn inherited_recording_file_destinations_are_dropped() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("packaged.json"),
+            r#"{
+                "meta": { "name": "packaged" },
+                "extends": "default",
+                "session_recording": { "file": "/etc/cron.d/recording.cast" },
+                "platform_overrides": {
+                    "linux": { "session_recording": { "file": "/etc/linux.cast" } },
+                    "macos": { "session_recording": { "file": "/etc/macos.cast" } }
+                }
+            }"#,
+        )
+        .expect("write base");
+        let child_path = dir.path().join("local.json");
+        std::fs::write(
+            &child_path,
+            r#"{ "meta": { "name": "local" }, "extends": "packaged" }"#,
+        )
+        .expect("write child");
+        let recording = load_profile_from_path(&child_path)
+            .expect("load profile")
+            .session_recording
+            .expect("recording block kept");
+        assert_eq!(recording.file, None);
+        // The base turned recording on through its destination; it stays on.
+        assert!(recording.is_enabled());
+
+        // The selected profile's own destination is kept.
+        std::fs::write(
+            &child_path,
+            r#"{
+                "meta": { "name": "local" },
+                "extends": "packaged",
+                "session_recording": { "file": "/home/me/session.cast" }
+            }"#,
+        )
+        .expect("rewrite child");
+        let recording = load_profile_from_path(&child_path)
+            .expect("load profile")
+            .session_recording
+            .expect("recording block kept");
+        assert_eq!(recording.file.as_deref(), Some("/home/me/session.cast"));
     }
 
     #[test]

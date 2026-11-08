@@ -161,9 +161,13 @@ Arbitrary environment variables are not included.
 
 - Values are matched raw, in base64 (standard and URL-safe), and
   percent-encoded, using a linear-time multi-pattern matcher.
-- A value split across two reads is still matched. The stage holds back a
-  tail as long as the longest value, and releases it on the next read, at
-  chunk close, or at session end.
+- A value split across reads is still matched, however long the pause
+  between them. The stage holds back only a tail that could start a value,
+  shorter than the longest value, and releases it with the next read. It is
+  never released on a timer or at a suspend, since the rest of the value
+  could follow. When the stream ends (session end, or input entering
+  password mode), a held tail of 8 bytes or more is replaced rather than
+  released.
 - Values shorter than 8 bytes are not matched. Their names (never their
   values) are listed in the session's coverage record, so the gap is
   visible.

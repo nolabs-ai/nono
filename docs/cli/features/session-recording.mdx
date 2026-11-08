@@ -55,9 +55,10 @@ Two protections always apply. They have no settings and cannot be turned off.
   input. This covers proxy-injected credentials, credentials loaded into the
   environment from keyrings or providers, and credential capture outputs, as
   well as tokens nono refreshes during the session. Values are also matched
-  base64-encoded and percent-encoded, and when they are split across reads.
-  Values shorter than 8 bytes are not matched; their names (never their values)
-  are listed in the recording so the gap is visible.
+  base64-encoded and percent-encoded, and when they are split across reads,
+  however long the pause between the pieces. Values shorter than 8 bytes are
+  not matched; their names (never their values) are listed in the recording so
+  the gap is visible.
 - **Password input is never recorded.** While the terminal is in canonical mode
   with echo off, which is how `sudo`, `ssh` and `getpass(3)` read passwords,
   nono records only that input was typed, not what or how much. Full-screen
@@ -146,9 +147,10 @@ is kept current while the session runs.
   `$WORKDIR` and `~` are expanded in profile paths.
 - Both files are created when the session starts and must not already exist.
   nono never overwrites a file or writes through a symlink.
-- `file` is honoured only in profiles you authored (a user profile or a profile
-  given by path). Package, registry and built-in profiles cannot choose where
-  nono writes; recording stays on without the copy.
+- `file` is honoured only in the profile you select, and only when you authored
+  it (a user profile or a profile given by path). A `file` inherited through
+  `extends` is ignored, as is one in a package, registry or built-in profile;
+  recording stays on without the copy.
 - A profile can set one `file`, and `--record-file` adds another.
 
 The copy in the audit directory remains the authoritative recording.

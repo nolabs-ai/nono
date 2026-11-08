@@ -74,6 +74,11 @@ pub(crate) struct ChunkInfo {
 pub(crate) trait Sink: Send {
     fn name(&self) -> &str;
     fn required(&self) -> bool;
+    /// Start any worker the sink needs. Runs on the recorder thread, after
+    /// the supervisor has forked.
+    fn activate(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn write(&mut self, event: &ProtectedEvent) -> Result<()>;
     fn chunk_closed(&mut self, chunk: &ChunkInfo) -> Result<()>;
     fn close(&mut self, end: &SessionEnd) -> Result<()>;
@@ -259,6 +264,14 @@ impl Writer {
         rx: Receiver<WriterMsg>,
         queued: Arc<AtomicUsize>,
     ) -> WriterSummary {
+        for sink in &mut self.sinks {
+            if let Err(e) = sink.activate() {
+                tracing::warn!("terminal capture sink {} failed to start: {e}", sink.name());
+                if sink.required() {
+                    set_fatal(&self.fatal, format!("{} sink failed", sink.name()));
+                }
+            }
+        }
         loop {
             let msg = match self.open.as_ref() {
                 Some(chunk) => {

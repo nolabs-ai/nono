@@ -32,7 +32,7 @@ use nono_proxy::SecretRegistry;
 use redact::Redactor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,9 +55,6 @@ pub(crate) const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const QUEUE_MESSAGES: usize = 4096;
 const QUEUE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Held-back bytes older than this are released even without new input, so
-/// a pause never keeps them out of the recording past one chunk window.
-const HOLDBACK_MAX_AGE: Duration = DEFAULT_CHUNK_MAX_DURATION;
 /// Output silence after which the foreground process is sampled.
 const FOREGROUND_QUIET: Duration = Duration::from_millis(300);
 
@@ -174,8 +171,8 @@ pub(crate) fn start_for_session(ctx: SessionCaptureContext<'_>) -> Result<Option
     if let Some(delivery) = ctx.settings.delivery.as_ref() {
         let started = delivery::platform_receiver()
             .and_then(|receiver| delivery::PlatformTransport::new(receiver, audit_session_id))
-            .and_then(|transport| {
-                delivery::DeliverySink::start(
+            .map(|transport| {
+                delivery::DeliverySink::new(
                     Box::new(transport),
                     recording_dir(audit_session_dir),
                     delivery.clone(),
@@ -295,11 +292,12 @@ pub(crate) struct TerminalCapture {
     lost: Option<(u64, u64)>,
     fatal: FatalSlot,
     writer: Option<JoinHandle<WriterSummary>>,
+    /// The writer before `activate` starts its thread.
+    pending_writer: Option<(Writer, Receiver<WriterMsg>)>,
     last_mode: Option<(bool, bool)>,
     last_foreground: Option<i32>,
     last_size: Option<(u16, u16)>,
     last_input_client: Option<String>,
-    held_since: [Option<Instant>; 3],
     last_output_at: Option<Instant>,
     foreground_sampled: bool,
     /// `file` sink destinations that were opened.
@@ -309,8 +307,11 @@ pub(crate) struct TerminalCapture {
 }
 
 impl TerminalCapture {
-    /// Start capture: create the recording directory and the writer thread,
-    /// and record the `started` lifecycle event.
+    /// Prepare capture: create the recording directory and the writer, and
+    /// record the `started` lifecycle event. No thread is started, so this
+    /// may run before the supervisor forks; [`activate`](Self::activate)
+    /// starts the recorder afterwards, in the parent. Events recorded in
+    /// between wait in the queue.
     pub(crate) fn start(
         config: CaptureConfig,
         registry: SecretRegistry,
@@ -337,13 +338,6 @@ impl TerminalCapture {
         )?;
         let (tx, rx) = sync_channel(QUEUE_MESSAGES);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
-        let writer_queued = queued_bytes.clone();
-        let handle = std::thread::Builder::new()
-            .name("nono-terminal-recorder".to_string())
-            .spawn(move || writer.run(rx, writer_queued))
-            .map_err(|e| {
-                NonoError::Snapshot(format!("failed to start terminal recorder thread: {e}"))
-            })?;
 
         let mut capture = Self {
             start: Instant::now(),
@@ -355,12 +349,12 @@ impl TerminalCapture {
             queued_bytes,
             lost: None,
             fatal,
-            writer: Some(handle),
+            writer: None,
+            pending_writer: Some((writer, rx)),
             last_mode: None,
             last_foreground: None,
             last_size: config.initial_size,
             last_input_client: None,
-            held_since: [None; 3],
             last_output_at: None,
             foreground_sampled: true,
             files: Vec::new(),
@@ -375,6 +369,24 @@ impl TerminalCapture {
             capture.emit(CaptureEvent::Coverage { unmatched }, 0);
         }
         Ok(capture)
+    }
+
+    /// Start the recorder thread, and through it the sinks' workers. Called
+    /// in the supervisor after the fork, which needs a single-threaded
+    /// process; calling it again does nothing.
+    pub(crate) fn activate(&mut self) -> Result<()> {
+        let Some((writer, rx)) = self.pending_writer.take() else {
+            return Ok(());
+        };
+        let queued = self.queued_bytes.clone();
+        let handle = std::thread::Builder::new()
+            .name("nono-terminal-recorder".to_string())
+            .spawn(move || writer.run(rx, queued))
+            .map_err(|e| {
+                NonoError::Snapshot(format!("failed to start terminal recorder thread: {e}"))
+            })?;
+        self.writer = Some(handle);
+        Ok(())
     }
 
     fn offset_us(&self) -> u64 {
@@ -453,16 +465,6 @@ impl TerminalCapture {
         }
     }
 
-    fn note_held(&mut self, stream: usize) {
-        if let Some(slot) = self.held_since.get_mut(stream) {
-            if self.redactor.has_pending(stream) {
-                slot.get_or_insert_with(Instant::now);
-            } else {
-                *slot = None;
-            }
-        }
-    }
-
     /// Record agent output.
     pub(crate) fn output(&mut self, stream: OutputStream, bytes: &[u8]) {
         if bytes.is_empty() {
@@ -470,7 +472,6 @@ impl TerminalCapture {
         }
         self.refresh_redactor();
         let protected = self.redactor.process(stream.index(), bytes);
-        self.note_held(stream.index());
         self.last_output_at = Some(Instant::now());
         self.foreground_sampled = false;
         if !protected.bytes.is_empty() {
@@ -542,9 +543,10 @@ impl TerminalCapture {
             None
         };
         if let Some(reason) = reason {
-            // Release anything typed before the window opened, then record
-            // only that input happened: no content, no length.
-            self.release_held(INPUT_STREAM);
+            // Input typed before the window opened can no longer continue
+            // a match: end that stream, then record only that input
+            // happened: no content, no length.
+            self.end_stream(INPUT_STREAM);
             self.emit(
                 CaptureEvent::InputSuppressed {
                     client: client.to_string(),
@@ -556,7 +558,6 @@ impl TerminalCapture {
         }
         self.refresh_redactor();
         let protected = self.redactor.process(INPUT_STREAM, &bytes);
-        self.note_held(INPUT_STREAM);
         if !protected.bytes.is_empty() {
             self.emit(
                 CaptureEvent::Input {
@@ -603,23 +604,23 @@ impl TerminalCapture {
 
     pub(crate) fn lifecycle(&mut self, event: Lifecycle) {
         if matches!(event, Lifecycle::Suspended) {
-            self.release_all_held();
+            // A suspend closes the open chunk (§4). Bytes held back as a
+            // possible credential stay held, so the match can still
+            // complete when the session resumes.
             self.emit(CaptureEvent::Lifecycle(event), 0);
-            // A suspend closes the open chunk (§4).
             let _ = self.send(WriterMsg::CloseChunk);
             return;
         }
         self.emit(CaptureEvent::Lifecycle(event), 0);
     }
 
-    fn release_held(&mut self, stream: usize) {
+    /// End `stream`: no more bytes can continue a match, so release what is
+    /// held back (see [`Redactor::end_stream`]).
+    fn end_stream(&mut self, stream: usize) {
         if !self.redactor.has_pending(stream) {
             return;
         }
-        let protected = self.redactor.flush(stream);
-        if let Some(slot) = self.held_since.get_mut(stream) {
-            *slot = None;
-        }
+        let protected = self.redactor.end_stream(stream);
         if protected.bytes.is_empty() {
             return;
         }
@@ -644,27 +645,14 @@ impl TerminalCapture {
         self.emit(event, protected.redactions);
     }
 
-    fn release_all_held(&mut self) {
-        for stream in 0..3 {
-            self.release_held(stream);
-        }
-    }
-
-    /// Periodic housekeeping from the poll loop: release held-back bytes
-    /// that have waited a full chunk window, and report a fatal failure of
-    /// a required destination.
+    /// Periodic check from the poll loop: report a fatal failure of a
+    /// required destination.
+    ///
+    /// Held-back bytes are never released on a timer: releasing a partial
+    /// match would let the rest of the credential, arriving later, through
+    /// unmatched. At most the longest pattern's length less one byte is held
+    /// per stream, and it is recorded with the next bytes or at session end.
     pub(crate) fn tick(&mut self) -> Option<String> {
-        for stream in 0..3 {
-            if self
-                .held_since
-                .get(stream)
-                .copied()
-                .flatten()
-                .is_some_and(|t| t.elapsed() >= HOLDBACK_MAX_AGE)
-            {
-                self.release_held(stream);
-            }
-        }
         self.fatal_reason()
     }
 
@@ -681,7 +669,14 @@ impl TerminalCapture {
     /// Must run before the audit log records `session_ended`, so every
     /// `terminal_chunk` record precedes it.
     pub(crate) fn finish(mut self, status: String) -> CaptureSummary {
-        self.release_all_held();
+        // Normally started after the fork; a session that ended before then
+        // still closes its recording.
+        if let Err(e) = self.activate() {
+            tracing::warn!("{e}");
+        }
+        for stream in 0..3 {
+            self.end_stream(stream);
+        }
         self.emit(
             CaptureEvent::Lifecycle(Lifecycle::Exited {
                 status: status.clone(),
@@ -723,7 +718,8 @@ impl TerminalCapture {
 impl Drop for TerminalCapture {
     fn drop(&mut self) {
         // Without `finish`, closing the channel lets the writer close its
-        // open chunk and exit.
+        // open chunk and exit. A writer never started has nothing open.
+        self.pending_writer.take();
         self.tx.take();
         if let Some(handle) = self.writer.take() {
             let _ = handle.join();
@@ -800,13 +796,15 @@ mod tests {
         }
 
         fn start(&self, config: CaptureConfig) -> TerminalCapture {
-            TerminalCapture::start(
+            let mut capture = TerminalCapture::start(
                 config,
                 self.registry.clone(),
                 self.audit.clone(),
                 Vec::new(),
             )
-            .unwrap()
+            .unwrap();
+            capture.activate().unwrap();
+            capture
         }
 
         fn chunk_events(&self) -> Vec<TerminalChunkEvent> {
@@ -1267,6 +1265,38 @@ mod tests {
         capture.output(OutputStream::Pty, b"b");
         capture.finish("exited:0".to_string());
         assert_eq!(h.chunk_events().len(), 2);
+    }
+
+    #[test]
+    fn preparing_capture_starts_no_thread_until_activated() {
+        let h = Harness::new();
+        let mut capture =
+            TerminalCapture::start(h.config(), h.registry.clone(), h.audit.clone(), Vec::new())
+                .unwrap();
+        // The supervisor forks here; the process must still be single-threaded.
+        assert!(capture.writer.is_none());
+        capture.output(OutputStream::Pty, b"queued before the fork");
+        capture.activate().unwrap();
+        assert!(capture.writer.is_some());
+        capture.finish("exited:0".to_string());
+        assert!(h.recording().contains("queued before the fork"));
+    }
+
+    #[test]
+    fn a_credential_split_by_a_suspend_is_still_removed() {
+        let h = Harness::new();
+        let mut capture = h.start(h.config());
+        let (a, b) = SECRET.split_at(12);
+        capture.output(OutputStream::Pty, format!("token: {a}").as_bytes());
+        capture.lifecycle(Lifecycle::Suspended);
+        assert!(capture.tick().is_none());
+        capture.lifecycle(Lifecycle::Resumed);
+        capture.output(OutputStream::Pty, format!("{b}\r\n").as_bytes());
+        capture.finish("exited:0".to_string());
+        let recording = h.recording();
+        assert!(!recording.contains(a), "the start of the value leaked");
+        assert!(!recording.contains(b), "the rest of the value leaked");
+        assert!(recording.contains("[redacted:credential:GITHUB_TOKEN]"));
     }
 
     #[test]

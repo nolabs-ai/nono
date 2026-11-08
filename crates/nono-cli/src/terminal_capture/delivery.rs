@@ -51,7 +51,10 @@ pub(crate) struct DeliveryOutcome {
 
 enum Job {
     Chunk(TerminalChunkEvent),
+    /// No more chunks: finish delivering the queue, then report.
     End,
+    /// The flush timeout ran out: report now and stop.
+    Cancel,
 }
 
 /// Result of one upload attempt.
@@ -181,7 +184,7 @@ fn classify(status: u16, index: u64, body: &str) -> Attempt {
 }
 
 /// The uploader's loop: deliver queued chunks in order until told to end
-/// and the queue is empty.
+/// and the queue is empty, or until cancelled.
 fn run_uploader(
     mut transport: Box<dyn Transport>,
     dir: PathBuf,
@@ -194,43 +197,47 @@ fn run_uploader(
     let mut backoff = BACKOFF_START;
     let mut retry_at: Option<Instant> = None;
     loop {
-        // Wait for work only when there is nothing to send.
-        if queue.is_empty() && !ending {
-            match jobs.recv() {
-                Ok(Job::Chunk(chunk)) => queue.push_back(chunk),
-                Ok(Job::End) | Err(_) => ending = true,
-            }
+        if queue.is_empty() && ending {
+            let _ = done.send(outcome);
+            return;
         }
-        loop {
-            match jobs.try_recv() {
-                Ok(Job::Chunk(chunk)) => queue.push_back(chunk),
-                Ok(Job::End) | Err(TryRecvError::Disconnected) => {
-                    ending = true;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
+        // Block for work when there is nothing to send, wait for new jobs
+        // or the retry time while backing off, and otherwise just collect
+        // whatever has arrived. The sender stays connected until `close`
+        // has its answer or cancels, so these waits do not spin.
+        let now = Instant::now();
+        let next = if queue.is_empty() {
+            jobs.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        } else {
+            match retry_at {
+                Some(at) if at > now => jobs.recv_timeout(at - now),
+                _ => jobs.try_recv().map_err(|e| match e {
+                    TryRecvError::Empty => RecvTimeoutError::Timeout,
+                    TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+                }),
             }
-        }
-        if queue.is_empty() {
-            if ending {
+        };
+        match next {
+            Ok(Job::Chunk(chunk)) => {
+                queue.push_back(chunk);
+                continue;
+            }
+            Ok(Job::End) => {
+                ending = true;
+                continue;
+            }
+            // Cancelled, or the sink is gone: stop without further attempts.
+            Ok(Job::Cancel) | Err(RecvTimeoutError::Disconnected) => {
+                outcome.undelivered = u64::try_from(queue.len()).unwrap_or(u64::MAX);
                 let _ = done.send(outcome);
                 return;
             }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        if retry_at.is_some_and(|at| Instant::now() < at) {
             continue;
         }
-        if let Some(at) = retry_at {
-            let now = Instant::now();
-            if now < at {
-                // Wake for new jobs or the retry, whichever is first.
-                match jobs.recv_timeout(at - now) {
-                    Ok(Job::Chunk(chunk)) => queue.push_back(chunk),
-                    Ok(Job::End) | Err(RecvTimeoutError::Disconnected) => ending = true,
-                    Err(RecvTimeoutError::Timeout) => {}
-                }
-                continue;
-            }
-            retry_at = None;
-        }
+        retry_at = None;
         let Some(chunk) = queue.front().cloned() else {
             continue;
         };
@@ -265,31 +272,44 @@ fn run_uploader(
     }
 }
 
+/// The uploader's inputs, kept until [`Sink::activate`] starts it.
+struct PendingUploader {
+    transport: Box<dyn Transport>,
+    recording_dir: PathBuf,
+    jobs: Receiver<Job>,
+    done: Sender<DeliveryOutcome>,
+}
+
 pub(crate) struct DeliverySink {
     jobs: Option<Sender<Job>>,
     done: Receiver<DeliveryOutcome>,
+    uploader: Option<PendingUploader>,
     queued: u64,
     settings: DeliverySettings,
 }
 
 impl DeliverySink {
-    pub(crate) fn start(
+    /// Prepare delivery. The uploader thread starts in `activate`, after the
+    /// supervisor has forked; chunks closed before then wait in the queue.
+    pub(crate) fn new(
         transport: Box<dyn Transport>,
         recording_dir: PathBuf,
         settings: DeliverySettings,
-    ) -> Result<Self> {
+    ) -> Self {
         let (jobs, job_rx) = channel();
         let (done_tx, done) = channel();
-        std::thread::Builder::new()
-            .name("nono-recording-delivery".to_string())
-            .spawn(move || run_uploader(transport, recording_dir, job_rx, done_tx))
-            .map_err(|e| NonoError::Snapshot(format!("failed to start recording delivery: {e}")))?;
-        Ok(Self {
+        Self {
             jobs: Some(jobs),
             done,
+            uploader: Some(PendingUploader {
+                transport,
+                recording_dir,
+                jobs: job_rx,
+                done: done_tx,
+            }),
             queued: 0,
             settings,
-        })
+        }
     }
 }
 
@@ -300,6 +320,24 @@ impl Sink for DeliverySink {
 
     fn required(&self) -> bool {
         self.settings.required
+    }
+
+    fn activate(&mut self) -> Result<()> {
+        let Some(pending) = self.uploader.take() else {
+            return Ok(());
+        };
+        std::thread::Builder::new()
+            .name("nono-recording-delivery".to_string())
+            .spawn(move || {
+                run_uploader(
+                    pending.transport,
+                    pending.recording_dir,
+                    pending.jobs,
+                    pending.done,
+                )
+            })
+            .map_err(|e| NonoError::Snapshot(format!("failed to start recording delivery: {e}")))?;
+        Ok(())
     }
 
     fn write(&mut self, _event: &ProtectedEvent) -> Result<()> {
@@ -321,19 +359,33 @@ impl Sink for DeliverySink {
     }
 
     fn close(&mut self, _end: &SessionEnd) -> Result<()> {
-        if let Some(jobs) = self.jobs.take() {
-            let _ = jobs.send(Job::End);
-        }
-        let outcome = match self.done.recv_timeout(self.settings.flush_timeout) {
-            Ok(outcome) => outcome,
-            // Out of time: whatever was not confirmed is undelivered. The
-            // uploader thread is abandoned and ends with the process.
-            Err(_) => DeliveryOutcome {
-                delivered: 0,
-                rejected: 0,
-                undelivered: self.queued,
-            },
+        // The sender stays open until the uploader answers or is cancelled,
+        // so its waits keep working while it finishes.
+        let jobs = self.jobs.take();
+        let ended = jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.send(Job::End).is_ok());
+        let answer = if ended {
+            self.done.recv_timeout(self.settings.flush_timeout).ok()
+        } else {
+            None
         };
+        let outcome = match answer {
+            Some(outcome) => outcome,
+            // Out of time, or the uploader is gone: cancel it, and count
+            // whatever was not confirmed as undelivered.
+            None => {
+                if let Some(jobs) = jobs.as_ref() {
+                    let _ = jobs.send(Job::Cancel);
+                }
+                DeliveryOutcome {
+                    delivered: 0,
+                    rejected: 0,
+                    undelivered: self.queued,
+                }
+            }
+        };
+        drop(jobs);
         let missing = outcome.rejected.saturating_add(outcome.undelivered);
         if missing == 0 {
             tracing::info!(
@@ -426,15 +478,15 @@ mod tests {
             answers: answers.iter().copied().collect(),
             sent: sent.clone(),
         };
-        let sink = DeliverySink::start(
+        let mut sink = DeliverySink::new(
             Box::new(transport),
             dir.to_path_buf(),
             DeliverySettings {
                 required,
                 flush_timeout: flush,
             },
-        )
-        .unwrap();
+        );
+        sink.activate().unwrap();
         (sink, sent)
     }
 
@@ -482,6 +534,47 @@ mod tests {
         let started = Instant::now();
         assert!(sink.close(&end()).is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_timed_out_uploader_is_cancelled_and_stops_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sink, sent) = start_sink(
+            dir.path(),
+            &["retry"; 50],
+            false,
+            Duration::from_millis(200),
+        );
+        sink.chunk_closed(&chunk_info(dir.path(), 0)).unwrap();
+        assert!(sink.close(&end()).is_ok());
+        let attempts = sent.lock().unwrap().len();
+        // Past the first backoff: a live uploader would have retried by now.
+        std::thread::sleep(BACKOFF_START + Duration::from_millis(500));
+        assert_eq!(sent.lock().unwrap().len(), attempts);
+    }
+
+    #[test]
+    fn nothing_is_sent_before_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let transport = Scripted {
+            answers: ["ok"].into_iter().collect(),
+            sent: sent.clone(),
+        };
+        let mut sink = DeliverySink::new(
+            Box::new(transport),
+            dir.path().to_path_buf(),
+            DeliverySettings {
+                required: true,
+                flush_timeout: Duration::from_secs(10),
+            },
+        );
+        sink.chunk_closed(&chunk_info(dir.path(), 0)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(sent.lock().unwrap().is_empty());
+        sink.activate().unwrap();
+        sink.close(&end()).unwrap();
+        assert_eq!(*sent.lock().unwrap(), vec![0]);
     }
 
     #[test]

@@ -291,7 +291,7 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v2
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           draft: false
@@ -421,7 +421,7 @@ jobs:
           nix run .#prebuilt -- --version
 
       - name: Open PR
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8 # v8.1.2
         with:
           commit-message: "chore(nix): update prebuilt hashes for ${{ env.RELEASE_TAG }}"
           title: "chore(nix): update prebuilt hashes for ${{ env.RELEASE_TAG }}"

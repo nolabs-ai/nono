@@ -650,6 +650,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "argv_prepend",
             "credentials",
             "environment",
+            "exec_paths",
             "fs_read",
             "fs_read_file",
             "fs_write",
@@ -721,6 +722,8 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
         &[
             "allow_all",
             "allow_domain",
+            "open_port",
+            "open_port_range",
             "tcp_bind_ports",
             "tcp_connect_ports",
         ],
@@ -1475,4 +1478,63 @@ fn test_schema_allow_domain_endpoint_policy_excludes_endpoints() {
         validator.validate(&with_both).is_err(),
         "endpoints and endpoint_policy are mutually exclusive"
     );
+}
+
+#[test]
+fn test_schema_validates_aws_auth_profiles_map() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": { "custom_credentials": { "aws-sts": {
+            "upstream": "https://sts.us-east-1.amazonaws.com",
+            "aws_auth": {
+                "profiles": {
+                    "NONOPROFILE0DEVRO01": "dev-ro",
+                    "NONOPROFILE0STGRO01": "staging-ro"
+                }
+            }
+        } } }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("aws_auth.profiles map should validate");
+}
+
+#[test]
+fn test_schema_rejects_aws_auth_profile_with_profiles() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": { "custom_credentials": { "aws-sts": {
+            "upstream": "https://sts.us-east-1.amazonaws.com",
+            "aws_auth": {
+                "profile": "dev-ro",
+                "profiles": { "NONOPROFILE0DEVRO01": "dev-ro" }
+            }
+        } } }
+    });
+
+    assert!(
+        validator.validate(&profile).is_err(),
+        "aws_auth.profile and aws_auth.profiles must be mutually exclusive"
+    );
+}
+
+#[test]
+fn test_schema_rejects_aws_auth_profiles_bad_key() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    for profiles in [json!({}), json!({ "dev": "dev-ro" })] {
+        let profile = json!({
+            "network": { "custom_credentials": { "aws-sts": {
+                "upstream": "https://sts.us-east-1.amazonaws.com",
+                "aws_auth": { "profiles": profiles }
+            } } }
+        });
+        assert!(
+            validator.validate(&profile).is_err(),
+            "aws_auth.profiles {profiles} should be rejected"
+        );
+    }
 }

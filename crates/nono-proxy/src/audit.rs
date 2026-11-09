@@ -347,9 +347,9 @@ pub fn log_denied(
     push_event(audit_log, event);
 }
 
-/// Records a runtime host-approval decision on the CONNECT (transparent tunnel)
-/// path — the outcome of an interactive/backend prompt for a host that is not
-/// on the static allowlist.
+/// Records a runtime host-approval decision — the outcome of an
+/// interactive/backend prompt for a host that is not on the static allowlist,
+/// on either the CONNECT tunnel or the plain-HTTP forward-proxy path (`mode`).
 ///
 /// `decision` distinguishes the approval lifecycle states
 /// ([`NetworkAuditDecision::ApproveGranted`] / [`ApproveDenied`] / etc.) from a
@@ -358,8 +358,9 @@ pub fn log_denied(
 /// backend; `reason` carries the denial reason on refusal.
 ///
 /// [`ApproveDenied`]: NetworkAuditDecision::ApproveDenied
-pub fn log_connect_approval(
+pub fn log_host_approval(
     audit_log: Option<&SharedAuditLog>,
+    mode: ProxyMode,
     ctx: &EventContext<'_>,
     host: &str,
     port: u16,
@@ -368,20 +369,20 @@ pub fn log_connect_approval(
 ) {
     info!(
         target: "nono_proxy::audit",
-        mode = %ProxyMode::Connect,
+        mode = %mode,
         host = host,
         port = port,
         decision = ?decision,
         approval_backend = ctx.approval_backend,
         reason = reason,
-        "connect host approval decision"
+        "host approval decision"
     );
 
     push_event(
         audit_log,
         NetworkAuditEvent {
             timestamp_unix_ms: now_unix_millis(),
-            mode: map_mode(ProxyMode::Connect),
+            mode: map_mode(mode),
             decision,
             route_id: ctx.route_id.map(str::to_string),
             auth_mechanism: ctx.auth_mechanism.clone(),

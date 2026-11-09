@@ -3444,11 +3444,10 @@ fn add_outer_process_exec_gate(caps: &mut CapabilitySet, state: &ToolSandboxStat
         denied.insert(deny_only.path.clone());
     }
     // This sandbox is a routing guard, not the command sandbox selected by policy.
-    // It permits ordinary agent process execution, then denies configured
-    // policy command binaries by exact path so those tools must be reached
-    // through the broker shim on PATH. The supervisor applies the actual
+    // Exec is already scoped to the read set by the library profile; this denies
+    // configured policy command binaries by exact path so those tools must be
+    // reached through the broker shim on PATH. The supervisor applies the actual
     // command sandbox to the approved grandchild invocation.
-    caps.add_platform_rule("(allow process-exec*)")?;
     add_controlled_source_denies(caps, denied)
 }
 
@@ -6832,7 +6831,7 @@ mod tests {
     }
 
     #[test]
-    fn outer_process_exec_gate_allows_exec_but_denies_controlled_paths() -> Result<()> {
+    fn outer_process_exec_gate_has_no_blanket_allow_and_denies_controlled_paths() -> Result<()> {
         let temp = test_tempdir()?;
         let bin_dir = temp.path().join("bin");
         create_dir(&bin_dir)?;
@@ -6852,7 +6851,7 @@ mod tests {
 
         let rules = caps.platform_rules();
         assert!(
-            rules
+            !rules
                 .iter()
                 .any(|rule| rule.as_str() == "(allow process-exec*)")
         );

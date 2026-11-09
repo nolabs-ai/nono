@@ -54,6 +54,8 @@ aws-config = { version = "1", features = [
 ] }
 aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-types = "1"
+aws-runtime = "1"
 
 # TLS for upstream connections (reverse proxy mode)
 hyper-rustls = { version = "0.27.10", features = ["http1", "http2", "ring", "webpki-tokio"] }

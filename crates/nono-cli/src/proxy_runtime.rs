@@ -4653,6 +4653,7 @@ mod tests {
                 upstream: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
                 aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                     profile: Some("production".to_string()),
+                    profiles: None,
                     region: Some("us-east-1".to_string()),
                     service: Some("bedrock".to_string()),
                 }),

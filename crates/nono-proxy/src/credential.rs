@@ -518,14 +518,18 @@ impl CredentialStore {
                     }
                 }
             } else if let Some(ref aws_auth) = route.aws_auth {
+                // Identity source for logs: the listed profiles on a
+                // multi-profile route, else the single profile (None = default chain).
+                let identity = match aws_auth.profiles {
+                    Some(ref profiles) => {
+                        format!("profiles={:?}", profiles.values().collect::<Vec<_>>())
+                    }
+                    None => format!("profile={:?}", aws_auth.profile),
+                };
                 debug!(
                     "aws credential load: prefix='{}' upstream='{}' \
-                     explicit_region={:?} explicit_service={:?} profile={:?}",
-                    normalized_prefix,
-                    route.upstream,
-                    aws_auth.region,
-                    aws_auth.service,
-                    aws_auth.profile,
+                     explicit_region={:?} explicit_service={:?} {}",
+                    normalized_prefix, route.upstream, aws_auth.region, aws_auth.service, identity,
                 );
 
                 let Some((region, service)) = crate::aws::endpoints::resolve_signing_params(
@@ -544,32 +548,53 @@ impl CredentialStore {
                 // Profile deduplication is handled inside AwsRouteTable.
                 let profile_opt = aws_auth.profile.as_deref();
                 debug!(
-                    "aws credential load: prefix='{}' building provider for profile={:?}",
-                    normalized_prefix, profile_opt
+                    "aws credential load: prefix='{}' building providers for {}",
+                    normalized_prefix, identity
                 );
 
-                match aws_routes
-                    .insert_route(
-                        normalized_prefix.clone(),
-                        profile_opt,
-                        route.upstream.clone(),
-                        region,
-                        service,
-                    )
-                    .await
-                {
+                let inserted = match aws_auth.profiles {
+                    Some(ref profiles) => {
+                        aws_routes
+                            .insert_multi_profile_route(
+                                normalized_prefix.clone(),
+                                profiles,
+                                route.upstream.clone(),
+                                region,
+                                service,
+                            )
+                            .await
+                    }
+                    None => {
+                        aws_routes
+                            .insert_route(
+                                normalized_prefix.clone(),
+                                profile_opt,
+                                route.upstream.clone(),
+                                region,
+                                service,
+                            )
+                            .await
+                    }
+                };
+                match inserted {
                     Ok(()) => {
                         debug!(
-                            "aws credential load: prefix='{}' route inserted (profile={:?})",
-                            normalized_prefix, profile_opt
+                            "aws credential load: prefix='{}' route inserted ({})",
+                            normalized_prefix, identity
                         );
                     }
                     Err(msg) => {
-                        warn!(
+                        let message = format!(
                             "AWS route '{}': could not build credential provider: {} — \
                              managed-credential requests on this route will be denied.",
                             normalized_prefix, msg
                         );
+                        warn!("{message}");
+                        diagnostics.push(ProxyDiagnostic::warning(
+                            ProxyDiagnosticCode::CredentialUnavailable,
+                            &normalized_prefix,
+                            message,
+                        ));
                         continue;
                     }
                 }
@@ -1066,6 +1091,48 @@ mod tests {
                 "raw credential fragment '{leak}' leaked in '{detail}'"
             );
         }
+    }
+
+    /// A multi-profile AWS route naming a profile that is not defined fails
+    /// at load; the user must see why, not just a 503 on every request.
+    #[test]
+    fn test_load_aws_missing_profile_records_diagnostic() {
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::write(&config, "[profile dev-ro]\nregion = us-east-1\n").unwrap();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("AWS_CONFIG_FILE", config.to_str().unwrap()),
+            ("AWS_SHARED_CREDENTIALS_FILE", config.to_str().unwrap()),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ]);
+        let route: RouteConfig = serde_json::from_value(serde_json::json!({
+            "prefix": "sts",
+            "upstream": "https://sts.us-east-1.amazonaws.com",
+            "aws_auth": { "profiles": { "NONOPROFILE0TYPO001": "dev-r0" } }
+        }))
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let tls = test_tls_connector();
+            let outcome = CredentialStore::load_with_diagnostics(&[route], &tls, None)
+                .await
+                .expect("load");
+            assert!(outcome.store.get_aws("sts").is_none());
+            assert_eq!(outcome.diagnostics.len(), 1);
+            assert_eq!(
+                outcome.diagnostics[0].code,
+                ProxyDiagnosticCode::CredentialUnavailable
+            );
+            assert!(
+                outcome.diagnostics[0].message.contains("dev-r0"),
+                "{}",
+                outcome.diagnostics[0].message
+            );
+        });
     }
 
     #[tokio::test]

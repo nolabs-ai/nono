@@ -151,6 +151,7 @@
           "/sbin",
           "/usr/bin",
           "/usr/sbin",
+          "/usr/libexec",
           "/usr/local/bin",
           "/usr/lib",
           "/usr/local/lib",

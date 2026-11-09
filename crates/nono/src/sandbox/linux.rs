@@ -4072,6 +4072,14 @@ mod tests {
     }
 
     #[test]
+    fn test_read_access_includes_execute_write_does_not() {
+        let read = access_to_landlock(AccessMode::Read, ABI::V3);
+        assert!(read.effective.contains(AccessFs::Execute));
+        let write = access_to_landlock(AccessMode::Write, ABI::V3);
+        assert!(!write.effective.contains(AccessFs::Execute));
+    }
+
+    #[test]
     fn test_access_conversion_v3() {
         let abi = ABI::V3;
 

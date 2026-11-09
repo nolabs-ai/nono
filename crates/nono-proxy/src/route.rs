@@ -299,6 +299,21 @@ impl RouteStore {
                 )));
             }
 
+            // A multi-profile route selects its identity from the agent's
+            // access key ID; reject maps that could never match, and a
+            // `profile` that would otherwise be silently ignored.
+            if let Some(profiles) = route.aws_auth.as_ref().and_then(|a| a.profiles.as_ref()) {
+                if route.aws_auth.as_ref().is_some_and(|a| a.profile.is_some()) {
+                    return Err(ProxyError::Config(format!(
+                        "route '{}': `aws_auth.profile` and `aws_auth.profiles` are mutually exclusive",
+                        normalized_prefix
+                    )));
+                }
+                crate::config::validate_aws_auth_profiles(profiles).map_err(|e| {
+                    ProxyError::Config(format!("route '{}': {}", normalized_prefix, e))
+                })?;
+            }
+
             // Connect to the SPIRE Workload API for SPIFFE routes. This blocks
             // startup (fail-closed) if the socket is unreachable within the
             // initial_sync_timeout configured on the source builder.
@@ -1461,6 +1476,33 @@ mod tests {
             "jenkins.*.ci.example.com:8443",
             "jenkins.prod.ci.example.com:443"
         ));
+    }
+
+    #[tokio::test]
+    async fn aws_auth_profiles_misconfiguration_rejected_by_route_store() {
+        // The library validates aws_auth.profiles itself: a direct consumer of
+        // nono-proxy must not get a silently-ignored `profile` or an
+        // unmatchable map.
+        for aws_auth in [
+            serde_json::json!({
+                "profile": "dev-ro",
+                "profiles": {"NONOPROFILE0DEVRO01": "dev-ro"}
+            }),
+            serde_json::json!({ "profiles": {} }),
+            serde_json::json!({ "profiles": {"nonoprofile0devro01": "dev-ro"} }),
+        ] {
+            let route: RouteConfig = serde_json::from_value(serde_json::json!({
+                "prefix": "sts",
+                "upstream": "https://sts.us-east-1.amazonaws.com",
+                "aws_auth": aws_auth,
+            }))
+            .unwrap();
+            let err = RouteStore::load(&[route]).await.err();
+            assert!(
+                matches!(err, Some(ProxyError::Config(ref m)) if m.contains("profiles")),
+                "{aws_auth}: expected config error, got {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

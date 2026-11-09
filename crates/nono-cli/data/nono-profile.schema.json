@@ -1425,6 +1425,12 @@
       "type": "object",
       "description": "AWS SigV4 signing configuration for a credential route. All fields are optional: an empty {} block uses the default credential chain with region and service auto-detected from the upstream URL.",
       "additionalProperties": false,
+      "not": {
+        "allOf": [
+          { "required": ["profile"], "properties": { "profile": { "not": { "type": "null" } } } },
+          { "required": ["profiles"], "properties": { "profiles": { "not": { "type": "null" } } } }
+        ]
+      },
       "properties": {
         "profile": {
           "oneOf": [
@@ -1432,6 +1438,18 @@
             { "type": "null" }
           ],
           "description": "AWS profile name to use for credentials. If omitted, the default credential chain is used (environment variables → AWS_PROFILE → default profile → instance metadata). Must be non-empty if set."
+        },
+        "profiles": {
+          "oneOf": [
+            {
+              "type": "object",
+              "minProperties": 1,
+              "propertyNames": { "pattern": "^[A-Z0-9]{16,128}$" },
+              "additionalProperties": { "type": "string", "minLength": 1, "pattern": "^\\S+$" }
+            },
+            { "type": "null" }
+          ],
+          "description": "Operator-approved signing profiles keyed by placeholder access key ID. Each request signs as the profile mapped to the access key ID in its own SigV4 Authorization header; a missing or unlisted key is rejected with 403. Give the sandboxed client one placeholder key per allowed profile. Each profile may be mapped at most once (checked at load; not expressible in this schema). Mutually exclusive with profile."
         },
         "region": {
           "oneOf": [

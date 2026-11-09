@@ -19,13 +19,15 @@
 //!
 //! ## Caching & refresh
 //!
-//! Each `AwsRoute` holds a `SharedCredentialsProvider`. Smithy's internal
-//! `LazyCredentialsCache` caches resolved `Credentials` and refreshes ~5 min
-//! before expiry for STS/SSO/IMDS/web-identity. Static env creds are
-//! non-refreshable: on expiry AWS returns 403; user re-runs nono with fresh env.
+//! Each `AwsRoute` holds one `SharedCredentialsProvider`, or one per allowed
+//! profile. These providers are not wrapped in an identity cache, so every
+//! signed request resolves credentials again (re-running `credential_process`,
+//! STS AssumeRole, or SSO GetRoleCredentials as the profile requires). Static
+//! env creds are non-refreshable: on expiry AWS returns 403; user re-runs nono
+//! with fresh env.
 
 use super::route::AwsRoute;
-use aws_credential_types::provider::ProvideCredentials;
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use aws_sigv4::http_request::{
     PayloadChecksumKind, PercentEncodingMode, SessionTokenMode, SignableBody, SignableRequest,
     SigningSettings, UriPathNormalizationMode, sign,
@@ -58,12 +60,52 @@ pub fn is_aws_auth_header(name: &str) -> bool {
     AUTH_HEADERS_TO_STRIP.iter().any(|h| *h == lower)
 }
 
+/// Returns `true` if `id` has the shape of an AWS access key ID: 16 to 128
+/// ASCII uppercase letters or digits (IAM `AccessKeyIdType`, restricted to the
+/// alphabet AWS actually issues).
+pub(crate) fn is_access_key_id(id: &str) -> bool {
+    (16..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// Extract the access key ID from the agent's SigV4 `Authorization` header.
+///
+/// Reads the `Credential=<AKID>/<date>/<region>/<service>/aws4_request` scope
+/// of an `AWS4-HMAC-SHA256` header. Returns `None` when there is no such
+/// header, when it appears more than once, or when the key ID is malformed,
+/// so callers that select a signing identity from it fail closed.
+pub fn sigv4_access_key_id(headers: &[(String, String)]) -> Option<String> {
+    let mut values = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.as_str());
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+
+    let rest = value.trim().strip_prefix("AWS4-HMAC-SHA256 ")?;
+    let credential = rest
+        .split(',')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("Credential="))?;
+    let (access_key_id, scope) = credential.split_once('/')?;
+    if scope.is_empty() || !is_access_key_id(access_key_id) {
+        return None;
+    }
+    Some(access_key_id.to_string())
+}
+
 /// Compute a fresh SigV4 signature and return the headers to inject.
 ///
 /// # Parameters
 /// - `route`: the resolved `AwsRoute` for this upstream.
 /// - `region`: the SigV4 region for this request (the route's fixed region, or
 ///   the one derived from the request host for wildcard-region routes).
+/// - `provider`: the credential provider chosen for this request by
+///   [`AwsRoute::select_provider`].
 /// - `method`: HTTP method (e.g., `"POST"`).
 /// - `url`: full URL including scheme, host, path, and query string
 ///   (e.g., `"https://bedrock-runtime.us-east-1.amazonaws.com/model/.../invoke"`).
@@ -87,14 +129,14 @@ pub fn is_aws_auth_header(name: &str) -> bool {
 pub async fn sign_request(
     route: &AwsRoute,
     region: &str,
+    provider: &SharedCredentialsProvider,
     method: &str,
     url: &str,
     clean_headers: &[(String, String)],
     body: &[u8],
 ) -> Result<Vec<(String, String)>, String> {
-    // Resolve credentials from the provider.
-    // smithy's LazyCredentialsCache handles refresh for STS/SSO/IMDS/web-identity.
-    let credentials = route.provider.provide_credentials().await.map_err(|e| {
+    // Resolve credentials from the provider (uncached; see module docs).
+    let credentials = provider.provide_credentials().await.map_err(|e| {
         format!(
             "AWS credential resolution failed for route '{}': {}",
             route.service, e
@@ -188,7 +230,6 @@ mod tests {
     use super::*;
     use crate::aws::endpoints::SigningRegion;
     use aws_credential_types::Credentials;
-    use aws_credential_types::provider::SharedCredentialsProvider;
 
     // =========================================================================
     // Header strip predicate
@@ -242,6 +283,120 @@ mod tests {
     }
 
     // =========================================================================
+    // Access key ID extraction from the agent's Authorization header
+    // =========================================================================
+
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn access_key_id_extracted_from_sigv4_authorization() {
+        let h = headers(&[
+            ("Content-Type", "application/json"),
+            (
+                "Authorization",
+                "AWS4-HMAC-SHA256 Credential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123",
+            ),
+        ]);
+        assert_eq!(
+            sigv4_access_key_id(&h).as_deref(),
+            Some("NONOPROFILE0DEVRO01")
+        );
+    }
+
+    #[test]
+    fn access_key_id_header_name_is_case_insensitive() {
+        let h = headers(&[(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=abc",
+        )]);
+        assert_eq!(
+            sigv4_access_key_id(&h).as_deref(),
+            Some("NONOPROFILE0DEVRO01")
+        );
+    }
+
+    #[test]
+    fn access_key_id_tolerates_no_space_after_comma() {
+        // botocore and the Rust SDK both emit ", " but the separator is not
+        // load-bearing for the Credential scope, which comes first.
+        let h = headers(&[(
+            "Authorization",
+            "AWS4-HMAC-SHA256 Credential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request,SignedHeaders=host,Signature=abc",
+        )]);
+        assert_eq!(
+            sigv4_access_key_id(&h).as_deref(),
+            Some("NONOPROFILE0DEVRO01")
+        );
+    }
+
+    #[test]
+    fn access_key_id_none_without_authorization() {
+        let h = headers(&[("Content-Type", "application/json")]);
+        assert_eq!(sigv4_access_key_id(&h), None);
+    }
+
+    #[test]
+    fn access_key_id_none_for_non_sigv4_scheme() {
+        for value in [
+            "Bearer NONOPROFILE0DEVRO01",
+            "AWS NONOPROFILE0DEVRO01:signature",
+            "AWS4-HMAC-SHA256",
+            "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc",
+        ] {
+            let h = headers(&[("Authorization", value)]);
+            assert_eq!(sigv4_access_key_id(&h), None, "value: {value}");
+        }
+    }
+
+    #[test]
+    fn access_key_id_none_for_empty_or_malformed_key() {
+        for value in [
+            "AWS4-HMAC-SHA256 Credential=/20261105/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=abc",
+            "AWS4-HMAC-SHA256 Credential=NONOPROFILE0DEVRO01, SignedHeaders=host, Signature=abc",
+            "AWS4-HMAC-SHA256 Credential=nono-profile/20261105/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=abc",
+        ] {
+            let h = headers(&[("Authorization", value)]);
+            assert_eq!(sigv4_access_key_id(&h), None, "value: {value}");
+        }
+    }
+
+    #[test]
+    fn access_key_id_none_for_scheme_case_or_separator_variants() {
+        // Only the exact scheme token followed by a space is accepted, so
+        // case or whitespace games cannot reach a different parse.
+        for value in [
+            "aws4-hmac-sha256 Credential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=abc",
+            "AWS4-HMAC-SHA256\tCredential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=abc",
+            "AWS4-HMAC-SHA256Credential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request",
+        ] {
+            let h = headers(&[("Authorization", value)]);
+            assert_eq!(sigv4_access_key_id(&h), None, "value: {value:?}");
+        }
+    }
+
+    #[test]
+    fn access_key_id_none_for_obs_fold_header() {
+        // An obs-fold continuation is dropped by header parsing, leaving only
+        // the first physical line; the scheme alone must not select a key.
+        let raw = b"POST / HTTP/1.1\r\nHost: sts.amazonaws.com\r\nAuthorization: AWS4-HMAC-SHA256\r\n Credential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request\r\n\r\n";
+        let h = crate::reverse::filter_headers(raw, "");
+        assert_eq!(sigv4_access_key_id(&h), None, "headers: {h:?}");
+    }
+
+    #[test]
+    fn access_key_id_none_when_authorization_repeated() {
+        // Two Authorization headers are ambiguous: refuse to pick one.
+        let value = "AWS4-HMAC-SHA256 Credential=NONOPROFILE0DEVRO01/20261105/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=abc";
+        let h = headers(&[("Authorization", value), ("authorization", value)]);
+        assert_eq!(sigv4_access_key_id(&h), None);
+    }
+
+    // =========================================================================
     // Signing produces well-formed Authorization header
     // =========================================================================
 
@@ -262,8 +417,10 @@ mod tests {
             region: SigningRegion::Fixed(region.to_string()),
             service_label: None,
             service: service.to_string(),
-            profile_key: None,
-            provider,
+            credentials: super::super::route::AwsRouteCredentials::Single {
+                profile_key: None,
+                provider,
+            },
         }
     }
 
@@ -280,7 +437,16 @@ mod tests {
         ];
         let body = b"{\"prompt\": \"hello\"}";
 
-        let result = sign_request(&route, "us-east-1", "POST", url, &clean_headers, body).await;
+        let result = sign_request(
+            &route,
+            "us-east-1",
+            route.select_provider(&[]).unwrap().provider,
+            "POST",
+            url,
+            &clean_headers,
+            body,
+        )
+        .await;
 
         let headers = result.expect("signing should succeed with static creds");
 
@@ -332,9 +498,17 @@ mod tests {
         let clean_headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
         let body = b"hello world";
 
-        let headers = sign_request(&route, "eu-west-1", "PUT", url, &clean_headers, body)
-            .await
-            .expect("signing should succeed");
+        let headers = sign_request(
+            &route,
+            "eu-west-1",
+            route.select_provider(&[]).unwrap().provider,
+            "PUT",
+            url,
+            &clean_headers,
+            body,
+        )
+        .await
+        .expect("signing should succeed");
 
         // Static creds have no session token
         let has_security_token = headers
@@ -361,15 +535,25 @@ mod tests {
             region: SigningRegion::Fixed("us-east-1".to_string()),
             service_label: None,
             service: "bedrock".to_string(),
-            profile_key: None,
-            provider,
+            credentials: super::super::route::AwsRouteCredentials::Single {
+                profile_key: None,
+                provider,
+            },
         };
         let url = "https://bedrock-runtime.us-east-1.amazonaws.com/model/test/invoke";
         let clean_headers = vec![("Content-Type".to_string(), "application/json".to_string())];
 
-        let headers = sign_request(&route, "us-east-1", "POST", url, &clean_headers, b"{}")
-            .await
-            .expect("signing should succeed");
+        let headers = sign_request(
+            &route,
+            "us-east-1",
+            route.select_provider(&[]).unwrap().provider,
+            "POST",
+            url,
+            &clean_headers,
+            b"{}",
+        )
+        .await
+        .expect("signing should succeed");
 
         let has_security_token = headers
             .iter()
@@ -391,14 +575,30 @@ mod tests {
                 .unwrap()
         };
         let a = auth(
-            sign_request(&route, "eu-central-1", "GET", url, &[], b"")
-                .await
-                .unwrap(),
+            sign_request(
+                &route,
+                "eu-central-1",
+                route.select_provider(&[]).unwrap().provider,
+                "GET",
+                url,
+                &[],
+                b"",
+            )
+            .await
+            .unwrap(),
         );
         let b = auth(
-            sign_request(&route, "us-west-2", "GET", url, &[], b"")
-                .await
-                .unwrap(),
+            sign_request(
+                &route,
+                "us-west-2",
+                route.select_provider(&[]).unwrap().provider,
+                "GET",
+                url,
+                &[],
+                b"",
+            )
+            .await
+            .unwrap(),
         );
         assert!(a.contains("/eu-central-1/eks/aws4_request"), "{a}");
         assert!(b.contains("/us-west-2/eks/aws4_request"), "{b}");

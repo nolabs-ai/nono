@@ -481,9 +481,9 @@ mod tests {
 
     fn cfg(region: Option<&str>, service: Option<&str>) -> crate::config::AwsAuthConfig {
         crate::config::AwsAuthConfig {
-            profile: None,
             region: region.map(str::to_owned),
             service: service.map(str::to_owned),
+            ..Default::default()
         }
     }
 

@@ -1680,6 +1680,7 @@ mod tests {
             oauth2: None,
             aws_auth: Some(crate::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: Some("us-east-1".to_string()),
                 service: Some("bedrock".to_string()),
             }),

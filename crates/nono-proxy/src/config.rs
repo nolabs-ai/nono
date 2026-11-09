@@ -1617,6 +1617,50 @@ pub enum ClientAssertionConfig {
     },
 }
 
+/// Validate an `aws_auth.profiles` map.
+///
+/// Shared by every config surface that accepts `aws_auth` so the rules cannot
+/// drift. Requires at least one entry; each key must look like an AWS access
+/// key ID (16-128 uppercase letters or digits) so it can match the `Credential=`
+/// scope of a SigV4 header; each value follows the `profile` rules (non-empty,
+/// no whitespace); and no profile may appear twice.
+///
+/// # Errors
+///
+/// Returns a message describing the first invalid entry.
+pub fn validate_aws_auth_profiles(
+    profiles: &std::collections::BTreeMap<String, String>,
+) -> std::result::Result<(), String> {
+    if profiles.is_empty() {
+        return Err(
+            "aws_auth.profiles must map at least one placeholder access key ID \
+                    to a profile; omit the field to sign with a single profile"
+                .to_string(),
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (access_key_id, profile) in profiles {
+        if !crate::aws::sign::is_access_key_id(access_key_id) {
+            return Err(format!(
+                "aws_auth.profiles key '{access_key_id}' is not a valid access key ID \
+                 (16-128 uppercase letters or digits)"
+            ));
+        }
+        if profile.is_empty() || profile.contains(char::is_whitespace) {
+            return Err(format!(
+                "aws_auth.profiles entry '{access_key_id}' must map to a non-empty \
+                 profile name with no whitespace"
+            ));
+        }
+        if !seen.insert(profile.as_str()) {
+            return Err(format!(
+                "aws_auth.profiles maps more than one access key ID to profile '{profile}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// AWS SigV4 signing configuration for a credential route.
 ///
 /// When present on a route, the proxy will sign outbound requests using AWS
@@ -1634,6 +1678,16 @@ pub struct AwsAuthConfig {
     /// AWS INI config parser; profile names are case-sensitive).
     #[serde(default)]
     pub profile: Option<String>,
+
+    /// Operator-approved signing profiles, keyed by placeholder access key ID.
+    ///
+    /// When set, each request picks its signing profile by the access key ID
+    /// in the `Credential=` scope of its own `Authorization` header: the child
+    /// holds one placeholder key per allowed profile, and the proxy signs with
+    /// the mapped host profile. A request whose key ID is missing or unlisted
+    /// is rejected with 403. Mutually exclusive with `profile`.
+    #[serde(default)]
+    pub profiles: Option<std::collections::BTreeMap<String, String>>,
 
     /// Explicit SigV4 signing region (e.g., `"us-east-1"`).
     /// If omitted, auto-detected from the upstream URL.
@@ -2498,6 +2552,7 @@ mod tests {
     fn test_aws_auth_config_all_fields_roundtrip() {
         let original = AwsAuthConfig {
             profile: Some("my-aws-profile".to_string()),
+            profiles: None,
             region: Some("us-east-1".to_string()),
             service: Some("bedrock".to_string()),
         };
@@ -2506,6 +2561,78 @@ mod tests {
         assert_eq!(deserialized.profile.as_deref(), Some("my-aws-profile"));
         assert_eq!(deserialized.region.as_deref(), Some("us-east-1"));
         assert_eq!(deserialized.service.as_deref(), Some("bedrock"));
+    }
+
+    #[test]
+    fn test_aws_auth_config_profiles_deserializes() {
+        let json = r#"{"profiles": {"NONOPROFILE0DEVRO01": "dev-ro", "NONOPROFILE0STGRO01": "staging-ro"}}"#;
+        let aws: AwsAuthConfig = serde_json::from_str(json).unwrap();
+        assert!(aws.profile.is_none());
+        let profiles = aws.profiles.unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            profiles.get("NONOPROFILE0DEVRO01").map(String::as_str),
+            Some("dev-ro")
+        );
+        assert_eq!(
+            profiles.get("NONOPROFILE0STGRO01").map(String::as_str),
+            Some("staging-ro")
+        );
+    }
+
+    fn profiles_of(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_validation_accepts_well_formed_map() {
+        let profiles = profiles_of(&[
+            ("NONOPROFILE0DEVRO01", "dev-ro"),
+            ("NONOPROFILE0STGRO01", "staging-ro"),
+        ]);
+        assert_eq!(validate_aws_auth_profiles(&profiles), Ok(()));
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_validation_rejects_empty_map() {
+        let err = validate_aws_auth_profiles(&profiles_of(&[])).unwrap_err();
+        assert!(err.contains("at least one"), "{err}");
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_validation_rejects_malformed_access_key_id() {
+        for key in ["short", "nonoprofile0devro01", "NONO-PROFILE-DEVRO01", ""] {
+            let err = validate_aws_auth_profiles(&profiles_of(&[(key, "dev-ro")])).unwrap_err();
+            assert!(err.contains("access key ID"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_validation_rejects_bad_profile_name() {
+        for profile in ["", "dev ro"] {
+            let err = validate_aws_auth_profiles(&profiles_of(&[("NONOPROFILE0DEVRO01", profile)]))
+                .unwrap_err();
+            assert!(err.contains("profile"), "{profile:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_validation_rejects_duplicate_profile() {
+        let err = validate_aws_auth_profiles(&profiles_of(&[
+            ("NONOPROFILE0DEVRO01", "dev-ro"),
+            ("NONOPROFILE0DEVRO02", "dev-ro"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("dev-ro"), "{err}");
+    }
+
+    #[test]
+    fn test_aws_auth_config_profiles_absent_is_none() {
+        let aws: AwsAuthConfig = serde_json::from_str(r#"{"profile": "dev"}"#).unwrap();
+        assert!(aws.profiles.is_none());
     }
 
     #[test]

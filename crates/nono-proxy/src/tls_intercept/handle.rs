@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 /// Header byte cap matching the outer proxy's `MAX_HEADER_SIZE` to keep the
@@ -1213,7 +1213,9 @@ where
             return Ok(());
         }
         let strict_ok = super::http1::parse_header_fields(&req.header_bytes).is_ok();
-        let mut headers = reverse::filter_headers(&req.header_bytes, "");
+        // Keep the agent's auth headers: signing-profile selection reads them.
+        let agent_headers = reverse::filter_headers(&req.header_bytes, "");
+        let mut headers = agent_headers.clone();
         headers.retain(|(name, _)| !crate::aws::sign::is_aws_auth_header(name));
         let Some(body) =
             reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await?
@@ -1227,7 +1229,7 @@ where
             strict_ok,
             &body,
         ));
-        aws_headers = Some(headers);
+        aws_headers = Some(agent_headers);
         req.body = Some(body);
     }
 
@@ -1932,14 +1934,50 @@ async fn handle_inner_request_aws<S>(
     route: Option<&crate::route::LoadedRoute>,
     service: Option<&str>,
     req: &ParsedRequest,
-    filtered_headers: Vec<(String, String)>,
+    agent_headers: Vec<(String, String)>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    // `filtered_headers` already has the five auth-bearing headers stripped so
-    // the agent's dummy credentials are never forwarded or signed. All other
+    let mut filtered_headers = agent_headers;
+
+    // Pick the signing identity before the agent's auth headers are stripped:
+    // a multi-profile route selects it by the placeholder access key ID the
+    // agent signed with. Unknown or missing keys fail closed.
+    let selected = match aws.select_provider(&filtered_headers) {
+        Ok(selected) => selected,
+        Err(e) => {
+            let svc = service.unwrap_or("unknown");
+            let reason = format!("AWS signing profile not allowed for route '{}': {}", svc, e);
+            warn!("tls_intercept: {}", reason);
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::ConnectIntercept,
+                &audit::EventContext {
+                    route_id: service,
+                    auth_mechanism: route.and_then(|r| r.managed_auth_mechanism.clone()),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                    managed_credential_active: Some(false),
+                    injection_mode: route.and_then(|r| r.managed_injection_mode.clone()),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                    ),
+                    ..audit::EventContext::default()
+                },
+                ctx.host,
+                ctx.port,
+                &reason,
+            );
+            reverse::send_error_generic(tls_stream, 403, "Forbidden").await?;
+            return Ok(());
+        }
+    };
+
+    // Strip the five auth-bearing headers so the agent's dummy credentials are
+    // never forwarded or included in the canonical request. All other
     // x-amz-* headers (X-Amz-Target, meta, etc.) are preserved and signed.
+    filtered_headers.retain(|(name, _)| !crate::aws::sign::is_aws_auth_header(name));
+
     // The body was read before policy evaluation; sign and forward that exact
     // buffer.
     let Some(body) = req.body.as_deref() else {
@@ -1985,7 +2023,24 @@ where
         body.len(),
         filtered_headers.len(),
     );
-    match crate::aws::sign::sign_request(aws, &req.method, &full_url, &filtered_headers, body).await
+    // Record which host identity signs: on a multi-profile route this is the
+    // only trace of which allowed profile the agent selected.
+    info!(
+        target: audit::AUDIT_TARGET,
+        "aws sigv4 signing route={} target={} profile={}",
+        service.unwrap_or("unknown"),
+        ctx.host,
+        selected.profile.unwrap_or("<default chain>"),
+    );
+    match crate::aws::sign::sign_request(
+        aws,
+        selected.provider,
+        &req.method,
+        &full_url,
+        &filtered_headers,
+        body,
+    )
+    .await
     {
         Ok(sign_headers) => {
             debug!(

@@ -1453,3 +1453,62 @@ fn test_schema_validates_profile_authoring_guide_environment_example() {
         .validate(&profile)
         .expect("profile-authoring-guide.md environment example should validate");
 }
+
+#[test]
+fn test_schema_validates_aws_auth_profiles_map() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": { "custom_credentials": { "aws-sts": {
+            "upstream": "https://sts.us-east-1.amazonaws.com",
+            "aws_auth": {
+                "profiles": {
+                    "NONOPROFILE0DEVRO01": "dev-ro",
+                    "NONOPROFILE0STGRO01": "staging-ro"
+                }
+            }
+        } } }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("aws_auth.profiles map should validate");
+}
+
+#[test]
+fn test_schema_rejects_aws_auth_profile_with_profiles() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": { "custom_credentials": { "aws-sts": {
+            "upstream": "https://sts.us-east-1.amazonaws.com",
+            "aws_auth": {
+                "profile": "dev-ro",
+                "profiles": { "NONOPROFILE0DEVRO01": "dev-ro" }
+            }
+        } } }
+    });
+
+    assert!(
+        validator.validate(&profile).is_err(),
+        "aws_auth.profile and aws_auth.profiles must be mutually exclusive"
+    );
+}
+
+#[test]
+fn test_schema_rejects_aws_auth_profiles_bad_key() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    for profiles in [json!({}), json!({ "dev": "dev-ro" })] {
+        let profile = json!({
+            "network": { "custom_credentials": { "aws-sts": {
+                "upstream": "https://sts.us-east-1.amazonaws.com",
+                "aws_auth": { "profiles": profiles }
+            } } }
+        });
+        assert!(
+            validator.validate(&profile).is_err(),
+            "aws_auth.profiles {profiles} should be rejected"
+        );
+    }
+}

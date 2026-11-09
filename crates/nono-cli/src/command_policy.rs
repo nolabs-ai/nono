@@ -2934,6 +2934,23 @@ fn validate_credential(
                         ),
                     );
                 }
+                if let Some(ref profiles) = aws.profiles {
+                    if aws.profile.is_some() {
+                        report.error(
+                            "invalid_credential",
+                            format!(
+                                "proxy credential '{name}' cannot set both aws_auth.profile \
+                                 and aws_auth.profiles; list every allowed profile in profiles"
+                            ),
+                        );
+                    }
+                    if let Err(e) = nono_proxy::config::validate_aws_auth_profiles(profiles) {
+                        report.error(
+                            "invalid_credential",
+                            format!("proxy credential '{name}': {e}"),
+                        );
+                    }
+                }
                 if let Some(ref region) = aws.region
                     && (region.is_empty()
                         || region.contains(char::is_whitespace)
@@ -7124,6 +7141,7 @@ mod tests {
             upstream: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some("production".to_string()),
+                profiles: None,
                 region: Some("us-east-1".to_string()),
                 service: Some("bedrock".to_string()),
             }),
@@ -7132,6 +7150,68 @@ mod tests {
         assert!(
             validate_one(&cred).errors.is_empty(),
             "well-formed proxy aws_auth should validate"
+        );
+    }
+
+    #[test]
+    fn proxy_credential_with_aws_auth_profiles_accepted() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://sts.us-east-1.amazonaws.com".to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profiles: Some(
+                    [("NONOPROFILE0DEVRO01".to_string(), "dev-ro".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred).errors.is_empty(),
+            "well-formed aws_auth.profiles should validate"
+        );
+    }
+
+    #[test]
+    fn proxy_credential_with_aws_auth_profile_and_profiles_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://sts.us-east-1.amazonaws.com".to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: Some("dev-ro".to_string()),
+                profiles: Some(
+                    [("NONOPROFILE0DEVRO01".to_string(), "dev-ro".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let errors = validate_one(&cred).errors;
+        assert!(
+            errors.iter().any(|e| e.message.contains("profiles")),
+            "expected profile/profiles exclusivity error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_credential_with_empty_aws_auth_profiles_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://sts.us-east-1.amazonaws.com".to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profiles: Some(std::collections::BTreeMap::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let errors = validate_one(&cred).errors;
+        assert!(
+            errors.iter().any(|e| e.message.contains("at least one")),
+            "expected empty profiles error, got {errors:?}"
         );
     }
 

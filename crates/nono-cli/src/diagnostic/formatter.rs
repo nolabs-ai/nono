@@ -988,14 +988,17 @@ impl<'a> DiagnosticFormatter<'a> {
             Some(c) => c,
             None => return true, // no context, assume readable
         };
-        let binary_path = &cmd.resolved_path;
+        // Compare canonical paths so symlinks and /tmp vs /private/tmp aliases
+        // do not produce a wrong verdict. `starts_with` is component-based.
+        let binary_path = canonical_or_self(&cmd.resolved_path);
         for cap in self.caps.fs_capabilities() {
             if cap.access == AccessMode::Read || cap.access == AccessMode::ReadWrite {
+                let cap_path = canonical_or_self(&cap.resolved);
                 if cap.is_file {
-                    if *binary_path == cap.resolved {
+                    if binary_path == cap_path {
                         return true;
                     }
-                } else if binary_path.starts_with(&cap.resolved) {
+                } else if binary_path.starts_with(&cap_path) {
                     return true;
                 }
             }
@@ -1009,14 +1012,15 @@ impl<'a> DiagnosticFormatter<'a> {
             Some(c) => c,
             None => return true,
         };
-        let binary_dir = match cmd.resolved_path.parent() {
+        let resolved = canonical_or_self(&cmd.resolved_path);
+        let binary_dir = match resolved.parent() {
             Some(d) => d,
             None => return false,
         };
         for cap in self.caps.fs_capabilities() {
             if !cap.is_file
                 && (cap.access == AccessMode::Read || cap.access == AccessMode::ReadWrite)
-                && binary_dir.starts_with(&cap.resolved)
+                && binary_dir.starts_with(canonical_or_self(&cap.resolved))
             {
                 return true;
             }
@@ -1069,6 +1073,13 @@ impl<'a> DiagnosticFormatter<'a> {
                             );
                             lines.push(format!("[nono]   nono run --read {} ...", parent_path,));
                         }
+                        // Exec requires read; a file grant is the narrowest fix.
+                        let canonical = canonical_or_self(&cmd.resolved_path).display().to_string();
+                        lines.push("[nono] Or, for just this binary:".to_string());
+                        lines.push(format!(
+                            "[nono]   nono run --read-file {} ...",
+                            sanitize_for_diagnostic(&canonical)
+                        ));
                     } else if !self.is_binary_dir_readable() {
                         // Binary itself is allowed but its directory isn't
                         // (unlikely but possible with file-level grants)
@@ -1139,6 +1150,18 @@ impl<'a> DiagnosticFormatter<'a> {
                         "[nono] may be blocking execution of binaries in that directory."
                             .to_string(),
                     );
+                    if !self.is_binary_path_readable() {
+                        // On macOS, exec is only allowed for paths in the read set.
+                        let canonical = canonical_or_self(&cmd.resolved_path).display().to_string();
+                        lines.push("[nono]".to_string());
+                        lines.push(
+                            "[nono] The binary is not in the sandbox read set. Fix:".to_string(),
+                        );
+                        lines.push(format!(
+                            "[nono]   nono run --read-file {} ...",
+                            sanitize_for_diagnostic(&canonical)
+                        ));
+                    }
                 } else {
                     lines.push(
                         "[nono] The command was found but could not be executed.".to_string(),
@@ -2906,6 +2929,11 @@ fn shell_quote(s: &str) -> String {
     }
     quoted.push('\'');
     quoted
+}
+
+/// Canonicalize for comparison, falling back to the path as given.
+fn canonical_or_self(path: &std::path::Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]

@@ -81,6 +81,7 @@ pub(crate) fn run_replay(args: &ReplayArgs) -> Result<()> {
             Some(from) => ReplayStart::parse(from)?,
             None => ReplayStart::Beginning,
         },
+        viewport: crate::pty_proxy::get_terminal_winsize().map(|ws| (ws.ws_col, ws.ws_row)),
     };
     super::replay::play(&loaded, &options)
 }

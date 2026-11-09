@@ -439,7 +439,7 @@ pub unsafe fn setup_child_pty(slave_fd: RawFd) {
 }
 
 /// Get the current terminal window size, if available.
-fn get_terminal_winsize() -> Option<Winsize> {
+pub(crate) fn get_terminal_winsize() -> Option<Winsize> {
     let mut ws: Winsize = unsafe { std::mem::zeroed() };
     // SAFETY: ioctl with TIOCGWINSZ reads window size into ws
     let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };

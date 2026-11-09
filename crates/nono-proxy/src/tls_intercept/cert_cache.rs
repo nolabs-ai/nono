@@ -153,7 +153,7 @@ fn mint_leaf_at(
     let leaf_key_der = leaf_key.serialize_der();
 
     let mut params = CertificateParams::default();
-    params.subject_alt_names = vec![dns_san(hostname)?];
+    params.subject_alt_names = vec![server_san(hostname)?];
     // RFC 5280 §4.2.1.1 requires Authority Key Identifier on certs issued
     // by a CA; rcgen defaults the flag to false. Stricter verifiers
     // (OpenSSL 3.6+, BoringSSL) reject leaves without AKI with
@@ -213,6 +213,17 @@ fn dns_san(hostname: &str) -> Result<SanType> {
     Ok(SanType::DnsName(hostname.to_string().try_into().map_err(
         |e| ProxyError::Config(format!("invalid DNS name '{}': {}", hostname, e)),
     )?))
+}
+
+/// Subject Alternative Name for an intercepted target. IP-literal CONNECT
+/// authorities (e.g. `https://10.0.0.5:8443` routes) must carry an
+/// `iPAddress` SAN — RFC 5280 verifiers do not match IP dials against
+/// `dNSName` entries.
+fn server_san(hostname: &str) -> Result<SanType> {
+    match hostname.parse::<std::net::IpAddr>() {
+        Ok(ip) => Ok(SanType::IpAddress(ip)),
+        Err(_) => dns_san(hostname),
+    }
 }
 
 /// Lightweight DNS-name shape check. Not a full RFC 1035 validator —
@@ -415,12 +426,44 @@ mod tests {
     }
 
     #[test]
-    fn ip_literal_rejected() {
-        // We refuse to mint for IP-literal CONNECT targets — the SNI shape
-        // would be wrong and the agent would reject the cert anyway.
+    fn ip_literal_mints_ip_san() {
+        // IP-literal CONNECT targets mint an iPAddress SAN — the SAN type
+        // RFC 5280 verifiers require for IP dials. Minting a dNSName for
+        // an address would be rejected by every client (which is why the
+        // DNS-name guard below still refuses bare-numeric names).
         let cache = fresh_cache();
-        assert!(cache.get_or_mint("127.0.0.1").is_err());
-        assert!(cache.get_or_mint("::1").is_err());
+        for host in ["127.0.0.1", "::1"] {
+            let key = cache.get_or_mint(host).expect("IP literal must mint");
+            let cert = key
+                .cert
+                .first()
+                .and_then(|der| x509_parser::parse_x509_certificate(der.as_ref()).ok())
+                .map(|(_, c)| c)
+                .expect("leaf must parse");
+            let sans = cert
+                .extensions()
+                .iter()
+                .filter_map(|ext| match ext.parsed_extension() {
+                    x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) => {
+                        Some(&san.general_names)
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            assert!(
+                sans.iter().any(|name| {
+                    matches!(name, x509_parser::extensions::GeneralName::IPAddress(_))
+                }),
+                "{host}: leaf must carry an iPAddress SAN"
+            );
+            assert!(
+                !sans
+                    .iter()
+                    .any(|name| matches!(name, x509_parser::extensions::GeneralName::DNSName(_))),
+                "{host}: leaf must not claim a DNS name"
+            );
+        }
     }
 
     #[test]

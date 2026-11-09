@@ -769,6 +769,13 @@ only the command sandbox: `aws_auth.profile` is still resolved by the host super
 For an SSO profile, run `aws sso login --profile <name>` outside the sandbox first.
 Do not grant the command sandbox access to `~/.aws`.
 
+To let the command switch between several host profiles, set `aws_auth.profiles`
+instead of `aws_auth.profile`. Point `AWS_CONFIG_FILE` at a host-written file with
+one placeholder profile per entry instead of `/dev/null`, and drop the
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` placeholders: clients prefer them over
+the selected profile, so `AWS_PROFILE` would not switch identities. See
+[Multiple profiles](/cli/features/credential-injection#multiple-profiles).
+
 `aws_auth` is valid only on `proxy` credentials and cannot be combined with
 `credential_key` or `source`. As with every command-scoped proxy credential, each
 grant must include an `endpoint_policy`. See

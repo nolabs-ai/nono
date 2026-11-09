@@ -935,6 +935,18 @@ fn validate_aws_auth(name: &str, aws: &nono_proxy::config::AwsAuthConfig) -> Res
         )));
     }
 
+    if let Some(ref profiles) = aws.profiles {
+        if aws.profile.is_some() {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{}' cannot set both aws_auth.profile and \
+                 aws_auth.profiles; list every allowed profile in profiles",
+                name
+            )));
+        }
+        nono_proxy::config::validate_aws_auth_profiles(profiles)
+            .map_err(|e| NonoError::ProfileParse(format!("custom credential '{}': {}", name, e)))?;
+    }
+
     if let Some(ref region) = aws.region
         && (region.is_empty()
             || region.contains(char::is_whitespace)
@@ -11352,6 +11364,7 @@ mod tests {
             auth: None,
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: None,
             }),
@@ -11384,6 +11397,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some("my-aws-profile".to_string()),
+                profiles: None,
                 region: Some("us-east-1".to_string()),
                 service: Some("bedrock".to_string()),
             }),
@@ -11468,11 +11482,70 @@ mod tests {
         );
     }
 
+    fn aws_profiles(pairs: &[(&str, &str)]) -> Option<std::collections::BTreeMap<String, String>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_accepted() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profiles: aws_profiles(&[
+                    ("NONOPROFILE0DEVRO01", "dev-ro"),
+                    ("NONOPROFILE0STGRO01", "staging-ro"),
+                ]),
+                ..Default::default()
+            }),
+            ..aws_auth_cred_builder()
+        };
+        assert!(validate_custom_credential("aws-sts", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_aws_auth_profile_and_profiles_together_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: Some("dev-ro".to_string()),
+                profiles: aws_profiles(&[("NONOPROFILE0DEVRO01", "dev-ro")]),
+                ..Default::default()
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let msg = validate_custom_credential("aws-sts", &cred)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("profile") && msg.contains("profiles"), "{msg}");
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_malformed_key_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profiles: aws_profiles(&[("dev", "dev-ro")]),
+                ..Default::default()
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let msg = validate_custom_credential("aws-sts", &cred)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("aws-sts") && msg.contains("access key ID"),
+            "{msg}"
+        );
+    }
+
     #[test]
     fn test_aws_auth_empty_profile_rejected() {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some(String::new()),
+                profiles: None,
                 region: None,
                 service: None,
             }),
@@ -11493,6 +11566,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: Some(String::new()),
                 service: None,
             }),
@@ -11513,6 +11587,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: Some(String::new()),
             }),
@@ -11533,6 +11608,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: Some("us east-1".to_string()),
                 service: None,
             }),
@@ -11553,6 +11629,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: Some("bed rock".to_string()),
             }),
@@ -11598,6 +11675,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some("my profile".to_string()),
+                profiles: None,
                 region: None,
                 service: None,
             }),
@@ -11618,6 +11696,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some("my\tprofile".to_string()),
+                profiles: None,
                 region: None,
                 service: None,
             }),
@@ -11638,6 +11717,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some("MyCompany-Prod".to_string()),
+                profiles: None,
                 region: None,
                 service: None,
             }),
@@ -11653,6 +11733,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: Some("US-EAST-1".to_string()),
                 service: None,
             }),
@@ -11673,6 +11754,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: Some("Us-East-1".to_string()),
                 service: None,
             }),
@@ -11695,6 +11777,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: Some("Bedrock".to_string()),
             }),
@@ -11715,6 +11798,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: Some("S3".to_string()),
             }),
@@ -11735,6 +11819,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: Some("workers-ai".to_string()),
             }),
@@ -11748,6 +11833,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: Some("ap-southeast-2".to_string()),
                 service: Some("execute-api".to_string()),
             }),

@@ -2751,7 +2751,9 @@ version = "0.81.0"
 dependencies = [
  "aws-config",
  "aws-credential-types",
+ "aws-runtime",
  "aws-sigv4",
+ "aws-types",
  "base64 0.23.1",
  "bytes",
  "getrandom 0.4.3",

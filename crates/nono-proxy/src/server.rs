@@ -704,14 +704,15 @@ impl ProxyHandle {
             // and double-slashed URLs.
             let prefix = route.prefix.trim_matches('/');
 
-            // Synthetic endpoint-filtered routes (prefix `_ep_<domain>`,
-            // created by `partition_allow_domain` for `allow_domain`
+            // Synthetic endpoint-filtered routes (prefix
+            // `ENDPOINT_ROUTE_PREFIX` + `<domain>`, created by
+            // `partition_allow_domain` for `allow_domain`
             // entries with `endpoints`) have no credential and no SDK to
             // point at them, so a `{PREFIX}_BASE_URL` var only hands the
             // agent a dead end it will try and fail (see #2286). Skip
             // them entirely; the route itself stays in the route store,
             // so proxying and endpoint filtering are unchanged.
-            if prefix.starts_with("_ep_") {
+            if prefix.starts_with(crate::config::ENDPOINT_ROUTE_PREFIX) {
                 continue;
             }
 
@@ -4547,7 +4548,7 @@ mod tests {
                 },
                 crate::config::RouteConfig {
                     redeem_phantoms: Vec::new(),
-                    prefix: "_ep_example.com".to_string(),
+                    prefix: format!("{}example.com", crate::config::ENDPOINT_ROUTE_PREFIX),
                     upstream: "https://example.com".to_string(),
                     credential_key: None,
                     inject_mode: crate::config::InjectMode::Header,

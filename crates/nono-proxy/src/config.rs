@@ -735,6 +735,14 @@ fn normalise_no_proxy_host(host: &str) -> String {
     lower.parse::<IpAddr>().map_or(lower, |ip| ip.to_string())
 }
 
+/// Prefix marking a synthetic endpoint-authorization route created by the CLI
+/// (`partition_allow_domain`) for an `allow_domain` entry with `endpoints`.
+/// The route gates requests to the domain's endpoints and carries no
+/// credential. Shared between the creation site (`nono-cli`) and the match
+/// site (`credential_env_vars` in `server.rs`) so renaming one cannot
+/// silently reintroduce the vars this prefix suppresses (see #2286).
+pub const ENDPOINT_ROUTE_PREFIX: &str = "_ep_";
+
 /// Configuration for a reverse proxy credential route.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteConfig {

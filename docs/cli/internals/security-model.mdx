@@ -205,12 +205,27 @@ The supervisor's external attack surface is minimal:
 
 | Surface | Exposure |
 |---------|----------|
-| IPC socket | Anonymous `socketpair()` — no filesystem path, no way for external processes to connect |
+| Inherited IPC socket | Anonymous `socketpair()` — access requires possession of the inherited descriptor |
+| Named session IPC sockets | Optional session authentication for browser, tool-execution, tool-browser, and credential-capture listeners |
 | seccomp notif fd | Owned solely by the supervisor; no other process holds it |
 | Approval input | Reads from `/dev/tty`; requires access to the user's terminal session |
 | Network | Minimal — in proxy mode, the supervisor listens on a random localhost port protected by a session token; otherwise none |
 
-There is no network-exposed surface, no filesystem-visible socket, and no way to interact with the supervisor without already having the user's terminal session or the ability to inject code into the supervisor's address space.
+Set `security.session_socket_auth` in a profile to authenticate callers of that session's named IPC listeners:
+
+```json
+{
+  "security": {
+    "session_socket_auth": true
+  }
+}
+```
+
+The default is `false`, preserving existing IPC behavior and the Linux 5.13 baseline. With the option off, the browser listener can still accept another sandbox's requests when that sandbox can reach its socket. Enable the option on each session whose listeners should be protected.
+
+When enabled, listeners reject processes from other sessions even when those processes can read the helper scripts and connect to the socket paths. The main sandbox and its supervisor-launched tools share session ownership; command and URL policies still apply after authentication. Membership comes from verified process ancestry or protected tool-lineage records, never a caller-supplied PID or session identifier. Callers whose membership cannot be established are rejected.
+
+On Linux, enabling this option requires `SO_PEERPIDFD` (Linux 6.5 or later) to bind credentials to the connecting process's lifetime. Startup fails if the kernel cannot support the requested authentication. With the option off, this kernel feature is not used. On macOS, authentication checks the peer audit token and process identity across the ancestry walk. The terminal attach endpoint has a separate policy because it intentionally accepts host-side clients. Use `--profile` for authenticated sessions; capability manifests cannot represent this CLI policy, so manifest export rejects profiles with it enabled.
 
 ### What if the supervisor has a vulnerability?
 

@@ -140,6 +140,7 @@ struct ChildLaunchResult {
 }
 
 struct ToolSandboxState {
+    session_socket_auth: bool,
     runtime_dir: PathBuf,
     socket_path: PathBuf,
     /// Dedicated URL-open listener socket path, present only when at least one
@@ -285,6 +286,7 @@ impl PreparedToolSandboxRuntime {
 
     pub(crate) fn prepare(input: super::ToolSandboxPrepare<'_>) -> Result<Self> {
         let super::ToolSandboxPrepare {
+            session_socket_auth,
             config,
             resolved_command_binaries,
             audit_context,
@@ -365,6 +367,7 @@ impl PreparedToolSandboxRuntime {
         let lineage = LineageMarker::build(&plan.config, plan.daemon_pid_source_helpers.clone());
         let runtime = Self {
             inner: Arc::new(ToolSandboxState {
+                session_socket_auth,
                 runtime_dir,
                 socket_path,
                 url_socket_path,
@@ -519,6 +522,10 @@ impl PreparedToolSandboxRuntime {
             resolved_program,
             file_id(&metadata),
         ))
+    }
+
+    pub(crate) fn owns_orphan(&self, pid: u32) -> bool {
+        owns_orphan(&self.inner, pid)
     }
 
     /// Starts the IPC accept loop in a background thread. Returns immediately;
@@ -850,7 +857,11 @@ fn handle_url_open_stream(
         return;
     }
 
-    let peer_pid = match peer_pid_from_stream(&stream) {
+    let peer_pid = match crate::session_auth::authenticate(
+        stream.as_raw_fd(),
+        state.session_socket_auth,
+        |pid| owns_orphan(state, pid),
+    ) {
         Ok(pid) => pid,
         Err(err) => {
             debug!("command-mediation URL open: peer pid resolution failed: {err}");
@@ -996,7 +1007,11 @@ fn handle_shim_stream_inner(
     session_id: &str,
     audit_recorder: Option<Arc<Mutex<crate::audit_integrity::AuditRecorder>>>,
 ) -> Result<(i32, Vec<u8>)> {
-    let auth = authenticate_shim(stream, state)?;
+    let peer_pid =
+        crate::session_auth::authenticate(stream.as_raw_fd(), state.session_socket_auth, |pid| {
+            owns_orphan(state, pid)
+        })?;
+    let auth = authenticate_shim(peer_pid, state)?;
     let request: ToolSandboxShimRequest = read_frame(stream)?;
     // Ack before receiving stdio FDs: on macOS, sendmsg with SCM_RIGHTS ancillary
     // data returns EMSGSIZE if the peer's receive buffer still holds unread frame
@@ -1818,8 +1833,7 @@ struct ShimAuth {
     command: String,
 }
 
-fn authenticate_shim(stream: &UnixStream, state: &ToolSandboxState) -> Result<ShimAuth> {
-    let peer_pid = peer_pid_from_stream(stream)?;
+fn authenticate_shim(peer_pid: u32, state: &ToolSandboxState) -> Result<ShimAuth> {
     let exe_path = exe_path_for_pid(peer_pid)?;
     let command = state.shims_by_path.get(&exe_path).cloned().ok_or_else(|| {
         NonoError::SandboxInit(format!(
@@ -1843,28 +1857,6 @@ fn authenticate_shim(stream: &UnixStream, state: &ToolSandboxState) -> Result<Sh
         )));
     }
     Ok(ShimAuth { peer_pid, command })
-}
-
-fn peer_pid_from_stream(stream: &UnixStream) -> Result<u32> {
-    // SAFETY: getsockopt with LOCAL_PEERPID is stable on macOS.
-    let mut pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            &mut pid as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if ret != 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "command-mediation: getsockopt(LOCAL_PEERPID) failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(pid as u32)
 }
 
 fn exe_path_for_pid(pid: u32) -> Result<PathBuf> {
@@ -1893,6 +1885,12 @@ fn exe_path_for_pid(pid: u32) -> Result<PathBuf> {
 enum Caller {
     Session,
     Command { name: String },
+}
+
+fn owns_orphan(state: &ToolSandboxState, pid: u32) -> bool {
+    session_id_of(pid)
+        .and_then(|sid| state.session_lineage.resolve_sid(sid))
+        .is_some()
 }
 
 fn resolve_caller(
@@ -5800,6 +5798,7 @@ mod tests {
         let runtime_dir = PathBuf::from("/tmp/nono-tool-sandbox-test");
         let shim_dir = runtime_dir.join("shims");
         ToolSandboxState {
+            session_socket_auth: false,
             runtime_dir: runtime_dir.clone(),
             socket_path: runtime_dir.join("supervisor.sock"),
             url_socket_path: None,

@@ -79,6 +79,8 @@ mod sandbox_log;
 mod sandbox_prepare;
 mod sandbox_state;
 mod session;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod session_auth;
 mod session_commands;
 mod setup;
 mod startup_prompt;
@@ -302,6 +304,7 @@ mod tests {
             deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
+            session_socket_auth: false,
             command_policies: None,
             resolved_command_binaries: None,
             approval_backends: std::collections::BTreeMap::new(),
@@ -386,6 +389,7 @@ mod tests {
             deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
+            session_socket_auth: false,
             command_policies: None,
             resolved_command_binaries: None,
             approval_backends: std::collections::BTreeMap::new(),

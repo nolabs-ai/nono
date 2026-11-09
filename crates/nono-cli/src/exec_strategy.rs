@@ -355,6 +355,7 @@ pub struct StartupTimeoutConfig<'a> {
 /// `NONO_SUPERVISOR_PATH`). The parent runs an IPC event loop that handles
 /// capability expansion requests and URL open delegations.
 pub struct SupervisorConfig<'a> {
+    pub session_socket_auth: bool,
     /// Protected nono state roots that must never be granted dynamically.
     pub protected_roots: &'a [std::path::PathBuf],
     /// The session's resolved deny paths (deny groups and profile
@@ -3889,6 +3890,22 @@ fn handle_url_listener_connection(
         }
     };
 
+    let peer_pid = match crate::session_auth::authenticate(
+        sock.as_raw_fd(),
+        config.session_socket_auth,
+        |pid| {
+            config
+                .tool_sandbox_runtime
+                .is_some_and(|runtime| runtime.owns_orphan(pid))
+        },
+    ) {
+        Ok(pid) => pid,
+        Err(err) => {
+            warn!("Rejected URL listener connection: {err}");
+            return;
+        }
+    };
+
     let msg = match sock.recv_message() {
         Ok(m) => m,
         Err(e) => {
@@ -3898,7 +3915,9 @@ fn handle_url_listener_connection(
     };
 
     match msg {
-        SupervisorMessage::OpenUrl(url_request) => {
+        SupervisorMessage::OpenUrl(mut url_request) => {
+            url_request.child_pid = peer_pid;
+            url_request.session_id = config.session_id.to_string();
             let request_id = url_request.request_id.clone();
             let (success, error, push_denial) =
                 match validate_and_open_url(&url_request.url, config) {
@@ -5689,6 +5708,7 @@ mod tests {
 
         let backend = DenyAll;
         let sup_cfg = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -5821,6 +5841,7 @@ mod tests {
         // ProxyOnly mode with proxy_port set, but seccomp_proxy_fallback is false
         // (simulating V4+ where Landlock handles networking).
         let sup_cfg = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -5919,6 +5940,7 @@ mod tests {
         let backend = TestDenyBackend;
         let origins = vec!["https://claude.ai".to_string()];
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -5970,6 +5992,7 @@ mod tests {
     fn test_validate_url_blocks_non_https() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6028,6 +6051,7 @@ mod tests {
         let backend = TestDenyBackend;
         let origins = vec!["https://claude.ai".to_string()];
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6102,6 +6126,7 @@ mod tests {
     fn test_validate_url_localhost() {
         let backend = TestDenyBackend;
         let config_allow = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6137,6 +6162,7 @@ mod tests {
             tool_sandbox_runtime: None,
         };
         let config_deny = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6191,6 +6217,7 @@ mod tests {
     fn test_validate_url_max_length() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6350,6 +6377,7 @@ mod tests {
 
         let backend = TestBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6413,6 +6441,7 @@ mod tests {
         let backend = TestDenyBackend;
         let origins = vec!["https://idp.example.com".to_string()];
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6465,6 +6494,7 @@ mod tests {
     fn test_validate_url_ipv6_localhost() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6536,6 +6566,7 @@ mod tests {
     fn test_validate_url_rejects_data_scheme() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,

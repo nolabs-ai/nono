@@ -32,7 +32,6 @@ use landlock::{
     RulesetCreatedAttr,
 };
 use nix::libc;
-use nono::supervisor::socket::peer_credentials;
 use nono::{
     AccessMode, CapabilitySet, FsCapability, NetworkMode, NonoError, Result, Sandbox,
     UnixSocketCapability, UnixSocketMode,
@@ -99,6 +98,7 @@ pub(crate) struct PreparedToolSandboxRuntime {
 }
 
 struct ToolSandboxState {
+    session_socket_auth: bool,
     runtime_dir: PathBuf,
     socket_path: PathBuf,
     /// Dedicated URL-open listener socket path, present only when a command
@@ -267,6 +267,7 @@ impl PreparedToolSandboxRuntime {
 
     pub(crate) fn prepare(input: super::ToolSandboxPrepare<'_>) -> Result<Self> {
         let super::ToolSandboxPrepare {
+            session_socket_auth,
             config,
             initial_program,
             resolved_command_binaries,
@@ -396,6 +397,7 @@ impl PreparedToolSandboxRuntime {
         let lineage = LineageMarker::deferred(std::process::id());
         let runtime = Self {
             inner: Arc::new(ToolSandboxState {
+                session_socket_auth,
                 runtime_dir,
                 socket_path,
                 url_socket_path,
@@ -618,6 +620,10 @@ impl PreparedToolSandboxRuntime {
 
     pub(crate) fn emitted_error_response(&self) -> bool {
         self.inner.emitted_error_response.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn owns_orphan(&self, pid: u32) -> bool {
+        owns_orphan(&self.inner, pid)
     }
 
     pub(crate) fn handle_listener(
@@ -1143,8 +1149,12 @@ fn handle_url_open_stream(
         return;
     }
 
-    let peer_pid = match peer_credentials(stream.as_raw_fd()) {
-        Ok(creds) => creds.pid,
+    let peer_pid = match crate::session_auth::authenticate(
+        stream.as_raw_fd(),
+        state.session_socket_auth,
+        |pid| owns_orphan(state, pid),
+    ) {
+        Ok(pid) => pid,
         Err(err) => {
             debug!("command-mediation URL open: peer pid resolution failed: {err}");
             return;
@@ -1273,7 +1283,10 @@ fn handle_shim_stream_inner(
     session_id: &str,
     audit_recorder: Option<Arc<Mutex<AuditRecorder>>>,
 ) -> Result<(i32, Vec<u8>)> {
-    let peer_pid = peer_credentials(stream.as_raw_fd())?.pid;
+    let peer_pid =
+        crate::session_auth::authenticate(stream.as_raw_fd(), state.session_socket_auth, |pid| {
+            owns_orphan(state, pid)
+        })?;
     let shim_fd = recv_fd_via_socket(stream.as_raw_fd())?;
     let request: ToolSandboxShimRequest = read_frame(stream)?;
     send_frame_ack(stream)?;
@@ -2102,6 +2115,10 @@ fn send_shim_identity_fd(stream: &UnixStream, shim_exe: &Path) -> Result<()> {
         source,
     })?;
     send_fd_via_socket(stream.as_raw_fd(), shim_file.as_raw_fd())
+}
+
+fn owns_orphan(state: &ToolSandboxState, pid: u32) -> bool {
+    state.lineage.resolve_severed_command(pid).is_some()
 }
 
 fn resolve_caller(
@@ -6569,6 +6586,7 @@ mod tests {
         shim: ShimIdentity,
     ) -> ToolSandboxState {
         ToolSandboxState {
+            session_socket_auth: false,
             runtime_dir,
             socket_path,
             url_socket_path: None,

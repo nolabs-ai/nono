@@ -593,6 +593,11 @@
       "description": "Security configuration for process-level isolation modes.",
       "additionalProperties": false,
       "properties": {
+        "session_socket_auth": {
+          "oneOf": [{ "type": "boolean" }, { "type": "null" }],
+          "default": false,
+          "description": "Opt-in authentication of named IPC callers against the owning nono session, including brokered tools. Defaults to false for compatibility. Requires Linux 6.5+ on Linux; enabling it on an unsupported kernel fails at startup."
+        },
         "signal_mode": {
           "oneOf": [
             { "$ref": "#/$defs/ProfileSignalMode" },

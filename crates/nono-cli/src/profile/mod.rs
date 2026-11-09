@@ -2457,6 +2457,10 @@ pub struct WorkdirConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
+    /// Authenticate named IPC callers against the owning nono session.
+    /// Opt-in; requires SO_PEERPIDFD on Linux (kernel 6.5+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_socket_auth: Option<bool>,
     /// Signal isolation mode. Controls whether the sandboxed process can signal
     /// other processes. When `None`, inherits from the base profile during merge
     /// (defaults to `Isolated` if no base sets it).
@@ -3705,6 +3709,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         ),
         meta: child.meta,
         security: SecurityConfig {
+            session_socket_auth: child
+                .security
+                .session_socket_auth
+                .or(base.security.session_socket_auth),
             signal_mode: child.security.signal_mode.or(base.security.signal_mode),
             process_info_mode: child
                 .security
@@ -9364,6 +9372,30 @@ mod tests {
         std::fs::write(&path, json).expect("write profile");
         let profile = load_profile_from_path(&path).expect("parse profile");
         assert!(profile.security.process_info_mode.is_none());
+    }
+
+    #[test]
+    fn session_socket_auth_defaults_off_and_inherits_explicit_settings() {
+        let unset: Profile = serde_json::from_value(serde_json::json!({})).expect("profile");
+        assert_eq!(unset.security.session_socket_auth, None);
+        let mut base = base_profile();
+        base.security.session_socket_auth = Some(true);
+        let merged = merge_profiles(base.clone(), unset);
+        assert_eq!(merged.security.session_socket_auth, Some(true));
+        let disabled: Profile = serde_json::from_value(serde_json::json!({
+            "security": {"session_socket_auth": false}
+        }))
+        .expect("disabled profile");
+        assert_eq!(
+            merge_profiles(base, disabled).security.session_socket_auth,
+            Some(false)
+        );
+        assert!(
+            serde_json::from_value::<Profile>(serde_json::json!({
+                "security": {"session_socket_auth": "true"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

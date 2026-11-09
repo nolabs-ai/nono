@@ -2158,6 +2158,7 @@ mod tests {
             static EMPTY_CAPS: std::sync::LazyLock<nono::CapabilitySet> =
                 std::sync::LazyLock::new(nono::CapabilitySet::default);
             SupervisorConfig {
+                session_socket_auth: false,
                 protected_roots: &[],
                 deny_paths: &[],
                 approval_backend: backend,

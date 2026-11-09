@@ -131,6 +131,7 @@ pub(crate) struct OpenUrlIntent {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProxyLaunchOptions {
+    pub(crate) session_socket_auth: bool,
     pub(crate) domain_filter: Option<DomainFilterIntent>,
     pub(crate) endpoint_filter: Option<EndpointFilterIntent>,
     pub(crate) credentials: Option<CredentialProxyIntent>,
@@ -237,6 +238,7 @@ fn mark_network_audit_disabled(network: &mut NetworkIntent) {
 
 #[derive(Clone)]
 pub(crate) struct ExecutionFlags {
+    pub(crate) session_socket_auth: bool,
     pub(crate) strategy: exec_strategy::ExecStrategy,
     pub(crate) workdir: PathBuf,
     pub(crate) no_diagnostics: bool,
@@ -300,6 +302,7 @@ impl ExecutionFlags {
             .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?;
         Ok(Self {
             strategy: exec_strategy::ExecStrategy::Supervised,
+            session_socket_auth: prepared.session_socket_auth,
             workdir: cwd.clone(),
             no_diagnostics: false,
             diagnostics_json: false,

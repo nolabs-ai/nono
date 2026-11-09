@@ -534,6 +534,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) deny_paths: Vec<PathBuf>,
     pub(crate) secrets: Vec<nono::LoadedSecret>,
     pub(crate) profile_display_name: Option<String>,
+    pub(crate) session_socket_auth: bool,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Command binaries already resolved while validating `command_policies`.
     /// Reused by the command-mediation plan build so every controlled binary is
@@ -747,6 +748,7 @@ fn finalize_prepared_sandbox(
     args: &SandboxArgs,
     silent: bool,
 ) -> Result<PreparedSandbox> {
+    crate::session_auth::validate_support(prepared.session_socket_auth)?;
     // Attach resource limits from CLI flags. The manifest path already set caps via
     // `CapabilitySet::try_from`, and flags conflict with `--config`, so this only
     // runs on the flag path. Enforcement is later, in the supervised runtime; here
@@ -1562,6 +1564,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 deny_paths: Vec::new(),
                 secrets: Vec::new(),
                 profile_display_name: None,
+                session_socket_auth: false,
                 command_policies: None,
                 resolved_command_binaries: None,
                 approval_backends: std::collections::BTreeMap::new(),
@@ -1968,6 +1971,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .map(|profile| profile.credential_capture.clone())
         .unwrap_or_default();
     let loaded_secrets = load_env_credentials(args, &profile_secrets, silent, &caps)?;
+    let session_socket_auth = loaded_profile
+        .as_ref()
+        .and_then(|profile| profile.security.session_socket_auth)
+        .unwrap_or(false);
 
     finalize_prepared_sandbox(
         PreparedSandbox {
@@ -1975,6 +1982,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             deny_paths: prepared_deny_paths,
             secrets: loaded_secrets,
             profile_display_name,
+            session_socket_auth,
             command_policies,
             resolved_command_binaries: profile_resolved_command_binaries,
             approval_backends: profile_approval_backends,
@@ -3035,6 +3043,7 @@ mod tests {
             deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
+            session_socket_auth: false,
             command_policies: None,
             resolved_command_binaries: None,
             approval_backends: std::collections::BTreeMap::new(),

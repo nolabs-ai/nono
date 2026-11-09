@@ -38,6 +38,7 @@ fn make_jwt_route(socket: &str) -> RouteConfig {
             credential_format: None,
             svid_hint: None,
         }),
+        aauth: None,
         upgrades: vec![],
         rate_limit: None,
     }
@@ -178,6 +179,7 @@ async fn test_spiffe_jwt_live_proxy_startup() {
             credential_format: None,
             svid_hint: None,
         }),
+        aauth: None,
         upgrades: vec![],
         rate_limit: None,
     };

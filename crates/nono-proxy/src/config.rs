@@ -100,6 +100,18 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
 
+    /// The agent's persistent aauth identity, if any. One identity per
+    /// profile — individual routes opt into signing with it via
+    /// `RouteConfig::aauth` (or `aauth_sign_all_outbound` below).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aauth_identity: Option<AauthIdentityConfig>,
+
+    /// When `true`, every route signs with `aauth_identity` unless it sets
+    /// `aauth: false`. When `false` (the default), routes must opt in with
+    /// `aauth: true`.
+    #[serde(default)]
+    pub aauth_sign_all_outbound: bool,
+
     /// Declarative OAuth token capture routes.
     ///
     /// These are not reverse-proxy routes. They mark OAuth token endpoints
@@ -266,6 +278,8 @@ impl Default for ProxyConfig {
             strict_connect_auth: false,
             session_token: None,
             routes: Vec::new(),
+            aauth_identity: None,
+            aauth_sign_all_outbound: false,
             oauth_capture: Vec::new(),
             oauth_capture_store_path: None,
             external_proxy: None,
@@ -868,6 +882,12 @@ pub struct RouteConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spiffe: Option<SpiffeAuthConfig>,
 
+    /// Whether this route signs outbound requests with the profile's
+    /// `aauth_identity`. `None` defers to `ProxyConfig::aauth_sign_all_outbound`.
+    /// Mutually exclusive with `credential_key`, `oauth2`, `aws_auth`, and `spiffe`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aauth: Option<bool>,
+
     /// Optional allow-list of WebSocket upgrade targets for this route.
     ///
     /// When a client requests an HTTP `Upgrade` on this route, it is only
@@ -934,6 +954,111 @@ pub enum SpiffeAuthConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         svid_hint: Option<String>,
     },
+}
+
+/// Resolve the signing default consistently for profile and proxy routes.
+/// An explicit opt-in is validated separately for conflicting auth sources.
+pub fn resolve_aauth_enabled(
+    explicit: Option<bool>,
+    sign_all_outbound: bool,
+    has_other_auth: bool,
+) -> bool {
+    explicit.unwrap_or(sign_all_outbound && !has_other_auth)
+}
+
+/// The agent's persistent aauth identity (RFC 9421 request signing).
+///
+/// One identity per profile. `key_ref` accepts an existing absolute path or
+/// file://, keyring://, or env:// reference. Files accept unencrypted Ed25519
+/// PKCS#8 PEM/DER or legacy base64 DER; no import is required.
+///
+/// `jwt` requires an `aauth:local@domain` agent_id, carried in a self-issued
+/// agent token. Under `hwk`, agent_id is an optional local audit label.
+/// Under raw `jwks_uri`, omit it: the issuer itself is the identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AauthIdentityConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub key_ref: String,
+    /// Which `Signature-Key` scheme to sign with. Defaults to `hwk`
+    /// (pseudonymous, public key inline — no hosting required).
+    #[serde(default)]
+    pub scheme: AauthSigSchemeConfig,
+}
+
+/// Which `Signature-Key` scheme an aauth identity signs with.
+///
+/// Use `jwt` for Aauth agent identity. The self-hosted issuer publishes
+/// `/.well-known/aauth-agent.json` and its public JWKS. `hwk` and raw
+/// `jwks_uri` remain available for generic HTTP Signature Keys usage.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AauthSigSchemeConfig {
+    #[default]
+    Hwk,
+    JwksUri {
+        /// This agent's issuer identifier — an HTTPS URL with no port or
+        /// path (e.g. `https://agent.example.com`), matching the `issuer`
+        /// field of the hosted `aauth-agent.json`.
+        issuer: String,
+    },
+    Jwt {
+        /// Self-hosted agent provider's bare HTTPS origin. Its published key
+        /// verifies both the agent token and the HTTP request.
+        issuer: String,
+    },
+}
+
+impl AauthSigSchemeConfig {
+    /// Validate scheme constraints at both profile and proxy startup boundaries.
+    pub fn validate_identity(&self, agent_id: Option<&str>) -> crate::error::Result<()> {
+        if let Self::JwksUri { issuer } | Self::Jwt { issuer } = self {
+            let invalid = || {
+                crate::error::ProxyError::Config(
+                    concat!(
+                        "aauth identity scheme.issuer must be a bare lowercase HTTPS origin ",
+                        "with no credentials, port, path, query, or fragment ",
+                        "(e.g. https://agent.example.com)"
+                    )
+                    .to_string(),
+                )
+            };
+            aauth_core::identifiers::validate_server_identifier(issuer).map_err(|_| invalid())?;
+            let parsed = url::Url::parse(issuer).map_err(|_| invalid())?;
+            if parsed.origin().ascii_serialization() != *issuer {
+                return Err(invalid());
+            }
+            if matches!(self, Self::JwksUri { .. })
+                && let Some(explicit) = agent_id
+            {
+                return Err(crate::error::ProxyError::Config(format!(
+                    "aauth identity: agent_id ('{explicit}') must not be set under jwks_uri — the verifying resource recovers issuer '{issuer}'; remove agent_id from the profile"
+                )));
+            }
+            if matches!(self, Self::Jwt { .. }) {
+                // The MVP self-issues top-level agents only. Check the current
+                // grammar here: aauth-core 0.1.2 incorrectly rejects uppercase
+                // local parts and allows '+' without a parent_agent claim.
+                let valid = agent_id
+                    .and_then(|id| id.strip_prefix("aauth:"))
+                    .and_then(|id| id.split_once('@'))
+                    .is_some_and(|(local, domain)| {
+                        !local.is_empty()
+                            && local.len() <= 255
+                            && local
+                                .bytes()
+                                .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+                            && Some(domain) == parsed.host_str()
+                    });
+                if !valid {
+                    return Err(crate::error::ProxyError::Config(
+                        "aauth jwt requires agent_id 'aauth:local@domain' with the issuer's domain; local must be 1–255 ASCII letters, digits, '-', '_', or '.'".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Per-route request-rate limit configuration for a [`RouteConfig`].
@@ -1646,6 +1771,97 @@ pub struct AwsAuthConfig {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aauth_identity_rejects_invalid_origins_without_echoing_credentials() {
+        for issuer in [
+            "",
+            "http://agent.example.com",
+            "https://agent.example.com/path",
+            "https://agent.example.com/",
+            "https://agent.example.com:443",
+            "https://agent.example.com:8443",
+            "https://agent.example.com?query",
+            "https://agent.example.com#fragment",
+            "https://user:secret@agent.example.com",
+        ] {
+            let scheme = AauthSigSchemeConfig::JwksUri {
+                issuer: issuer.to_string(),
+            };
+            let error = scheme
+                .validate_identity(None)
+                .expect_err("invalid origin")
+                .to_string();
+            assert!(error.contains("scheme.issuer"));
+            assert!(!error.contains("secret"));
+        }
+        let scheme = AauthSigSchemeConfig::JwksUri {
+            issuer: "https://agent.example.com".to_string(),
+        };
+        assert!(scheme.validate_identity(None).is_ok());
+        assert!(scheme.validate_identity(Some("local-label")).is_err());
+        assert!(
+            AauthSigSchemeConfig::Hwk
+                .validate_identity(Some("local-label"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn aauth_jwt_requires_top_level_agent_in_the_issuer_domain() {
+        let scheme = AauthSigSchemeConfig::Jwt {
+            issuer: "https://agent.example.com".to_string(),
+        };
+        for id in [
+            None,
+            Some(""),
+            Some("local-label"),
+            Some("aauth:@agent.example.com"),
+            Some("aauth:agent@other.example.com"),
+            Some("aauth:agent+child@agent.example.com"),
+            Some("aauth:bad space@agent.example.com"),
+            Some("aauth:é@agent.example.com"),
+            Some("aauth:agent@AGENT.example.com"),
+        ] {
+            assert!(scheme.validate_identity(id).is_err(), "must reject {id:?}");
+        }
+        assert!(
+            scheme
+                .validate_identity(Some("aauth:Agent_01-v2.3@agent.example.com"))
+                .is_ok()
+        );
+        assert!(
+            scheme
+                .validate_identity(Some(&format!(
+                    "aauth:{}@agent.example.com",
+                    "a".repeat(256)
+                )))
+                .is_err()
+        );
+        assert!(
+            AauthSigSchemeConfig::Jwt {
+                issuer: "https://secret:password@agent.example.com".to_string()
+            }
+            .validate_identity(Some("aauth:agent@agent.example.com"))
+            .unwrap_err()
+            .to_string()
+            .contains("scheme.issuer")
+        );
+    }
+
+    #[test]
+    fn aauth_default_preserves_explicit_choices_and_other_credentials() {
+        for global in [false, true] {
+            for other_auth in [false, true] {
+                assert!(!resolve_aauth_enabled(Some(false), global, other_auth));
+                assert!(resolve_aauth_enabled(Some(true), global, other_auth));
+            }
+        }
+        assert!(resolve_aauth_enabled(None, true, false));
+        assert!(!resolve_aauth_enabled(None, true, true));
+        assert!(!resolve_aauth_enabled(None, false, false));
+        assert!(!resolve_aauth_enabled(None, false, true));
+    }
 
     #[test]
     fn test_http_header_token_char_alphanumeric() {

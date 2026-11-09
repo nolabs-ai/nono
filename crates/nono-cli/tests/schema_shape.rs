@@ -76,6 +76,8 @@ fn test_schema_network_config_matches_rust_model() {
             "connect_port",
             "no_proxy",
             "custom_credentials",
+            "aauth_identity",
+            "aauth_sign_all_outbound",
             "tls_intercept",
             "upstream_proxy",
             "upstream_bypass",
@@ -475,6 +477,7 @@ fn test_schema_custom_credential_def_matches_rust_model() {
             "auth",
             "aws_auth",
             "spiffe",
+            "aauth",
             "inject_mode",
             "inject_header",
             "credential_format",
@@ -520,6 +523,147 @@ fn test_schema_validates_custom_credential_with_spiffe_and_endpoint_policy() {
     validator
         .validate(&profile)
         .expect("custom credential with spiffe and endpoint_policy should validate");
+}
+
+#[test]
+fn test_schema_validates_custom_credential_with_aauth_hwk() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": {
+            "aauth_identity": { "key_ref": "file:///path/to/key.pem" },
+            "custom_credentials": {
+                "internal-api": {
+                    "upstream": "https://internal.example.com",
+                    "aauth": true
+                }
+            }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("custom credential with aauth: true should validate");
+}
+
+#[test]
+fn test_schema_validates_aauth_identity_with_jwks_uri_scheme() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": {
+            "aauth_identity": {
+                "key_ref": "file:///path/to/key.pem",
+                "scheme": { "type": "jwks_uri", "issuer": "https://agent.example.com" }
+            },
+            "aauth_sign_all_outbound": true,
+            "custom_credentials": {
+                "internal-api": { "upstream": "https://internal.example.com" }
+            }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("aauth_identity with jwks_uri scheme and aauth_sign_all_outbound should validate");
+}
+
+#[test]
+fn test_schema_validates_jwt_agent_identity_and_requires_subject() {
+    let validator = jsonschema::validator_for(&load_schema()).expect("schema compiles");
+    let mut profile = json!({"network": {"aauth_identity": {
+        "key_ref": "/home/alice/agent.pem",
+        "agent_id": "aauth:Agent@agent.example.com",
+        "scheme": {"type": "jwt", "issuer": "https://agent.example.com"}
+    }}});
+    validator.validate(&profile).expect("JWT agent identity");
+    for id in [
+        json!(null),
+        json!("audit-label"),
+        json!("aauth:parent+child@agent.example.com"),
+    ] {
+        profile["network"]["aauth_identity"]["agent_id"] = id;
+        assert!(validator.validate(&profile).is_err());
+    }
+    profile["network"]["aauth_identity"]
+        .as_object_mut()
+        .expect("identity object")
+        .remove("agent_id");
+    assert!(validator.validate(&profile).is_err());
+}
+
+#[test]
+fn test_schema_bare_route_requires_effective_aauth_default() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    for global in [None, Some(false), Some(true)] {
+        for explicit in [None, Some(false), Some(true)] {
+            let mut profile = json!({
+                "network": {
+                    "aauth_identity": { "key_ref": "/path/to/key.pem" },
+                    "custom_credentials": {
+                        "api": { "upstream": "https://api.example.com" }
+                    }
+                }
+            });
+            if let Some(global) = global {
+                profile["network"]["aauth_sign_all_outbound"] = json!(global);
+            }
+            if let Some(explicit) = explicit {
+                profile["network"]["custom_credentials"]["api"]["aauth"] = json!(explicit);
+            }
+            let expected = explicit.unwrap_or(global.unwrap_or(false));
+            assert_eq!(
+                validator.is_valid(&profile),
+                expected,
+                "global={global:?}, explicit={explicit:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_schema_rejects_custom_credential_with_aauth_and_credential_key() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": {
+            "custom_credentials": {
+                "internal-api": {
+                    "upstream": "https://internal.example.com",
+                    "credential_key": "internal_api_token",
+                    "aauth": true
+                }
+            }
+        }
+    });
+
+    assert!(
+        validator.validate(&profile).is_err(),
+        "custom credential combining aauth: true with credential_key must fail schema validation"
+    );
+}
+
+#[test]
+fn test_schema_preserves_phantom_routes_and_rejects_explicit_aauth_combination() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let mut profile = json!({
+        "network": {
+            "aauth_sign_all_outbound": true,
+            "custom_credentials": {
+                "partner": {
+                    "upstream": "https://partner.example.com",
+                    "redeem_phantoms": ["partner-token"]
+                }
+            }
+        }
+    });
+    validator
+        .validate(&profile)
+        .expect("phantom-only route remains valid");
+    profile["network"]["custom_credentials"]["partner"]["aauth"] = json!(true);
+    assert!(validator.validate(&profile).is_err());
 }
 
 #[test]

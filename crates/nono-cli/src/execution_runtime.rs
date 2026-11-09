@@ -423,6 +423,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let proxy_env_vars = active_proxy.env_vars;
     let tool_sandbox_proxy_credentials = active_proxy.tool_sandbox_proxy_credentials;
     let scoped_proxy_env_vars = active_proxy.scoped_proxy_env_vars;
+    let aauth_env_var_to_deny = active_proxy.aauth_env_var_to_deny;
     let tool_sandbox_trust_bundle_paths = active_proxy.tool_sandbox_trust_bundle_paths;
     let reserved_proxy_ports: std::collections::BTreeSet<u16> = active_proxy
         .handle
@@ -798,7 +799,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         #[cfg(target_os = "linux")]
         namespaces,
         allowed_env_vars: flags.allowed_env_vars,
-        denied_env_vars: flags.denied_env_vars,
+        denied_env_vars: {
+            let mut denied = flags.denied_env_vars;
+            if let Some(var) = aauth_env_var_to_deny {
+                denied.get_or_insert_with(Vec::new).push(var);
+            }
+            denied
+        },
         case_insensitive_env_vars: flags.case_insensitive_env_vars,
         set_vars: flags.set_vars.unwrap_or_default(),
         #[cfg(any(target_os = "linux", target_os = "macos"))]

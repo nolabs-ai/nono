@@ -898,6 +898,33 @@
       "type": "object",
       "description": "Network access configuration including proxy, credential injection, and port allowlists.",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": ["aauth_sign_all_outbound"],
+            "properties": { "aauth_sign_all_outbound": { "const": true } }
+          },
+          "then": {
+            "properties": {
+              "custom_credentials": {
+                "additionalProperties": {
+                  "anyOf": [
+                    { "$ref": "#/$defs/CustomCredentialAuthRequired" },
+                    { "properties": { "aauth": { "not": { "const": false } } } }
+                  ]
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "custom_credentials": {
+                "additionalProperties": { "$ref": "#/$defs/CustomCredentialAuthRequired" }
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "block": {
           "type": "boolean",
@@ -981,6 +1008,14 @@
           },
           "description": "Custom credential definitions for services not in network-policy.json. Keys are service names used with --credential."
         },
+        "aauth_identity": {
+          "$ref": "#/$defs/AauthIdentityDef",
+          "description": "The agent's persistent aauth identity (RFC 9421 request signing). One identity per profile; individual custom_credentials entries opt into signing with it via their aauth field."
+        },
+        "aauth_sign_all_outbound": {
+          "type": "boolean",
+          "description": "When true, every custom credential route with no other auth mechanism signs with aauth_identity by default, unless it sets aauth: false. When false (the default), routes must opt in with aauth: true."
+        },
         "tls_intercept": {
           "$ref": "#/$defs/TlsInterceptConfig",
           "description": "TLS interception certificate lifecycle controls for L7 proxy routes."
@@ -1039,17 +1074,21 @@
         }
       }
     },
-    "CustomCredentialDef": {
-      "type": "object",
-      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must set at least one of: credential_key, auth, aws_auth, spiffe, or redeem_phantoms. credential_key/auth/aws_auth/spiffe are mutually exclusive with each other. redeem_phantoms may stand alone OR combine with credential_key/auth (but not aws_auth/spiffe).",
-      "additionalProperties": false,
-      "required": ["upstream"],
+    "CustomCredentialAuthRequired": {
       "anyOf": [
         { "required": ["credential_key"], "properties": { "credential_key": { "not": { "type": "null" } } } },
         { "required": ["auth"], "properties": { "auth": { "not": { "type": "null" } } } },
         { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } },
-        { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
-      ],
+        { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } },
+        { "required": ["aauth"], "properties": { "aauth": { "const": true } } },
+        { "required": ["redeem_phantoms"], "properties": { "redeem_phantoms": { "minItems": 1 } } }
+      ]
+    },
+    "CustomCredentialDef": {
+      "type": "object",
+      "description": "Custom credential route definition for the reverse proxy. Must configure an auth source or inherit aauth_sign_all_outbound. credential_key/auth/aws_auth/spiffe/aauth are mutually exclusive. redeem_phantoms may stand alone or combine with credential_key/auth. NetworkConfig enforces the auth requirement using the profile-wide signing default.",
+      "additionalProperties": false,
+      "required": ["upstream"],
       "allOf": [
         {
           "not": {
@@ -1098,7 +1137,12 @@
               { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
             ]
           }
-        }
+        },
+        {"not": {"allOf": [{"required": ["credential_key"], "properties": {"credential_key": {"not": {"type": "null"}}}}, {"required": ["aauth"], "properties": {"aauth": {"const": true}}}]}},
+        {"not": {"allOf": [{"required": ["auth"], "properties": {"auth": {"not": {"type": "null"}}}}, {"required": ["aauth"], "properties": {"aauth": {"const": true}}}]}},
+        {"not": {"allOf": [{"required": ["aws_auth"], "properties": {"aws_auth": {"not": {"type": "null"}}}}, {"required": ["aauth"], "properties": {"aauth": {"const": true}}}]}},
+        {"not": {"allOf": [{"required": ["spiffe"], "properties": {"spiffe": {"not": {"type": "null"}}}}, {"required": ["aauth"], "properties": {"aauth": {"const": true}}}]}},
+        {"not": {"allOf": [{"required": ["redeem_phantoms"], "properties": {"redeem_phantoms": {"minItems": 1}}}, {"required": ["aauth"], "properties": {"aauth": {"const": true}}}]}}
       ],
       "properties": {
         "upstream": {
@@ -1213,6 +1257,7 @@
           ],
           "description": "Path to the PEM-encoded private key corresponding to tls_client_cert. Must be set together with tls_client_cert."
         },
+        "aauth": {"oneOf": [{"type": "boolean"}, {"type": "null"}], "description": "Whether this route signs outbound requests with the profile's aauth_identity. true to sign, false to opt out of aauth_sign_all_outbound. Mutually exclusive with credential_key, auth, aws_auth, and spiffe."},
         "rate_limit": {
           "oneOf": [
             { "$ref": "#/$defs/RouteRateLimitConfig" },
@@ -1489,6 +1534,68 @@
           "description": "Select a specific SVID by SPIFFE ID when the Workload API returns multiple SVIDs for the same workload. When absent, the first SVID returned by the agent is used."
         }
       }
+    },
+    "AauthIdentityDef": {
+      "type": "object",
+      "description": "The agent's persistent aauth identity (RFC 9421 request signing). key_ref accepts an existing absolute path or keyring://, file://, or env:// reference. Files accept unencrypted Ed25519 PKCS#8 PEM/DER or legacy base64 DER.",
+      "additionalProperties": false,
+      "required": ["key_ref"],
+      "properties": {
+        "agent_id": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Required aauth:local@domain token subject under jwt, using the issuer's domain. Under hwk, an optional local audit label; omit under raw jwks_uri."
+        },
+        "key_ref": {
+          "type": "string",
+          "description": "Existing private key: absolute filesystem path, file://, keyring://, or env://. Files accept unencrypted Ed25519 PKCS#8 PEM/DER or legacy base64 DER; no import is needed."
+        },
+        "scheme": {
+          "$ref": "#/$defs/AauthSigSchemeConfig",
+          "description": "Which Signature-Key scheme to sign with. Defaults to hwk."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["scheme"],
+            "properties": {
+              "scheme": { "properties": { "type": { "const": "jwt" } }, "required": ["type"] }
+            }
+          },
+          "then": {
+            "required": ["agent_id"],
+            "properties": { "agent_id": { "type": "string", "pattern": "^aauth:[A-Za-z0-9_.-]{1,255}@[a-z0-9.-]+$" } }
+          }
+        }
+      ]
+    },
+    "AauthSigSchemeConfig": {
+      "description": "Use jwt for self-hosted Aauth agent identity: nono issues a one-hour agent token at startup. The issuer hosts /.well-known/aauth-agent.json and public JWKS. hwk and raw jwks_uri are generic HTTP Signature Keys modes.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "type": "string", "enum": ["hwk"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "issuer"],
+          "properties": {
+            "type": { "type": "string", "enum": ["jwks_uri", "jwt"] },
+            "issuer": {
+              "type": "string",
+              "description": "This agent's issuer identifier: an HTTPS URL with no port or path (e.g. https://agent.example.com), matching the issuer field of the hosted aauth-agent.json."
+            }
+          }
+        }
+      ]
     },
     "PlatformOverrides": {
       "type": "object",

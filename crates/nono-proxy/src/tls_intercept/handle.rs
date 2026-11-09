@@ -985,6 +985,31 @@ pub(crate) async fn resolve_managed_credential<'a>(
     method: &str,
     path: &str,
 ) -> CredentialResolution<'a> {
+    // Signing is supported by the reverse-proxy path only. Both HTTP/1.1
+    // and HTTP/2 interception must reject rather than forward unsigned.
+    if let Some(rt) = route
+        && let Some(signer) = &rt.aauth_signer
+    {
+        let reason =
+            "aauth signing requires the reverse proxy URL; CONNECT interception is unsupported";
+        audit::log_denied(
+            audit_log,
+            audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                route_id: service,
+                auth_mechanism: rt.managed_auth_mechanism.clone(),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::ConnectBypassesL7),
+                aauth_context: Some(signer.audit_context()),
+                ..audit::EventContext::default()
+            },
+            host,
+            port,
+            reason,
+        );
+        return CredentialResolution::Rejected(403);
+    }
+
     let static_cred = service.and_then(|s| credential_store.get(s));
     let cmd_route = service.and_then(|s| credential_store.get_cmd(s));
     let oauth2_route = service.and_then(|s| credential_store.get_oauth2(s));
@@ -2329,6 +2354,44 @@ fn parse_request_line(line: &str) -> Result<(String, String, String)> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn aauth_intercept_rejects_instead_of_forwarding_unsigned() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let key_path = root.path().join("identity.der");
+        let (key, _) = aauth_core::keys::generate_ed25519_keypair();
+        std::fs::write(&key_path, key.to_pkcs8_der().expect("DER")).expect("write key");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("permissions");
+        let route = serde_json::from_value(serde_json::json!({
+            "prefix": "signed", "upstream": "https://example.com", "aauth": true
+        }))
+        .expect("route");
+        let identity = crate::config::AauthIdentityConfig {
+            key_ref: key_path.to_string_lossy().into_owned(),
+            agent_id: None,
+            scheme: crate::config::AauthSigSchemeConfig::Hwk,
+        };
+        let routes = RouteStore::load_with_aauth(&[route], Some(&identity), false)
+            .await
+            .expect("load signer");
+        let credentials = CredentialStore::empty();
+        // This production resolver is called by both HTTP/1.1 and HTTP/2.
+        let result = resolve_managed_credential(
+            &credentials,
+            None,
+            None,
+            "example.com",
+            443,
+            Some("signed"),
+            routes.get("signed"),
+            "GET",
+            "/widgets",
+        )
+        .await;
+        assert!(matches!(result, CredentialResolution::Rejected(403)));
+    }
+
     #[test]
     fn handshake_validity_errors_suggest_clocks_and_expiry() {
         let time = rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(1));
@@ -2739,6 +2802,7 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }
@@ -2776,6 +2840,7 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }
@@ -2867,6 +2932,7 @@ mod tests {
                 spiffe: None,
                 upgrades: vec![],
                 rate_limit: None,
+                aauth: None,
             }
         }
 
@@ -2924,6 +2990,7 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             // Burst of 1 with no delay budget: the first request passes, the
             // second is rejected within the same instant.
@@ -3031,6 +3098,7 @@ mod tests {
                 allow: vec![],
             }),
             spiffe: None,
+            aauth: None,
             rate_limit: None,
         }
     }

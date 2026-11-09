@@ -161,6 +161,10 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
     /// Declarative OAuth provider route bindings.
     pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
+    /// The agent's persistent aauth identity, if configured.
+    pub(crate) aauth_identity: Option<profile::AauthIdentityDef>,
+    /// Whether custom credential routes sign with `aauth_identity` by default.
+    pub(crate) aauth_sign_all_outbound: bool,
     /// Enable HTTP/2 negotiation for upstream connections.
     pub(crate) enable_h2: bool,
     /// Profile-declared client-side proxy bypass entries for generated

@@ -1212,7 +1212,12 @@ pub async fn start_with_network_approval(
     let route_store = if config.routes.is_empty() {
         RouteStore::empty()
     } else {
-        RouteStore::load(&config.routes).await?
+        RouteStore::load_with_aauth(
+            &config.routes,
+            config.aauth_identity.as_ref(),
+            config.aauth_sign_all_outbound,
+        )
+        .await?
     };
     let route_hosts = route_store.route_upstream_hosts();
     validate_no_proxy_route_conflicts(&config.no_proxy, &route_hosts)?;
@@ -2857,6 +2862,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -3036,6 +3042,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }
@@ -3091,6 +3098,48 @@ mod tests {
             .next()
             .unwrap_or("")
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn aauth_no_auth_accepts_local_request_and_preserves_rate_limit() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("identity.der");
+        let (key, _) = aauth_core::keys::generate_ed25519_keypair();
+        std::fs::write(&path, key.to_pkcs8_der().expect("DER")).expect("write key");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("permissions");
+        let upstream = spawn_mock_upstream().await;
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.aauth = Some(true);
+        route.rate_limit = Some(crate::config::RouteRateLimitConfig {
+            requests_per_minute: 1,
+            burst: 1,
+            max_delay_secs: 0,
+        });
+        let config = ProxyConfig {
+            routes: vec![route],
+            aauth_identity: Some(crate::config::AauthIdentityConfig {
+                key_ref: path.to_string_lossy().into_owned(),
+                agent_id: None,
+                scheme: crate::config::AauthSigSchemeConfig::Hwk,
+            }),
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.expect("start proxy");
+        let first = unauthenticated_reverse_request(handle.port).await;
+        assert!(
+            first.contains("200"),
+            "--no-auth must allow the local request: {first}"
+        );
+        let second = unauthenticated_reverse_request(handle.port).await;
+        assert!(
+            second.contains("429"),
+            "signing route must retain its rate limit: {second}"
+        );
+        handle.shutdown();
     }
 
     #[tokio::test]
@@ -3692,6 +3741,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    aauth: None,
                     upgrades: vec![],
                     rate_limit: None,
                 }],
@@ -3772,6 +3822,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -3862,6 +3913,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -3914,6 +3966,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    aauth: None,
                     upgrades: vec![],
                     rate_limit: None,
                 },
@@ -3938,6 +3991,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    aauth: None,
                     upgrades: vec![],
                     rate_limit: None,
                 },
@@ -4002,6 +4056,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    aauth: None,
                     upgrades: vec![],
                     rate_limit: None,
                 },
@@ -4027,6 +4082,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    aauth: None,
                     upgrades: vec![],
                     rate_limit: None,
                 },
@@ -4091,6 +4147,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    aauth: None,
                     upgrades: vec![],
                     rate_limit: None,
                 },
@@ -4116,6 +4173,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    aauth: None,
                     upgrades: vec![],
                     rate_limit: None,
                 },
@@ -4169,6 +4227,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         };
@@ -4218,6 +4277,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         };
@@ -4337,6 +4397,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -4394,6 +4455,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -4460,6 +4522,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -4532,6 +4595,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    aauth: None,
                     upgrades: vec![],
                     rate_limit: None,
                 },
@@ -4556,6 +4620,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    aauth: None,
                     upgrades: vec![],
                     rate_limit: None,
                 },
@@ -4630,6 +4695,7 @@ mod tests {
                     credential_format: None,
                     svid_hint: None,
                 }),
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -4690,6 +4756,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -4730,6 +4797,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -4793,6 +4861,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -4845,6 +4914,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -5125,6 +5195,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -5172,6 +5243,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -5243,6 +5315,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -5284,6 +5357,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -5327,6 +5401,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -5527,6 +5602,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -6456,6 +6532,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],
@@ -6545,6 +6622,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 rate_limit: None,
                 redeem_phantoms: Vec::new(),
                 upgrades: vec![],
@@ -6644,6 +6722,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 rate_limit: None,
                 redeem_phantoms: Vec::new(),
                 upgrades: vec![],
@@ -6777,6 +6856,7 @@ mod tests {
             spiffe: None,
             upgrades: vec![],
             rate_limit: None,
+            aauth: None,
         }
     }
 
@@ -7092,6 +7172,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }],

@@ -28,6 +28,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
+nix = { workspace = true, features = ["fs", "user"] }
 sha2.workspace = true
 sha1.workspace = true
 getrandom.workspace = true
@@ -85,6 +86,9 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 # SPIFFE Workload API client. Aliased to avoid colliding with any future `spiffe`
 # naming in the workspace.
 spiffe-workload = { package = "spiffe", version = "0.16", features = ["jwt-source"] }
+
+# aauth: RFC 9421 request signing with a persistent agent keypair.
+aauth-core = "0.1.2"
 
 [dev-dependencies]
 tempfile.workspace = true

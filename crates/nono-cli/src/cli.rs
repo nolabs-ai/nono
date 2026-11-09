@@ -51,6 +51,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   login      Sign in to a nono platform as yourself
   logout     Sign out of the platform
   trust      Manage file trust and attestation
+  aauth      Manage aauth agent identity keys (RFC 9421 request signing)
 
 \x1b[1mPACKS\x1b[0m
   pull       Install a signed nono pack from the registry
@@ -355,6 +356,23 @@ pub enum Commands {
   nono trust keygen                            # Generate a new signing key pair
 ")]
     Trust(TrustArgs),
+
+    /// Manage aauth agent identity keys (RFC 9421 request signing)
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono aauth <subcommand>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono aauth keygen --keyref ~/.config/nono/aauth-keys/agent.pem
+                                                    # Generate a new agent identity
+  nono aauth show --keyref ~/.config/nono/aauth-keys/agent.pem
+                                                    # Print public key / thumbprint
+")]
+    Aauth(AauthArgs),
 
     /// List local or remote sandboxed sessions
     #[command(help_template = "\
@@ -3193,6 +3211,59 @@ pub struct TrustExportKeyArgs {
     pub help: Option<bool>,
 }
 
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AauthArgs {
+    #[command(subcommand)]
+    pub command: AauthCommands,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AauthCommands {
+    /// Generate a new Ed25519 agent identity keypair
+    Keygen(AauthKeygenArgs),
+    /// Print an identity's public key and JWK thumbprint
+    Show(AauthShowArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AauthKeygenArgs {
+    /// Absolute path or file:// reference for the new private PEM file.
+    /// Recommended location: ~/.config/nono/aauth-keys/.
+    #[arg(long, value_name = "PATH_OR_REF")]
+    pub keyref: String,
+
+    /// Overwrite an existing key at the same key_ref.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AauthShowArgs {
+    /// Existing private key: absolute path, file://, keyring://, or env://.
+    #[arg(long, value_name = "PATH_OR_REF")]
+    pub keyref: String,
+
+    /// Print the JWKS document to host at your `jwks_uri` (to stdout,
+    /// nothing else) instead of the human-readable summary.
+    #[arg(long)]
+    pub jwks: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4817,6 +4888,7 @@ mod tests {
         "login",
         "logout",
         "trust",
+        "aauth",
         "policy",
         "profile",
         "pull",

@@ -625,6 +625,17 @@ impl ProxyHandle {
             // and double-slashed URLs.
             let prefix = route.prefix.trim_matches('/');
 
+            // Synthetic endpoint-filtered routes (prefix `_ep_<domain>`,
+            // created by `partition_allow_domain` for `allow_domain`
+            // entries with `endpoints`) have no credential and no SDK to
+            // point at them, so a `{PREFIX}_BASE_URL` var only hands the
+            // agent a dead end it will try and fail (see #2286). Skip
+            // them entirely; the route itself stays in the route store,
+            // so proxying and endpoint filtering are unchanged.
+            if prefix.starts_with("_ep_") {
+                continue;
+            }
+
             // Base URL override (e.g., OPENAI_BASE_URL)
             let base_url_name = format!("{}_BASE_URL", prefix.to_uppercase());
             let url = format!("http://127.0.0.1:{}/{}", self.port, prefix);
@@ -4055,6 +4066,97 @@ mod tests {
         assert!(
             bad_var.is_none(),
             "Should not generate env var from op:// URI uppercase"
+        );
+    }
+
+    #[test]
+    fn test_proxy_credential_env_vars_skips_synthetic_endpoint_routes() {
+        // Synthetic `_ep_<domain>` routes (created by `partition_allow_domain`
+        // for `allow_domain` entries with `endpoints`) must not export a
+        // `{PREFIX}_BASE_URL` var: agents find it with `env` and try a dead
+        // end instead of the real host. See #2286.
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handle = ProxyHandle {
+            listener_attach: None,
+            port: 12345,
+            token: Zeroizing::new("test_token".to_string()),
+            audit_log: Some(audit::new_audit_log()),
+            shutdown_tx,
+            loaded_routes: ["openai".to_string()].into_iter().collect(),
+            no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            diagnostics: vec![],
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
+                    prefix: "openai".to_string(),
+                    upstream: "https://api.openai.com".to_string(),
+                    credential_key: Some("openai_api_key".to_string()),
+                    inject_mode: crate::config::InjectMode::Header,
+                    inject_header: "Authorization".to_string(),
+                    credential_format: Some("Bearer {}".to_string()),
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                    spiffe: None,
+                    upgrades: vec![],
+                    rate_limit: None,
+                },
+                crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
+                    prefix: "_ep_example.com".to_string(),
+                    upstream: "https://example.com".to_string(),
+                    credential_key: None,
+                    inject_mode: crate::config::InjectMode::Header,
+                    inject_header: "Authorization".to_string(),
+                    credential_format: None,
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![crate::config::EndpointRule {
+                        method: "GET".to_string(),
+                        path: "/**".to_string(),
+                    }],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                    spiffe: None,
+                    upgrades: vec![],
+                    rate_limit: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let vars = handle.credential_env_vars(&config);
+
+        // The credential route keeps its vars; the synthetic endpoint route
+        // contributes none.
+        assert_eq!(vars.len(), 2); // OPENAI_BASE_URL + OPENAI_API_KEY
+        assert!(vars.iter().any(|(k, _)| k == "OPENAI_BASE_URL"));
+        assert!(vars.iter().any(|(k, _)| k == "OPENAI_API_KEY"));
+        assert!(
+            vars.iter().all(|(k, _)| !k.starts_with("_EP_")),
+            "synthetic endpoint routes must not export _EP_*_BASE_URL vars: {vars:?}"
         );
     }
 

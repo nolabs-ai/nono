@@ -41,6 +41,7 @@ mod login_cmd;
 mod macos_trust;
 mod migration;
 mod network_policy;
+mod oauth_capture_legacy;
 mod open_url_runtime;
 mod output;
 mod owned_children;
@@ -317,6 +318,7 @@ mod tests {
             credential_capture: std::collections::HashMap::new(),
             credential_providers: std::collections::HashMap::new(),
             credential_routes: Vec::new(),
+            oauth_capture_store_backend: Default::default(),
             tls_intercept: None,
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
@@ -400,6 +402,7 @@ mod tests {
             credential_capture: std::collections::HashMap::new(),
             credential_providers: std::collections::HashMap::new(),
             credential_routes: Vec::new(),
+            oauth_capture_store_backend: Default::default(),
             tls_intercept: None,
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,

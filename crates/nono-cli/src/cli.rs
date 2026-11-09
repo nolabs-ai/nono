@@ -48,6 +48,8 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   rollback   Manage rollback sessions (browse, restore, cleanup)
   audit      View audit trail of sandboxed commands
   platform   Enroll with and inspect an audit control plane
+  login      Sign in to a nono platform as yourself
+  logout     Sign out of the platform
   trust      Manage file trust and attestation
 
 \x1b[1mPACKS\x1b[0m
@@ -185,7 +187,7 @@ pub enum Commands {
     Wrap(Box<WrapArgs>),
 
     // ── Exploration & debugging ─────────────────────────────────────────
-    /// Check why filesystem, network, scope, or command access would be allowed or denied
+    /// Check why filesystem, Unix socket, network, scope, or command access would be allowed or denied
     #[command(help_template = "\
 {about}
 
@@ -198,6 +200,7 @@ pub enum Commands {
   nono why --path ~/.ssh --op read             # Check if ~/.ssh is readable
   nono why --path ./src --op write --allow .   # Check with capability context
   nono why --json --path ~/.aws --op read      # JSON output for agents
+  nono why --unix-socket /run/docker.sock      # Query pathname Unix socket connect access
   nono why --host api.openai.com --port 443    # Query network access
   nono why --self --path /var --op write       # Inside sandbox, query own capabilities
   nono why --profile gh --command gh -- issue comment 1052
@@ -290,6 +293,46 @@ pub enum Commands {
   nono platform status --json
 ")]
     Platform(PlatformArgs),
+
+    /// Sign in to a nono platform as yourself
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono login [--url <origin>] [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Sign in to app.nolabs.ai through the browser with GitHub or Google
+    nono login
+
+    # Over SSH or in a container: sign in with a code on another device
+    nono login --device-code
+
+    # Sign in to a self-hosted platform
+    nono login --url https://nono.example.com
+
+    # See your account and organizations, or work in another organization
+    nono login
+    nono login --org acme
+")]
+    Login(LoginArgs),
+
+    /// Sign out of the platform
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono logout
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Revoke this terminal's platform sign-in
+    nono logout
+")]
+    Logout(LogoutArgs),
 
     /// Manage file trust and attestation
     #[command(subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
@@ -516,7 +559,7 @@ SESSION PICKER:
   nono profile init my-agent --extends default --groups deny_credentials
                                                # Extend an existing profile
   nono profile init my-agent --full            # Generate a full skeleton
-  nono profile list                            # List all profiles (built-in and user)
+  nono profile list                            # List built-in, package, and user profiles
   nono profile show nolabs-ai/claude            # Show an installed package profile
   nono profile diff default nolabs-ai/claude    # Compare two profiles
   nono profile validate my-agent               # Validate a profile by name
@@ -897,7 +940,7 @@ pub struct ProfileCmdArgs {
 pub enum ProfileCommands {
     /// Generate a skeleton profile JSON file
     Init(ProfileInitArgs),
-    /// List all available profiles (built-in and user)
+    /// List all available profiles (built-in, package, and user)
     List(ProfileListArgs),
     /// Show a fully resolved profile
     Show(ProfileShowArgs),
@@ -1347,6 +1390,27 @@ pub struct SandboxArgs {
     #[cfg(target_os = "linux")]
     #[arg(long, help_heading = "OPTIONS", value_name = "POLICY")]
     pub sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
+
+    /// Run the command in new Linux namespaces (opt-in, NEP-0004).
+    ///
+    /// Comma-separated list of: net, loopback, ipc, uts. Always adds a user
+    /// namespace. `loopback` (requires `net`) allows TCP bind/connect on any
+    /// port of the namespace's own loopback, for local dev servers and tests.
+    /// `net` leaves only loopback; egress is possible only through the session
+    /// proxy, so it requires --block-net or a proxied network policy and cannot
+    /// be combined with direct-access grants (--open-port, --listen-port,
+    /// --allow-connect-port, network.no_proxy). Adds to any `linux.isolate`
+    /// set by the profile; it cannot remove it. Fails at startup if this host
+    /// cannot create the namespaces.
+    #[cfg(target_os = "linux")]
+    #[arg(
+        long,
+        help_heading = "OPTIONS",
+        value_name = "NAMESPACES",
+        value_enum,
+        value_delimiter = ','
+    )]
+    pub isolate: Vec<IsolateNamespace>,
 
     /// Allow HTTP/2 multiplexing for upstream proxy connections.
     ///
@@ -1838,6 +1902,34 @@ pub struct WrapSandboxArgs {
     pub dry_run: bool,
 }
 
+/// A namespace that `--isolate` can request.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum IsolateNamespace {
+    /// Network namespace containing only loopback.
+    Net,
+    /// TCP on the isolated network namespace's own loopback (requires `net`).
+    Loopback,
+    /// IPC namespace.
+    Ipc,
+    /// UTS namespace.
+    Uts,
+}
+
+#[cfg(target_os = "linux")]
+impl SandboxArgs {
+    /// The isolation set requested on the command line.
+    pub fn isolate_config(&self) -> crate::profile::LinuxIsolateConfig {
+        let has = |namespace| self.isolate.contains(&namespace);
+        crate::profile::LinuxIsolateConfig {
+            network: has(IsolateNamespace::Net),
+            loopback: has(IsolateNamespace::Loopback),
+            ipc: has(IsolateNamespace::Ipc),
+            uts: has(IsolateNamespace::Uts),
+        }
+    }
+}
+
 impl From<WrapSandboxArgs> for SandboxArgs {
     fn from(args: WrapSandboxArgs) -> Self {
         Self {
@@ -1895,6 +1987,8 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             dry_run: args.dry_run,
             #[cfg(target_os = "linux")]
             sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Vec::new(),
         }
     }
 }
@@ -2087,13 +2181,13 @@ pub struct RemoteRunArgs {
     /// Remote workspace name or ID; prompts when omitted in a terminal
     #[arg(long, requires = "remote", help_heading = "REMOTE")]
     pub workspace: Option<String>,
-    /// Platform origin; defaults to the enrolled platform
+    /// Platform origin; defaults to the signed-in or enrolled platform
     #[arg(long = "platform-url", requires = "remote", help_heading = "REMOTE")]
     pub platform_url: Option<String>,
     /// Console origin; defaults to enrolled console discovery
     #[arg(long, requires = "remote", help_heading = "REMOTE")]
     pub console: Option<String>,
-    /// Protected Run API personal access token file (or NONO_RUN_TOKEN)
+    /// Run API personal access token file (or NONO_RUN_TOKEN); not needed after `nono login`
     #[arg(long = "run-token-file", requires = "remote", help_heading = "REMOTE")]
     pub run_token_file: Option<PathBuf>,
     /// Console token file override; normally browser authorization is automatic
@@ -2196,6 +2290,25 @@ pub struct WhyArgs {
     #[arg(long, help_heading = "QUERY")]
     pub path: Option<PathBuf>,
 
+    /// Pathname AF_UNIX socket to check
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["command", "path", "host", "scope"],
+        help_heading = "QUERY"
+    )]
+    pub unix_socket: Option<PathBuf>,
+
+    /// Unix socket operation to check (default: connect)
+    #[arg(
+        long,
+        value_enum,
+        value_name = "OP",
+        requires = "unix_socket",
+        help_heading = "QUERY"
+    )]
+    pub socket_op: Option<WhySocketOp>,
+
     /// Match absolute literal paths against profile rules without resolving them on this host
     #[arg(long, requires_all = ["path", "profile"], help_heading = "QUERY")]
     pub lexical_profile_path: bool,
@@ -2261,6 +2374,30 @@ pub struct WhyArgs {
     #[arg(long, value_name = "FILE", help_heading = "CONTEXT")]
     pub write_file: Vec<PathBuf>,
 
+    /// Exact pathname Unix sockets to allow connect access (for query context)
+    #[arg(long, value_name = "SOCKET", help_heading = "CONTEXT")]
+    pub allow_unix_socket: Vec<PathBuf>,
+
+    /// Exact pathname Unix sockets to allow connect and bind (for query context)
+    #[arg(long, value_name = "SOCKET", help_heading = "CONTEXT")]
+    pub allow_unix_socket_bind: Vec<PathBuf>,
+
+    /// Direct-child pathname Unix sockets to allow in a directory (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_dir: Vec<PathBuf>,
+
+    /// Direct-child pathname Unix sockets to allow connect and bind (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_dir_bind: Vec<PathBuf>,
+
+    /// Descendant pathname Unix sockets to allow in a subtree (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_subtree: Vec<PathBuf>,
+
+    /// Descendant pathname Unix sockets to allow connect and bind (for query context)
+    #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
+    pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
+
     /// Block network access (for query context)
     #[arg(long = "block-net", help_heading = "CONTEXT")]
     pub block_net: bool,
@@ -2297,6 +2434,15 @@ pub enum WhyOp {
     /// Read and write access
     #[value(name = "readwrite")]
     ReadWrite,
+}
+
+/// Pathname Unix socket operation type for why command
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum WhySocketOp {
+    /// Connect to an existing socket
+    Connect,
+    /// Bind and create a socket at this path
+    Bind,
 }
 
 /// Landlock scope type for why command
@@ -2546,6 +2692,34 @@ pub struct PlatformEnrollArgs {
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
 }
+
+#[derive(Parser, Debug)]
+pub struct LoginArgs {
+    /// Platform origin for a self-hosted platform; defaults to the platform
+    /// you last signed in to, else https://app.nolabs.ai
+    #[arg(long, env = "NONO_PLATFORM_URL")]
+    pub url: Option<String>,
+
+    /// Organization to work in (name, slug or ID); when already signed in,
+    /// switches to it without a browser. NONO_ORG overrides it for one command
+    #[arg(long)]
+    pub org: Option<String>,
+
+    /// Sign in through a local browser and a loopback redirect
+    #[arg(long, conflicts_with = "device_code")]
+    pub browser: bool,
+
+    /// Sign in with a user code on any device (for SSH sessions and containers)
+    #[arg(long)]
+    pub device_code: bool,
+
+    /// Print the sign-in URL instead of opening a browser
+    #[arg(long)]
+    pub no_open: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct LogoutArgs {}
 
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
@@ -3023,6 +3197,71 @@ pub struct TrustExportKeyArgs {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn test_why_unix_socket_defaults_to_connect() {
+        let cli = Cli::parse_from(["nono", "why", "--unix-socket", "/run/example.sock"]);
+        let Commands::Why(args) = cli.command else {
+            panic!("expected why command");
+        };
+        assert_eq!(args.unix_socket, Some(PathBuf::from("/run/example.sock")));
+        assert!(args.socket_op.is_none());
+    }
+
+    #[test]
+    fn test_why_unix_socket_bind_parses() {
+        let cli = Cli::parse_from([
+            "nono",
+            "why",
+            "--unix-socket",
+            "/run/example.sock",
+            "--socket-op",
+            "bind",
+        ]);
+        let Commands::Why(args) = cli.command else {
+            panic!("expected why command");
+        };
+        assert!(matches!(args.socket_op, Some(WhySocketOp::Bind)));
+    }
+
+    #[test]
+    fn test_why_unix_socket_context_grant_parses() {
+        let cli = Cli::parse_from([
+            "nono",
+            "why",
+            "--unix-socket",
+            "/run/example.sock",
+            "--allow-unix-socket",
+            "/run/example.sock",
+        ]);
+        let Commands::Why(args) = cli.command else {
+            panic!("expected why command");
+        };
+        assert_eq!(
+            args.allow_unix_socket,
+            vec![PathBuf::from("/run/example.sock")]
+        );
+    }
+
+    #[test]
+    fn test_why_unix_socket_conflicts_with_path() {
+        assert!(
+            Cli::try_parse_from([
+                "nono",
+                "why",
+                "--path",
+                "/run/example.sock",
+                "--unix-socket",
+                "/run/example.sock",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_why_socket_op_requires_unix_socket() {
+        assert!(Cli::try_parse_from(["nono", "why", "--socket-op", "bind"]).is_err());
+    }
 
     #[test]
     fn test_run_basic() {
@@ -4575,6 +4814,8 @@ mod tests {
         "rollback",
         "audit",
         "platform",
+        "login",
+        "logout",
         "trust",
         "policy",
         "profile",

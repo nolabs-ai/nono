@@ -30,10 +30,13 @@ mod execution_runtime;
 #[cfg(unix)]
 mod hook_runtime;
 mod instruction_deny;
+#[cfg(target_os = "linux")]
+mod isolation;
 mod jsonc;
 mod launch_runtime;
 #[cfg(target_os = "linux")]
 mod lineage_cgroup;
+mod login_cmd;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
@@ -47,6 +50,7 @@ mod package_cmd;
 mod package_status;
 mod platform;
 mod platform_client;
+mod platform_oauth;
 mod policy;
 mod profile;
 mod profile_cmd;
@@ -59,6 +63,7 @@ mod pty_proxy;
 mod pull_ui;
 mod query_ext;
 mod registry_client;
+mod relay_prompt_gate;
 #[cfg(unix)]
 mod remote_run;
 #[cfg(target_os = "linux")]
@@ -119,6 +124,14 @@ fn main() {
         return;
     }
     tool_sandbox::record_main_start();
+
+    // Both rustls providers are in the dependency graph (ring via ureq,
+    // aws-lc-rs via the AWS SDK in nono-proxy), so rustls cannot infer a
+    // process default and any dependency that builds a TLS config without
+    // naming a provider panics. Choose ring, which nono's own TLS code names
+    // explicitly. This only fills the default: code that selects a provider
+    // keeps it. `Err` means a default is already installed, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
@@ -308,6 +321,8 @@ mod tests {
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -318,6 +333,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Default::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]
@@ -387,6 +404,8 @@ mod tests {
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -397,6 +416,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
+            #[cfg(target_os = "linux")]
+            isolate: Default::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]

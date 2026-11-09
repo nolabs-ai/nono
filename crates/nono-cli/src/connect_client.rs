@@ -1,10 +1,13 @@
 //! Terminal-native remote attach client for nono-console.
 //!
 //! The open wire contract is documented in `docs/protocols/remote-attach-v1.md`.
-//! Human authentication is deliberately separate from device enrollment. This
-//! explicit protected file or `NONO_CONNECT_TOKEN`. Otherwise an enrolled
-//! device runs browser-approved human authorization, caches a device-bound
-//! opaque credential, and exchanges it for a short-lived console bearer token.
+//! Human authentication is deliberately separate from device enrollment. A
+//! console token comes from an explicit protected file or `NONO_CONNECT_TOKEN`.
+//! Otherwise a device signed in with `nono login` (NEP-0009) refreshes a
+//! DPoP-bound OAuth access token; a token-enrolled device without such a
+//! session runs the remote-attach-v1 browser-approved authorization, caches a
+//! device-bound opaque credential, and exchanges it for a short-lived bearer
+//! token.
 
 use std::io::{self, IsTerminal, Write};
 use std::os::fd::{AsFd, AsRawFd};
@@ -17,15 +20,13 @@ use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{
-    HeaderValue,
-    header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL},
-};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, header::SEC_WEBSOCKET_PROTOCOL};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use url::Url;
 use zeroize::Zeroizing;
 
 use crate::cli::{ConnectArgs, PsArgs};
+use crate::platform_oauth::ApiCredential;
 
 const RESPONSE_LIMIT_BYTES: u64 = 1024 * 1024;
 const DISCOVERY_PROTOCOL_V1: &str = "1";
@@ -36,7 +37,7 @@ const DEFAULT_DETACH_SEQUENCE: &[u8] = &[0x1d, b'd'];
 const WEBSOCKET_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const TERMINAL_PROTOCOL_V1: &str = "nono.terminal.v1";
 const SELECTOR_HEADER_ROWS: u16 = 7;
-const SELECTOR_ROWS_PER_SESSION: u16 = 3;
+const SELECTOR_ROWS_PER_SESSION: u16 = 2;
 static REMOTE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Debug, Deserialize)]
@@ -157,8 +158,8 @@ pub(crate) fn run_connect(args: ConnectArgs) -> Result<()> {
         ));
     }
 
-    let token = load_token(args.token_file.as_deref())?;
-    let attach_url = resolve_attach_url(args.target.as_deref(), args.console.as_deref(), &token)?;
+    let access = console_access(args.token_file.as_deref())?;
+    let attach_url = resolve_attach_url(args.target.as_deref(), args.console.as_deref(), &access)?;
     validate_transport_url(&attach_url)?;
     let detach_sequence = crate::launch_runtime::load_configured_detach_sequence()?
         .unwrap_or_else(|| DEFAULT_DETACH_SEQUENCE.to_vec());
@@ -169,7 +170,7 @@ pub(crate) fn run_connect(args: ConnectArgs) -> Result<()> {
         .map_err(|error| {
             NonoError::ConfigParse(format!("could not start connect runtime: {error}"))
         })?;
-    let outcome = runtime.block_on(attach(attach_url, token, detach_sequence));
+    let outcome = runtime.block_on(attach(attach_url, access.credential, detach_sequence));
     // Tokio's stdin uses an uncancellable blocking read. The terminal guard
     // has restored terminal settings when attach returns, but dropping the
     // runtime would wait for another keystroke before letting this CLI exit.
@@ -192,7 +193,7 @@ pub(crate) fn run_remote_ps(args: &PsArgs) -> Result<()> {
         .flatten()
         .map(std::path::PathBuf::from);
     let token_file = args.token_file.as_deref().or(token_file_env.as_deref());
-    let token = load_token(token_file)?;
+    let access = console_access(token_file)?;
     let console_env = if args.console.is_none() {
         match std::env::var("NONO_CONSOLE_URL") {
             Ok(value) => Some(value),
@@ -206,11 +207,8 @@ pub(crate) fn run_remote_ps(args: &PsArgs) -> Result<()> {
     } else {
         None
     };
-    let console = match args.console.as_deref().or(console_env.as_deref()) {
-        Some(console) => validate_console_url(console)?,
-        None => discover_console()?,
-    };
-    let sessions = filter_remote_sessions(fetch_sessions(&console, &token)?, args.all);
+    let console = resolve_console(args.console.as_deref().or(console_env.as_deref()), &access)?;
+    let sessions = filter_remote_sessions(fetch_sessions(&console, &access.credential)?, args.all);
 
     if args.json {
         let json = serde_json::to_string_pretty(&sessions).map_err(|error| {
@@ -220,13 +218,7 @@ pub(crate) fn run_remote_ps(args: &PsArgs) -> Result<()> {
         return Ok(());
     }
 
-    let enrollment = crate::platform_client::load_state()?;
-    print_remote_sessions(
-        &sessions,
-        args.all,
-        &console,
-        enrollment.as_ref().map(|state| state.platform_url.as_str()),
-    );
+    print_remote_sessions(&sessions, args.all, &remote_host_label(&access, &console));
     Ok(())
 }
 
@@ -240,29 +232,78 @@ pub(crate) fn take_remote_exit_code() -> Option<i32> {
     }
 }
 
-fn resolve_attach_url(target: Option<&str>, console: Option<&str>, token: &str) -> Result<Url> {
+/// The credential for console requests, and the console a `nono login`
+/// session names.
+#[derive(Debug)]
+pub(crate) struct ConsoleAccess {
+    pub(crate) credential: ApiCredential,
+    pub(crate) session_console: Option<Url>,
+    /// The platform a `nono login` session is signed in to. Display only.
+    pub(crate) session_platform: Option<String>,
+}
+
+/// Choose the console credential: an explicit token file or
+/// `NONO_CONNECT_TOKEN` first, then the `nono login` session (for the
+/// organization `NONO_ORG` names, or the active one), then an enrolled
+/// device's remote-attach-v1 authorization.
+pub(crate) fn console_access(token_file: Option<&Path>) -> Result<ConsoleAccess> {
+    let explicit = token_file.is_some() || std::env::var_os("NONO_CONNECT_TOKEN").is_some();
+    if !explicit && let Some(session) = crate::platform_oauth::session_access()? {
+        return Ok(ConsoleAccess {
+            credential: session.credential,
+            session_console: session.console_url,
+            session_platform: Some(session.platform_url),
+        });
+    }
+    if !explicit && crate::platform_oauth::org_override()?.is_some() {
+        return Err(NonoError::ActionRequired(format!(
+            "{} needs a platform sign-in; run `nono login`",
+            crate::platform_oauth::ORG_ENV
+        )));
+    }
+    Ok(ConsoleAccess {
+        credential: load_token(token_file)?,
+        session_console: None,
+        session_platform: None,
+    })
+}
+
+/// The console to use: an explicit one, else the signed-in session's, else
+/// the enrolled device's discovered console.
+pub(crate) fn resolve_console(explicit: Option<&str>, access: &ConsoleAccess) -> Result<Url> {
+    match (explicit, &access.session_console) {
+        (Some(console), _) => validate_console_url(console),
+        (None, Some(console)) => validate_console_url(console.as_str()),
+        (None, None) => discover_console(),
+    }
+}
+
+fn resolve_attach_url(
+    target: Option<&str>,
+    console: Option<&str>,
+    access: &ConsoleAccess,
+) -> Result<Url> {
+    let token = &access.credential;
     if let Some(target) = target
         && let Ok(url) = Url::parse(target)
         && matches!(url.scheme(), "ws" | "wss")
     {
         validate_direct_attach_url(&url)?;
-        verify_attach_origin(&url, console)?;
+        verify_attach_origin(&url, console, access.session_console.as_ref())?;
         return Ok(url);
     }
 
-    let console_url = match console {
-        Some(console) => validate_console_url(console)?,
-        None => discover_console()?,
-    };
+    let console_url = resolve_console(console, access)?;
+    let host = remote_host_label(access, &console_url);
     let session = match target {
         Some(value) => select_named_session(&list_live_sessions(&console_url, token)?, value)?,
-        None => select_interactively(&list_live_sessions(&console_url, token)?)?,
+        None => select_interactively(&list_live_sessions(&console_url, token)?, &host)?,
     };
-    print_connect_target(&session, &console_url);
+    print_connect_target(&session, &host);
     terminal_url(&console_url, &session.global_session_id)
 }
 
-pub(crate) fn load_token(path: Option<&Path>) -> Result<Zeroizing<String>> {
+pub(crate) fn load_token(path: Option<&Path>) -> Result<ApiCredential> {
     let value = match path {
         Some(path) => {
             let metadata = std::fs::metadata(path).map_err(|source| NonoError::ConfigRead {
@@ -296,7 +337,9 @@ pub(crate) fn load_token(path: Option<&Path>) -> Result<Zeroizing<String>> {
         }
         None => match std::env::var("NONO_CONNECT_TOKEN") {
             Ok(value) => value,
-            Err(std::env::VarError::NotPresent) => return acquire_console_access_token(),
+            Err(std::env::VarError::NotPresent) => {
+                return acquire_console_credential().map(ApiCredential::Bearer);
+            }
             Err(error) => {
                 return Err(NonoError::ConfigParse(format!(
                     "could not read NONO_CONNECT_TOKEN: {error}"
@@ -310,14 +353,14 @@ pub(crate) fn load_token(path: Option<&Path>) -> Result<Zeroizing<String>> {
             "connect token is empty or contains whitespace".to_string(),
         ));
     }
-    Ok(Zeroizing::new(token.to_string()))
+    Ok(ApiCredential::Bearer(Zeroizing::new(token.to_string())))
 }
 
-fn acquire_console_access_token() -> Result<Zeroizing<String>> {
+/// remote-attach-v1: an enrolled device's browser-approved authorization.
+fn acquire_console_credential() -> Result<Zeroizing<String>> {
     let state = crate::platform_client::load_state()?.ok_or_else(|| {
         NonoError::ActionRequired(
-            "human authorization requires platform enrollment; run `nono platform enroll` or provide --token-file"
-                .to_string(),
+            "not signed in; run `nono login --url <platform>` or provide --token-file".to_string(),
         )
     })?;
     if state.subject_kind != "device" {
@@ -575,7 +618,7 @@ fn device_auth_cache_path() -> Result<std::path::PathBuf> {
     Ok(crate::state_paths::user_state_dir()?.join(DEVICE_AUTH_CACHE_FILENAME))
 }
 
-fn open_browser(url: &str) -> std::result::Result<(), String> {
+pub(crate) fn open_browser(url: &str) -> std::result::Result<(), String> {
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open").arg(url).status();
     #[cfg(target_os = "linux")]
@@ -750,7 +793,11 @@ fn attach_origin_is_authorized(url: &Url, authorized: &[Url]) -> bool {
 /// enrolled platform, or the console that platform discloses. Anything else is
 /// refused rather than confirmed interactively — a prompt here is answered
 /// under exactly the pretext that motivated the attack.
-fn verify_attach_origin(url: &Url, console: Option<&str>) -> Result<()> {
+fn verify_attach_origin(
+    url: &Url,
+    console: Option<&str>,
+    session_console: Option<&Url>,
+) -> Result<()> {
     // Loopback remains the documented development exception, as in
     // `validate_transport_url`. Reaching it already requires local code
     // execution, which outranks the credential this check protects.
@@ -759,9 +806,11 @@ fn verify_attach_origin(url: &Url, console: Option<&str>) -> Result<()> {
     }
 
     let mut authorized = Vec::new();
-    match console {
-        Some(value) => authorized.push(validate_console_url(value)?),
-        None => {
+    match (console, session_console) {
+        (Some(value), _) => authorized.push(validate_console_url(value)?),
+        // The console the signed-in session's platform named.
+        (None, Some(session_console)) => authorized.push(session_console.clone()),
+        (None, None) => {
             if let Some(state) = crate::platform_client::load_state()?
                 && let Ok(platform) = validate_console_url(&state.platform_url)
             {
@@ -792,16 +841,18 @@ fn is_loopback(url: &Url) -> bool {
     matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
 }
 
-fn fetch_sessions(console: &Url, token: &str) -> Result<Vec<RemoteSession>> {
+fn fetch_sessions(console: &Url, token: &ApiCredential) -> Result<Vec<RemoteSession>> {
     let endpoint = console_endpoint(console, "/api/v1/sessions")?;
     let agent = crate::platform_client::http_agent(std::time::Duration::from_secs(15));
-    let authorization = format!("Bearer {token}");
-    let mut response = agent
+    let mut request = agent
         .get(endpoint.as_str())
         .config()
         .http_status_as_error(false)
-        .build()
-        .header("Authorization", &authorization)
+        .build();
+    for (name, value) in token.headers("GET", &endpoint)? {
+        request = request.header(name, value.as_str());
+    }
+    let mut response = request
         .call()
         .map_err(|error| NonoError::ConfigParse(format!("console request failed: {error}")))?;
     if !response.status().is_success() {
@@ -821,7 +872,7 @@ fn fetch_sessions(console: &Url, token: &str) -> Result<Vec<RemoteSession>> {
     Ok(response.sessions)
 }
 
-fn list_live_sessions(console: &Url, token: &str) -> Result<Vec<RemoteSession>> {
+fn list_live_sessions(console: &Url, token: &ApiCredential) -> Result<Vec<RemoteSession>> {
     Ok(filter_remote_sessions(
         fetch_sessions(console, token)?,
         false,
@@ -849,7 +900,6 @@ fn filter_remote_sessions(mut sessions: Vec<RemoteSession>, all: bool) -> Vec<Re
 }
 
 struct RemoteDisplayRow {
-    session: String,
     name: String,
     status: String,
     agent: String,
@@ -860,36 +910,36 @@ struct RemoteDisplayRow {
 impl RemoteDisplayRow {
     fn from_session(session: &RemoteSession) -> Self {
         Self {
-            session: terminal_text(&session.global_session_id),
-            name: terminal_text(remote_name(session)),
+            name: terminal_text(remote_display_name(session)),
             status: terminal_text(remote_status(session)),
             agent: terminal_text(remote_agent(session)),
             repo: terminal_text(&remote_repo(session)),
             live: is_live_session(session),
         }
     }
+
+    /// `agent · repo`, omitting fields the console did not report.
+    fn metadata(&self) -> Option<String> {
+        let parts = [self.agent.as_str(), self.repo.as_str()]
+            .into_iter()
+            .filter(|part| *part != "-")
+            .collect::<Vec<_>>();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 struct RemoteTableLayout {
-    widths: [usize; 5],
+    widths: [usize; 4],
     compact: bool,
 }
 
-fn print_remote_sessions(
-    sessions: &[RemoteSession],
-    all: bool,
-    console: &Url,
-    platform_url: Option<&str>,
-) {
-    if let Some(platform_url) = platform_url {
-        println!("  Platform: {}", terminal_text(platform_url));
-    }
+fn print_remote_sessions(sessions: &[RemoteSession], all: bool, host: &str) {
     if sessions.is_empty() {
         if all {
-            eprintln!("No remote sessions found.");
+            eprintln!("No remote sessions found on {host}.");
         } else {
-            eprintln!("No live remote sessions. Use --all to include inactive sessions.");
+            eprintln!("No live remote sessions on {host}. Use --all to include inactive sessions.");
         }
         return;
     }
@@ -908,8 +958,8 @@ fn print_remote_sessions(
     println!(
         "  {}  {}  {}",
         "REMOTE SESSIONS".bold(),
+        host.bold(),
         summary.dimmed(),
-        console_label(console).dimmed(),
     );
     println!();
 
@@ -923,12 +973,12 @@ fn print_remote_sessions(
 }
 
 fn remote_table_layout(rows: &[RemoteDisplayRow], columns: usize) -> RemoteTableLayout {
-    const HEADERS: [&str; 5] = ["NAME", "STATUS", "AGENT", "REPOSITORY", "SESSION"];
-    const CAPS: [usize; 5] = [28, 14, 20, 36, 32];
-    const MINIMUMS: [usize; 5] = [8, 8, 8, 10, 10];
-    const SHRINK_ORDER: [usize; 5] = [3, 4, 2, 0, 1];
+    const HEADERS: [&str; 4] = ["NAME", "STATUS", "AGENT", "REPOSITORY"];
+    const CAPS: [usize; 4] = [28, 14, 20, 36];
+    const MINIMUMS: [usize; 4] = [8, 8, 8, 10];
+    const SHRINK_ORDER: [usize; 4] = [3, 2, 0, 1];
     const DECORATION_WIDTH: usize = 2;
-    const SEPARATOR_WIDTH: usize = 4;
+    const SEPARATOR_WIDTH: usize = 3;
 
     if columns < 52 {
         return RemoteTableLayout {
@@ -972,31 +1022,23 @@ fn remote_table_layout(rows: &[RemoteDisplayRow], columns: usize) -> RemoteTable
 }
 
 fn print_remote_session_table(rows: &[RemoteDisplayRow], layout: &RemoteTableLayout) {
-    let [
-        name_width,
-        status_width,
-        agent_width,
-        repo_width,
-        session_width,
-    ] = layout.widths;
+    let [name_width, status_width, agent_width, repo_width] = layout.widths;
     println!(
-        "  {} {} {} {} {}",
+        "  {} {} {} {}",
         pad_cell("NAME", name_width).dimmed(),
         pad_cell("STATUS", status_width).dimmed(),
         pad_cell("AGENT", agent_width).dimmed(),
         pad_cell("REPOSITORY", repo_width).dimmed(),
-        pad_cell("SESSION", session_width).dimmed(),
     );
     for row in rows {
         let status = pad_cell(&row.status, status_width);
         println!(
-            "{} {} {} {} {} {}",
+            "{} {} {} {} {}",
             remote_status_dot(row),
             pad_cell(&row.name, name_width).bold(),
             color_remote_status(&status, row),
             pad_cell(&row.agent, agent_width),
             pad_cell(&row.repo, repo_width),
-            pad_cell(&row.session, session_width).dimmed(),
         );
     }
 }
@@ -1005,20 +1047,17 @@ fn print_remote_session_cards(rows: &[RemoteDisplayRow], columns: usize) {
     let content_width = columns.saturating_sub(4).max(12);
     for row in rows {
         let title = format!("{}  {}", row.name, row.status);
-        let metadata = format!("{} · {}", row.agent, row.repo);
         println!(
             "{} {}",
             remote_status_dot(row),
             crate::command_display::truncate_chars(&title, content_width).bold(),
         );
-        println!(
-            "    {}",
-            crate::command_display::truncate_chars(&metadata, content_width).dimmed(),
-        );
-        println!(
-            "    {}",
-            crate::command_display::truncate_chars(&row.session, content_width).dimmed(),
-        );
+        if let Some(metadata) = row.metadata() {
+            println!(
+                "    {}",
+                crate::command_display::truncate_chars(&metadata, content_width).dimmed(),
+            );
+        }
     }
 }
 
@@ -1027,8 +1066,7 @@ fn remote_row_field(row: &RemoteDisplayRow, index: usize) -> &str {
         0 => &row.name,
         1 => &row.status,
         2 => &row.agent,
-        3 => &row.repo,
-        _ => &row.session,
+        _ => &row.repo,
     }
 }
 
@@ -1082,6 +1120,24 @@ fn console_label(console: &Url) -> String {
     terminal_text(&label)
 }
 
+/// The host people know the remote sessions by: the signed-in platform, else
+/// the enrolled device's platform, else the console itself. Display only; the
+/// console URL alone decides where requests go.
+fn remote_host_label(access: &ConsoleAccess, console: &Url) -> String {
+    let platform = access.session_platform.clone().or_else(|| {
+        crate::platform_client::load_state()
+            .ok()
+            .flatten()
+            .map(|state| state.platform_url)
+    });
+    platform
+        .as_deref()
+        .and_then(|value| Url::parse(value).ok())
+        .filter(|url| url.host_str().is_some())
+        .map(|url| console_label(&url))
+        .unwrap_or_else(|| console_label(console))
+}
+
 fn terminal_text(value: &str) -> String {
     crate::terminal_approval::sanitize_for_terminal(value)
 }
@@ -1092,6 +1148,16 @@ fn remote_name(session: &RemoteSession) -> &str {
         .as_ref()
         .and_then(|record| record.name.as_deref())
         .unwrap_or("-")
+}
+
+/// The session name, or its global ID when the runtime recorded no name, so
+/// the row still names something `nono connect` accepts.
+fn remote_display_name(session: &RemoteSession) -> &str {
+    session
+        .record
+        .as_ref()
+        .and_then(|record| record.name.as_deref())
+        .unwrap_or(&session.global_session_id)
 }
 
 fn remote_status(session: &RemoteSession) -> &str {
@@ -1112,10 +1178,14 @@ fn remote_agent(session: &RemoteSession) -> &str {
         .as_ref()
         .map(|agent| agent.name.as_str())
         .or_else(|| {
+            // A bare program name such as `claude` identifies the agent; a
+            // path is runtime plumbing (for example a workspace activation
+            // script) and means nothing to the person choosing a session.
             session
                 .record
                 .as_ref()
                 .and_then(|record| record.command.first().map(String::as_str))
+                .filter(|program| !program.is_empty() && !program.contains('/'))
         })
         .unwrap_or("-")
 }
@@ -1150,7 +1220,7 @@ fn select_named_session(sessions: &[RemoteSession], target: &str) -> Result<Remo
     }
 }
 
-fn select_interactively(sessions: &[RemoteSession]) -> Result<RemoteSession> {
+fn select_interactively(sessions: &[RemoteSession], host: &str) -> Result<RemoteSession> {
     if sessions.is_empty() {
         return Err(NonoError::ActionRequired(
             "the console has no live sessions visible to this user".to_string(),
@@ -1159,7 +1229,7 @@ fn select_interactively(sessions: &[RemoteSession]) -> Result<RemoteSession> {
     let terminal = SelectionTerminal::enter()?;
     let mut selected = 0;
     loop {
-        draw_session_selector(sessions, selected)?;
+        draw_session_selector(sessions, selected, host)?;
         match read_selector_key(&io::stdin())? {
             SelectorKey::Up => selected = selected.checked_sub(1).unwrap_or(sessions.len() - 1),
             SelectorKey::Down => selected = (selected + 1) % sessions.len(),
@@ -1218,7 +1288,7 @@ enum SelectorKey {
     Ignore,
 }
 
-fn draw_session_selector(sessions: &[RemoteSession], selected: usize) -> Result<()> {
+fn draw_session_selector(sessions: &[RemoteSession], selected: usize, host: &str) -> Result<()> {
     let (columns, rows) = terminal_size();
     let columns = usize::from(columns);
     let visible = usize::from(
@@ -1237,9 +1307,10 @@ fn draw_session_selector(sessions: &[RemoteSession], selected: usize) -> Result<
     write_terminal_line(
         &mut stdout,
         &format!(
-            "  {}  {}",
+            "  {}  {}  {}",
             "NONO CONNECT".bold(),
-            format!("{} live remote sessions", sessions.len()).dimmed(),
+            host.bold(),
+            format!("{} live", sessions.len()).dimmed(),
         ),
     )?;
     write_terminal_line(&mut stdout, "")?;
@@ -1264,33 +1335,34 @@ fn draw_session_selector(sessions: &[RemoteSession], selected: usize) -> Result<
         } else {
             " ".to_string()
         };
-        let display_name = if row.name == "-" {
-            &row.session
+        // `name  host  status`, each part truncated against what remains of
+        // the line so styling never splits a truncated string.
+        let mut budget = columns.saturating_sub(8).max(12);
+        let name = crate::command_display::truncate_chars(&row.name, budget);
+        budget = budget.saturating_sub(name.chars().count() + 2);
+        let host_text = crate::command_display::truncate_chars(host, budget);
+        budget = budget.saturating_sub(host_text.chars().count() + 2);
+        let status = crate::command_display::truncate_chars(&row.status, budget);
+        let name = if active {
+            name.bold().to_string()
         } else {
-            &row.name
-        };
-        let title_width = columns.saturating_sub(8).max(12);
-        let title = crate::command_display::truncate_chars(
-            &format!("{display_name}  {}", row.status),
-            title_width,
-        );
-        let title = if active {
-            title.bold().to_string()
-        } else {
-            title
+            name
         };
         write_terminal_line(
             &mut stdout,
-            &format!("  {pointer} {} {title}", remote_status_dot(&row)),
+            &format!(
+                "  {pointer} {} {name}  {}  {status}",
+                remote_status_dot(&row),
+                host_text.dimmed(),
+            ),
         )?;
+        // Always draw the second line so every entry keeps the fixed height
+        // the scroll window assumes.
         let metadata = crate::command_display::truncate_chars(
-            &format!("{} · {}", row.agent, row.repo),
+            &row.metadata().unwrap_or_default(),
             columns.saturating_sub(7).max(12),
         );
         write_terminal_line(&mut stdout, &format!("      {}", metadata.dimmed()))?;
-        let session_id =
-            crate::command_display::truncate_chars(&row.session, columns.saturating_sub(7).max(12));
-        write_terminal_line(&mut stdout, &format!("      {}", session_id.dimmed()))?;
     }
 
     if visible < sessions.len() {
@@ -1374,24 +1446,20 @@ fn selector_input_pending(input: &impl AsFd, timeout_ms: i32) -> Result<bool> {
     Ok(result > 0 && descriptor.revents & nix::libc::POLLIN != 0)
 }
 
-fn print_connect_target(session: &RemoteSession, console: &Url) {
+fn print_connect_target(session: &RemoteSession, host: &str) {
     let row = RemoteDisplayRow::from_session(session);
-    let display_name = if row.name == "-" {
-        &row.session
-    } else {
-        &row.name
-    };
     let theme = crate::theme::current();
     eprintln!();
     eprintln!(
         "  {} {}",
         crate::theme::fg("◆", theme.brand),
-        display_name.bold(),
+        row.name.bold(),
     );
-    eprintln!(
-        "    {}",
-        format!("{} · {} · {}", row.agent, row.repo, console_label(console)).dimmed(),
-    );
+    let details = match row.metadata() {
+        Some(metadata) => format!("{metadata} · {host}"),
+        None => host.to_string(),
+    };
+    eprintln!("    {}", details.dimmed());
 }
 
 fn clone_session(session: &RemoteSession) -> RemoteSession {
@@ -1574,7 +1642,7 @@ fn format_detach_sequence(sequence: &[u8]) -> String {
 
 async fn attach(
     mut url: Url,
-    token: Zeroizing<String>,
+    token: ApiCredential,
     detach_sequence: Vec<u8>,
 ) -> Result<AttachOutcome> {
     let (initial_cols, initial_rows) = terminal_size();
@@ -1583,18 +1651,24 @@ async fn attach(
         .as_str()
         .into_client_request()
         .map_err(|error| NonoError::ConfigParse(format!("invalid terminal request: {error}")))?;
-    let authorization = HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
-        .map_err(|_| NonoError::ConfigParse("invalid connect token".to_string()))?;
-    request.headers_mut().insert(AUTHORIZATION, authorization);
+    for (name, value) in token.headers("GET", &url)? {
+        let value = HeaderValue::from_str(value.as_str())
+            .map_err(|_| NonoError::ConfigParse("invalid connect token".to_string()))?;
+        let name = tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| NonoError::ConfigParse("invalid connect header".to_string()))?;
+        request.headers_mut().insert(name, value);
+    }
+    drop(token);
     request.headers_mut().insert(
         "Sec-WebSocket-Protocol",
         HeaderValue::from_static(TERMINAL_PROTOCOL_V1),
     );
 
+    let connector = websocket_tls_connector()?;
     let mut progress = ConnectionProgress::start(&url);
     let connection = tokio::time::timeout(
         WEBSOCKET_CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async(request),
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector)),
     );
     tokio::pin!(connection);
     let mut animation = tokio::time::interval(std::time::Duration::from_millis(90));
@@ -1716,6 +1790,41 @@ fn set_initial_terminal_size(url: &mut Url, cols: u16, rows: u16) {
     url.query_pairs_mut()
         .append_pair("cols", &cols.to_string())
         .append_pair("rows", &rows.to_string());
+}
+
+/// TLS for the terminal WebSocket, with the crypto provider named explicitly.
+///
+/// The dependency graph enables both rustls providers (`ring` via ureq,
+/// `aws-lc-rs` via the AWS SDK in nono-proxy), so rustls cannot pick a
+/// process default and `connect_async` panics when it builds its own config.
+/// Like nono-proxy, select `ring` here rather than installing a process-wide
+/// default. Trust anchors are the platform's native roots, which is what
+/// tokio-tungstenite's `rustls-tls-native-roots` used; an empty store is an
+/// error, never an unverified connection.
+fn websocket_tls_connector() -> Result<tokio_tungstenite::Connector> {
+    let native = rustls_native_certs::load_native_certs();
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, _ignored) = roots.add_parsable_certificates(native.certs);
+    if added == 0 {
+        let detail = native
+            .errors
+            .first()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default();
+        return Err(NonoError::ConfigParse(format!(
+            "no trusted root certificates found for the terminal connection{detail}"
+        )));
+    }
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|error| NonoError::ConfigParse(format!("terminal TLS configuration: {error}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+        config,
+    )))
 }
 
 fn ws_error(error: tokio_tungstenite::tungstenite::Error) -> NonoError {
@@ -1853,7 +1962,13 @@ impl DetachMatcher {
                         }
                     }
                     crate::pty_proxy::EnhancedKeyMatch::Invalid => {
-                        self.flush_pending(&mut forward);
+                        if self.sequence[..self.pending_match_len].iter().any(|&key| {
+                            crate::pty_proxy::is_enhanced_key_echo(&self.pending_escape, key)
+                        }) {
+                            self.pending_escape.clear();
+                        } else {
+                            self.flush_pending(&mut forward);
+                        }
                     }
                 }
                 continue;
@@ -1952,6 +2067,22 @@ mod tests {
         writer.write_all(b"\x1b").map_err(NonoError::Io)?;
         assert_eq!(read_selector_key(&input)?, SelectorKey::Cancel);
         Ok(())
+    }
+
+    /// Regression: with both rustls providers enabled there is no process
+    /// default, and `connect_async` panicked building its TLS config. The
+    /// connector names its provider, so building it returns a result (a
+    /// connector, or the explicit no-roots error on a host without a trust
+    /// store) and never panics.
+    #[test]
+    fn websocket_tls_connector_does_not_need_a_process_default_provider() {
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        match websocket_tls_connector() {
+            Ok(connector) => {
+                assert!(matches!(connector, tokio_tungstenite::Connector::Rustls(_)))
+            }
+            Err(error) => assert!(error.to_string().contains("no trusted root certificates")),
+        }
     }
 
     #[test]
@@ -2070,11 +2201,57 @@ mod tests {
 
         let row = RemoteDisplayRow::from_session(&session);
 
-        assert!(!row.session.contains('\x1b'));
         assert!(!row.name.contains('\r'));
         assert!(!row.name.contains('\n'));
         assert!(!row.agent.contains('\x1b'));
         assert!(!row.repo.contains('\x1b'));
+    }
+
+    #[test]
+    fn remote_rows_hide_runtime_plumbing() {
+        let mut session = remote_session(
+            "firecracker:workspace-01a1a0f1a9b170d79de1e78264c95603:ae366d84cf1f379d",
+            Some("safe-edge"),
+            "ready",
+            "running",
+        );
+        session.agent = None;
+        if let Some(record) = session.record.as_mut() {
+            record.command = vec!["/opt/nono/workspace-environment/environment/activate".into()];
+        }
+
+        let row = RemoteDisplayRow::from_session(&session);
+
+        assert_eq!(row.name, "safe-edge");
+        assert_eq!(row.agent, "-");
+        assert_eq!(row.metadata(), None);
+    }
+
+    #[test]
+    fn remote_rows_keep_bare_program_and_fall_back_to_session_id() {
+        let mut session = remote_session("local:host:abc", None, "ready", "running");
+        session.agent = None;
+        session.repo = Some(RemoteRepo {
+            full_name: "org/repo".to_string(),
+            base_branch: "main".to_string(),
+        });
+
+        let row = RemoteDisplayRow::from_session(&session);
+
+        assert_eq!(row.name, "local:host:abc");
+        assert_eq!(row.metadata().as_deref(), Some("claude · org/repo#main"));
+    }
+
+    #[test]
+    fn remote_host_label_prefers_signed_in_platform() {
+        let access = ConsoleAccess {
+            credential: ApiCredential::Bearer(Zeroizing::new("token".to_string())),
+            session_console: None,
+            session_platform: Some("https://app.nolabs.dev".to_string()),
+        };
+        let console = Url::parse("https://console.internal.example:8443").unwrap();
+
+        assert_eq!(remote_host_label(&access, &console), "app.nolabs.dev");
     }
 
     #[test]
@@ -2096,7 +2273,7 @@ mod tests {
         let layout = remote_table_layout(&rows, 80);
 
         assert!(!layout.compact);
-        assert!(layout.widths.iter().sum::<usize>() + 6 <= 80);
+        assert!(layout.widths.iter().sum::<usize>() + 5 <= 80);
         assert!(remote_table_layout(&rows, 44).compact);
     }
 
@@ -2167,6 +2344,15 @@ mod tests {
         let third = matcher.push(b"d");
         assert!(third.forward.is_empty());
         assert!(third.detach);
+    }
+
+    #[test]
+    fn detach_matcher_ignores_kitty_release_of_matched_prefix() {
+        let mut matcher = DetachMatcher::new(vec![0x1d, b'd']);
+        let matched = matcher.push(b"\x1b[93;5u\x1b[93;5:3ud");
+        assert!(matched.forward.is_empty());
+        assert!(matched.detach);
+        assert!(!matcher.pending_bytes());
     }
 
     #[test]
@@ -2244,12 +2430,20 @@ mod tests {
         // Reaches the loopback exception without consulting enrollment state,
         // matching the development carve-out in `validate_transport_url`.
         assert!(
-            verify_attach_origin(&Url::parse("ws://127.0.0.1:8080/terminal").unwrap(), None)
-                .is_ok()
+            verify_attach_origin(
+                &Url::parse("ws://127.0.0.1:8080/terminal").unwrap(),
+                None,
+                None
+            )
+            .is_ok()
         );
         assert!(
-            verify_attach_origin(&Url::parse("ws://localhost:8080/terminal").unwrap(), None)
-                .is_ok()
+            verify_attach_origin(
+                &Url::parse("ws://localhost:8080/terminal").unwrap(),
+                None,
+                None
+            )
+            .is_ok()
         );
     }
 
@@ -2258,6 +2452,7 @@ mod tests {
         let error = verify_attach_origin(
             &Url::parse("wss://evil.com/api/v1/sessions/abc/terminal").unwrap(),
             Some("https://console.example"),
+            None,
         )
         .expect_err("an unenrolled host must be refused");
         assert!(
@@ -2272,8 +2467,30 @@ mod tests {
             verify_attach_origin(
                 &Url::parse("wss://console.example/api/v1/sessions/abc/terminal").unwrap(),
                 Some("https://console.example"),
+                None,
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn attach_origin_trusts_only_the_signed_in_sessions_console() {
+        let session_console = Url::parse("https://console.example").unwrap();
+        assert!(
+            verify_attach_origin(
+                &Url::parse("wss://console.example/api/v1/sessions/abc/terminal").unwrap(),
+                None,
+                Some(&session_console),
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_attach_origin(
+                &Url::parse("wss://evil.com/api/v1/sessions/abc/terminal").unwrap(),
+                None,
+                Some(&session_console),
+            )
+            .is_err()
         );
     }
 }

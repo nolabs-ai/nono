@@ -10,6 +10,8 @@ use crate::error::Result;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod linux_namespace;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -21,7 +23,15 @@ pub use macos::{extension_consume, extension_issue_file, extension_release};
 // Re-export Linux Landlock ABI detection and scope policy reporting
 #[cfg(target_os = "linux")]
 pub use linux::{
-    DetectedAbi, LandlockScopePolicy, detect_abi, landlock_scope_policy, restrict_execute,
+    DetectedAbi, LandlockScopePolicy, MAX_ENFORCED_ABI, detect_abi, kernel_abi_version,
+    landlock_scope_policy, restrict_execute,
+};
+
+// Re-export Linux opt-in namespace isolation mechanism (NEP-0004)
+#[cfg(target_os = "linux")]
+pub use linux_namespace::{
+    NamespaceProbe, NamespaceProbeStage, NamespaceSpec, probe_namespaces, validate_bridge_listener,
+    write_id_maps,
 };
 
 // Re-export Linux WSL2 detection
@@ -37,10 +47,10 @@ pub use linux::{
     UnixSocketKind, classify_access_from_flags, classify_af_unix, continue_notif, deny_notif,
     inject_fd, install_seccomp_af_unix_filter, install_seccomp_notify,
     install_seccomp_proxy_filter, notif_id_valid, prepare_landlock_with_abi,
-    prepare_seccomp_af_unix_filter, prepare_seccomp_proxy_filter, prepare_seccomp_with_abi,
-    probe_seccomp_block_network_support, read_mmsghdr_dests, read_msghdr_dest, read_notif_path,
-    read_notif_sockaddr, read_open_how, recv_notif, resolve_notif_path, respond_notif_errno,
-    validate_openat2_size,
+    prepare_seccomp_af_unix_filter, prepare_seccomp_openat_filter, prepare_seccomp_proxy_filter,
+    prepare_seccomp_with_abi, probe_seccomp_block_network_support, read_mmsghdr_dests,
+    read_msghdr_dest, read_notif_path, read_notif_sockaddr, read_open_how, recv_notif,
+    resolve_notif_path, respond_notif_errno, validate_openat2_size,
 };
 
 /// Information about sandbox support on this platform
@@ -90,6 +100,19 @@ impl Sandbox {
     #[must_use = "ABI detection result should be checked"]
     pub fn detect_abi() -> Result<DetectedAbi> {
         linux::detect_abi()
+    }
+
+    /// Probe whether this host can provide the namespaces in `spec`.
+    ///
+    /// Attempts the real operations in a scratch child instead of reading
+    /// sysctls. A host refusal is `Ok(NamespaceProbe::Unavailable { .. })`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `spec` is invalid or the probe cannot run.
+    #[cfg(target_os = "linux")]
+    pub fn probe_namespaces(spec: &NamespaceSpec) -> Result<NamespaceProbe> {
+        linux_namespace::probe_namespaces(spec)
     }
 
     /// Apply sandboxing with automatic Landlock → seccomp fallback (Linux).

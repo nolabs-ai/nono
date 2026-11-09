@@ -272,7 +272,8 @@ impl std::fmt::Display for UnixSocketMode {
 /// do) are not conflated. The supervisor's seccomp-notify handler maps
 /// `SYS_CONNECT` -> `Connect`, `SYS_BIND` -> `Bind`,
 /// `SYS_SENDTO`/`SYS_SENDMSG`/`SYS_SENDMMSG` -> `Send`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UnixSocketOp {
     /// About to call `connect(2)`.
     Connect,
@@ -1589,7 +1590,21 @@ impl CapabilitySet {
     /// -> [`UnixSocketOp::Send`].
     #[must_use]
     pub fn unix_socket_allowed(&self, sockaddr_path: &Path, op: UnixSocketOp) -> bool {
-        self.unix_sockets.iter().any(|cap| {
+        self.matching_unix_socket(sockaddr_path, op).is_some()
+    }
+
+    /// Return the first AF_UNIX socket capability that covers `sockaddr_path`
+    /// and permits `op`.
+    ///
+    /// Enforcement and diagnostics share this matcher so they cannot disagree
+    /// about file, direct-child, subtree, or bind semantics.
+    #[must_use]
+    pub fn matching_unix_socket(
+        &self,
+        sockaddr_path: &Path,
+        op: UnixSocketOp,
+    ) -> Option<&UnixSocketCapability> {
+        self.unix_sockets.iter().find(|cap| {
             cap.covers(sockaddr_path)
                 && match op {
                     UnixSocketOp::Connect | UnixSocketOp::Send => true, // any grant allows connect/send

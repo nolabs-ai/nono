@@ -221,7 +221,7 @@ Command-policy denials are not filesystem-policy denials. A message like:
 nono: command policy denied gh: Command 'gh' is blocked: agents may read issues but not comment on them
 ```
 
-means the command policy blocked the resolved command invocation. `nono why --path ...` only explains filesystem-policy grants and denials, and `nono why --host ...` only explains network-policy reachability. For command-policy denials, query the command edge directly:
+means the command policy blocked the resolved command invocation. `nono why --path ...` only explains filesystem-policy grants and denials, `nono why --unix-socket ...` explains pathname socket operations, and `nono why --host ...` only explains network-policy reachability. For command-policy denials, query the command edge directly:
 
 ```sh
 nono why --profile <profile> --command gh -- issue comment 1052
@@ -353,6 +353,8 @@ Endpoint policy uses the same decision order as invocation policy: `deny`, then 
 | `process_info_mode`   | string          | `"isolated"` | One of: `"isolated"`, `"allow_same_sandbox"`, `"allow_all"`. |
 | `ipc_mode`            | string          | `"shared_memory_only"` | One of: `"shared_memory_only"`, `"full"`. Use `"full"` for multiprocessing (enables POSIX semaphores). macOS only. |
 | `capability_elevation`| boolean         | `false`      | Enable runtime capability elevation via seccomp-notify. Linux only. |
+| `approval_backends`   | map of string to backend | `{}` | Named backends that answer supervised-mode file and capability prompts instead of the terminal. Same shape as `network.approval_backends` (see [Network approvals](#network-approvals)). |
+| `approval_defaults`   | object          | `null`       | `{ "backend": "<name>" }`: which `approval_backends` entry answers by default. |
 | `wsl2_proxy_policy`  | string          | `"error"`    | WSL2 only. Controls behavior when proxy-only network mode cannot be kernel-enforced. `"error"`: refuse to run (fail-secure). `"insecure_proxy"`: allow degraded execution where credential proxy runs but child is not prevented from bypassing it. See [WSL2 docs](https://nono.sh/docs/cli/internals/wsl2). |
 
 ### filesystem
@@ -435,7 +437,7 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 
 | Field                   | Type                              | Default  | Description |
 |-------------------------|-----------------------------------|----------|-------------|
-| `block`                 | boolean                           | `false`  | Block all network access. |
+| `block`                 | boolean                           | `false`  | Block outbound IP network access. |
 | `allow_http2`           | boolean                           | `false`  | Allow HTTP/2 to upstream servers via ALPN negotiation. Default is HTTP/1.1 with keep-alive. Equivalent to `--allow-http2`. |
 | `network_profile`       | string or null                    | inherit  | Name from `network-policy.json` for proxy filtering. Set to `null` to clear inherited value. |
 | `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Supports wildcard subdomains (`*.googleapis.com`) and a whole-label wildcard in a non-leading position (`jenkins.*.ci.example.com`, matching exactly one label there). |
@@ -449,6 +451,37 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 | `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). Defines the route only — the proxy does not activate unless the service name also appears in `credentials`. |
 | `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). |
 | `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. |
+| `approval_backends`     | map of string to backend          | `{}`     | Named backends that are asked before connecting to a host outside the allowlist (see [Network approvals](#network-approvals)). A non-empty map turns on the proxy and makes an empty allowlist ask for every host. |
+| `approval_defaults`     | object                            | `null`   | `{ "backend": "<name>" }`: which `approval_backends` entry answers host approvals. |
+
+#### Network approvals
+
+With `approval_backends`, a host outside `allow_domain` is sent for approval instead of denied. Used by `nono run`, `nono shell`, and `nono proxy`. A backend is one of:
+
+- `{ "type": "terminal" }`: ask on the terminal.
+- `{ "type": "webhook", "url": "..." }`: ask an HTTP endpoint (`https://...`), or a local helper on a Unix socket (`unix:///abs/path.sock`).
+- `{ "type": "chain", "mode": "all" | "any", "backends": [...] }`: combine other backends.
+
+Each backend takes an optional `timeout_secs`.
+
+```json
+{
+  "network": {
+    "allow_domain": ["github.com"],
+    "approval_backends": {
+      "prompt": { "type": "terminal", "timeout_secs": 120 },
+      "dialog": { "type": "webhook", "url": "unix:///Users/me/.myhelper/s/approval.sock" },
+      "either": { "type": "chain", "mode": "any", "backends": ["dialog", "prompt"] }
+    },
+    "approval_defaults": { "backend": "either" }
+  }
+}
+```
+
+- `network.block: true` and `--block-net` cannot be combined with approval backends.
+- Explicit `deny_domain` entries and metadata/link-local addresses are never sent for approval.
+- With a `unix://` webhook, the launch is refused if the sandbox could write to the socket or a directory above it. Keep the socket in a directory the sandbox can't write.
+- `security.approval_backends` and `command_policies.approval_backends` take the same backend shapes.
 
 #### Hostname wildcard patterns
 
@@ -989,7 +1022,7 @@ To replace inherited URL-opening permissions, provide `open_urls` with an explic
 
 ### Linux host compatibility
 
-On Linux, the built-in `default` profile keeps host runtime, sysfs, and shared temp reads out of the base policy. If your tool needs access to paths like `/run`, `/var/run`, `/sys`, or `/tmp`, extend the built-in compatibility preset:
+On Linux, the built-in `default` profile keeps host runtime, sysfs, and shared temp reads out of the base policy. If your tool needs access to paths like `/run`, `/var/run`, `/sys`, or `/tmp`, extend the built-in compatibility profile:
 
 ```json
 {
@@ -1072,7 +1105,7 @@ Block access to a file in the working directory while keeping the rest accessibl
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": {
     "name": "no-dotenv",
     "description": "Claude Code without .env access"
@@ -1089,7 +1122,7 @@ Block access to a file in the working directory while keeping the rest accessibl
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": {
     "name": "no-dotenv",
     "description": "Claude Code without .env access"
@@ -1115,7 +1148,7 @@ Use `filesystem.deny` on the socket path. Seatbelt treats `connect(2)` as a netw
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": {
     "name": "no-docker",
     "description": "Claude Code without Docker access"
@@ -1136,13 +1169,28 @@ Creating a new exact socket with `unix_socket_bind` requires write access to
 its parent directory. If that parent is denied, bypass the parent directory or,
 preferably, use `unix_socket_dir_bind` with a dedicated directory.
 
+#### Linux namespace isolation
+
+`linux.isolate` runs the command in new namespaces (opt-in, Linux only). `network` leaves only loopback, so egress must go through the proxy, and the profile cannot also grant `network.open_port`, `network.connect_port`, `network.listen_port`, or `network.no_proxy`. The fields merge by OR: an extending profile can add isolation but never remove it.
+
+```json
+{
+  "network": { "allow_domain": ["api.openai.com"] },
+  "linux": { "isolate": { "network": true, "ipc": true, "uts": true } }
+}
+```
+
+Add `"loopback": true` (requires `network`) to let the command use TCP on the namespace's own loopback, for local dev servers and tests. Egress stays proxy-only and the host's localhost stays unreachable.
+
+Network isolation does not block pathname Unix sockets (such as `/run/docker.sock`); use `linux.af_unix_mediation` for those.
+
 #### Linux
 
 Landlock cannot express deny-within-allow, so `filesystem.deny` is a no-op on Linux. Instead, enable `linux.af_unix_mediation` to switch to a default-deny seccomp supervisor for AF_UNIX pathname sockets, then add back only the sockets the agent needs via `filesystem.unix_socket`:
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": {
     "name": "no-docker",
     "description": "Claude Code without Docker access"
@@ -1164,6 +1212,12 @@ With no `filesystem.unix_socket` entries, every AF_UNIX pathname connect and bin
 }
 ```
 
+Access to a container runtime socket grants the authority of the daemon behind
+it. A rootful Docker daemon runs outside nono's process sandbox and usually has
+root access to the host. For sensitive workloads that require Docker, use a
+separate container or MicroVM with its own daemon; mounting the host's rootful
+Docker socket preserves the same host authority.
+
 #### Deprecation note
 
 `commands.deny` is deprecated startup-only gating — it blocks the command from launching but does not enforce socket access and should not be relied on as enforcement. It remains visible in `nono profile show` under the commands section for compatibility.
@@ -1178,7 +1232,7 @@ restriction can be relaxed when the profile opts in with
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": {
     "name": "home-access",
     "description": "Claude Code with full home directory access"
@@ -1304,9 +1358,9 @@ draft base hash does not match current profile. The profile changed after the dr
 
 Reread the current profile, recompute the hash, and update your draft.
 
-### Extending a built-in or pack profile
+### Extending a built-in or package profile
 
-`promote` refuses to replace a built-in or pack-installed profile. Instead, draft a derived profile that extends it:
+`promote` refuses to replace a built-in or package-installed profile. Instead, draft a derived profile that extends it:
 
 ```json
 {

@@ -122,6 +122,20 @@ pub(super) struct SeccompNotificationState<'a> {
     pub(super) denials: &'a mut Vec<DenialRecord>,
     pub(super) trust_interceptor: Option<&'a mut TrustInterceptor>,
     pub(super) pty: Option<&'a mut crate::pty_proxy::PtyProxy>,
+    pub(super) unix_socket_decisions: &'a mut UnixSocketSessionDecisions,
+}
+
+/// Session-scoped answers to unix socket approvals, keyed by canonical path and operation.
+pub(super) type UnixSocketSessionDecisions =
+    std::collections::HashMap<(std::path::PathBuf, UnixSocketOp), ApprovalDecision>;
+
+/// What the network handler needs to put a unix socket request to the
+/// approval backend. Absent while draining after the child exits.
+struct UnixSocketApproval<'a> {
+    child: Pid,
+    rate_limiter: &'a mut RateLimiter,
+    pty: Option<&'a mut crate::pty_proxy::PtyProxy>,
+    decisions: &'a mut UnixSocketSessionDecisions,
 }
 
 /// Read the TGID (thread group ID / process ID) of a thread from /proc/<tid>/status.
@@ -249,6 +263,7 @@ fn handle_received_filesystem_notification(
         denials,
         mut trust_interceptor,
         pty,
+        unix_socket_decisions: _,
     } = state;
 
     // 1. Receive the notification
@@ -365,7 +380,11 @@ fn handle_received_filesystem_notification(
         std::borrow::Cow::Borrowed(canonicalized.as_path())
     };
 
-    // 4. Check protected roots BEFORE initial-set fast-path.
+    // 4. Check protected roots BEFORE initial-set fast-path. The one exception
+    // is an exact file the initial set grants: grant construction rejects any
+    // user or profile path inside a protected root, so such a grant is one nono
+    // made itself (the TLS-intercept trust bundle under the session directory).
+    // Without it, elevation would deny what Landlock allows.
     let protected_root = crate::protected_paths::overlapping_protected_root(
         &canonicalized,
         false,
@@ -377,7 +396,8 @@ fn handle_received_filesystem_notification(
             false,
             config.protected_roots,
         )
-    });
+    })
+    .filter(|_| !grants_exact_file(&cap_check_path, access, initial_caps));
     if let Some(protected_root) = protected_root {
         debug!(
             "Seccomp: path {} blocked by protected root {}",
@@ -754,12 +774,18 @@ fn handle_received_filesystem_notification(
 /// Split out as an explicit type so the (testable) policy logic is decoupled
 /// from the (untestable) seccomp-notify response plumbing. Callers translate
 /// `Allow` to `continue_notif(…)` and `Deny` to `respond_notif_errno(…, EACCES)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum NetworkDecision {
     /// Allow the operation.
     Allow,
     /// Fail the syscall with `EACCES`.
     Deny,
+    /// A pathname unix socket outside the granted set that the approval
+    /// backend may answer; denied when no backend can be consulted.
+    Ask {
+        path: std::path::PathBuf,
+        op: UnixSocketOp,
+    },
 }
 
 /// Whether a trapped network syscall on address `family` carries no policy
@@ -816,8 +842,9 @@ pub(super) fn network_notification_out_of_scope(policy: SeccompPolicy, family: u
 ///    (addrlen == 2) have no path to check.
 ///
 /// 2. For `AF_INET`/`AF_INET6` in proxy-only mode:
-///    - `connect()` is allowed to `127.0.0.1:proxy_port` (the nono proxy) or
-///      to an explicitly granted localhost IPC port.
+///    - `connect()` is allowed to `127.0.0.1:proxy_port` (the nono proxy), to
+///      an explicitly granted `connect_port`, or to an explicitly granted
+///      localhost IPC port (the latter only on loopback).
 ///    - `bind()` is allowed on ports in `proxy_bind_ports` or explicitly
 ///      granted localhost IPC ports and ranges.
 ///    - Everything else is denied.
@@ -871,21 +898,24 @@ pub(super) fn decide_network_notification(
 
     match syscall {
         SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => {
-            // Allow connect/sendto/sendmsg/sendmmsg only to loopback + proxy port
-            // or an explicit bidirectional localhost IPC grant (`--open-port`).
+            // An explicit `connect_port` grants direct connect() to that TCP
+            // port. Proxy and bidirectional localhost IPC grants remain loopback-only.
             // sendto/sendmsg/sendmmsg with a destination address is semantically
-            // equivalent to connect for network reach-out (issue #1089).
-            let allowed_port = sockaddr.port == config.proxy_port
+            // equivalent to connect for network reach-out (issue #1089), but a TCP
+            // connect-port grant does not authorize those datagram-style syscalls.
+            let allowed_connect_port =
+                syscall == SYS_CONNECT && config.caps.tcp_connect_ports().contains(&sockaddr.port);
+            let allowed_loopback_port = sockaddr.port == config.proxy_port
                 || config.caps.localhost_ports().contains(&sockaddr.port)
                 || config
                     .caps
                     .localhost_port_ranges()
                     .iter()
                     .any(|&(start, end)| sockaddr.port >= start && sockaddr.port <= end);
-            if sockaddr.is_loopback && allowed_port {
+            if allowed_connect_port || (sockaddr.is_loopback && allowed_loopback_port) {
                 debug!(
-                    "Proxy seccomp: allowing network syscall nr={} to loopback:{}",
-                    syscall, sockaddr.port
+                    "Proxy seccomp: allowing network syscall nr={} to family={} port={} loopback={}",
+                    syscall, sockaddr.family, sockaddr.port, sockaddr.is_loopback
                 );
                 NetworkDecision::Allow
             } else {
@@ -998,6 +1028,16 @@ fn decide_af_unix_pathname(
             canonical.display()
         );
         NetworkDecision::Allow
+    } else if unix_socket_approvable(canonical.as_path(), op, config) {
+        debug!(
+            "Proxy seccomp: AF_UNIX {} on {} needs approval",
+            op,
+            canonical.display()
+        );
+        NetworkDecision::Ask {
+            path: canonical,
+            op,
+        }
     } else {
         debug!(
             "Proxy seccomp: denying AF_UNIX {} on {}: no matching capability",
@@ -1006,6 +1046,89 @@ fn decide_af_unix_pathname(
         );
         NetworkDecision::Deny
     }
+}
+
+/// Whether a socket outside the granted set may be put to the approval
+/// backend. Mirrors file elevation: only with `capability_elevation`, never
+/// for nono's protected state or a path the policy denies, and never for
+/// datagram sends, which would ask once per message.
+fn unix_socket_approvable(
+    canonical: &std::path::Path,
+    op: UnixSocketOp,
+    config: &SupervisorConfig<'_>,
+) -> bool {
+    config.seccomp_policy.capability_elevation
+        && matches!(op, UnixSocketOp::Connect | UnixSocketOp::Bind)
+        && (op != UnixSocketOp::Bind
+            || canonical.parent().is_some_and(|parent| {
+                config
+                    .caps
+                    .path_covered_with_access(parent, AccessMode::Write)
+            }))
+        && crate::protected_paths::overlapping_protected_root(
+            canonical,
+            false,
+            config.protected_roots,
+        )
+        .is_none()
+        && !is_under_deny_path(canonical, config.deny_paths)
+}
+
+/// Put a unix socket request to the approval backend, honouring and
+/// recording session-scoped answers. Every failure path denies.
+fn request_unix_socket_approval(
+    config: &SupervisorConfig<'_>,
+    approval: Option<&mut UnixSocketApproval<'_>>,
+    path: &std::path::Path,
+    op: UnixSocketOp,
+) -> Result<ApprovalDecision> {
+    let Some(approval) = approval else {
+        return Ok(ApprovalDecision::Denied {
+            reason: "approval unavailable after the sandboxed process exited".to_string(),
+        });
+    };
+    let key = (path.to_path_buf(), op);
+    if let Some(decision) = approval.decisions.get(&key) {
+        return Ok(decision.clone());
+    }
+    if !approval.rate_limiter.try_acquire() {
+        debug!("Rate limited unix socket approval for {}", path.display());
+        return Ok(ApprovalDecision::Denied {
+            reason: "approval rate limit exceeded".to_string(),
+        });
+    }
+
+    let request = nono::supervisor::ApprovalRequest::UnixSocket {
+        request_id: format!("unix-socket-{}", unique_request_id()),
+        path: path.to_path_buf(),
+        op,
+        reason: Some("Sandbox intercepted unix socket operation (seccomp-notify)".to_string()),
+        child_pid: approval.child.as_raw() as u32,
+        session_id: config.session_id.to_string(),
+    };
+    let decision_started = Instant::now();
+    let decision = match super::request_approval_with_relay_paused(
+        config,
+        &request,
+        approval.pty.as_deref_mut(),
+    ) {
+        Ok(decision) => decision,
+        Err(e) => {
+            warn!("Approval backend error for unix socket request: {}", e);
+            ApprovalDecision::Denied {
+                reason: format!("Approval backend error: {e}"),
+            }
+        }
+    };
+    let session_scoped = matches!(
+        decision,
+        ApprovalDecision::GrantedForSession | ApprovalDecision::DeniedForSession
+    );
+    record_capability_audit(config, request, decision_started, decision.clone())?;
+    if session_scoped {
+        approval.decisions.insert(key, decision.clone());
+    }
+    Ok(decision)
 }
 
 fn resolve_af_unix_sockaddr_path(
@@ -1117,6 +1240,12 @@ pub(super) fn handle_combined_notification(
             network_throttle,
             state.denials,
             ipc_denials,
+            Some(UnixSocketApproval {
+                child,
+                rate_limiter: state.rate_limiter,
+                pty: state.pty,
+                decisions: state.unix_socket_decisions,
+            }),
             notif,
         )
     }
@@ -1136,6 +1265,7 @@ pub(super) fn handle_network_notification(
         network_throttle,
         denials,
         ipc_denials,
+        None,
         notif,
     )
 }
@@ -1146,6 +1276,7 @@ fn handle_received_network_notification(
     network_throttle: &mut NetworkDenialThrottle,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+    mut approval: Option<UnixSocketApproval<'_>>,
     notif: nono::sandbox::SeccompNotif,
 ) -> nono::error::Result<()> {
     use nono::sandbox::{
@@ -1312,31 +1443,62 @@ fn handle_received_network_notification(
     }
 
     for sockaddr in &sockaddrs {
-        match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
-            NetworkDecision::Allow => {}
-            NetworkDecision::Deny => {
-                // Enforcement is unconditional: the throttle only bounds how
-                // much bookkeeping this denial may create.
-                let record = network_throttle.admit();
-                if record {
-                    flush_suppressed_network_denials(config, network_throttle);
-                    record_af_unix_ipc_denial(
-                        sockaddr,
-                        notif.pid,
-                        notif.data.nr,
-                        denials,
-                        ipc_denials,
-                    );
+        let approval_denial =
+            match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
+                NetworkDecision::Allow => continue,
+                NetworkDecision::Deny => None,
+                NetworkDecision::Ask { path, op } => {
+                    match request_unix_socket_approval(config, approval.as_mut(), &path, op) {
+                        Ok(decision) => {
+                            if !notif_id_valid(notify_fd, notif.id)? {
+                                return Ok(());
+                            }
+                            match decision {
+                                ApprovalDecision::Granted | ApprovalDecision::GrantedForSession => {
+                                    continue;
+                                }
+                                ApprovalDecision::Denied { reason } => {
+                                    Some(format!("approval denied: {reason}"))
+                                }
+                                ApprovalDecision::DeniedForSession => {
+                                    Some("approval denied for this session".to_string())
+                                }
+                                ApprovalDecision::Timeout => Some("approval timed out".to_string()),
+                            }
+                        }
+                        Err(e) => {
+                            let _ = respond_notif_errno(notify_fd, notif.id, libc::EACCES);
+                            return Err(e);
+                        }
+                    }
                 }
-                respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
-                if record
-                    && let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr)
-                {
-                    warn!("Failed to record network denial audit event: {}", err);
-                }
-                return Ok(());
-            }
+            };
+        // Enforcement is unconditional: the throttle only bounds how
+        // much bookkeeping this denial may create.
+        let record = network_throttle.admit();
+        if record {
+            flush_suppressed_network_denials(config, network_throttle);
+            record_af_unix_ipc_denial(
+                sockaddr,
+                notif.pid,
+                notif.data.nr,
+                denials,
+                ipc_denials,
+                approval_denial.as_deref(),
+            );
         }
+        respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
+        if record
+            && let Err(err) = record_network_audit_denial(
+                config,
+                sockaddr,
+                notif.data.nr,
+                approval_denial.as_deref(),
+            )
+        {
+            warn!("Failed to record network denial audit event: {}", err);
+        }
+        return Ok(());
     }
 
     if let Err(e) = continue_notif(notify_fd, notif.id) {
@@ -1355,6 +1517,7 @@ fn record_af_unix_ipc_denial(
     syscall: i32,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+    approval_denial: Option<&str>,
 ) {
     if sockaddr.family != libc::AF_UNIX as u16 {
         return;
@@ -1369,7 +1532,7 @@ fn record_af_unix_ipc_denial(
     ipc_denials.push(nono::diagnostic::IpcDenialRecord::new(
         target,
         operation,
-        reason,
+        approval_denial.map_or(reason, str::to_string),
         remediation,
     ));
 
@@ -1461,9 +1624,13 @@ fn record_network_audit_denial(
     config: &SupervisorConfig<'_>,
     sockaddr: &nono::sandbox::SockaddrInfo,
     syscall: i32,
+    approval_denial: Option<&str>,
 ) -> nono::Result<()> {
     let target = network_audit_target(sockaddr);
-    let reason = network_audit_denial_reason(sockaddr, syscall);
+    let reason = approval_denial.map_or_else(
+        || network_audit_denial_reason(sockaddr, syscall),
+        str::to_string,
+    );
     let port = if sockaddr.port == 0 {
         None
     } else {
@@ -1544,21 +1711,27 @@ fn push_network_audit_event(
     config: &SupervisorConfig<'_>,
     event: nono::undo::NetworkAuditEvent,
 ) -> nono::Result<()> {
+    // Record live first, then buffer with the outcome so finalization can
+    // retry a failed write. The buffer also feeds the session metadata.
+    let live_result = config.audit_recorder.as_ref().map(|recorder_mutex| {
+        recorder_mutex
+            .lock()
+            .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))
+            .and_then(|mut recorder| recorder.record_network_event(event.clone()))
+    });
+    let live_recorded = matches!(live_result, Some(Ok(())));
+
     if let Some(events_mutex) = config.network_audit_events {
         let mut events = events_mutex
             .lock()
             .map_err(|_| NonoError::Snapshot("Network audit event lock poisoned".to_string()))?;
-        events.push(event.clone());
+        events.push(nono_proxy::audit::BufferedAuditEvent {
+            event,
+            live_recorded,
+        });
     }
 
-    if let Some(recorder_mutex) = config.audit_recorder.as_ref() {
-        let mut recorder = recorder_mutex
-            .lock()
-            .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
-        recorder.record_network_event(event)?;
-    }
-
-    Ok(())
+    live_result.unwrap_or(Ok(()))
 }
 
 fn network_audit_target(sockaddr: &nono::sandbox::SockaddrInfo) -> String {
@@ -1627,6 +1800,18 @@ fn current_unix_millis() -> u64 {
     }
 }
 
+/// Whether the initial set grants exactly this file with the requested access.
+/// Directory grants never qualify.
+fn grants_exact_file(
+    path: &std::path::Path,
+    requested: AccessMode,
+    initial_caps: &[InitialCapability],
+) -> bool {
+    initial_caps
+        .iter()
+        .any(|cap| cap.is_file && cap.path == path && cap.access.contains(requested))
+}
+
 /// Check if a path matches any capability in the initial set.
 ///
 /// Prefers the most specific capability. If the path is covered but the
@@ -1678,6 +1863,36 @@ fn match_initial_capability<'a>(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn only_an_exact_sufficient_file_grant_counts_as_exact() {
+        let bundle = PathBuf::from("/state/nono/sessions/s1/intercept-ca.pem");
+        let caps = vec![
+            InitialCapability {
+                path: bundle.clone(),
+                access: AccessMode::Read,
+                is_file: true,
+            },
+            InitialCapability {
+                path: PathBuf::from("/state/nono/sessions/s2"),
+                access: AccessMode::ReadWrite,
+                is_file: false,
+            },
+        ];
+
+        assert!(grants_exact_file(&bundle, AccessMode::Read, &caps));
+        assert!(!grants_exact_file(&bundle, AccessMode::Write, &caps));
+        assert!(!grants_exact_file(
+            &PathBuf::from("/state/nono/sessions/s1/other.pem"),
+            AccessMode::Read,
+            &caps
+        ));
+        assert!(!grants_exact_file(
+            &PathBuf::from("/state/nono/sessions/s2/audit.log"),
+            AccessMode::Read,
+            &caps
+        ));
+    }
 
     #[test]
     fn test_rate_limiter_allows_burst() {
@@ -1917,7 +2132,7 @@ mod tests {
         }
 
         fn make_config<'a>(
-            backend: &'a DenyAllBackend,
+            backend: &'a dyn ApprovalBackend,
             proxy_port: u16,
             proxy_bind_ports: Vec<u16>,
             unix_socket_allowlist: &'a [UnixSocketCapability],
@@ -1932,7 +2147,7 @@ mod tests {
         }
 
         fn make_config_with_ranges<'a>(
-            backend: &'a DenyAllBackend,
+            backend: &'a dyn ApprovalBackend,
             proxy_port: u16,
             proxy_bind_ports: Vec<u16>,
             proxy_bind_port_ranges: Vec<(u16, u16)>,
@@ -2019,16 +2234,49 @@ mod tests {
                 let recorded = events.lock().expect("lock");
                 assert_eq!(recorded.len(), 1, "exactly one summary event");
                 assert!(matches!(
-                    recorded[0].decision,
+                    recorded[0].event.decision,
                     nono::undo::NetworkAuditDecision::Deny
                 ));
-                let reason = recorded[0].reason.as_deref().unwrap_or_default();
+                assert!(!recorded[0].live_recorded, "no recorder configured");
+                let reason = recorded[0].event.reason.as_deref().unwrap_or_default();
                 assert!(reason.starts_with("4 network syscall denials"), "{reason}");
             }
 
             // Counter was reset: a second flush adds nothing.
             super::super::flush_suppressed_network_denials(&config, &mut throttle);
             assert_eq!(events.lock().expect("lock").len(), 1);
+        }
+
+        #[test]
+        fn network_audit_event_buffers_live_write_outcome() {
+            let backend = DenyAllBackend;
+            let events = std::sync::Mutex::new(Vec::new());
+            let dir = tempfile::tempdir().expect("tempdir");
+            let recorder = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::audit_integrity::AuditRecorder::new(dir.path().to_path_buf())
+                    .expect("recorder"),
+            ));
+            let mut config = make_proxy_only_config(&backend, 8080, vec![]);
+            config.network_audit_events = Some(&events);
+            config.audit_recorder = Some(std::sync::Arc::clone(&recorder));
+
+            let event =
+                || super::super::network_denial_event("a".to_string(), None, "r".to_string());
+            super::super::push_network_audit_event(&config, event()).expect("live write");
+
+            // A closed recorder rejects the live write; the event must stay
+            // buffered as unrecorded so finalization can retry it.
+            recorder
+                .lock()
+                .expect("lock")
+                .record_session_ended("2026-01-01T00:00:00Z".to_string(), 0)
+                .expect("end");
+            assert!(super::super::push_network_audit_event(&config, event()).is_err());
+
+            let buffered = events.lock().expect("lock");
+            assert_eq!(buffered.len(), 2);
+            assert!(buffered[0].live_recorded);
+            assert!(!buffered[1].live_recorded);
         }
 
         fn unix_pathname(path: &Path) -> SockaddrInfo {
@@ -2164,6 +2412,355 @@ mod tests {
                     &config,
                 ),
                 NetworkDecision::Deny
+            );
+        }
+
+        fn make_elevated_config(backend: &dyn ApprovalBackend) -> SupervisorConfig<'_> {
+            let mut config = make_config(backend, 8080, Vec::new(), &[]);
+            config.seccomp_policy.capability_elevation = true;
+            config
+        }
+
+        struct TestApprovalBackend<F>(F);
+
+        impl<F> ApprovalBackend for TestApprovalBackend<F>
+        where
+            F: Fn(&ApprovalRequest) -> nono::Result<ApprovalDecision> + Send + Sync,
+        {
+            fn request_approval(
+                &self,
+                request: &ApprovalRequest,
+            ) -> nono::Result<ApprovalDecision> {
+                self.0(request)
+            }
+
+            fn backend_name(&self) -> &str {
+                "test-approval"
+            }
+        }
+
+        #[test]
+        fn unix_socket_session_cache_requires_successful_audit() {
+            use super::super::{RateLimiter, UnixSocketApproval, request_unix_socket_approval};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let calls = AtomicUsize::new(0);
+            let backend = TestApprovalBackend(|_: &ApprovalRequest| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ApprovalDecision::GrantedForSession)
+            });
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut recorder = crate::audit_integrity::AuditRecorder::new(dir.path().to_path_buf())
+                .expect("recorder");
+            recorder
+                .record_session_ended("ended".into(), 0)
+                .expect("close recorder");
+            let mut config = make_elevated_config(&backend);
+            config.audit_recorder = Some(std::sync::Arc::new(std::sync::Mutex::new(recorder)));
+            let mut limiter = RateLimiter::new(10, 10);
+            let mut decisions = Default::default();
+            let mut approval = UnixSocketApproval {
+                child: nix::unistd::Pid::this(),
+                rate_limiter: &mut limiter,
+                pty: None,
+                decisions: &mut decisions,
+            };
+            let path = dir.path().join("test.sock");
+            for _ in 0..2 {
+                assert!(
+                    request_unix_socket_approval(
+                        &config,
+                        Some(&mut approval),
+                        &path,
+                        nono::UnixSocketOp::Connect
+                    )
+                    .is_err()
+                );
+                assert!(approval.decisions.is_empty());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+            let recovered = tempfile::tempdir().expect("recovered audit dir");
+            config.audit_recorder = Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::audit_integrity::AuditRecorder::new(recovered.path().to_path_buf())
+                    .expect("recorder"),
+            )));
+            for _ in 0..2 {
+                assert!(
+                    request_unix_socket_approval(
+                        &config,
+                        Some(&mut approval),
+                        &path,
+                        nono::UnixSocketOp::Connect
+                    )
+                    .expect("approval")
+                    .is_granted()
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(
+                config
+                    .audit_recorder
+                    .as_ref()
+                    .expect("recorder")
+                    .lock()
+                    .expect("lock")
+                    .event_count(),
+                1
+            );
+        }
+
+        #[test]
+        fn unix_socket_session_cache_is_scoped_by_path_and_operation() {
+            use super::super::{RateLimiter, UnixSocketApproval, request_unix_socket_approval};
+            use nono::UnixSocketOp::{Bind, Connect};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            for decision in [
+                ApprovalDecision::Granted,
+                ApprovalDecision::GrantedForSession,
+                ApprovalDecision::Denied {
+                    reason: "reviewer refused the operation".into(),
+                },
+                ApprovalDecision::DeniedForSession,
+                ApprovalDecision::Timeout,
+            ] {
+                let calls = AtomicUsize::new(0);
+                let backend = TestApprovalBackend(|_: &ApprovalRequest| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(decision.clone())
+                });
+                let config = make_elevated_config(&backend);
+                let mut limiter = RateLimiter::new(10, 10);
+                let mut decisions = Default::default();
+                let mut approval = UnixSocketApproval {
+                    child: nix::unistd::Pid::this(),
+                    rate_limiter: &mut limiter,
+                    pty: None,
+                    decisions: &mut decisions,
+                };
+                for (path, op) in [
+                    ("/a.sock", Connect),
+                    ("/a.sock", Connect),
+                    ("/a.sock", Bind),
+                    ("/b.sock", Connect),
+                ] {
+                    assert_eq!(
+                        request_unix_socket_approval(
+                            &config,
+                            Some(&mut approval),
+                            Path::new(path),
+                            op
+                        )
+                        .map(|answer| serde_json::to_value(answer).expect("serialize decision"))
+                        .expect("approval"),
+                        serde_json::to_value(&decision).expect("serialize expected decision")
+                    );
+                }
+                let session_scoped = matches!(
+                    decision,
+                    ApprovalDecision::GrantedForSession | ApprovalDecision::DeniedForSession
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    if session_scoped { 3 } else { 4 }
+                );
+                assert_eq!(approval.decisions.len(), if session_scoped { 3 } else { 0 });
+            }
+        }
+
+        #[test]
+        fn unix_socket_approval_failures_keep_their_cause() {
+            use super::super::{RateLimiter, UnixSocketApproval, request_unix_socket_approval};
+            let backend = TestApprovalBackend(|_: &ApprovalRequest| {
+                Err(nono::NonoError::SandboxInit("backend unavailable".into()))
+            });
+            let config = make_elevated_config(&backend);
+            let mut limiter = RateLimiter::new(0, 1);
+            let mut decisions = Default::default();
+            let mut approval = UnixSocketApproval {
+                child: nix::unistd::Pid::this(),
+                rate_limiter: &mut limiter,
+                pty: None,
+                decisions: &mut decisions,
+            };
+            let path = Path::new("/test.sock");
+            for (available, expected) in [
+                (true, "Approval backend error:"),
+                (true, "approval rate limit exceeded"),
+                (false, "approval unavailable"),
+            ] {
+                let context = if available { Some(&mut approval) } else { None };
+                let decision = request_unix_socket_approval(
+                    &config,
+                    context,
+                    path,
+                    nono::UnixSocketOp::Connect,
+                )
+                .expect("decision");
+                let ApprovalDecision::Denied { reason } = decision else {
+                    panic!("expected denial")
+                };
+                assert!(reason.contains(expected), "{reason}");
+            }
+            assert!(decisions.is_empty());
+        }
+
+        #[test]
+        fn unix_socket_denial_cause_reaches_diagnostics_and_audit() {
+            let backend = DenyAllBackend;
+            let events = std::sync::Mutex::new(Vec::new());
+            let mut config = make_elevated_config(&backend);
+            config.network_audit_events = Some(&events);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "test.sock");
+            let _listener = UnixListener::bind(&path).expect("bind socket");
+            let sockaddr = unix_pathname(&path);
+            for reason in [
+                None,
+                Some("approval timed out"),
+                Some("approval denied for this session"),
+                Some("approval denied: backend unavailable"),
+            ] {
+                let mut denials = Vec::new();
+                let mut ipc_denials = Vec::new();
+                super::super::record_af_unix_ipc_denial(
+                    &sockaddr,
+                    test_pid(),
+                    SYS_CONNECT,
+                    &mut denials,
+                    &mut ipc_denials,
+                    reason,
+                );
+                assert_eq!(ipc_denials.len(), 1);
+                assert_eq!(
+                    ipc_denials[0].reason,
+                    reason.unwrap_or("no matching unix_socket capability")
+                );
+                super::super::record_network_audit_denial(&config, &sockaddr, SYS_CONNECT, reason)
+                    .expect("audit");
+                let recorded = events.lock().expect("lock");
+                let event = &recorded.last().expect("audit event").event;
+                assert_eq!(
+                    event.reason.as_deref(),
+                    Some(reason.unwrap_or(
+                        "pathname AF_UNIX connect denied: no matching unix_socket capability"
+                    ))
+                );
+            }
+        }
+
+        #[test]
+        fn af_unix_bind_approval_requires_a_writable_parent_directory() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "new.sock");
+            for access in [
+                None,
+                Some(nono::AccessMode::Read),
+                Some(nono::AccessMode::Write),
+                Some(nono::AccessMode::ReadWrite),
+            ] {
+                let mut caps = nono::CapabilitySet::new();
+                if let Some(access) = access {
+                    caps.add_fs(nono::FsCapability::new_dir(dir.path(), access).expect("fs grant"));
+                }
+                let mut config = make_elevated_config(&backend);
+                config.caps = &caps;
+                let decision = decide_network_notification(
+                    test_pid(),
+                    SYS_BIND,
+                    &unix_pathname(&path),
+                    &config,
+                );
+                if matches!(
+                    access,
+                    Some(nono::AccessMode::Write | nono::AccessMode::ReadWrite)
+                ) {
+                    assert_eq!(
+                        decision,
+                        NetworkDecision::Ask {
+                            path: dir
+                                .path()
+                                .canonicalize()
+                                .expect("canonical")
+                                .join("new.sock"),
+                            op: nono::UnixSocketOp::Bind
+                        }
+                    );
+                } else {
+                    assert_eq!(decision, NetworkDecision::Deny);
+                }
+            }
+        }
+
+        #[test]
+        fn af_unix_connect_without_grant_asks_when_elevation_is_on() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "test.sock");
+            let _listener = UnixListener::bind(&path).expect("bind unix listener");
+            let config = make_elevated_config(&backend);
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Ask {
+                    path: path.canonicalize().expect("canonical"),
+                    op: nono::UnixSocketOp::Connect,
+                }
+            );
+        }
+
+        #[test]
+        fn af_unix_datagram_send_is_never_asked() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "test.sock");
+            let _listener = UnixListener::bind(&path).expect("bind unix listener");
+            let config = make_elevated_config(&backend);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_SENDTO, &unix_pathname(&path), &config),
+                NetworkDecision::Deny
+            );
+        }
+
+        #[test]
+        fn af_unix_denied_or_protected_paths_are_never_asked() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "test.sock");
+            let _listener = UnixListener::bind(&path).expect("bind unix listener");
+            let root = dir.path().canonicalize().expect("canonical");
+            let roots = vec![root];
+
+            let mut config = make_elevated_config(&backend);
+            config.deny_paths = &roots;
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Deny,
+                "a path the policy denies must not reach a reviewer"
+            );
+
+            let mut config = make_elevated_config(&backend);
+            config.protected_roots = &roots;
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Deny,
+                "nono's protected state must not reach a reviewer"
             );
         }
 
@@ -2360,6 +2957,42 @@ mod tests {
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(3000), &config),
                 NetworkDecision::Allow
+            );
+        }
+
+        /// A supervised proxy session must also honor explicit outbound TCP port grants.
+        #[test]
+        fn proxy_only_allows_explicit_tcp_connect_ports() {
+            let backend = DenyAllBackend;
+            let mut caps = nono::CapabilitySet::default();
+            caps.add_tcp_connect_port(5432);
+            let mut config = make_proxy_only_config(&backend, 8080, Vec::new());
+            config.caps = &caps;
+
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(5432), &config),
+                NetworkDecision::Allow,
+                "an explicitly granted TCP connect port must be allowed in supervised proxy mode"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(5432), &config),
+                NetworkDecision::Allow,
+                "an explicit connect-port grant authorizes direct outbound connections"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(5433), &config),
+                NetworkDecision::Deny,
+                "an ungranted TCP connect port must remain denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(5433), &config),
+                NetworkDecision::Deny,
+                "an ungranted external TCP port must remain denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_SENDTO, &inet_external(5432), &config),
+                NetworkDecision::Deny,
+                "a TCP connect-port grant must not authorize datagram-style sendto"
             );
         }
 

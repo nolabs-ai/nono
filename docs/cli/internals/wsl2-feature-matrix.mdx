@@ -57,6 +57,7 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | `--listen-port` (child binds TCP port) | Unavailable | Needs Landlock V4 |
 | `--open-port` (bidirectional localhost TCP) | Unavailable | Needs Landlock V4 |
 | Per-port TCP filtering | Unavailable | Needs Landlock V4 (kernel 6.7+) |
+| `--isolate` / `linux.isolate` (namespace isolation) | Unverified | Expected to work (real Linux kernel); not yet tested on the Microsoft kernel. nono probes at startup and fails closed if unsupported |
 
 ## Credential Proxy
 

@@ -67,8 +67,8 @@ pub mod undo;
 
 // Re-exports for convenience
 pub use broker_path::{
-    safe_broker_path_for_binary, sanitize_broker_path, sanitize_broker_path_for_binary,
-    writable_path_dirs,
+    path_writable_by, safe_broker_path_for_binary, sanitize_broker_path,
+    sanitize_broker_path_for_binary, writable_path_dirs,
 };
 pub use capability::{
     AccessMode, CapabilitySet, CapabilitySource, CoveringCapabilities, FsCapability, IpcMode,
@@ -95,7 +95,8 @@ pub use path::try_canonicalize;
 pub use resource::ResourceLimits;
 #[cfg(target_os = "linux")]
 pub use sandbox::{
-    DetectedAbi, LandlockScopePolicy, SeccompOpts, detect_abi, is_wsl2, landlock_scope_policy,
+    DetectedAbi, LandlockScopePolicy, MAX_ENFORCED_ABI, NamespaceProbe, NamespaceProbeStage,
+    NamespaceSpec, SeccompOpts, detect_abi, is_wsl2, kernel_abi_version, landlock_scope_policy,
 };
 pub use sandbox::{Sandbox, SupportInfo};
 pub use scrub::{

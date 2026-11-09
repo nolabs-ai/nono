@@ -87,7 +87,7 @@ Precedence is: CLI flag, then `NONO_THEME`, then config file, then the default `
 |---------|---------|---------|
 | Pi | `nono pull nolabs-ai/pi` | `nono run --profile nolabs-ai/pi -- pi` |
 | Claude Code | `nono pull nolabs-ai/claude` | `nono run --profile nolabs-ai/claude -- claude` |
-| Codex | `nono pull nolabs-ai/codex` | `nono run --profile nolabs-ai/codex -- codex` |
+| Codex | `nono pull nolabs-ai/codex` | `nono run --profile nolabs-ai/codex -- codex --no-daemon --sandbox danger-full-access --ask-for-approval on-request` |
 | OpenCode 2 | `nono pull nolabs-ai/opencode` | `nono run --profile nolabs-ai/opencode -- opencode --standalone` |
 | OpenCode 1 | `nono pull nolabs-ai/opencode-v1` | `nono run --profile nolabs-ai/opencode-v1 -- opencode` |
 
@@ -104,7 +104,7 @@ User profiles can extend built-in, pack, or other user profiles with the `extend
 
 ```json
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": { "name": "my-claude" },
   "filesystem": {
     "allow": ["/opt/my-tools"],
@@ -117,7 +117,7 @@ You can also extend multiple profiles at once. Bases are merged left-to-right, t
 
 ```json
 {
-  "extends": ["claude-code", "node-dev"],
+  "extends": ["nolabs-ai/claude", "node-dev"],
   "meta": { "name": "my-fullstack" },
   "filesystem": { "allow": ["/opt/extra"] }
 }
@@ -144,7 +144,7 @@ When extending multiple bases, they are merged left-to-right using the same rule
 Profiles can form chains (up to 10 levels deep). Circular dependencies are detected and rejected. Shared transitive bases are deduplicated.
 
 ```
-my-dev.json → team-base.json → claude-code (pack)
+my-dev.json → team-base.json → nolabs-ai/claude (package)
 ```
 
 ## Deprecated Command Blocking

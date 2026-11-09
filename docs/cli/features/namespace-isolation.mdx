@@ -1,0 +1,127 @@
+---
+title: Namespace Isolation (Linux)
+description: Opt-in user, network, IPC, and UTS namespaces that structurally remove local IPC and direct-network escape paths
+---
+
+Namespace isolation is an opt-in Linux layer that runs the sandboxed command inside new kernel namespaces, on top of the normal Landlock and seccomp sandbox. It is off by default and must be explicitly enabled with the `--isolate` flag or the corresponding profile settings.
+
+```bash
+# Network namespace with no route out; ipc and uts namespaces too
+nono run --isolate net,ipc,uts --block-net --allow-cwd -- my-agent
+
+# Network namespace whose only way out is the nono proxy
+nono run --isolate net --allow-domain api.openai.com --allow-cwd -- my-agent
+
+# Same, and let the agent run local servers and tests on its own loopback
+nono run --isolate net,loopback --allow-domain api.openai.com --allow-cwd -- my-agent
+```
+
+Or in a profile:
+
+```json
+{
+  "network": { "allow_domain": ["api.openai.com"] },
+  "linux": {
+    "isolate": { "network": true, "ipc": true, "uts": true }
+  }
+}
+```
+
+## What each namespace does
+
+Every request also creates a **user namespace**. It maps your own uid and gid to themselves, so files keep their owners and `id` reports your user. It is what lets an unprivileged process create the other namespaces. The capabilities the setup step holds inside that namespace do not survive into your command: the sandboxed process runs with no capabilities.
+
+| Namespace | Field / flag | Effect |
+|---|---|---|
+| Network | `network` / `net` | A fresh network stack containing only loopback. Host abstract Unix sockets (`@/tmp/.X11-unix/X0`, `@dbus-*`, and so on), host netlink, and every direct IP protocol (TCP, UDP, ICMP, raw) are unreachable, on every kernel version. |
+| IPC | `ipc` | SysV shared memory, semaphores, message queues, and POSIX message queues are not shared with the host. |
+| UTS | `uts` | Hostname changes inside the sandbox do not affect the host. |
+
+Network isolation closes some of the same classes as Landlock's scoping and network rules, but it does so on every kernel nono supports. Landlock abstract-socket scoping needs ABI V6 (Linux 6.12), and Landlock network rules cover TCP only.
+
+<Note>
+  Pathname Unix sockets (such as `/run/user/1000/bus` or
+  `/var/run/docker.sock`) use filesystem paths as addresses, but they are not
+  part of the IP network namespace. Use
+  [`linux.af_unix_mediation`](/cli/internals/landlock#pathname-unix-socket-mediation)
+  to control them.
+</Note>
+
+## Local servers on loopback
+
+By default an isolated command cannot use TCP even on its own loopback. nono's normal network rules still apply inside the namespace: `--block-net` denies TCP sockets, and proxied mode allows a connection only to the proxy port. Dev servers, test suites that listen on `127.0.0.1`, and language servers over TCP all fail.
+
+Add `loopback` to allow them:
+
+```bash
+nono run --isolate net,loopback --block-net --allow-cwd -- npm test
+```
+
+```json
+{ "linux": { "isolate": { "network": true, "loopback": true } } }
+```
+
+With `loopback`, the command can bind, listen, and connect on any TCP port on `127.0.0.1` and `::1` inside the namespace. That loopback belongs only to the sandbox:
+
+- Nothing on the host can connect to these listeners, and the command still cannot reach host localhost services.
+- Egress is unchanged: the only way out is still the nono proxy, with the same filtering and authentication.
+- UDP, raw sockets, and netlink stay denied.
+- The proxy port is already held by nono's bridge listener, so the command cannot take it over.
+
+`loopback` requires `net`; on its own it is a startup error, because without the namespace it would reach the host's localhost. `--open-port`, `--listen-port`, and `--allow-connect-port` stay rejected under isolation, because they refer to the host's localhost, not the namespace's.
+
+## Networking inside the namespace
+
+The isolated network has no route to the host or the internet. The only way out is via the session proxy:
+
+- **Network blocking:**`--block-net` results in no proxy and no bridge - loopback only.
+- **Proxied networking:** `--allow-domain`, `--network-profile`, credentials etc: A loopback listener *inside* the namespace on the proxy's port which is served from the supervisor.
+
+Because the namespace has no other way out, the following combinations produce **startup errors** for safe informative failure, rather than silent.
+
+| Combination | Why it fails |
+|---|---|
+| Unrestricted network (no `--block-net`, no proxy policy) | Allow-all cannot be satisfied in an empty namespace. |
+| `--open-port` / `network.open_port` | Host localhost ports do not exist inside the namespace. |
+| `--allow-connect-port` / `network.connect_port` | Direct outbound TCP has no route. |
+| `--listen-port` / `network.listen_port` | Listeners inside the namespace cannot be reached from the host. |
+| `network.no_proxy` | Hosts that bypass the proxy cannot be reached directly. |
+
+## Merging and precedence
+
+`linux.isolate` fields merge by logical OR across `extends`, packs, and the CLI. Any layer can turn a namespace on, and no layer can turn one off. `--isolate` adds to a profile's isolation; it cannot remove it.
+
+## Host requirements and failure
+
+nono probes the host at startup by actually creating the namespaces in a scratch process. If the host refuses, nono stops with an error that names the step that failed and the likely cause.
+
+Some common causes include:
+
+- **Ubuntu 23.10 and later** restrict unprivileged user namespaces with AppArmor (`kernel.apparmor_restrict_unprivileged_userns = 1`). Allow nono specifically by installing an AppArmor profile, for example `/etc/apparmor.d/nono`:
+
+  ```
+  abi <abi/4.0>,
+  include <tunables/global>
+
+  profile nono /usr/bin/nono flags=(unconfined) {
+    userns,
+    include if exists <local/nono>
+  }
+  ```
+
+  Adjust the path to where your `nono` binary is installed, then run `sudo apparmor_parser -r /etc/apparmor.d/nono`. This lets any local user obtain an unprivileged user namespace through nono, the same trade Ubuntu makes for its bubblewrap profile.
+- **Containers.** Docker's and Kubernetes' default seccomp profiles block `unshare`. See [Externally provisioned namespaces](#externally-provisioned-namespaces).
+- **Hardened kernels** with `kernel.unprivileged_userns_clone = 0` or `user.max_user_namespaces = 0`.
+
+## Externally provisioned namespaces
+
+Where unprivileged user namespaces cannot be enabled, create the namespace outside nono with the privileges you already have and run an unchanged nono inside it, without `--isolate`. Examples: `sudo ip netns exec`, `systemd-run -p PrivateNetwork=yes`, or the container itself. nono never runs privileged setup code itself.
+
+## Limits
+
+- **Linux only.** On macOS, `linux.isolate` is ignored and `--isolate` is not available. Seatbelt's deny-default profile covers the socket classes independently.
+- **`nono run` and `nono shell` only.** `nono wrap` has no supervisor to create the namespaces or serve the proxy bridge, so it rejects profiles that set `linux.isolate`.
+- **Supplementary groups** appear as `nobody` inside the namespace, because only your primary uid and gid are mapped. The kernel still applies your real groups for file access.
+- **Kernel attack surface.** Unprivileged user namespaces expose more kernel code to the sandboxed process. See the [security model](/cli/internals/security-model#opt-in-namespace-isolation-linux).
+- **`loopback` is Linux-only.** On macOS a profile that relies on it for a local server still needs `network.listen_port`.
+- **Not yet available:** a mount namespace that masks `$XDG_RUNTIME_DIR`, D-Bus, and container sockets, plus a per-session `/tmp`; a SOCKS5 route for non-HTTP TCP; and reverse forwarding for listen ports. These are planned under NEP-0004.

@@ -31,9 +31,109 @@ There are two variants of the contract:
 
 | Field | Meaning |
 | --- | --- |
-| `url` | Endpoint to call. Required for unsigned backends. With `auth: "platform"` it defaults to `<enrolled platform URL>/api/v1/approvals`, and if given must be `https://`, or `http://` to a loopback host. |
+| `url` | Endpoint to call. Required for unsigned backends. An `http(s)://` URL, or `unix:///abs/path.sock` for a [Unix-socket](#unix-socket-transport) helper. With `auth: "platform"` it defaults to `<enrolled platform URL>/api/v1/approvals`, and if given must be `https://`, or `http://` to a loopback host. |
 | `auth` | Omit for unsigned. `"platform"` selects the signed variant and fails closed if the client is not enrolled. |
 | `timeout_secs` | Total time this backend waits for a decision (default 60). It is also sent to the server as the hold hint. |
+
+### Unix-socket transport
+
+A local approval helper, such as a dialog drawn next to the session, should
+listen on a Unix socket rather than a loopback TCP port. A sandboxed child that
+may listen on TCP ports, or signal the helper, can take a loopback port over
+whenever the helper is not holding it, and then answer every approval itself.
+A socket in a directory the child cannot write to cannot be replaced that way.
+
+```json
+{
+  "network": {
+    "approval_backends": {
+      "dialog": { "type": "webhook", "url": "unix:///Users/me/.myhelper/s/approval.sock", "timeout_secs": 120 }
+    },
+    "approval_defaults": { "backend": "dialog" }
+  }
+}
+```
+
+- The request is the same unsigned exchange as over HTTP: HTTP/1.1
+  `POST /` with `Host: localhost`, and the same headers, body, and response
+  handling. The URL names only the socket; it has no host, request path,
+  query, or fragment.
+- The path must be absolute and must not contain `..`. `.` segments and
+  repeated `/` are normalized away. A path too long for the platform's
+  `sun_path` is rejected.
+- `auth: "platform"` cannot use a Unix socket.
+- The transport belongs to the backend, so it works for `network`,
+  `command_policies`, and `security` backends and inside `chain` backends.
+- A missing socket, a refused connection, and any other connect error deny
+  the request, like every other webhook failure.
+
+`nono run` and `nono shell` refuse to launch when the sandbox could replace a
+configured socket: when it has write access to the socket path, to any
+directory above it, or to a symlink on the way to it, or when it holds a
+`bind` grant for the socket. Each mediated command's sandbox under
+`command_policies` gets the same check before the command runs. Raw
+`unsafe_seatbelt_rules` on a macOS command are not inspected; do not use them
+to grant writes near the socket. Runtime capability expansion in supervised
+mode only hands the child a descriptor for an existing file, so it cannot
+create, remove, or bind the socket either.
+
+### Approval-only network configuration
+
+For `run`, `shell`, and standalone `proxy`, `network.approval_backends`
+also activates the proxy: no static `allow_domain` entry, credential route, or
+upstream proxy is required. `network.block` must be false or omitted, and
+`--block-net` must be absent. For example:
+
+```json
+{
+  "network": {
+    "block": false,
+    "allow_domain": [],
+    "approval_backends": {
+      "review": { "type": "terminal" }
+    },
+    "approval_defaults": { "backend": "review" }
+  }
+}
+```
+
+A non-empty backend map selects strict host filtering. An empty allowlist
+therefore sends every otherwise eligible CONNECT target for approval instead of using the legacy empty-list allow-all
+behavior. Static allowlist grants still work without a prompt; explicit host
+denies and metadata/link-local SSRF protection remain hard denials and cannot
+be approved. Approved destinations are resolved and checked again before use.
+Without network approval backends, the existing static-policy behavior is
+unchanged; `approval_defaults` alone does not activate a proxy.
+
+Both `--block-net` and profile `network.block: true` are hard network blocks,
+not default-deny settings that an approval can override. Combining either with
+`network.approval_backends` is rejected as contradictory before launch. To use
+approval-only mode, remove the hard block; to keep networking blocked, remove
+the approval backends. An inherited block also remains a hard block; adding
+approvals in a child profile cannot loosen it. The explicit `--allow-net`
+override clears a profile block and its approval backends along with its static
+proxy settings; this is an explicit unrestricted grant, not an approval.
+`nono wrap` cannot host an approval proxy and rejects active network approval
+backends rather than silently ignoring them; use `nono run` instead.
+Runtime network approvals currently apply to CONNECT tunnels handled directly
+by nono, including upstream-bypass destinations. CONNECTs forwarded to an
+enterprise upstream proxy do not consult these backends: unlisted destinations
+remain denied, so forwarded destinations need static allowlist grants.
+
+### Terminal approval deadline
+
+Terminal approval has a total deadline set by the terminal backend's
+`timeout_secs` (ten minutes by default). That budget includes waiting
+for another approval prompt to release the terminal and the anti-typeahead
+delay, not just time spent reading an answer. Expiry denies the request,
+restores terminal state, and leaves no active prompt reader behind. Named and
+chained backends advertise their bounded timeout to callers so a proxy backstop
+does not prematurely abandon a legitimate terminal prompt. The proxy passes its
+absolute deadline through queued approval work and chains; a worker that starts
+after expiry cannot open a fresh terminal prompt. For network approvals, set
+`timeout_secs` on the terminal or webhook backend entry: only `backend` is read
+from `network.approval_defaults`. A chain derives its bound from its children;
+a chain-level `timeout_secs` does not override their deadlines.
 
 ## Request
 
@@ -56,9 +156,34 @@ Both variants `POST` the same JSON body:
 | `network` | `host`, `port`, `protocol`, `resolved_ips` |
 | `endpoint` | `route_id`, `upstream`, `method`, `path`, `rule_label` |
 | `command` | `command`, `args`, `caller`, `intercept_rule` |
+| `unix_socket` | `path`, `op` (`connect`, `bind`) |
 
 Every variant also carries `request_id`, `session_id`, `reason` (nullable), and
-`child_pid`.
+`child_pid`. Endpoint requests carry the session that owns the proxy; only an
+embedding that starts the proxy without session context reports `"proxy"`.
+Network and endpoint requests report `child_pid` 0 because the proxy cannot
+attribute a connection to a process.
+
+Endpoint requests are answered by the `command_policies` approval backends
+when the profile declares them, otherwise by the `network` approval backends,
+so credential endpoint policies under `network.custom_credentials` can ask
+without a command policy.
+
+`unix_socket` requests come from Linux pathname socket mediation
+(`linux.af_unix_mediation: "pathname"`) with `security.capability_elevation`
+and are answered by the `security` backend. Only `connect` and `bind` outside
+the granted socket set are asked; datagram sends, abstract and unnamed
+sockets, denied paths and nono's own state are denied without a request.
+Session-scoped decisions are honoured for the rest of the session.
+Bind approval requires an existing filesystem write grant on the socket's
+parent directory; otherwise the operation is denied without a request.
+
+For CONNECT network approvals, `request_id` is a UUID v4 generated once per
+new approval attempt. It is independent of `host`, `port`, and `session_id`:
+subsequent connections, concurrent single-use attempts, and separate sessions
+or devices must not reuse an earlier attempt's identity. Retries of the same
+attempt retain the original body and ID; signed polls use that ID in the URL.
+The webhook client does not automatically retry failed HTTP requests.
 
 Headers on every request, in both variants:
 
@@ -87,10 +212,37 @@ The endpoint answers the `POST` with `2xx` and a JSON body:
 
 Accepted spellings for `decision` are `grant`, `granted`, `approve`,
 `approved`, `allow`, `allowed`; `deny`, `denied`, `reject`, `rejected`,
-`block`, `blocked`; and `timeout`, `timed_out`. Any other value is an error and
+`block`, `blocked`; `grant_session`, `granted_session`, `allow_session`,
+`always_allow`; `deny_session`, `denied_session`, `always_deny`; and `timeout`, `timed_out`. Any other value is an error and
 therefore a denial. A non-`2xx` status is a denial whose reason names the
 status and the elapsed time. The connection stays open until the endpoint
 answers or `timeout_secs` elapses.
+
+### CONNECT grant scope and local caching
+
+An ordinary `granted` / `allow` response (`ApprovalDecision::Granted`) authorizes
+only the connection that initiated the attempt. It is never cached locally.
+Each new connection consults the backend, so remote policy changes and
+revocations take effect on the next connection. If concurrent connections are
+waiting on that attempt, its single-use grant authorizes only the leader;
+followers start new approval attempts with fresh UUIDs.
+
+`allow_session` / `always_allow` (`GrantedForSession`) explicitly authorizes
+reuse for the remaining proxy session for the same normalized `(host, port)`.
+The backend must understand that later connections can proceed without further
+consultation; a remote revocation will not invalidate this local session grant.
+It also authorizes waiting followers. Every authorized connection, whether
+single-use, a follower, or cached, still independently resolves and checks its
+addresses against the SSRF guard. Session denials (`deny_session` /
+`always_deny`) are cached for the same scope; ordinary denials are not cached.
+
+In an `all` backend chain, every backend must grant for the session before the
+combined result can be `GrantedForSession`. Any ordinary `Granted` limits the
+combined result to single-use, regardless of backend order. An `any` chain
+uses the scope of its first granting backend. Callers without session caching,
+such as L7 endpoint approvals, treat a session grant as an ordinary grant.
+These session response spellings apply to the unsigned response contract;
+the signed `state: "granted"` contract below grants only the current attempt.
 
 ## Signed variant
 

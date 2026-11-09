@@ -529,6 +529,8 @@ mod tests {
         // Should include known LLM API hosts
         assert!(resolved.hosts.contains(&"api.openai.com".to_string()));
         assert!(resolved.hosts.contains(&"api.anthropic.com".to_string()));
+        // Nix substitutes and channel refetches go through the binary cache
+        assert!(resolved.hosts.contains(&"cache.nixos.org".to_string()));
     }
 
     #[test]

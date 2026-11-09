@@ -12,7 +12,7 @@ Profile files use **JSONC** (JSON with Comments): standard JSON plus `//` line c
 ```jsonc
 {
   // Extend the official Claude Code profile
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": {
     "name": "my-claude",
     "description": "Custom Claude profile with extra tooling access",
@@ -86,9 +86,9 @@ If you extend profiles A and B, and both of them extend a common base C, that's 
 
 The one thing to watch out for is if A and B intentionally set the same single-value field to *different* values, because only one can win and it might not be obvious which. If you're unsure what you're actually getting, run `nono profile show my-profile` to see the resolved result.
 
-### The `default` profile is always included
+### The `default` security groups are always included
 
-Every profile automatically gets the `default` built-in merged in, even if you don't write `extends` at all. You don't need to add `"extends": "default"` — it's already there.
+Every profile automatically receives the groups included by the built-in `default` profile, even without an explicit `extends`. Other `default` fields are not implicitly inherited; use `"extends": "default"` when you want the complete base profile.
 
 If you want to remove a group that `default` includes, use `groups.exclude`:
 
@@ -237,7 +237,7 @@ With `--full`, additional sections are included as empty stubs for all additive 
 The `init` command validates inputs before writing:
 
 - **Profile name** must be alphanumeric with hyphens (no leading/trailing hyphens)
-- **`--extends`** target must exist as a preset, pack, or user profile
+- **`--extends`** target must exist as a built-in or user profile, or as a package profile addressed by its fully-qualified package name
 - **`--groups`** are checked against the embedded policy groups
 
 After creating a profile, validate it:
@@ -624,7 +624,7 @@ User profiles can declare a `binary` field to specify the program that nono shou
 
 ```jsonc
 {
-  "extends": "claude-code",
+  "extends": "nolabs-ai/claude",
   "meta": { "name": "my-claude" },
   "binary": "/home/user/.local/bin/claude"
 }

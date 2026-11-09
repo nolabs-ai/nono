@@ -310,6 +310,7 @@ mod tests {
                 path: "/oauth/token".to_string(),
                 response_fields: opaque_fields(["access_token", "refresh_token"]),
                 request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.openai_oauth".to_string()],
@@ -326,6 +327,7 @@ mod tests {
                     path: "/oauth/token".to_string(),
                     response_fields: opaque_fields(["access_token", "refresh_token"]),
                     request_body: OAuthTokenRequestBodyFormat::Auto,
+                    response_body: OAuthTokenRequestBodyFormat::Auto,
                     request_nonce_fields: vec!["refresh_token".to_string()],
                 }],
                 admitted_consumers: vec!["proxy.openai_oauth".to_string()],
@@ -342,6 +344,7 @@ mod tests {
         let rewritten = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh"}"#,
             )
             .unwrap();
@@ -374,6 +377,7 @@ mod tests {
                 path: "/oauth/token".to_string(),
                 response_fields: opaque_fields(["access_token", "refresh_token", "id_token"]),
                 request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.codex_oauth".to_string()],
@@ -383,6 +387,7 @@ mod tests {
         let rewritten = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh","id_token":"real-id"}"#,
             )
             .unwrap();
@@ -413,6 +418,7 @@ mod tests {
                     fields
                 },
                 request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.codex_oauth".to_string()],
@@ -422,6 +428,7 @@ mod tests {
         let rewritten = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh","id_token":"real-id"}"#,
             )
             .unwrap();
@@ -454,6 +461,7 @@ mod tests {
         let err = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh","id_token":"real-id"}"#,
             )
             .expect_err("unlisted token fields must fail closed");
@@ -471,6 +479,7 @@ mod tests {
         let rewritten = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh"}"#,
             )
             .unwrap();
@@ -510,6 +519,96 @@ mod tests {
             .expect("form body without phantom should pass through");
 
         assert_eq!(rewritten, body);
+    }
+
+    #[test]
+    fn request_header_rewrite_resolves_provider_phantom() {
+        let store = store();
+        let endpoint = store.lookup("auth.openai.com:443", "/oauth/token").unwrap();
+        let rewritten = store
+            .rewrite_response_body(
+                endpoint,
+                &[],
+                br#"{"access_token":"real-access","refresh_token":"real-refresh"}"#,
+            )
+            .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        let phantom = json["access_token"].as_str().unwrap();
+
+        let resolved = store
+            .rewrite_request_header_value(endpoint, &format!("Bearer {phantom}"))
+            .expect("provider consumer resolves the minted phantom");
+        assert_eq!(resolved, "Bearer real-access");
+    }
+
+    #[test]
+    fn request_header_rewrite_passes_plain_and_unknown_values_through() {
+        let store = store();
+        let endpoint = store.lookup("auth.openai.com:443", "/oauth/token").unwrap();
+        let unknown = format!("nono_{}", "f".repeat(64));
+
+        assert_eq!(
+            store.rewrite_request_header_value(endpoint, "Bearer plain-token"),
+            None
+        );
+        assert!(
+            store
+                .rewrite_request_header_value(endpoint, &format!("Bearer {unknown}"))
+                .is_none(),
+            "an unknown phantom must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn request_header_rewrite_does_not_resolve_other_providers_phantom() {
+        let store = OAuthCaptureStore::load(&[
+            OAuthCaptureConfig {
+                provider: "github".to_string(),
+                token_endpoints: vec![OAuthTokenEndpointConfig {
+                    host: "https://github.com".to_string(),
+                    path: "/login/oauth/access_token".to_string(),
+                    response_fields: opaque_fields(["access_token"]),
+                    request_body: OAuthTokenRequestBodyFormat::Auto,
+                    response_body: OAuthTokenRequestBodyFormat::Auto,
+                    request_nonce_fields: vec!["refresh_token".to_string()],
+                }],
+                admitted_consumers: vec!["proxy.github".to_string()],
+            },
+            OAuthCaptureConfig {
+                provider: "other".to_string(),
+                token_endpoints: vec![OAuthTokenEndpointConfig {
+                    host: "https://auth.other.com".to_string(),
+                    path: "/oauth/token".to_string(),
+                    response_fields: opaque_fields(["access_token"]),
+                    request_body: OAuthTokenRequestBodyFormat::Auto,
+                    response_body: OAuthTokenRequestBodyFormat::Auto,
+                    request_nonce_fields: vec!["refresh_token".to_string()],
+                }],
+                admitted_consumers: vec!["proxy.other".to_string()],
+            },
+        ])
+        .unwrap();
+
+        let github_endpoint = store
+            .lookup("github.com:443", "/login/oauth/access_token")
+            .unwrap();
+        let other_endpoint = store.lookup("auth.other.com:443", "/oauth/token").unwrap();
+        let rewritten = store
+            .rewrite_response_body(
+                other_endpoint,
+                &[],
+                br#"{"access_token":"other-provider-token"}"#,
+            )
+            .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        let other_phantom = json["access_token"].as_str().unwrap();
+
+        assert!(
+            store
+                .rewrite_request_header_value(github_endpoint, &format!("Bearer {other_phantom}"))
+                .is_none(),
+            "a phantom minted for another provider must not resolve on this endpoint"
+        );
     }
 
     #[test]
@@ -626,6 +725,7 @@ mod tests {
         let rewritten = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh"}"#,
             )
             .unwrap();
@@ -682,6 +782,7 @@ mod tests {
                     format: Some(template.to_string()),
                 }],
                 request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.anthropic".to_string()],
@@ -696,7 +797,7 @@ mod tests {
             .lookup("platform.claude.com:443", "/v1/oauth/token")
             .unwrap();
         let rewritten = store
-            .rewrite_response_body(endpoint, br#"{"access_token":"real-oauth-token"}"#)
+            .rewrite_response_body(endpoint, &[], br#"{"access_token":"real-oauth-token"}"#)
             .unwrap();
         let json: Value = serde_json::from_slice(&rewritten).unwrap();
         let phantom = json["access_token"].as_str().unwrap();
@@ -724,7 +825,7 @@ mod tests {
             .lookup("platform.claude.com:443", "/v1/oauth/token")
             .unwrap();
         let rewritten = store
-            .rewrite_response_body(endpoint, br#"{"access_token":"real-oauth-token"}"#)
+            .rewrite_response_body(endpoint, &[], br#"{"access_token":"real-oauth-token"}"#)
             .unwrap();
         let json: Value = serde_json::from_slice(&rewritten).unwrap();
         let phantom = json["access_token"].as_str().unwrap();
@@ -748,6 +849,7 @@ mod tests {
                     format: Some("sk-ant-oat01-{}".to_string()),
                 }],
                 request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.anthropic".to_string()],
@@ -768,7 +870,11 @@ mod tests {
             .lookup("platform.claude.com:443", "/v1/oauth/token")
             .unwrap();
         let rewritten = store
-            .rewrite_response_body(endpoint, br#"{"access_token":"totally-different-shape"}"#)
+            .rewrite_response_body(
+                endpoint,
+                &[],
+                br#"{"access_token":"totally-different-shape"}"#,
+            )
             .unwrap();
         let json: Value = serde_json::from_slice(&rewritten).unwrap();
         let phantom = json["access_token"].as_str().unwrap();
@@ -795,6 +901,7 @@ mod tests {
                         format: Some("sk-ant-oat01-{}".to_string()),
                     }],
                     request_body: OAuthTokenRequestBodyFormat::Auto,
+                    response_body: OAuthTokenRequestBodyFormat::Auto,
                     request_nonce_fields: vec!["refresh_token".to_string()],
                 }],
                 admitted_consumers: vec!["proxy.anthropic".to_string()],
@@ -810,6 +917,7 @@ mod tests {
                         format: Some("oth_{}".to_string()),
                     }],
                     request_body: OAuthTokenRequestBodyFormat::Auto,
+                    response_body: OAuthTokenRequestBodyFormat::Auto,
                     request_nonce_fields: vec!["refresh_token".to_string()],
                 }],
                 admitted_consumers: vec!["proxy.other".to_string()],
@@ -821,7 +929,7 @@ mod tests {
             let endpoint = store.lookup(host, path).unwrap();
             let body = format!(r#"{{"access_token":"{real}"}}"#);
             let rewritten = store
-                .rewrite_response_body(endpoint, body.as_bytes())
+                .rewrite_response_body(endpoint, &[], body.as_bytes())
                 .unwrap();
             let json: Value = serde_json::from_slice(&rewritten).unwrap();
             let phantom = json["access_token"].as_str().unwrap().to_string();

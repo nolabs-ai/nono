@@ -8,9 +8,9 @@
 //! ## Properties
 //!
 //! * Algorithm: ECDSA P-256 (matches the rustls/ring stack already in use)
-//! * Validity: 24 hours from generation. Long enough to outlive any plausible
-//!   `nono` invocation; short enough that a leaked cert file becomes useless
-//!   quickly.
+//! * Validity: from one hour before generation to 24 hours after it. Tolerates
+//!   clock skew and outlives any plausible `nono` invocation; short enough that
+//!   a leaked cert file becomes useless quickly.
 //! * Subject: `CN=nono-session-ca`
 //! * Basic constraints: `CA:TRUE`
 //! * No CRL/OCSP — meaningless for an ephemeral, local-only CA.
@@ -36,6 +36,17 @@ use zeroize::Zeroizing;
 /// Default validity window for the ephemeral CA (1 day). Long enough to cover
 /// any plausible session, short enough to limit blast radius if the cert file leaks.
 pub const CA_VALIDITY_DEFAULT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Finite tolerance for clock differences between the issuer and TLS clients.
+/// 1 hour, suggested in https://github.com/nolabs-ai/nono/issues/2063
+pub(super) const NOT_BEFORE_SKEW: Duration = Duration::from_secs(60 * 60);
+
+pub(super) fn certificate_not_before(now: SystemTime) -> Result<OffsetDateTime> {
+    let not_before = now
+        .checked_sub(NOT_BEFORE_SKEW)
+        .ok_or_else(|| ProxyError::Config("certificate not_before time underflow".to_string()))?;
+    system_time_to_offset(not_before)
+}
 
 /// Ephemeral CA used to sign per-hostname leaf certificates for TLS interception.
 ///
@@ -124,6 +135,14 @@ impl EphemeralCa {
     /// Used by `--trust-proxy-ca` to create a CA with `CN=nono-proxy-ca` so
     /// it appears with a recognizable name in macOS Keychain and trust store.
     pub fn generate_with_cn(cn: &str, validity: Duration) -> Result<Self> {
+        Self::generate_with_cn_at(cn, validity, SystemTime::now())
+    }
+
+    pub(super) fn generate_with_cn_at(
+        cn: &str,
+        validity: Duration,
+        now: SystemTime,
+    ) -> Result<Self> {
         let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(|e| {
             ProxyError::Config(format!("failed to generate ephemeral CA key pair: {}", e))
         })?;
@@ -137,9 +156,10 @@ impl EphemeralCa {
             KeyUsagePurpose::DigitalSignature,
         ];
 
-        let now = SystemTime::now();
-        let not_after = now + validity;
-        params.not_before = system_time_to_offset(now)?;
+        let not_after = now
+            .checked_add(validity)
+            .ok_or_else(|| ProxyError::Config("CA certificate expiry time overflow".to_string()))?;
+        params.not_before = certificate_not_before(now)?;
         params.not_after = system_time_to_offset(not_after)?;
 
         let mut dn = DistinguishedName::new();
@@ -306,7 +326,7 @@ pub fn split_key_cert_pem(combined: &str) -> Result<(Zeroizing<Vec<u8>>, String)
 }
 
 /// Convert `SystemTime` to the `time::OffsetDateTime` that `rcgen` expects.
-fn system_time_to_offset(t: SystemTime) -> Result<OffsetDateTime> {
+pub(super) fn system_time_to_offset(t: SystemTime) -> Result<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp(
         t.duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| ProxyError::Config(format!("system time before unix epoch: {}", e)))?
@@ -323,6 +343,34 @@ mod tests {
     use super::*;
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject;
+
+    #[test]
+    fn generated_ca_backdates_start_without_extending_expiry() {
+        use x509_parser::prelude::FromDer;
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let validity = Duration::from_secs(600);
+        let ca = EphemeralCa::generate_with_cn_at("test-ca", validity, now).unwrap();
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(ca.cert_der()).unwrap();
+        assert_eq!(cert.validity().not_before.timestamp(), 1_800_000_000 - 3600);
+        assert_eq!(cert.validity().not_after.timestamp(), 1_800_000_000 + 600);
+        assert_eq!(ca.not_after(), now + validity);
+
+        // Loading persisted material must not rewrite either validity bound.
+        let restored = EphemeralCa::from_existing(ca.key_der(), ca.cert_pem()).unwrap();
+        assert_eq!(restored.cert_der(), ca.cert_der());
+        assert_eq!(restored.not_after(), ca.not_after());
+    }
+
+    #[test]
+    fn invalid_certificate_times_fail_closed() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(EphemeralCa::generate_with_cn_at("test-ca", Duration::MAX, now).is_err());
+        assert!(certificate_not_before(SystemTime::UNIX_EPOCH).is_err());
+        assert!(system_time_to_offset(SystemTime::UNIX_EPOCH - Duration::from_secs(1)).is_err());
+        let beyond_x509 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000_000);
+        assert!(system_time_to_offset(beyond_x509).is_err());
+    }
 
     #[test]
     fn generate_produces_valid_pem() {

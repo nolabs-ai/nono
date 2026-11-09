@@ -2,11 +2,14 @@ use crate::exec_strategy::StartupTimeoutConfig;
 use crate::output::format_startup_blocked;
 use std::io::{self, IsTerminal, Write};
 
+/// Print a line to stderr that renders correctly even while the PTY relay
+/// holds the terminal in raw mode, where a bare `\n` does not return the
+/// cursor to column 0.
 pub(crate) fn print_terminal_safe_stderr(message: &str) {
     let mut stderr = io::stderr();
     if stderr.is_terminal() {
         let normalized = message.replace('\n', "\r\n");
-        let _ = writeln!(stderr, "\r{}", normalized);
+        let _ = write!(stderr, "\r{}\r\n", normalized);
     } else {
         let _ = writeln!(stderr, "{}", message);
     }

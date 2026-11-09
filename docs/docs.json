@@ -65,7 +65,8 @@
       {
         "group": "Networking",
         "pages": [
-          "cli/features/networking"
+          "cli/features/networking",
+          "cli/features/namespace-isolation"
         ]
       },
       {

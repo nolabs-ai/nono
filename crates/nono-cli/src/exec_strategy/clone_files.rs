@@ -24,6 +24,9 @@ use std::sync::{Mutex, MutexGuard};
 const READY: u8 = 0xc1;
 const DETACHED: u8 = 0xd1;
 const ACK: u8 = 0xa1;
+// Sent instead of READY when namespace entry fails, followed by the failing
+// stage code and errno, so the parent can name what the host refused.
+const NAMESPACE_FAILED: u8 = 0xe1;
 const BOOTSTRAP_SECONDS: i64 = 15;
 
 // All supervised notification sessions hold this lock until their listener
@@ -41,6 +44,9 @@ pub(super) fn lock_listener_ownership() -> Result<MutexGuard<'static, ()>> {
 pub(super) struct Bootstrap {
     pub child: nix::unistd::Pid,
     pub network: Option<OwnedFd>,
+    /// Loopback listener created inside the child's network namespace, when
+    /// namespace isolation requested a proxy bridge.
+    pub bridge: Option<OwnedFd>,
 }
 
 pub(super) struct Command<'a> {
@@ -78,20 +84,87 @@ fn failure(detail: &str) -> NonoError {
     NonoError::SandboxInit(format!("CLONE_FILES bootstrap: {detail}"))
 }
 
+/// Whether the child's network namespace confines TCP to its own loopback
+/// (`linux.isolate.loopback`), so nono's TCP port rules are lifted.
+fn namespace_confines_tcp(config: &ExecConfig<'_>) -> bool {
+    config
+        .namespaces
+        .is_some_and(|spec| spec.has_network() && spec.loopback_tcp_enabled())
+}
+
 fn prepare(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
     policy: LinuxSandboxPolicy,
+    namespace_tcp: bool,
 ) -> Result<PreparedLandlockSandbox> {
-    match policy {
-        LinuxSandboxPolicy::Auto => {
+    match (policy, namespace_tcp) {
+        (LinuxSandboxPolicy::Auto, false) => {
             sandbox::prepare_seccomp_with_abi(caps, abi, nono::SeccompOpts::network_baseline())
         }
-        LinuxSandboxPolicy::External => {
+        // TCP confined by the network namespace: no Landlock TCP rules, but
+        // UDP, raw and non-IP sockets stay denied by the static baseline.
+        (LinuxSandboxPolicy::Auto, true) => sandbox::prepare_seccomp_with_abi(
+            caps,
+            abi,
+            nono::SeccompOpts::external_tcp_with_baseline(),
+        ),
+        // External delegates TCP already; Landlock policy installs no seccomp,
+        // so with loopback it keeps Landlock filesystem rules only.
+        (LinuxSandboxPolicy::External, _) | (LinuxSandboxPolicy::Landlock, true) => {
             sandbox::prepare_seccomp_with_abi(caps, abi, nono::SeccompOpts::external_tcp())
         }
-        LinuxSandboxPolicy::Landlock => sandbox::prepare_landlock_with_abi(caps, abi),
+        (LinuxSandboxPolicy::Landlock, false) => sandbox::prepare_landlock_with_abi(caps, abi),
     }
+}
+
+/// The seccomp-notify program the child installs, if any. Network
+/// notifications carry filesystem notifications when both are needed; an
+/// isolation-only launch may need filesystem notifications alone, or none.
+fn notify_filter(
+    config: &ExecConfig<'_>,
+    caps: &CapabilitySet,
+) -> Option<PreparedSeccompNotifyFilter> {
+    let policy = config.seccomp_policy;
+    let network = if policy.proxy_fallback {
+        let has_bind = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { bind_ports, .. } if !bind_ports.is_empty());
+        sandbox::prepare_seccomp_proxy_filter(has_bind)
+    } else if policy.af_unix_mediation {
+        sandbox::prepare_seccomp_af_unix_filter()
+    } else if policy.needs_openat_notify() {
+        return Some(sandbox::prepare_seccomp_openat_filter());
+    } else {
+        return None;
+    };
+    Some(if policy.needs_openat_notify() {
+        network.with_openat_notifications()
+    } else {
+        network
+    })
+}
+
+fn namespace_stage_code(stage: sandbox::RawSandboxStage) -> u8 {
+    match stage {
+        sandbox::RawSandboxStage::UnshareNamespaces => 1,
+        sandbox::RawSandboxStage::LoopbackUp => 2,
+        sandbox::RawSandboxStage::BridgeListener => 3,
+        _ => 0,
+    }
+}
+
+fn namespace_failure(record: [u8; 5]) -> NonoError {
+    let step = match record[0] {
+        1 => "creating the namespaces (unshare)",
+        2 => "bringing up loopback in the new network namespace",
+        3 => "creating the proxy bridge listener",
+        _ => "an unknown step",
+    };
+    let errno = i32::from_ne_bytes([record[1], record[2], record[3], record[4]]);
+    NonoError::SandboxInit(format!(
+        "namespace isolation failed while {step}: {}. The startup probe succeeded, so the \
+         host refused the launch itself; nono does not run without the requested isolation.",
+        std::io::Error::from_raw_os_error(errno)
+    ))
 }
 
 fn above_stdio(fd: OwnedFd) -> Result<OwnedFd> {
@@ -148,21 +221,23 @@ pub(super) fn spawn(
     caps: &CapabilitySet,
     abi: DetectedAbi,
 ) -> Result<Bootstrap> {
-    if sandbox::is_wsl2() {
+    let network = notify_filter(config, caps);
+    if network.is_some() && sandbox::is_wsl2() {
         return Err(failure("required notification filters unavailable on WSL2"));
     }
-    let baseline = prepare(caps, &abi, config.sandbox_policy)?;
-    let network = if config.seccomp_policy.proxy_fallback {
-        let has_bind = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { bind_ports, .. } if !bind_ports.is_empty());
-        sandbox::prepare_seccomp_proxy_filter(has_bind)
-    } else {
-        sandbox::prepare_seccomp_af_unix_filter()
-    };
-    let network = if config.seccomp_policy.needs_openat_notify() {
-        network.with_openat_notifications()
-    } else {
-        network
-    };
+    let namespaces = config.namespaces;
+    if let Some(ref spec) = namespaces {
+        spec.validate()?;
+    }
+    if network.is_none() && namespaces.is_none() {
+        return Err(failure("nothing requires the raw-clone bootstrap"));
+    }
+    let baseline = prepare(
+        caps,
+        &abi,
+        config.sandbox_policy,
+        namespace_confines_tcp(config),
+    )?;
     let gate = config
         .tool_sandbox_runtime
         .map(|runtime| runtime.prepare_outer_exec_gate())
@@ -195,7 +270,8 @@ pub(super) fn spawn(
         child_exec(
             &command,
             &baseline,
-            &network,
+            network.as_ref(),
+            namespaces.as_ref(),
             gate.as_ref().map(AsRawFd::as_raw_fd),
             child.as_raw_fd(),
             parent.as_raw_fd(),
@@ -215,7 +291,7 @@ pub(super) fn spawn(
     let mut cleanup_dir = None;
     #[cfg(test)]
     let mut late_fd = None;
-    let handshake = (|| -> Result<RawFd> {
+    let handshake = (|| -> Result<(RawFd, Option<OwnedFd>)> {
         // Harden before releasing the child, and before any untrusted code can
         // exec. The child independently enables inspection for notifications.
         // SAFETY: prctl changes only the parent's dumpability.
@@ -224,8 +300,25 @@ pub(super) fn spawn(
         }
         signals.restore()?;
         let mut ready = [0_u8];
-        if !transfer(parent.as_raw_fd(), &mut ready, false, Some(pid)) || ready[0] != READY {
+        if !transfer(parent.as_raw_fd(), &mut ready, false, Some(pid)) {
             return Err(failure("child failed before preparation"));
+        }
+        if ready[0] == NAMESPACE_FAILED {
+            // The child stays alive (blocked) until killed, so the record
+            // cannot be lost to the liveness check.
+            let mut record = [0_u8; 5];
+            if !transfer(parent.as_raw_fd(), &mut record, false, Some(pid)) {
+                return Err(failure("namespace isolation failed"));
+            }
+            return Err(namespace_failure(record));
+        }
+        if ready[0] != READY {
+            return Err(failure("child failed before preparation"));
+        }
+        if namespaces.is_some() {
+            // The child unshared its user namespace before READY and waits for
+            // the ruleset below, so its ids are mapped before it runs further.
+            sandbox::write_id_maps(pid)?;
         }
         #[cfg(test)]
         if command.fault == Fault::LateFd {
@@ -240,7 +333,12 @@ pub(super) fn spawn(
         let mut child_caps = caps.clone();
         child_caps.remap_procfs_self_references(pid as u32, None);
         child_caps.widen_procfs_self_to_proc();
-        let prepared = prepare(&child_caps, &abi, config.sandbox_policy)?;
+        let prepared = prepare(
+            &child_caps,
+            &abi,
+            config.sandbox_policy,
+            namespace_confines_tcp(config),
+        )?;
         ruleset = Some(above_stdio(prepared.create_ruleset()?)?);
         let Some(ref ruleset) = ruleset else {
             return Err(failure("missing ruleset"));
@@ -259,20 +357,48 @@ pub(super) fn spawn(
         if !transfer(parent.as_raw_fd(), &mut bytes, true, Some(pid)) {
             return Err(failure("cannot send prepared ruleset"));
         }
-        let mut report = [0_u8; 5];
+        let mut report = [0_u8; 9];
         if !transfer(parent.as_raw_fd(), &mut report, false, Some(pid)) {
             return Err(failure("child died or timed out before DETACHED"));
         }
-        if report[4] != DETACHED {
+        if report[8] != DETACHED {
             return Err(failure("invalid detachment confirmation"));
         }
         let network_fd = i32::from_ne_bytes([report[0], report[1], report[2], report[3]]);
-        validate_listener(network_fd, &snapshot)?;
-        let expected: BTreeSet<_> = [network_fd].into_iter().collect();
+        let bridge_fd = i32::from_ne_bytes([report[4], report[5], report[6], report[7]]);
+        let expected: BTreeSet<_> = if network.is_some() {
+            validate_listener(network_fd, &snapshot)?;
+            [network_fd].into_iter().collect()
+        } else if network_fd == -1 {
+            BTreeSet::new()
+        } else {
+            return Err(failure("unexpected notification listener"));
+        };
         let actual: BTreeSet<_> = listeners()?.difference(&snapshot).copied().collect();
         if actual != expected {
             return Err(failure("listener ownership mismatch"));
         }
+        let bridge = match namespaces.and_then(|spec| spec.bridge_port()) {
+            Some(port) => {
+                if bridge_fd < 3 || bridge_fd == network_fd {
+                    return Err(failure("invalid bridge listener slot"));
+                }
+                // SAFETY: the child created this slot in the shared table
+                // before detaching; it stays open in ours until we close it.
+                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(bridge_fd) };
+                // Proves the socket lives in the child's new network namespace,
+                // so this cannot be any descriptor the parent itself owns.
+                // If the child dies before DETACHED, the unreported socket
+                // stays in our table until the CLI exits on that launch
+                // failure; it is reachable only inside the dead namespace.
+                sandbox::validate_bridge_listener(borrowed, port)?;
+                // SAFETY: validated above; this is the only parent owner. The
+                // child closes its private copy before exec (scrub_fds).
+                Some(unsafe { OwnedFd::from_raw_fd(bridge_fd) })
+            }
+            None if bridge_fd == -1 => None,
+            None => return Err(failure("unexpected bridge listener")),
+        };
         // Use send(MSG_NOSIGNAL) only in the parent; the child's filter traps it.
         #[cfg(test)]
         if command.fault == Fault::FailedAck {
@@ -291,9 +417,9 @@ pub(super) fn spawn(
         if !transfer(parent.as_raw_fd(), &mut [ack], true, Some(pid)) {
             return Err(failure("acknowledgment failed"));
         }
-        Ok(network_fd)
+        Ok((network_fd, bridge))
     })();
-    let network_fd = match handshake {
+    let (network_fd, bridge) = match handshake {
         Ok(fds) => fds,
         Err(error) => {
             kill_and_reap(pid);
@@ -303,10 +429,13 @@ pub(super) fn spawn(
     };
     // SAFETY: DETACHED was received, identity/ownership checked, and this is
     // the only parent owner. The child closes its private copies before exec.
-    let network = Some(unsafe { OwnedFd::from_raw_fd(network_fd) });
+    let network = network
+        .is_some()
+        .then(|| unsafe { OwnedFd::from_raw_fd(network_fd) });
     Ok(Bootstrap {
         child: nix::unistd::Pid::from_raw(pid),
         network,
+        bridge,
     })
 }
 
@@ -314,7 +443,8 @@ pub(super) fn spawn(
 fn child_exec(
     command: &Command<'_>,
     baseline: &PreparedLandlockSandbox,
-    network: &PreparedSeccompNotifyFilter,
+    network: Option<&PreparedSeccompNotifyFilter>,
+    namespaces: Option<&nono::NamespaceSpec>,
     gate: Option<RawFd>,
     socket: RawFd,
     parent_socket: RawFd,
@@ -342,6 +472,25 @@ fn child_exec(
     if unsafe { libc::syscall(libc::SYS_prctl, libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } < 0 {
         die(126);
     }
+    // Enter the namespaces before READY: the parent writes our id maps on
+    // READY, then holds us until the ruleset arrives. No untrusted code runs
+    // before this, so there is no window to observe a half-built namespace.
+    let bridge_fd = match namespaces.map(nono::NamespaceSpec::enter_raw) {
+        None => -1,
+        Some(Ok(fd)) => fd.unwrap_or(-1),
+        Some(Err(error)) => {
+            let mut record = [0_u8; 6];
+            record[0] = NAMESPACE_FAILED;
+            record[1] = namespace_stage_code(error.stage());
+            record[2..].copy_from_slice(&error.errno().to_ne_bytes());
+            if transfer(socket, &mut record, true, None) {
+                // Stay alive until the parent has read the record and kills
+                // us; the parent's liveness check would otherwise race it.
+                let _ = transfer(socket, &mut [0_u8], false, None);
+            }
+            die(126);
+        }
+    };
     if !transfer(socket, &mut [READY], true, None) {
         die(126);
     }
@@ -369,9 +518,10 @@ fn child_exec(
     if command.fault == Fault::BeforeListener {
         die(126);
     }
-    let network_fd = match network.install_raw() {
-        Ok(fd) => fd,
-        Err(_) => die(126),
+    let network_fd = match network.map(PreparedSeccompNotifyFilter::install_raw) {
+        None => -1,
+        Some(Ok(fd)) => fd,
+        Some(Err(_)) => die(126),
     };
     #[cfg(test)]
     if matches!(
@@ -394,9 +544,10 @@ fn child_exec(
     if command.fault == Fault::AfterDetach {
         die(126);
     }
-    let mut report = [0_u8; 5];
+    let mut report = [0_u8; 9];
     report[..4].copy_from_slice(&network_fd.to_ne_bytes());
-    report[4] = DETACHED;
+    report[4..8].copy_from_slice(&bridge_fd.to_ne_bytes());
+    report[8] = DETACHED;
     #[cfg(test)]
     if command.fault == Fault::InvalidReport {
         report[..4].copy_from_slice(&command.supervisor_fd.unwrap_or(1).to_ne_bytes());

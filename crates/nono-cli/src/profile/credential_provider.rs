@@ -238,7 +238,7 @@ pub(super) fn validate_credential_provider_entries(profile: &Profile) -> Result<
         if provider
             .inject_header
             .as_deref()
-            .is_some_and(|header| !is_valid_http_header_name(header))
+            .is_some_and(|header| !nono_proxy::config::is_http_header_token(header))
         {
             return Err(NonoError::ProfileParse(format!(
                 "credential_providers.{name}.inject_header must be a valid HTTP header name (RFC 7230 token)"
@@ -480,33 +480,6 @@ fn validate_provider_field(context: &str, field: &str) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-/// RFC 7230 `token`: the grammar for an HTTP header field name. Rejects
-/// whitespace, colons, and control characters so a malformed `inject_header`
-/// can't break the outbound request or smuggle extra header material.
-fn is_valid_http_header_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
 }
 
 #[cfg(test)]

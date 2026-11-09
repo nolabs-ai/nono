@@ -6,7 +6,7 @@
 # loading, dry-run rendering, --workdir / --allow-cwd composition, basic
 # sandbox enforcement — not the *content* of any specific pack.
 #
-# Specific pack behaviour (e.g. "the always-further/codex pack allows
+# Specific pack behaviour (e.g. "the nolabs-ai/codex pack allows
 # cargo") is intentionally NOT tested here, because pack content is
 # published independently of the nono CLI release. Those tests live in
 # the pack repos' own CI.

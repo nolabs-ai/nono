@@ -1,7 +1,7 @@
 use crate::audit_attestation::prepare_audit_signer;
 #[cfg(unix)]
 use crate::hook_runtime;
-use crate::launch_runtime::{LaunchPlan, select_threading_context};
+use crate::launch_runtime::{ExecutionFlags, LaunchPlan, select_threading_context};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{SupervisedRuntimeContext, execute_supervised_runtime};
 use crate::{
@@ -365,7 +365,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         &allowed_domain_strs,
         &denied_domain_strs,
         &domain_endpoints,
-        flags.silent,
+        &flags,
     );
     let cap_file_path = cap_file.unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
     if cap_file_path != Path::new("/dev/null") {
@@ -391,6 +391,24 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     if matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
         output::print_supervised_info(flags.silent, rollback.requested, network.is_proxy_active());
     }
+
+    // `unix://` approval helpers on every surface. Neither the agent nor a
+    // mediated command may be able to replace one of these sockets.
+    let approval_sockets = crate::approval_runtime::approval_socket_paths(
+        [&flags.approval_backends]
+            .into_iter()
+            .chain(
+                flags
+                    .command_policies
+                    .as_ref()
+                    .map(|config| &config.approval_backends),
+            )
+            .chain(
+                network
+                    .proxy_options()
+                    .map(|proxy| &proxy.network_approval_backends),
+            ),
+    );
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let shared_broker = crate::tool_sandbox::token_broker::new_shared_broker();
@@ -455,6 +473,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 blocked_commands: caps.blocked_commands(),
                 outer_caps: &caps,
                 deny_paths: &deny_paths,
+                approval_sockets: &approval_sockets,
                 policy_root: &requested_workdir,
                 proxy_credentials: &tool_sandbox_proxy_credentials,
                 reserved_proxy_ports: &reserved_proxy_ports,
@@ -486,6 +505,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 blocked_commands: caps.blocked_commands(),
                 outer_caps: &caps,
                 deny_paths: &deny_paths,
+                approval_sockets: &approval_sockets,
                 bypass_protection_paths: &flags.bypass_protection_paths,
                 policy_root: &requested_workdir,
                 proxy_credentials: &tool_sandbox_proxy_credentials,
@@ -533,6 +553,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             "--audit-sign-key requires supervised execution".to_string(),
         ));
     }
+
+    // `caps` is final here: the proxy and tool-sandbox grants are in. Check
+    // before the sandbox applies and before any approval can be requested.
+    crate::approval_runtime::reject_child_replaceable_approval_sockets(&caps, &approval_sockets)?;
 
     apply_pre_fork_sandbox(
         strategy,
@@ -686,6 +710,25 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         }
     };
 
+    // Opt-in namespace isolation: validated against the final network mode
+    // and probed on this host before anything is forked. Never downgraded.
+    #[cfg(target_os = "linux")]
+    let namespaces = if flags.isolate.is_empty() {
+        None
+    } else {
+        Some(crate::isolation::prepare_namespaces(flags.isolate, &caps)?)
+    };
+
+    // With `linux.isolate.loopback` the validated network namespace confines
+    // TCP to its own loopback, so the supervisor's connect destination check
+    // (which allows only localhost:<proxy port>) is lifted with the Landlock
+    // TCP rules. Derived from the probed spec, never from the request alone.
+    #[cfg(target_os = "linux")]
+    let seccomp_proxy_fallback = seccomp_proxy_fallback
+        && !namespaces
+            .as_ref()
+            .is_some_and(|spec| spec.has_network() && spec.loopback_tcp_enabled());
+
     #[cfg(target_os = "linux")]
     if flags.af_unix_mediation.is_pathname() && nono::sandbox::is_wsl2() {
         return Err(NonoError::SandboxInit(
@@ -752,6 +795,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         },
         #[cfg(target_os = "linux")]
         sandbox_policy: flags.sandbox_policy,
+        #[cfg(target_os = "linux")]
+        namespaces,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         case_insensitive_env_vars: flags.case_insensitive_env_vars,
@@ -861,9 +906,9 @@ fn write_capability_state_file(
     allowed_domains: &[String],
     denied_domains: &[String],
     domain_endpoints: &[sandbox_state::DomainEndpointState],
-    silent: bool,
+    flags: &ExecutionFlags,
 ) -> Option<std::path::PathBuf> {
-    let state = sandbox_state::SandboxState::from_caps_with_denies(
+    let mut state = sandbox_state::SandboxState::from_caps_with_denies(
         caps,
         bypass_protection_paths,
         deny_paths,
@@ -871,6 +916,12 @@ fn write_capability_state_file(
         denied_domains,
         domain_endpoints,
     );
+    #[cfg(target_os = "linux")]
+    let linux_af_unix_mediation = flags.af_unix_mediation.is_pathname();
+    #[cfg(not(target_os = "linux"))]
+    let linux_af_unix_mediation = false;
+    state.pathname_socket_enforcement =
+        sandbox_state::pathname_socket_enforcement(linux_af_unix_mediation);
 
     for _ in 0..8 {
         let cap_file = next_capability_state_file_path();
@@ -887,7 +938,7 @@ fn write_capability_state_file(
                      Sandboxed processes will not be able to query their own capabilities using 'nono why --self'.",
                     e
                 );
-                if !silent {
+                if !flags.silent {
                     eprintln!(
                         "  WARNING: Capability state file could not be written.\n  \
                          The sandbox is active, but 'nono why --self' will not work inside this sandbox."
@@ -902,7 +953,7 @@ fn write_capability_state_file(
         "Failed to allocate a unique capability state file after repeated collisions. \
          Sandboxed processes will not be able to query their own capabilities using 'nono why --self'."
     );
-    if !silent {
+    if !flags.silent {
         eprintln!(
             "  WARNING: Capability state file could not be written.\n  \
              The sandbox is active, but 'nono why --self' will not work inside this sandbox."

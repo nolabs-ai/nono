@@ -5,6 +5,7 @@ authors:
   - lukehinds
 status: draft
 created: 2026-09-29
+breaking: false
 superseded-by:
 ---
 
@@ -24,6 +25,12 @@ runtimes (GitHub Actions, Docker, AWS Fargate, hosts that deny
 unprivileged user namespaces) that have no Windows equivalent nono
 targets. Admin is a setup step only; every run stays unprivileged, and
 enforcement fails secure if the install is absent.
+
+## Implementation status
+
+Unimplemented as of 2026-11-02. The library has Linux and macOS enforcement
+backends only. This draft still needs a consistent identity and launch model
+connecting the preferred AppContainer design to the WFP fence before acceptance.
 
 ## Motivation
 
@@ -136,12 +143,12 @@ mechanism in `nono`. Concretely, anything that writes persistent machine
 state (a WFP filter set, a local account, ACL grants) is a `nono-cli`
 install/broker action, not a library call a random embedder can trip.
 
-From here we can delivery the NEP over several PRs / phases.
+The proposal is divided into phases.
 
 ### Phase 1 — network fence
 
 `nono-proxy` runs on the host and binds a loopback port (as it does today). 
-Windows enforcement then consists of:
+The dedicated-user candidate consists of:
 
 - a **WFP permit** filter for loopback to the proxy port(s) at
   `ALE_AUTH_CONNECT_V4/V6`, and
@@ -180,9 +187,10 @@ closest to nono's per-invocation model. The dedicated-user + restricted-
 token + ACL model is a **documented fallback only** — used where
 AppContainer cannot express a specific confinement need (handle
 isolation, job limits) with acceptable robustness, and only for that need,
-not as the default posture. The residual unknown is not *which model we
-prefer* but *whether AppContainer proves sufficient in practice*; see Open
-Questions.
+not as the default posture. The account-free AppContainer design still needs
+an identity contract for the WFP fence and an unprivileged launch path. The
+user-SID fence above and Secondary Logon example below describe the
+dedicated-user candidate, not a completed design for AppContainer.
 
 ### The privilege model: elevated install
 
@@ -227,11 +235,11 @@ dependency. Fail-secure is unchanged and non-negotiable — if the install
 has not been performed or the fence is not present at run time, nono
 refuses to run the workload rather than running it unconfined.
 
-### Why per-run stays unprivileged
+### Dedicated-user reference: unprivileged run path
 
-"Admin once, never per run" is not just a policy we assert — it is
-achievable because nothing in the run path needs a privileged operation,
-and the reference (`srt-win`) is built exactly this way:
+The dedicated-user reference (`srt-win`) implements the proposed
+"admin once, never per run" constraint as follows. The preferred AppContainer
+design must demonstrate the same property before this NEP is accepted.
 
 - **WFP filters are persistent and SID-keyed.** They are installed once
   (`FWPM_FILTER_FLAG_PERSISTENT`, machine-wide) and match by the sandbox
@@ -357,6 +365,9 @@ secure, per the rule below.
 
 ## Open Questions
 
+- **Fence identity and launch model.** How does the preferred AppContainer
+  design bind the workload and its descendants to the WFP fence without a
+  dedicated account? Resolve this before acceptance.
 - **Does AppContainer hold up?** This NEP commits to AppContainer as the
   primary FS/process mechanism; the open part is empirical — whether it
   can express the handle isolation and job limits the confinement needs

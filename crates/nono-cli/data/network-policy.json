@@ -42,7 +42,10 @@
         "registry.yarnpkg.com",
         "cdn.jsdelivr.net",
         "unpkg.com",
-        "esm.sh"
+        "esm.sh",
+        "cache.nixos.org",
+        "channels.nixos.org",
+        "releases.nixos.org"
       ]
     },
     "github": {

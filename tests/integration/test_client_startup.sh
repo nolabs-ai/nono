@@ -142,17 +142,17 @@ echo ""
 echo "--- Claude Code Startup ---"
 
 # The `claude` profile now ships as a registry pack
-# (always-further/claude). The client-startup smoke test exercises
+# (nolabs-ai/claude). The client-startup smoke test exercises
 # the integration when both Claude Code AND the pack are installed.
 # In CI environments without the pack pulled, skip the pack-dependent
 # subtests cleanly rather than hit the migration prompt (which can't
 # be answered non-interactively and would fail the suite).
-PACK_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nono/packages/always-further/claude"
+PACK_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nono/packages/nolabs-ai/claude"
 if [[ ! -f "$PACK_DIR/package.json" ]]; then
     skip_test "nono run starts Claude Code successfully" \
-        "always-further/claude pack not installed (run 'nono pull always-further/claude' first)"
+        "nolabs-ai/claude pack not installed (run 'nono pull nolabs-ai/claude' first)"
     skip_test "nono wrap starts Claude Code successfully" \
-        "always-further/claude pack not installed"
+        "nolabs-ai/claude pack not installed"
     print_summary
     exit 0
 fi

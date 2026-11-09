@@ -667,18 +667,16 @@ fn expand_paths_json(paths: &[String]) -> serde_json::Value {
 
 /// Determine the actual source of a loaded profile.
 ///
-/// Load precedence is user-first (profile/mod.rs), so a user file with a
-/// built-in name shadows the built-in. We must check the filesystem to
-/// report the real source accurately.
+/// Bare-name load precedence is user-first (profile/mod.rs), so a user file
+/// with a built-in name shadows the built-in. Fully-qualified package names
+/// are a separate namespace.
 fn profile_source(name: &str) -> &'static str {
     let builtin_names = profile::builtin::list_builtin();
     let is_pack = profile::list_pack_store_profiles()
         .iter()
         .any(|(n, _)| n == name);
     if profile::is_user_override(name) {
-        if is_pack {
-            "user (overrides pack)"
-        } else if builtin_names.contains(&name.to_string()) {
+        if builtin_names.contains(&name.to_string()) {
             "user (overrides built-in)"
         } else {
             "user"
@@ -695,26 +693,26 @@ fn profile_source(name: &str) -> &'static str {
 pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
     let builtin_names = profile::builtin::list_builtin();
     let all_names = profile::list_profiles();
-    // (fully-qualified profile name -> pack ref) for the catalogue.
-    let pack_profiles: std::collections::HashMap<String, String> =
-        profile::list_pack_store_profiles().into_iter().collect();
+    let pack_profiles: std::collections::HashSet<String> = profile::list_pack_store_profiles()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
 
     let mut builtin_profiles: Vec<(String, Result<Profile>)> = Vec::new();
     let mut user_profiles: Vec<(String, Result<Profile>)> = Vec::new();
-    let mut pack_entries: Vec<(String, String, Result<Profile>)> = Vec::new();
+    let mut pack_entries: Vec<(String, Result<Profile>)> = Vec::new();
 
     for name in &all_names {
         // Use the no-migrate loader so listing never triggers an
         // install prompt for pack-provided profiles whose pack happens
         // to be installed via the resolver self-heal path.
         let p = profile::load_profile_no_migrate(name);
-        // Categorize by actual source. Precedence: user override > pack
-        // store > built-in. User overrides of either built-in or pack
-        // names go under user section to make shadowing visible.
+        // Categorize by actual source. Bare user profiles may override
+        // built-ins; fully-qualified package names cannot be shadowed.
         if profile::is_user_override(name) {
             user_profiles.push((name.clone(), p));
-        } else if let Some(pack_ref) = pack_profiles.get(name) {
-            pack_entries.push((name.clone(), pack_ref.clone(), p));
+        } else if pack_profiles.contains(name) {
+            pack_entries.push((name.clone(), p));
         } else if builtin_names.contains(name) {
             builtin_profiles.push((name.clone(), p));
         } else {
@@ -726,19 +724,16 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
         let format_entry = |name: &str, result: &Result<Profile>| {
             let source = profile_source(name);
             let extends = profile::load_profile_extends(name).unwrap_or_default();
-            let pack = pack_profiles.get(name).cloned();
             match result {
                 Ok(p) => serde_json::json!({
                     "name": name,
                     "source": source,
-                    "pack": pack,
                     "description": p.meta.description.as_deref().unwrap_or(""),
                     "extends": extends,
                 }),
                 Err(e) => serde_json::json!({
                     "name": name,
                     "source": source,
-                    "pack": pack,
                     "error": format!("{}", e),
                 }),
             }
@@ -747,7 +742,7 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
         let arr: Vec<serde_json::Value> = builtin_profiles
             .iter()
             .map(|(n, p)| format_entry(n, p))
-            .chain(pack_entries.iter().map(|(n, _, p)| format_entry(n, p)))
+            .chain(pack_entries.iter().map(|(n, p)| format_entry(n, p)))
             .chain(user_profiles.iter().map(|(n, p)| format_entry(n, p)))
             .collect();
         println!("{}", to_json(&serde_json::Value::Array(arr))?);
@@ -756,21 +751,42 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
 
     let t = theme::current();
     let total = builtin_profiles.len() + pack_entries.len() + user_profiles.len();
+    let name_width = all_names
+        .iter()
+        .map(String::len)
+        .max()
+        .unwrap_or(16)
+        .max(16);
+    let description_width = user_profiles
+        .iter()
+        .filter_map(|(_, result)| result.as_ref().ok())
+        .map(|profile| {
+            profile
+                .meta
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(42)
+        .max(42);
     println!("{}: {} profiles", prefix(), total);
 
     if !builtin_profiles.is_empty() {
         println!();
         println!("  {}", theme::fg("Built-in:", t.subtext).bold());
         for (name, result) in &builtin_profiles {
-            print_profile_line(name, result, t);
+            print_profile_line(name, result, name_width, description_width, false, t);
         }
     }
 
     if !pack_entries.is_empty() {
         println!();
         println!("  {}", theme::fg("Packages:", t.subtext).bold());
-        for (name, pack_ref, result) in &pack_entries {
-            print_pack_profile_line(name, pack_ref, result, t);
+        for (name, result) in &pack_entries {
+            print_pack_profile_line(name, result, name_width, t);
         }
     }
 
@@ -785,30 +801,32 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
             .bold()
         );
         for (name, result) in &user_profiles {
-            print_profile_line(name, result, t);
+            print_profile_line(name, result, name_width, description_width, true, t);
         }
     }
 
     Ok(())
 }
 
-/// Like `print_profile_line` but appends the providing pack ref so the
-/// user sees `claude-code  Anthropic Claude Code …  nolabs-ai/claude`.
-fn print_pack_profile_line(name: &str, pack_ref: &str, result: &Result<Profile>, t: &theme::Theme) {
+/// Print a fully-qualified package profile and its description or load error.
+fn print_pack_profile_line(
+    name: &str,
+    result: &Result<Profile>,
+    name_width: usize,
+    t: &theme::Theme,
+) {
     match result {
         Ok(p) => {
             let desc = p.meta.description.as_deref().unwrap_or("").to_string();
-            let pack_label = format!("from {pack_ref}");
             println!(
-                "    {:<16} {:<42} {}",
+                "    {:<name_width$} {}",
                 theme::fg(name, t.text).bold(),
                 theme::fg(&desc, t.subtext),
-                theme::fg(&pack_label, t.overlay),
             );
         }
         Err(e) => {
             println!(
-                "    {:<16} {}",
+                "    {:<name_width$} {}",
                 theme::fg(name, t.text).bold(),
                 theme::fg(&format!("[error: {}]", e), t.red),
             );
@@ -816,23 +834,40 @@ fn print_pack_profile_line(name: &str, pack_ref: &str, result: &Result<Profile>,
     }
 }
 
-fn print_profile_line(name: &str, result: &Result<Profile>, t: &theme::Theme) {
+fn print_profile_line(
+    name: &str,
+    result: &Result<Profile>,
+    name_width: usize,
+    description_width: usize,
+    show_extends: bool,
+    t: &theme::Theme,
+) {
     match result {
         Ok(p) => {
             let desc = p.meta.description.as_deref().unwrap_or("").to_string();
-            let extends = profile::load_profile_extends(name)
-                .map(|v| format!("extends {}", v.join(", ")))
-                .unwrap_or_default();
-            println!(
-                "    {:<16} {:<42} {}",
-                theme::fg(name, t.text).bold(),
-                theme::fg(&desc, t.subtext),
-                theme::fg(&extends, t.overlay),
-            );
+            let extends = show_extends
+                .then(|| profile::load_profile_extends(name))
+                .flatten()
+                .filter(|bases| !bases.is_empty())
+                .map(|v| format!("extends {}", v.join(", ")));
+            if let Some(extends) = extends {
+                println!(
+                    "    {:<name_width$} {:<description_width$} {}",
+                    theme::fg(name, t.text).bold(),
+                    theme::fg(&desc, t.subtext),
+                    theme::fg(&extends, t.overlay),
+                );
+            } else {
+                println!(
+                    "    {:<name_width$} {}",
+                    theme::fg(name, t.text).bold(),
+                    theme::fg(&desc, t.subtext),
+                );
+            }
         }
         Err(e) => {
             println!(
-                "    {:<16} {}",
+                "    {:<name_width$} {}",
                 theme::fg(name, t.text).bold(),
                 theme::fg(&format!("[error: {}]", e), t.red),
             );

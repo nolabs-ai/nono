@@ -4,6 +4,7 @@
 //! `nono why` command.
 
 use crate::config;
+use crate::sandbox_state::PathnameSocketEnforcement;
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, Result, try_canonicalize};
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,24 @@ pub enum QueryResult {
         details: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         policy_source: Option<String>,
+    },
+    /// nono is not mediating this operation on the active platform/configuration.
+    #[serde(rename = "unmediated")]
+    Unmediated {
+        surface: String,
+        operation: String,
+        path: String,
+        reason: String,
+        details: String,
+    },
+    /// The persisted state predates the information needed to answer safely.
+    #[serde(rename = "unknown")]
+    Unknown {
+        surface: String,
+        operation: String,
+        path: String,
+        reason: String,
+        details: String,
     },
     /// Not running inside a sandbox
     #[serde(rename = "not_sandboxed")]
@@ -210,6 +229,102 @@ pub fn query_path(
         suggested_flag: Some(suggested_flag_for_path(&canonical, requested)),
         endpoint_rules: None,
     })
+}
+
+/// Query nono's effective policy for a pathname AF_UNIX operation.
+///
+/// `denied_by_filesystem_policy` matters on macOS because nono translates a
+/// filesystem deny for a socket path into a Seatbelt `network-outbound` deny.
+/// Linux Landlock filesystem denies do not mediate AF_UNIX operations.
+pub fn query_unix_socket(
+    path: &Path,
+    op: nono::UnixSocketOp,
+    caps: &CapabilitySet,
+    enforcement: Option<PathnameSocketEnforcement>,
+    denied_by_filesystem_policy: bool,
+) -> QueryResult {
+    let resolved = try_canonicalize(path);
+    let surface = "pathname_unix_socket".to_string();
+    let operation = op.to_string();
+    let display_path = resolved.display().to_string();
+
+    let Some(enforcement) = enforcement else {
+        return QueryResult::Unknown {
+            surface,
+            operation,
+            path: display_path,
+            reason: "socket_enforcement_state_unavailable".to_string(),
+            details: "The sandbox state was written without pathname Unix socket enforcement metadata. Start a new sandbox with the current nono version and query again."
+                .to_string(),
+        };
+    };
+
+    if enforcement == PathnameSocketEnforcement::LinuxUnmediated {
+        return QueryResult::Unmediated {
+            surface,
+            operation,
+            path: display_path,
+            reason: "linux_af_unix_mediation_off".to_string(),
+            details: "nono does not restrict pathname Unix socket operations in this configuration. Host permissions or an outer sandbox may still deny the operation. Enable linux.af_unix_mediation = \"pathname\" to enforce explicit socket grants."
+                .to_string(),
+        };
+    }
+
+    if enforcement == PathnameSocketEnforcement::MacosSeatbelt && denied_by_filesystem_policy {
+        return QueryResult::Denied {
+            reason: "filesystem_deny".to_string(),
+            details: Some(format!(
+                "Seatbelt blocks {} on the denied socket path {}",
+                op,
+                resolved.display()
+            )),
+            policy_source: Some("filesystem.deny".to_string()),
+            matching_capability: None,
+            suggested_flag: None,
+            endpoint_rules: None,
+        };
+    }
+
+    if enforcement == PathnameSocketEnforcement::MacosSeatbelt
+        && matches!(caps.network_mode(), nono::NetworkMode::AllowAll)
+    {
+        return QueryResult::Allowed {
+            reason: "macos_socket_unrestricted".to_string(),
+            granted_path: None,
+            access: Some(op.to_string()),
+            source: Some("default network policy".to_string()),
+            endpoint_rules: None,
+            warning: None,
+        };
+    }
+
+    if let Some(cap) = caps.matching_unix_socket(&resolved, op) {
+        return QueryResult::Allowed {
+            reason: "unix_socket_granted".to_string(),
+            granted_path: Some(cap.resolved.display().to_string()),
+            access: Some(cap.mode.to_string()),
+            source: Some(cap.source.to_string()),
+            endpoint_rules: None,
+            warning: None,
+        };
+    }
+
+    let suggested_flag = match op {
+        nono::UnixSocketOp::Connect | nono::UnixSocketOp::Send => "--allow-unix-socket",
+        nono::UnixSocketOp::Bind => "--allow-unix-socket-bind",
+    };
+    QueryResult::Denied {
+        reason: "unix_socket_not_granted".to_string(),
+        details: Some(format!(
+            "No pathname Unix socket capability permits {} on {}",
+            op,
+            resolved.display()
+        )),
+        policy_source: None,
+        matching_capability: None,
+        suggested_flag: Some(format!("{suggested_flag} {}", resolved.display())),
+        endpoint_rules: None,
+    }
 }
 
 /// Check host:port then bare host against the deny list, so a port-scoped
@@ -695,6 +810,34 @@ pub fn print_result(result: &QueryResult) {
                 println!("  Policy: {}", policy);
             }
         }
+        QueryResult::Unmediated {
+            surface,
+            operation,
+            path,
+            reason,
+            details,
+        } => {
+            println!("{}", "UNMEDIATED".yellow().bold());
+            println!("  Surface: {}", surface);
+            println!("  Operation: {}", operation);
+            println!("  Path: {}", path);
+            println!("  Reason: {}", reason);
+            println!("  Details: {}", details);
+        }
+        QueryResult::Unknown {
+            surface,
+            operation,
+            path,
+            reason,
+            details,
+        } => {
+            println!("{}", "UNKNOWN".yellow().bold());
+            println!("  Surface: {}", surface);
+            println!("  Operation: {}", operation);
+            println!("  Path: {}", path);
+            println!("  Reason: {}", reason);
+            println!("  Details: {}", details);
+        }
         QueryResult::NotSandboxed { message } => {
             println!("{}", "NOT SANDBOXED".yellow().bold());
             println!("  {}", message);
@@ -891,9 +1034,126 @@ pub(crate) fn is_sensitive_root(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nono::{CapabilitySource, FsCapability};
+    use nono::{
+        CapabilitySource, FsCapability, UnixSocketCapability, UnixSocketMode, UnixSocketOp,
+    };
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_query_unix_socket_linux_unmediated_is_not_reported_allowed() {
+        let path = PathBuf::from("/run/example.sock");
+        let result = query_unix_socket(
+            &path,
+            UnixSocketOp::Connect,
+            &CapabilitySet::new(),
+            Some(PathnameSocketEnforcement::LinuxUnmediated),
+            false,
+        );
+        assert!(matches!(
+            result,
+            QueryResult::Unmediated { reason, .. } if reason == "linux_af_unix_mediation_off"
+        ));
+    }
+
+    #[test]
+    fn test_query_unix_socket_missing_enforcement_state_is_unknown() {
+        let result = query_unix_socket(
+            Path::new("/run/example.sock"),
+            UnixSocketOp::Connect,
+            &CapabilitySet::new(),
+            None,
+            false,
+        );
+        assert!(matches!(result, QueryResult::Unknown { .. }));
+    }
+
+    #[test]
+    fn test_query_unix_socket_allowlist_denies_ungranted_path() {
+        let result = query_unix_socket(
+            Path::new("/run/example.sock"),
+            UnixSocketOp::Connect,
+            &CapabilitySet::new(),
+            Some(PathnameSocketEnforcement::LinuxAllowlist),
+            false,
+        );
+        assert!(matches!(
+            result,
+            QueryResult::Denied { reason, suggested_flag: Some(flag), .. }
+                if reason == "unix_socket_not_granted" && flag.starts_with("--allow-unix-socket ")
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_query_unix_socket_allowlist_reports_matching_grant() {
+        let dir = tempdir().expect("tempdir");
+        let socket_path = dir.path().join("service.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let mut cap =
+            UnixSocketCapability::new_file(&socket_path, UnixSocketMode::Connect).expect("cap");
+        cap.source = CapabilitySource::Profile;
+        let mut caps = CapabilitySet::new();
+        caps.add_unix_socket(cap);
+
+        let result = query_unix_socket(
+            &socket_path,
+            UnixSocketOp::Connect,
+            &caps,
+            Some(PathnameSocketEnforcement::LinuxAllowlist),
+            false,
+        );
+        assert!(matches!(
+            result,
+            QueryResult::Allowed { reason, source: Some(source), .. }
+                if reason == "unix_socket_granted" && source == "profile"
+        ));
+
+        let bind = query_unix_socket(
+            &socket_path,
+            UnixSocketOp::Bind,
+            &caps,
+            Some(PathnameSocketEnforcement::LinuxAllowlist),
+            false,
+        );
+        assert!(matches!(
+            bind,
+            QueryResult::Denied { suggested_flag: Some(flag), .. }
+                if flag.starts_with("--allow-unix-socket-bind ")
+        ));
+    }
+
+    #[test]
+    fn test_query_unix_socket_macos_filesystem_deny_wins() {
+        let result = query_unix_socket(
+            Path::new("/var/run/docker.sock"),
+            UnixSocketOp::Connect,
+            &CapabilitySet::new(),
+            Some(PathnameSocketEnforcement::MacosSeatbelt),
+            true,
+        );
+        assert!(matches!(
+            result,
+            QueryResult::Denied { reason, .. } if reason == "filesystem_deny"
+        ));
+    }
+
+    #[test]
+    fn test_query_unix_socket_macos_allow_all_is_allowed_without_grant() {
+        let result = query_unix_socket(
+            Path::new("/var/run/example.sock"),
+            UnixSocketOp::Connect,
+            &CapabilitySet::new(),
+            Some(PathnameSocketEnforcement::MacosSeatbelt),
+            false,
+        );
+        assert!(matches!(
+            result,
+            QueryResult::Allowed { reason, .. } if reason == "macos_socket_unrestricted"
+        ));
+    }
 
     #[test]
     fn test_query_path_granted() {

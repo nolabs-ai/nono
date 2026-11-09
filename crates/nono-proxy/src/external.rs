@@ -43,6 +43,7 @@ pub async fn connect_via_proxy(
             proxy_addr, e
         ))
     })?;
+    crate::upstream_socket::set_liveness(&proxy_stream);
 
     let mut connect_req = format!(
         "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n",
@@ -196,8 +197,29 @@ pub async fn handle_external_proxy(
     let (host, port) = parse_connect_target(first_line)?;
     debug!("External proxy CONNECT to {}:{}", host, port);
 
-    // Validate session token (skipped when auth is disabled)
-    enforce_proxy_auth(require_auth, remaining_header, session_token)?;
+    // Answer a failed token check with a 407 challenge (RFC 9110 section
+    // 15.5.8) so reactive clients can retry with credentials.
+    if let Err(e) = enforce_proxy_auth(require_auth, remaining_header, session_token) {
+        debug!(
+            "External proxy CONNECT to {}:{} failed proxy auth: {}",
+            host, port, e
+        );
+        audit::log_denied(
+            audit_log,
+            audit::ProxyMode::External,
+            &audit::EventContext {
+                auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
+                ..audit::EventContext::default()
+            },
+            &host,
+            port,
+            "proxy auth missing or invalid",
+        );
+        crate::connect::write_proxy_auth_challenge(stream).await?;
+        return Ok(());
+    }
 
     // Check cloud metadata deny list.
     // Cloud metadata endpoints are always blocked even through enterprise proxies.

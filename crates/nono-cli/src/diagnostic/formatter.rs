@@ -390,6 +390,15 @@ fn format_allow_net_help_line() -> String {
     "[nono]   --allow-net        unrestricted network for this session".to_string()
 }
 
+/// Network grant help for sessions in an isolated network namespace.
+///
+/// `--allow-net` is rejected alongside `linux.isolate.network`, so the only
+/// remedy that can work is proxied access to a named host.
+fn format_allow_domain_help_line() -> String {
+    "[nono]   --allow-domain <host>  proxied access to a host (network isolation has no direct route out)"
+        .to_string()
+}
+
 fn format_command_succeeded_with_stderr_line() -> String {
     "[nono] The command succeeded, but stderr showed a likely sandbox-related access issue."
         .to_string()
@@ -690,6 +699,9 @@ pub struct DiagnosticFormatter<'a> {
     /// `network_blocked_hint`. Populated only in supervised mode with an
     /// active proxy.
     network_denials: Vec<nono::undo::NetworkAuditEvent>,
+    /// The session ran in an isolated network namespace (NEP-0004), where
+    /// `--allow-net` is a configuration error.
+    network_isolated: bool,
 }
 
 impl<'a> DiagnosticFormatter<'a> {
@@ -719,6 +731,7 @@ impl<'a> DiagnosticFormatter<'a> {
             canonical_denial_paths: Vec::new(),
             session_diagnostics: &[],
             network_denials: Vec::new(),
+            network_isolated: false,
         }
     }
 
@@ -922,6 +935,15 @@ impl<'a> DiagnosticFormatter<'a> {
     #[must_use]
     pub fn with_network_denials(mut self, denials: Vec<nono::undo::NetworkAuditEvent>) -> Self {
         self.network_denials = denials;
+        self
+    }
+
+    /// Mark the session as running in an isolated network namespace, so
+    /// network grant help suggests `--allow-domain` instead of `--allow-net`.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn with_network_isolated(mut self, isolated: bool) -> Self {
+        self.network_isolated = isolated;
         self
     }
 
@@ -1906,6 +1928,23 @@ impl<'a> DiagnosticFormatter<'a> {
         diagnostics: &[NonoDiagnostic],
     ) {
         const MAX_INLINE_LIST: usize = 10;
+        const MAX_REASON_CHARS: usize = 256;
+        use crate::terminal_approval::sanitize_for_terminal;
+
+        let mut groups = std::collections::BTreeMap::<_, usize>::new();
+        for diagnostic in ipc_diagnostics {
+            if let Some(NonoDiagnosticDetail::IpcDenial {
+                operation,
+                target,
+                ipc_reason,
+            }) = &diagnostic.detail
+            {
+                let count = groups
+                    .entry((operation.as_str(), target.as_str(), ipc_reason.as_str()))
+                    .or_default();
+                *count = count.saturating_add(1);
+            }
+        }
 
         let total = ipc_diagnostics.len();
         let plural_s = if total == 1 { "" } else { "s" };
@@ -1913,19 +1952,28 @@ impl<'a> DiagnosticFormatter<'a> {
             "[nono] IPC denial: {} Unix socket operation{} blocked.",
             total, plural_s
         ));
-        for (idx, diagnostic) in ipc_diagnostics.iter().enumerate() {
+        for (idx, ((operation, target, reason), count)) in groups.iter().enumerate() {
             if idx >= MAX_INLINE_LIST {
-                lines.push(format!("[nono]   ... and {} more", total - idx));
+                lines.push(format!(
+                    "[nono]   ... and {} more distinct denials",
+                    groups.len() - idx
+                ));
                 break;
             }
-            if let Some(NonoDiagnosticDetail::IpcDenial {
-                operation,
-                target,
-                ipc_reason,
-            }) = &diagnostic.detail
-            {
-                lines.push(format!("[nono]   {operation} {target} ({ipc_reason})"));
-            }
+            let reason = crate::command_display::truncate_chars(
+                &sanitize_for_terminal(reason),
+                MAX_REASON_CHARS,
+            );
+            let attempts = if *count > 1 {
+                format!("; {count} attempts")
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "[nono]   {} {} ({reason}{attempts})",
+                sanitize_for_terminal(operation),
+                sanitize_for_terminal(target)
+            ));
         }
 
         let flags =
@@ -2157,7 +2205,15 @@ impl<'a> DiagnosticFormatter<'a> {
         lines.push("[nono]   --write <path>     write-only access to directory".to_string());
 
         if self.caps.is_network_blocked() && stderr_network_diagnostic(diagnostics).is_some() {
-            lines.push(format_allow_net_help_line());
+            lines.push(self.network_grant_help_line());
+        }
+    }
+
+    fn network_grant_help_line(&self) -> String {
+        if self.network_isolated {
+            format_allow_domain_help_line()
+        } else {
+            format_allow_net_help_line()
         }
     }
 
@@ -2168,7 +2224,7 @@ impl<'a> DiagnosticFormatter<'a> {
     /// evidence this failure was network-related.
     fn format_network_grant_help(&self, lines: &mut Vec<String>) {
         lines.push("[nono] To grant additional access, re-run with:".to_string());
-        lines.push(format_allow_net_help_line());
+        lines.push(self.network_grant_help_line());
     }
 
     /// Render proxy-observed network denials with grant guidance.
@@ -3958,6 +4014,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn test_network_isolated_suggests_allow_domain_not_allow_net() {
+        // --allow-net is rejected alongside linux.isolate.network, so the hint
+        // must point at the only remedy that can work: proxied access.
+        let caps = make_test_caps();
+        let observation = || ErrorObservation {
+            primary_verdict: None,
+            blocked_protected_file: None,
+            path_hints: Vec::new(),
+            missing_paths: Vec::new(),
+            non_sandbox_failure: None,
+            network_blocked_hint: true,
+        };
+        let isolated = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_error_observation(observation())
+            .with_network_isolated(true)
+            .format_footer(1);
+        assert!(!isolated.contains("--allow-net"), "{isolated}");
+        assert!(isolated.contains("--allow-domain <host>"), "{isolated}");
+
+        let plain = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_error_observation(observation())
+            .format_footer(1);
+        assert!(plain.contains("--allow-net"), "{plain}");
+    }
+
+    #[test]
     fn test_next_steps_header_omitted_without_follow_up_remediations() {
         // Path evidence with no RunDiscovery/CheckPolicy remediation must not
         // leave a bare "Next steps:" header behind.
@@ -4487,6 +4572,98 @@ mod tests {
         // Policy-blocked paths cannot be fixed with a path flag.
         assert!(!output.contains("Fix flags: --read /etc/shadow"));
         assert!(!output.contains("--allow <path>"));
+    }
+
+    #[test]
+    fn test_ipc_summary_groups_by_target_operation_and_reason() {
+        let caps = make_test_caps();
+        let ipc_denials: Vec<_> = [
+            ("/bus", "connect", "approval timed out"),
+            ("/bus", "connect", "approval timed out"),
+            ("/bus", "connect", "approval denied for this session"),
+            ("/bus", "bind", "approval timed out"),
+            ("/other", "connect", "approval timed out"),
+        ]
+        .into_iter()
+        .map(|(target, operation, reason)| {
+            nono::IpcDenialRecord::new(target.into(), operation.into(), reason.into(), None)
+        })
+        .collect();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_ipc_denials(&ipc_denials);
+        let report = formatter.build_session_report(0);
+        assert_eq!(report.ipc_denials.len(), 5);
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| matches!(
+                    diagnostic.detail,
+                    Some(NonoDiagnosticDetail::IpcDenial { .. })
+                ))
+                .count(),
+            5
+        );
+        let output = formatter.with_session_report(&report).format_footer(0);
+
+        assert!(output.contains("IPC denial: 5 Unix socket operations blocked."));
+        assert_eq!(
+            output
+                .matches("connect /bus (approval timed out; 2 attempts)")
+                .count(),
+            1
+        );
+        assert!(output.contains("connect /bus (approval denied for this session)"));
+        assert!(output.contains("bind /bus (approval timed out)"));
+        assert!(output.contains("connect /other (approval timed out)"));
+    }
+
+    #[test]
+    fn test_ipc_summary_limits_distinct_denials() {
+        let caps = make_test_caps();
+        let ipc_denials: Vec<_> = (0..12)
+            .flat_map(|index| {
+                let denial = nono::IpcDenialRecord::new(
+                    format!("/socket-{index:02}"),
+                    "connect".into(),
+                    "approval timed out".into(),
+                    None,
+                );
+                [denial.clone(), denial]
+            })
+            .collect();
+        let output = format_footer_with_session_report(
+            DiagnosticFormatter::new(&caps)
+                .with_mode(DiagnosticMode::Supervised)
+                .with_ipc_denials(&ipc_denials),
+            0,
+        );
+        assert!(output.contains("IPC denial: 24 Unix socket operations blocked."));
+        assert_eq!(output.matches("2 attempts").count(), 10);
+        assert!(output.contains("... and 2 more distinct denials"));
+        assert!(!output.contains("/socket-10"));
+    }
+
+    #[test]
+    fn test_ipc_summary_sanitizes_and_bounds_backend_reasons() {
+        let caps = make_test_caps();
+        let ipc_denials = [nono::IpcDenialRecord::new(
+            "/bus\x1b]0;spoof\x07".into(),
+            "connect\x1b[31m".into(),
+            format!("approval denied: \x1b[2K\r\n{}", "界".repeat(5000)),
+            None,
+        )];
+        let output = format_footer_with_session_report(
+            DiagnosticFormatter::new(&caps)
+                .with_mode(DiagnosticMode::Supervised)
+                .with_ipc_denials(&ipc_denials),
+            0,
+        );
+        assert!(output.contains("connect /bus (approval denied:"));
+        assert!(!output.contains("spoof"));
+        assert!(!output.contains('\x1b'));
+        assert!(output.chars().count() < 700);
     }
 
     #[test]

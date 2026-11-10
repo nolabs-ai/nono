@@ -1465,7 +1465,7 @@
             { "type": "string" },
             { "type": "null" }
           ],
-          "description": "Explicit SigV4 signing region (e.g., \"us-east-1\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set."
+          "description": "Explicit SigV4 signing region (e.g., \"us-east-1\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set. Must be omitted when the upstream is `https://{service}.*.amazonaws.com`; the region is then taken from each request's host."
         },
         "service": {
           "oneOf": [

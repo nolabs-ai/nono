@@ -12,6 +12,7 @@
 //! inner requests are not required to carry a token.
 
 use crate::audit;
+use crate::aws::endpoints::SigningRegion;
 use crate::capture::CredentialCaptureBackend;
 use crate::config::EndpointPolicyOutcome;
 use crate::credential::CredentialStore;
@@ -282,6 +283,15 @@ struct ParsedRequest {
     buffered: Vec<u8>,
 }
 
+/// Denial reason for a wildcard-region AWS route whose host yields no valid
+/// region. Names the route and host label only; never credentials.
+fn aws_region_denial_reason(route: &str, host: &str) -> String {
+    format!(
+        "AWS route '{route}': host '{host}' is not a canonical \
+         {{service}}.{{region}}.amazonaws.com commercial-region host on port 443"
+    )
+}
+
 /// Calls [`ProxyFilter::check_host`] and handles the denial path.
 ///
 /// On success returns the resolved addresses for use in [`select_upstream_strategy`].
@@ -499,6 +509,38 @@ pub(crate) async fn select_intercept_route<'a>(
                 // Asked after every route is evaluated, so a `deny` on any
                 // route refuses without prompting. Bucketed as if granted; a
                 // refusal rejects the request below.
+                // AWS wildcard-region routes show the derived region; a host
+                // that yields none is denied before prompting.
+                let aws_region = match &route.aws_wildcard_service_label {
+                    Some(label) => match crate::aws::endpoints::derive_region(host, port, label) {
+                        Some(region) => Some(region),
+                        None => {
+                            let concrete_upstream = format!(
+                                "https://{}",
+                                reverse::format_host_header(UpstreamScheme::Https, host, port)
+                            );
+                            let deny_reason = aws_region_denial_reason(prefix, host);
+                            warn!("tls_intercept: {}", deny_reason);
+                            audit::log_denied(
+                                audit_log,
+                                audit::ProxyMode::ConnectIntercept,
+                                &audit::EventContext {
+                                    denial_category: Some(
+                                        nono::undo::NetworkAuditDenialCategory::HostDenied,
+                                    ),
+                                    route_id: Some(prefix),
+                                    upstream: Some(&concrete_upstream),
+                                    ..audit::EventContext::default()
+                                },
+                                host,
+                                port,
+                                &deny_reason,
+                            );
+                            return RouteSelection::Rejected(403);
+                        }
+                    },
+                    None => None,
+                };
                 let approval = crate::endpoint_approval::PendingApproval {
                     route_id: prefix,
                     upstream: &route.upstream,
@@ -508,6 +550,7 @@ pub(crate) async fn select_intercept_route<'a>(
                     rule_label,
                     // Credential-route approvals stay one-shot.
                     session_scope: !route.requires_managed_credential,
+                    aws_region,
                 };
                 if route.requires_managed_credential {
                     credential_approvals.push(approval);
@@ -1019,9 +1062,8 @@ where
     let oauth2_route = service.and_then(|s| ctx.credential_store.get_oauth2(s));
     let spiffe_assertion_route = service.and_then(|s| ctx.credential_store.get_spiffe_assertion(s));
 
-    // Early branch: AWS SigV4 path is completely self-contained. Must be
-    // checked before calling resolve_managed_credential, which still carries
-    // a 501 stub for the aws_route case.
+    // Early branch: AWS SigV4 path is completely self-contained and runs
+    // before resolve_managed_credential.
     let aws_route = service.and_then(|s| ctx.credential_store.get_aws(s));
     if let Some(aws) = aws_route {
         return handle_inner_request_aws(tls_stream, ctx, aws, route, service, &req).await;
@@ -1648,6 +1690,50 @@ where
     // x-amz-* headers (X-Amz-Target, meta, etc.) are preserved and signed.
     filtered_headers.retain(|(name, _)| !crate::aws::sign::is_aws_auth_header(name));
 
+    // Resolve the SigV4 region before reading the body or touching the network.
+    // Wildcard-region routes derive it from the raw CONNECT host only (never the
+    // inner `Host` header or client SNI) and deny hosts that yield none.
+    let concrete_upstream = format!(
+        "https://{}",
+        reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port)
+    );
+    let (region, region_source) = match (&aws.region, aws.service_label.as_deref()) {
+        (SigningRegion::Fixed(r), _) => (r.clone(), "route"),
+        (SigningRegion::FromRequestHost, Some(label)) => {
+            match crate::aws::endpoints::derive_region(ctx.host, ctx.port, label) {
+                Some(r) => (r, "request_host"),
+                None => {
+                    let reason = aws_region_denial_reason(service.unwrap_or("unknown"), ctx.host);
+                    warn!("tls_intercept: {}", reason);
+                    audit::log_denied(
+                        ctx.audit_log,
+                        audit::ProxyMode::ConnectIntercept,
+                        &audit::EventContext {
+                            route_id: service,
+                            managed_credential_active: Some(true),
+                            injection_mode: Some(nono::undo::NetworkAuditInjectionMode::Header),
+                            denial_category: Some(
+                                nono::undo::NetworkAuditDenialCategory::HostDenied,
+                            ),
+                            upstream: Some(&concrete_upstream),
+                            ..audit::EventContext::default()
+                        },
+                        ctx.host,
+                        ctx.port,
+                        &reason,
+                    );
+                    reverse::send_error_generic(tls_stream, 403, "Forbidden").await?;
+                    return Ok(());
+                }
+            }
+        }
+        (SigningRegion::FromRequestHost, None) => {
+            warn!("tls_intercept: wildcard-region AWS route has no service label");
+            reverse::send_error_generic(tls_stream, 403, "Forbidden").await?;
+            return Ok(());
+        }
+    };
+
     let body =
         match reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await? {
             Some(b) => b,
@@ -1662,6 +1748,7 @@ where
             route_id: service,
             managed_credential_active: Some(true),
             injection_mode: Some(nono::undo::NetworkAuditInjectionMode::Header),
+            upstream: Some(&concrete_upstream),
             ..audit::EventContext::default()
         },
     )
@@ -1684,11 +1771,12 @@ where
     let full_url = format!("https://{}{}", upstream_authority, req.path);
     debug!(
         "tls_intercept: signing AWS request: method={} url='{}' \
-         service='{}' region='{}' body_len={} header_count={}",
+         service='{}' region='{}' region_source={} body_len={} header_count={}",
         req.method,
         full_url,
         aws.service,
-        aws.region,
+        region,
+        region_source,
         body.len(),
         filtered_headers.len(),
     );
@@ -1703,6 +1791,7 @@ where
     );
     match crate::aws::sign::sign_request(
         aws,
+        &region,
         selected.provider,
         &req.method,
         &full_url,
@@ -1778,6 +1867,7 @@ where
         managed_credential_active: Some(true),
         injection_mode: Some(nono::undo::NetworkAuditInjectionMode::Header),
         denial_category: None,
+        upstream: Some(&concrete_upstream),
         ..audit::EventContext::default()
     };
     let audit_ctx = AuditCtx {
@@ -4983,5 +5073,122 @@ mod tests {
             !response.contains(&client_secret_phantom),
             "the phantom must not be echoed to the client, got: {response}"
         );
+    }
+
+    /// Records the upstream and reason each endpoint approval request shows.
+    struct PromptRecordingBackend {
+        prompts: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl nono::ApprovalBackend for PromptRecordingBackend {
+        fn request_approval(
+            &self,
+            request: &nono::ApprovalRequest,
+        ) -> nono::Result<nono::ApprovalDecision> {
+            if let nono::ApprovalRequest::Endpoint {
+                upstream, reason, ..
+            } = request
+            {
+                self.prompts
+                    .lock()
+                    .map_err(|_| nono::NonoError::SandboxInit("poisoned".to_string()))?
+                    .push((upstream.clone(), reason.clone()));
+            }
+            Ok(nono::ApprovalDecision::Denied {
+                reason: "recorded".to_string(),
+            })
+        }
+
+        fn backend_name(&self) -> &str {
+            "prompt-recording"
+        }
+    }
+
+    fn wildcard_aws_approval_route() -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            upstream: "https://eks.*.amazonaws.com".to_string(),
+            credential_key: None,
+            credential_format: None,
+            aws_auth: Some(crate::config::AwsAuthConfig {
+                region: None,
+                service: Some("eks".to_string()),
+                ..Default::default()
+            }),
+            ..approval_gated_route("eks")
+        }
+    }
+
+    /// The approval prompt for a wildcard AWS route names the concrete host and
+    /// the derived region, not the route pattern.
+    #[tokio::test]
+    async fn wildcard_aws_approval_prompt_shows_concrete_upstream_and_region() {
+        let store = RouteStore::load(&[wildcard_aws_approval_route()])
+            .await
+            .unwrap();
+        let backend = std::sync::Arc::new(PromptRecordingBackend {
+            prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+
+        let selection = select_intercept_route(
+            &store,
+            "eks.eu-west-1.amazonaws.com",
+            443,
+            InterceptRouteRequest {
+                method: "GET",
+                path: "/gated",
+                websocket_path: None,
+            },
+            None,
+            Some(&registry),
+        )
+        .await;
+
+        assert!(matches!(selection, RouteSelection::Rejected(403)));
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].0, "https://eks.eu-west-1.amazonaws.com");
+        assert!(
+            prompts[0]
+                .1
+                .as_deref()
+                .is_some_and(|r| r.contains("AWS region: eu-west-1")),
+            "{:?}",
+            prompts[0].1
+        );
+    }
+
+    /// A host that yields no region is denied before the user is prompted.
+    #[tokio::test]
+    async fn wildcard_aws_approval_denies_underivable_region_without_prompting() {
+        let store = RouteStore::load(&[wildcard_aws_approval_route()])
+            .await
+            .unwrap();
+        let backend = std::sync::Arc::new(PromptRecordingBackend {
+            prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+
+        // `zz-fake-9` matches the route pattern but is not a valid region label.
+        for host in [
+            "eks.us-gov-west-1.amazonaws.com",
+            "eks.zz-fake-9.amazonaws.com",
+        ] {
+            let selection = select_intercept_route(
+                &store,
+                host,
+                443,
+                InterceptRouteRequest {
+                    method: "GET",
+                    path: "/gated",
+                    websocket_path: None,
+                },
+                None,
+                Some(&registry),
+            )
+            .await;
+            assert!(matches!(selection, RouteSelection::Rejected(403)), "{host}");
+        }
+        assert!(backend.prompts.lock().unwrap().is_empty());
     }
 }

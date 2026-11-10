@@ -1799,6 +1799,8 @@ pub struct AwsAuthConfig {
     /// If omitted, auto-detected from the upstream URL.
     /// Must be non-empty and lowercase if provided (SigV4 credential scope
     /// requires lowercase region codes).
+    /// Must be omitted when the upstream is `https://{service}.*.amazonaws.com`;
+    /// the region is then taken from each request's host.
     #[serde(default)]
     pub region: Option<String>,
 

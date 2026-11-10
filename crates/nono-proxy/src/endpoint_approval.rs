@@ -96,6 +96,8 @@ pub(crate) struct PendingApproval<'a> {
     /// Whether a session answer may be cached for this approval. `false`
     /// collapses session answers to one-shot ones (credential routes).
     pub session_scope: bool,
+    /// Region derived from the host for AWS wildcard-region routes.
+    pub aws_region: Option<String>,
 }
 
 /// The request being approved and where its audit events go.
@@ -507,12 +509,16 @@ fn describe(
 }
 
 fn request_reason(approval: &PendingApproval<'_>, target: &ApprovalTarget<'_>) -> String {
-    approval.reason.map(str::to_string).unwrap_or_else(|| {
+    let mut reason = approval.reason.map(str::to_string).unwrap_or_else(|| {
         format!(
             "endpoint approval required by {} for {} {}",
             approval.rule_label, target.method, target.path
         )
-    })
+    });
+    if let Some(region) = &approval.aws_region {
+        reason.push_str(&format!(" (AWS region: {region})"));
+    }
+    reason
 }
 
 fn log_outcome(
@@ -529,7 +535,12 @@ fn log_outcome(
         endpoint_policy_action: Some("approve"),
         endpoint_policy_rule: Some(&approval.rule_label),
         approval_backend: backend_name,
-        upstream: Some(approval.upstream),
+        // A wildcard route audits the concrete host, not the pattern.
+        upstream: Some(if approval.upstream.contains('*') {
+            target.upstream
+        } else {
+            approval.upstream
+        }),
         ..target.audit_ctx.clone()
     };
     audit::log_l7_policy_decision(
@@ -602,6 +613,7 @@ mod tests {
             timeout_secs,
             rule_label: rule_label.to_string(),
             session_scope: true,
+            aws_region: None,
         }
     }
 
@@ -614,6 +626,7 @@ mod tests {
             timeout_secs: None,
             rule_label: rule_label.to_string(),
             session_scope: false,
+            aws_region: None,
         }
     }
 

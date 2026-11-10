@@ -1134,6 +1134,7 @@ fn host_endpoint_policies<'a>(
                     timeout_secs,
                     rule_label,
                     session_scope: true,
+                    aws_region: None,
                 });
                 continue;
             }
@@ -1287,6 +1288,7 @@ async fn enforce_endpoint_policy(
                 timeout_secs,
                 rule_label,
                 session_scope: false,
+                aws_region: None,
             });
         }
     }

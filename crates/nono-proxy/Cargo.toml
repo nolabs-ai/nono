@@ -48,7 +48,7 @@ socket2 = { version = "0.6", features = ["all"] }
 # feature(s) enabled: credentials-login", so an `aws_auth` route cannot sign for
 # an SSO-logged-in operator — the primary intended use of host-side credential
 # resolution.
-aws-config = { version = "1", features = [
+aws-config = { version = "1.13.1", features = [
     "behavior-version-latest",
     "credentials-login",
 ] }

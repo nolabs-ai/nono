@@ -98,6 +98,8 @@ tempfile.workspace = true
 vt100 = "0.18.1"
 shlex = "2"
 jsonc-parser = { version = "0.34", features = ["serde"] }
+zstd = "0.14"
+aho-corasick = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir", "hostname"] }

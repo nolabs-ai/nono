@@ -1226,6 +1226,34 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         }
     }
 
+    // Session recording
+    if let Some(recording) = profile
+        .session_recording
+        .as_ref()
+        .filter(|recording| recording.is_enabled())
+    {
+        let mut parts = vec![if recording.required == Some(true) {
+            "required".to_string()
+        } else {
+            "on".to_string()
+        }];
+        if recording.input == Some(crate::profile::SessionRecordingInput::Off) {
+            parts.push("input off".to_string());
+        }
+        if let Some(max_bytes) = recording.max_bytes {
+            parts.push(format!("max {max_bytes} bytes"));
+        }
+        if let Some(file) = recording.file.as_deref() {
+            parts.push(format!("file {file}"));
+        }
+        println!();
+        println!(
+            "  {}  {}",
+            theme::fg("Session recording:", t.subtext).bold(),
+            theme::fg(&parts.join(", "), t.text)
+        );
+    }
+
     // Open URLs
     if let Some(ref urls) = profile.open_urls {
         println!();
@@ -1388,6 +1416,10 @@ fn profile_to_json(
         "exclude_patterns": profile.rollback.exclude_patterns,
         "exclude_globs": profile.rollback.exclude_globs,
     });
+
+    if let Some(recording) = profile.session_recording.as_ref() {
+        val["session_recording"] = serde_json::json!(recording);
+    }
 
     // Env credentials
     if !profile.env_credentials.mappings.is_empty() {

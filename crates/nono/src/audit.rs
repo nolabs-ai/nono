@@ -96,6 +96,24 @@ pub enum AuditEventPayload {
         /// Command policy decision event.
         event: Box<CommandPolicyAuditEvent>,
     },
+    /// A payload type this build does not know: written by a newer nono, or
+    /// an extension event recorded with
+    /// [`AuditRecorder::record_extension_event`].
+    ///
+    /// Readers keep these records so that such logs still verify: the record's leaf hash covers its stored `event_json` bytes, so
+    /// its integrity is checked without understanding its content. Known types
+    /// with malformed fields still fail to parse. This variant is never
+    /// serialized, so the recorder cannot write one.
+    #[serde(other, skip_serializing)]
+    Unrecognized,
+}
+
+impl AuditEventPayload {
+    /// Whether this payload is a type this build does not know.
+    #[must_use]
+    pub fn is_unrecognized(&self) -> bool {
+        matches!(self, Self::Unrecognized)
+    }
 }
 
 /// Sandbox runtime metadata captured in the audit log.
@@ -538,6 +556,54 @@ impl AuditRecorder {
         self.command_policy_summary.clone().finish()
     }
 
+    /// Record an event whose payload type the caller defines.
+    ///
+    /// The event is written as `{"type": event_type, ...payload fields}`, hash
+    /// linked like every other record, and read back by this library as
+    /// [`AuditEventPayload::Unrecognized`]: the chain verifies it without
+    /// interpreting it, and the caller parses its own type from the record's
+    /// `event_json`.
+    ///
+    /// `event_type` must be a lowercase `snake_case` name that this library
+    /// does not itself define, so an extension can never be taken for one of
+    /// the library's own events (such as `session_ended`). A type the library
+    /// adds later would make older extension records of that name
+    /// ambiguous, so the library must not add a type an extension uses.
+    /// `payload` must serialize to a JSON object without a `type` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the name or payload is not allowed, or if the
+    /// event cannot be written.
+    pub fn record_extension_event<T: Serialize>(
+        &mut self,
+        event_type: &str,
+        payload: &T,
+    ) -> Result<()> {
+        validate_extension_event_type(event_type)?;
+        let fields = serde_json::to_value(payload).map_err(|e| {
+            NonoError::Snapshot(format!("Failed to serialize audit extension event: {e}"))
+        })?;
+        match fields.as_object() {
+            Some(object) if !object.contains_key("type") => {}
+            _ => {
+                return Err(NonoError::Snapshot(format!(
+                    "Audit extension event '{event_type}' must be a JSON object without a `type` field"
+                )));
+            }
+        }
+        self.append_serialized(&ExtensionEvent {
+            event_type,
+            payload,
+        })
+    }
+
+    /// Sequence number the next appended record will receive.
+    #[must_use]
+    pub fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
     /// Number of events appended by this recorder.
     #[must_use]
     pub fn event_count(&self) -> u64 {
@@ -558,25 +624,32 @@ impl AuditRecorder {
     }
 
     fn append_event(&mut self, event: AuditEventPayload) -> Result<()> {
+        self.append_serialized(&event)
+    }
+
+    /// Append one record for `event`, which serializes to the canonical event
+    /// JSON. The record line has the same shape as [`AuditEventRecord`].
+    fn append_serialized<E: Serialize>(&mut self, event: &E) -> Result<()> {
         if self.ended {
             return Err(NonoError::Snapshot(
                 "Audit log is closed: session already ended".to_string(),
             ));
         }
-        let event_bytes = serde_json::to_vec(&event)
+        let event_bytes = serde_json::to_vec(event)
             .map_err(|e| NonoError::Snapshot(format!("Failed to serialize audit event: {e}")))?;
         let leaf_hash = hash_event(&event_bytes);
         let chain_hash = hash_chain(self.previous_chain.as_ref(), &leaf_hash);
-        let record = AuditEventRecord {
+        let event_json = String::from_utf8(event_bytes).map_err(|e| {
+            NonoError::Snapshot(format!(
+                "Failed to encode canonical audit event JSON as UTF-8: {e}"
+            ))
+        })?;
+        let record = RecordLine {
             sequence: self.next_sequence,
             prev_chain: self.previous_chain,
             leaf_hash,
             chain_hash,
-            event_json: Some(String::from_utf8(event_bytes.clone()).map_err(|e| {
-                NonoError::Snapshot(format!(
-                    "Failed to encode canonical audit event JSON as UTF-8: {e}"
-                ))
-            })?),
+            event_json: &event_json,
             event,
         };
         let line = serde_json::to_vec(&record)
@@ -590,6 +663,55 @@ impl AuditRecorder {
         self.previous_chain = Some(chain_hash);
         self.leaf_hashes.push(leaf_hash);
         Ok(())
+    }
+}
+
+/// The serialized form of an [`AuditEventRecord`], borrowing its event so
+/// library and extension events share one writer.
+#[derive(Serialize)]
+struct RecordLine<'a, E: Serialize> {
+    sequence: u64,
+    prev_chain: Option<ContentHash>,
+    leaf_hash: ContentHash,
+    chain_hash: ContentHash,
+    event_json: &'a str,
+    event: &'a E,
+}
+
+/// An extension event: its type first, then the payload's fields, the same
+/// layout the library's own internally tagged events have.
+#[derive(Serialize)]
+struct ExtensionEvent<'a, T: Serialize> {
+    #[serde(rename = "type")]
+    event_type: &'a str,
+    #[serde(flatten)]
+    payload: &'a T,
+}
+
+/// Longest extension event type name.
+const EXTENSION_EVENT_TYPE_MAX_LEN: usize = 64;
+
+/// An extension event type must be a `snake_case` name the library does not
+/// define. Whether the library defines it is decided by the library's own
+/// parser, so every current and future library type is refused.
+fn validate_extension_event_type(event_type: &str) -> Result<()> {
+    let well_formed = !event_type.is_empty()
+        && event_type.len() <= EXTENSION_EVENT_TYPE_MAX_LEN
+        && event_type.starts_with(|c: char| c.is_ascii_lowercase())
+        && event_type
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !well_formed {
+        return Err(NonoError::Snapshot(format!(
+            "Invalid audit extension event type '{event_type}'"
+        )));
+    }
+    let probe = serde_json::json!({ "type": event_type });
+    match serde_json::from_value::<AuditEventPayload>(probe) {
+        Ok(payload) if payload.is_unrecognized() => Ok(()),
+        _ => Err(NonoError::Snapshot(format!(
+            "Audit extension event type '{event_type}' is reserved by the audit log"
+        ))),
     }
 }
 
@@ -1443,6 +1565,47 @@ fn hash_ledger_link(
     Ok(ContentHash::from_bytes(hasher.finalize().into()))
 }
 
+/// Leaf bytes for a record whose payload type this build does not know.
+///
+/// The record cannot be re-serialized canonically, so its stored
+/// `event_json` bytes are hashed as written. They must be present, must also
+/// be an unknown type, and must be the same JSON value as the record's
+/// `event` object, so the readable payload cannot diverge from the hashed one.
+fn unrecognized_event_bytes(line: &str, raw: Option<&str>, index: usize) -> Result<Vec<u8>> {
+    let line_number = index.saturating_add(1);
+    let raw = raw.ok_or_else(|| {
+        NonoError::Snapshot(format!(
+            "Audit event at line {line_number} has an unrecognized type and no canonical event_json"
+        ))
+    })?;
+    let raw_payload: AuditEventPayload = serde_json::from_str(raw).map_err(|e| {
+        NonoError::Snapshot(format!(
+            "Failed to parse canonical audit event JSON at line {line_number}: {e}"
+        ))
+    })?;
+    if !raw_payload.is_unrecognized() {
+        return Err(NonoError::Snapshot(format!(
+            "Audit event JSON mismatch at line {line_number}"
+        )));
+    }
+    let raw_value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        NonoError::Snapshot(format!(
+            "Failed to parse canonical audit event JSON at line {line_number}: {e}"
+        ))
+    })?;
+    let line_value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+        NonoError::Snapshot(format!(
+            "Failed to parse audit event record at line {line_number}: {e}"
+        ))
+    })?;
+    if line_value.get("event") != Some(&raw_value) {
+        return Err(NonoError::Snapshot(format!(
+            "Audit event JSON mismatch at line {line_number}"
+        )));
+    }
+    Ok(raw.as_bytes().to_vec())
+}
+
 /// Verify an alpha audit log and optionally cross-check stored metadata.
 pub fn verify_audit_log(
     session_dir: &Path,
@@ -1498,7 +1661,9 @@ pub fn verify_audit_log(
             )));
         }
 
-        let event_bytes = if let Some(raw) = record.event_json.as_ref() {
+        let event_bytes = if record.event.is_unrecognized() {
+            unrecognized_event_bytes(&line, record.event_json.as_deref(), index)?
+        } else if let Some(raw) = record.event_json.as_ref() {
             serde_json::from_str::<AuditEventPayload>(raw).map_err(|e| {
                 NonoError::Snapshot(format!(
                     "Failed to parse canonical audit event JSON at line {}: {e}",
@@ -1607,6 +1772,126 @@ mod tests {
     use crate::undo::{ExecutableIdentity, NetworkAuditDecision, NetworkAuditMode};
     use std::io::BufReader;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[derive(Serialize)]
+    struct ExampleExtension {
+        value: u64,
+        note: &'static str,
+    }
+
+    #[test]
+    fn extension_events_are_chained_verified_and_read_back_unrecognized() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        recorder
+            .record_extension_event(
+                "example_extension",
+                &ExampleExtension {
+                    value: 7,
+                    note: "z",
+                },
+            )
+            .unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
+            .unwrap();
+        let summary = recorder.finalize().unwrap();
+        let result = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert_eq!(result.event_count, 3);
+
+        let text = std::fs::read_to_string(dir.path().join(AUDIT_EVENTS_FILENAME)).unwrap();
+        let line = text.lines().nth(1).unwrap();
+        let record: AuditEventRecord = serde_json::from_str(line).unwrap();
+        assert!(record.event.is_unrecognized());
+        // The type comes first, then the payload's fields in their order.
+        assert_eq!(
+            record.event_json.as_deref(),
+            Some(r#"{"type":"example_extension","value":7,"note":"z"}"#)
+        );
+    }
+
+    #[test]
+    fn extension_events_cannot_take_a_library_event_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        let payload = ExampleExtension {
+            value: 1,
+            note: "x",
+        };
+        for reserved in [
+            "session_started",
+            "session_ended",
+            "capability_decision",
+            "url_open",
+            "network",
+            "sandbox_runtime",
+            "command_policy",
+        ] {
+            let err = recorder
+                .record_extension_event(reserved, &payload)
+                .err()
+                .unwrap_or_else(|| panic!("{reserved} was accepted"));
+            assert!(err.to_string().contains("reserved"), "{reserved}: {err}");
+        }
+        for malformed in [
+            "",
+            "Upper",
+            "1st",
+            "with-dash",
+            "space here",
+            &"a".repeat(65),
+        ] {
+            assert!(
+                recorder
+                    .record_extension_event(malformed, &payload)
+                    .is_err(),
+                "{malformed:?} was accepted"
+            );
+        }
+        // Nothing was written.
+        assert_eq!(recorder.event_count(), 0);
+    }
+
+    #[test]
+    fn extension_payloads_must_be_objects_without_a_type_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        assert!(
+            recorder
+                .record_extension_event("example_extension", &5u32)
+                .is_err()
+        );
+        assert!(
+            recorder
+                .record_extension_event(
+                    "example_extension",
+                    &serde_json::json!({ "type": "session_ended" })
+                )
+                .is_err()
+        );
+        assert_eq!(recorder.event_count(), 0);
+    }
+
+    #[test]
+    fn extension_events_are_refused_after_the_session_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
+            .unwrap();
+        let payload = ExampleExtension {
+            value: 1,
+            note: "x",
+        };
+        assert!(
+            recorder
+                .record_extension_event("example_extension", &payload)
+                .is_err()
+        );
+    }
 
     #[test]
     fn recorder_produces_integrity_summary() {
@@ -1738,6 +2023,136 @@ mod tests {
         assert_eq!(verified.event_count, 5);
         assert_eq!(verified.merkle_scheme, "alpha");
         assert!(verified.records_verified);
+    }
+
+    /// A payload a newer nono might write, unknown to this build.
+    const FUTURE_EVENT_JSON: &str =
+        r#"{"type":"future_kind","index":3,"detail":{"sha256":"abc","note":"x"}}"#;
+
+    /// Write `session_started`, then one raw record carrying `event_json` with
+    /// `event` as its readable payload, chained as a newer recorder would.
+    /// Returns the integrity summary for the two-record log.
+    fn write_log_with_raw_record(
+        dir: &Path,
+        event_json: Option<&str>,
+        event: &str,
+    ) -> AuditIntegritySummary {
+        let mut recorder = AuditRecorder::new(dir.to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        let first = recorder.finalize().unwrap();
+        drop(recorder);
+
+        let hashed = event_json.unwrap_or(event);
+        let leaf = hash_event(hashed.as_bytes());
+        let chain = hash_chain(Some(&first.chain_head), &leaf);
+        let mut record = serde_json::json!({
+            "sequence": 1,
+            "prev_chain": first.chain_head,
+            "leaf_hash": leaf,
+            "chain_hash": chain,
+            "event": serde_json::from_str::<serde_json::Value>(event).unwrap(),
+        });
+        if let Some(raw) = event_json {
+            record["event_json"] = serde_json::Value::String(raw.to_string());
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(AUDIT_EVENTS_FILENAME))
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(&record).unwrap()).unwrap();
+
+        let first_leaf = hash_event(
+            &serde_json::to_vec(&AuditEventPayload::SessionStarted {
+                started: "2026-04-21T00:00:00Z".to_string(),
+                command: vec!["pwd".to_string()],
+                redaction_policy: None,
+            })
+            .unwrap(),
+        );
+        AuditIntegritySummary {
+            hash_algorithm: AUDIT_HASH_ALGORITHM.to_string(),
+            event_count: 2,
+            chain_head: chain,
+            merkle_root: merkle_root(&[first_leaf, leaf]),
+        }
+    }
+
+    #[test]
+    fn verifier_accepts_payload_types_from_newer_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let summary =
+            write_log_with_raw_record(dir.path(), Some(FUTURE_EVENT_JSON), FUTURE_EVENT_JSON);
+
+        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert!(verified.records_verified);
+        assert_eq!(verified.event_count, 2);
+        assert_eq!(verified.computed_chain_head, Some(summary.chain_head));
+    }
+
+    #[test]
+    fn verifier_accepts_unknown_payload_with_reordered_event_object() {
+        // `event` and `event_json` are compared as JSON values, so key order in
+        // the readable copy does not matter; the hash covers `event_json`.
+        let dir = tempfile::tempdir().unwrap();
+        let reordered = r#"{"detail":{"note":"x","sha256":"abc"},"index":3,"type":"future_kind"}"#;
+        let summary = write_log_with_raw_record(dir.path(), Some(FUTURE_EVENT_JSON), reordered);
+
+        assert!(verify_audit_log(dir.path(), Some(&summary)).is_ok());
+    }
+
+    #[test]
+    fn verifier_rejects_unknown_payload_whose_event_diverges_from_event_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let tampered = r#"{"type":"future_kind","index":4,"detail":{"sha256":"abc","note":"x"}}"#;
+        write_log_with_raw_record(dir.path(), Some(FUTURE_EVENT_JSON), tampered);
+
+        let err = verify_audit_log(dir.path(), None).err().unwrap();
+        assert!(err.to_string().contains("JSON mismatch"), "{err}");
+    }
+
+    #[test]
+    fn verifier_rejects_unknown_payload_without_event_json() {
+        let dir = tempfile::tempdir().unwrap();
+        write_log_with_raw_record(dir.path(), None, FUTURE_EVENT_JSON);
+
+        let err = verify_audit_log(dir.path(), None).err().unwrap();
+        assert!(err.to_string().contains("no canonical event_json"), "{err}");
+    }
+
+    #[test]
+    fn verifier_rejects_unknown_event_json_under_known_event() {
+        // A known readable payload must not hide an unknown hashed one.
+        let dir = tempfile::tempdir().unwrap();
+        let known = r#"{"type":"session_ended","ended":"2026-04-21T00:00:01Z","exit_code":0}"#;
+        write_log_with_raw_record(dir.path(), Some(FUTURE_EVENT_JSON), known);
+
+        let err = verify_audit_log(dir.path(), None).err().unwrap();
+        assert!(err.to_string().contains("JSON mismatch"), "{err}");
+    }
+
+    #[test]
+    fn verifier_rejects_known_event_json_under_unknown_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = r#"{"type":"session_ended","ended":"2026-04-21T00:00:01Z","exit_code":0}"#;
+        write_log_with_raw_record(dir.path(), Some(known), FUTURE_EVENT_JSON);
+
+        let err = verify_audit_log(dir.path(), None).err().unwrap();
+        assert!(err.to_string().contains("JSON mismatch"), "{err}");
+    }
+
+    #[test]
+    fn known_payload_type_with_malformed_fields_still_fails_to_parse() {
+        let malformed = r#"{"type":"session_ended","ended":"2026-04-21T00:00:01Z"}"#;
+        assert!(serde_json::from_str::<AuditEventPayload>(malformed).is_err());
+        let unknown = serde_json::from_str::<AuditEventPayload>(FUTURE_EVENT_JSON).unwrap();
+        assert!(unknown.is_unrecognized());
+    }
+
+    #[test]
+    fn unrecognized_payload_cannot_be_serialized() {
+        assert!(serde_json::to_vec(&AuditEventPayload::Unrecognized).is_err());
     }
 
     #[test]

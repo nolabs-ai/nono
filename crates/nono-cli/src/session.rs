@@ -37,6 +37,24 @@ pub struct SessionRecord {
     pub workdir: PathBuf,
     pub network: String,
     pub rollback_session: Option<String>,
+    /// Set once the session's terminal recording has started (NEP-0010), so
+    /// launchers and attaching clients can show the recording notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<SessionRecordingState>,
+}
+
+/// Recording facts published in the session file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRecordingState {
+    /// Whether typed input is recorded.
+    pub input: bool,
+    pub required: bool,
+    /// Extra copies being written (`file` sink).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<PathBuf>,
+    /// Chunks are uploaded to the platform.
+    #[serde(default)]
+    pub delivered: bool,
 }
 
 /// Session lifecycle status.
@@ -88,6 +106,14 @@ impl SessionGuard {
         self.record.child_pid = pid;
         if let Err(e) = update_session_file(&self.path, &self.record) {
             warn!("Failed to update session file with child PID: {}", e);
+        }
+    }
+
+    /// Record that terminal recording is on for this session.
+    pub fn set_recording(&mut self, recording: SessionRecordingState) {
+        self.record.recording = Some(recording);
+        if let Err(e) = update_session_file(&self.path, &self.record) {
+            warn!("Failed to update session file with recording state: {}", e);
         }
     }
 
@@ -1029,6 +1055,7 @@ mod tests {
             workdir: PathBuf::from("/home/user/project"),
             network: "allowed".to_string(),
             rollback_session: None,
+            recording: None,
         };
 
         let json = serde_json::to_string(&record).expect("serialize");
@@ -1069,6 +1096,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             network: "blocked".to_string(),
             rollback_session: None,
+            recording: None,
         };
 
         write_session_file(&path, &record).expect("write");
@@ -1100,6 +1128,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             network: "allowed".to_string(),
             rollback_session: None,
+            recording: None,
         };
 
         write_session_file(&path, &record).expect("write");
@@ -1147,6 +1176,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             network: "allowed".to_string(),
             rollback_session: None,
+            recording: None,
         };
 
         let file_path = path.join("guard1.json");
@@ -1183,6 +1213,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             network: "blocked".to_string(),
             rollback_session: None,
+            recording: None,
         };
         write_session_file(&path, &record).expect("write initial session");
         let mut guard = SessionGuard {
@@ -1258,6 +1289,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             network: "allowed".to_string(),
             rollback_session: None,
+            recording: None,
         };
 
         write_session_file(&sessions_path.join("aabbcc.json"), &record).expect("write");

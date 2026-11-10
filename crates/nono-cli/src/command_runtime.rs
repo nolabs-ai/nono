@@ -289,11 +289,19 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         false,
     );
 
+    let workdir = resolve_requested_workdir(args.sandbox.workdir.as_ref());
+    let session_recording = crate::terminal_capture::settings::resolve(
+        prepared.session_recording.as_ref(),
+        &args.recording,
+        &crate::launch_runtime::launch_dir()?,
+        &workdir,
+    )?;
     let flags = ExecutionFlags {
         strategy,
-        workdir: resolve_requested_workdir(args.sandbox.workdir.as_ref()),
+        workdir,
         no_diagnostics: true,
         startup_timeout_secs: args.startup_timeout_secs,
+        session_recording,
         network,
         session: SessionLaunchOptions {
             session_id: Some(session_id),
@@ -474,6 +482,7 @@ mod tests {
             shell: Some(PathBuf::from("/bin/sh")),
             name: None,
             startup_timeout_secs: None,
+            recording: Default::default(),
             help: None,
         };
 

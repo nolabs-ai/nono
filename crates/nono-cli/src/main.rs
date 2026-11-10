@@ -85,6 +85,7 @@ mod state_paths;
 mod supervised_runtime;
 mod temp_keepalive;
 mod terminal_approval;
+mod terminal_capture;
 mod terminal_prompt;
 mod theme;
 mod timeouts;
@@ -307,6 +308,7 @@ mod tests {
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            session_recording: None,
             network_profile: Some("developer".to_string()),
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),
@@ -390,6 +392,7 @@ mod tests {
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            session_recording: None,
             network_profile: Some("developer".to_string()),
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),

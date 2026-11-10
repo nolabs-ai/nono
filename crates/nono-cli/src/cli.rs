@@ -44,6 +44,8 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   connect    Connect this terminal to a session hosted by nono-console
   logs       View runtime session event logs
   inspect    Show detailed runtime session state
+  replay     Play a session's terminal recording back
+  transcript Print a session's terminal recording as text
   session    Manage runtime session storage
   rollback   Manage rollback sessions (browse, restore, cleanup)
   audit      View audit trail of sandboxed commands
@@ -525,6 +527,46 @@ SESSION PICKER:
     nono inspect --json a3f7c2
 ")]
     Inspect(InspectArgs),
+
+    /// Play a session's terminal recording back
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono replay [flags] <session>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Replay a recorded session
+    nono replay a3f7c2
+
+    # Twice as fast, with pauses capped at 2 seconds
+    nono replay --speed 2 --idle-limit 2 a3f7c2
+
+    # Start 90 seconds in, or at the first suspend
+    nono replay --from 1:30 a3f7c2
+    nono replay --from suspended a3f7c2
+")]
+    Replay(ReplayArgs),
+
+    /// Print a session's terminal recording as readable text
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono transcript [flags] <session>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Readable text
+    nono transcript a3f7c2
+
+    # Structured entries
+    nono transcript --format json a3f7c2
+")]
+    Transcript(TranscriptArgs),
 
     /// Manage runtime session storage
     #[command(subcommand_help_heading = "COMMANDS")]
@@ -2111,7 +2153,15 @@ pub struct RunArgs {
     /// Disable the audit trail for this session
     #[arg(
         long,
-        conflicts_with_all = ["audit_integrity", "no_audit_integrity", "rollback"],
+        conflicts_with_all = [
+            "audit_integrity",
+            "no_audit_integrity",
+            "rollback",
+            "record",
+            "record_required",
+            "record_file",
+            "deliver_to",
+        ],
         help_heading = "OPTIONS"
     )]
     pub no_audit: bool,
@@ -2160,6 +2210,9 @@ pub struct RunArgs {
         help_heading = "OPTIONS"
     )]
     pub capability_elevation: bool,
+
+    #[command(flatten)]
+    pub recording: RecordingArgs,
 
     /// Command to run inside the sandbox (optional if profile specifies `binary`)
     #[arg(hide = true)]
@@ -2223,9 +2276,57 @@ pub struct ShellArgs {
     )]
     pub startup_timeout_secs: Option<u64>,
 
+    #[command(flatten)]
+    pub recording: RecordingArgs,
+
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
+}
+
+/// Session terminal recording (NEP-0010). These flags can only raise what
+/// the profile sets: they never turn recording off.
+#[derive(clap::Args, Debug, Default, Clone)]
+pub struct RecordingArgs {
+    /// Record the session's terminal into the audit log
+    #[arg(
+        long,
+        env = "NONO_RECORD",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::SetTrue,
+        help_heading = "RECORDING"
+    )]
+    pub record: bool,
+
+    /// Stop the session rather than run it unrecorded (implies --record)
+    #[arg(
+        long,
+        env = "NONO_RECORD_REQUIRED",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::SetTrue,
+        help_heading = "RECORDING"
+    )]
+    pub record_required: bool,
+
+    /// Also write the finished recording, and a chunk manifest beside it, to
+    /// this new file (implies --record)
+    #[arg(
+        long,
+        value_name = "PATH",
+        env = "NONO_RECORD_FILE",
+        help_heading = "RECORDING"
+    )]
+    pub record_file: Option<PathBuf>,
+
+    /// Upload the recording as it is made (implies --record). RECEIVER is
+    /// `platform`, the platform this host is enrolled with
+    #[arg(
+        long,
+        value_name = "RECEIVER",
+        env = "NONO_DELIVER_TO",
+        help_heading = "RECORDING"
+    )]
+    pub deliver_to: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -2951,6 +3052,53 @@ pub struct LogsArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct ReplayArgs {
+    /// Session ID, prefix or name
+    pub session: String,
+
+    /// Playback speed multiplier
+    #[arg(long, value_name = "N", default_value_t = 1.0, value_parser = parse_positive_f64)]
+    pub speed: f64,
+
+    /// Cap pauses at this many seconds
+    #[arg(long, value_name = "SECS", value_parser = parse_positive_f64)]
+    pub idle_limit: Option<f64>,
+
+    /// Start at a time (SECS, MM:SS or HH:MM:SS) or at the first marker with
+    /// this name (for example suspended, resumed, resize)
+    #[arg(long, value_name = "TIME|MARKER")]
+    pub from: Option<String>,
+}
+
+fn parse_positive_f64(value: &str) -> std::result::Result<f64, String> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a number"))?;
+    if parsed.is_finite() && parsed > 0.0 {
+        Ok(parsed)
+    } else {
+        Err(format!("`{value}` must be greater than zero"))
+    }
+}
+
+/// Output format for `nono transcript`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum TranscriptFormat {
+    Text,
+    Json,
+}
+
+#[derive(Parser, Debug)]
+pub struct TranscriptArgs {
+    /// Session ID, prefix or name
+    pub session: String,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t = TranscriptFormat::Text)]
+    pub format: TranscriptFormat,
 }
 
 #[derive(Parser, Debug)]
@@ -3681,6 +3829,80 @@ mod tests {
                 _ => panic!("Expected Restore subcommand"),
             },
             _ => panic!("Expected Rollback command"),
+        }
+    }
+
+    #[test]
+    fn test_run_and_shell_recording_flags_parse() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--record",
+            "--record-required",
+            "--record-file",
+            "artifacts/session.cast",
+            "--",
+            "true",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.recording.record);
+                assert!(args.recording.record_required);
+                assert_eq!(
+                    args.recording.record_file,
+                    Some(PathBuf::from("artifacts/session.cast"))
+                );
+            }
+            _ => panic!("Expected Run command"),
+        }
+        let cli = Cli::parse_from(["nono", "shell", "--record-required"]);
+        match cli.command {
+            Commands::Shell(args) => assert!(args.recording.record_required),
+            _ => panic!("Expected Shell command"),
+        }
+    }
+
+    #[test]
+    fn test_recording_flags_conflict_with_no_audit() {
+        for flag in ["--record", "--record-required"] {
+            assert!(
+                Cli::try_parse_from(["nono", "run", flag, "--no-audit", "--", "true"]).is_err(),
+                "{flag} with --no-audit must be rejected"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "nono",
+                "run",
+                "--record-file",
+                "x.cast",
+                "--no-audit",
+                "--",
+                "true"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_recording_flags_read_environment() {
+        let _env_lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("NONO_RECORD", "1"),
+            ("NONO_RECORD_REQUIRED", "true"),
+            ("NONO_RECORD_FILE", "/artifacts/session.cast"),
+        ]);
+        let cli = Cli::parse_from(["nono", "run", "--", "true"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.recording.record);
+                assert!(args.recording.record_required);
+                assert_eq!(
+                    args.recording.record_file,
+                    Some(PathBuf::from("/artifacts/session.cast"))
+                );
+            }
+            _ => panic!("Expected Run command"),
         }
     }
 
@@ -4810,6 +5032,8 @@ mod tests {
         "connect",
         "logs",
         "inspect",
+        "replay",
+        "transcript",
         "session",
         "rollback",
         "audit",

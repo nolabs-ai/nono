@@ -333,6 +333,19 @@ pub(crate) fn sign_request_v1(
     request_id: Uuid,
     body: &[u8],
 ) -> Result<SignedRequestHeaders> {
+    let key_pair = load_signing_key(state)?;
+    sign_request_v1_with_key(state, &key_pair, method, path, request_id, body)
+}
+
+/// Sign with a key already loaded, for callers that send many requests.
+pub(crate) fn sign_request_v1_with_key(
+    state: &PlatformState,
+    key_pair: &EcdsaKeyPair,
+    method: &str,
+    path: &str,
+    request_id: Uuid,
+    body: &[u8],
+) -> Result<SignedRequestHeaders> {
     let timestamp = current_timestamp_ms()?.to_string();
     let request_id = request_id.to_string();
     let body_digest = format!("sha256:{}", sha256_hex(body));
@@ -344,7 +357,6 @@ pub(crate) fn sign_request_v1(
         &request_id,
         &body_digest,
     );
-    let key_pair = load_signing_key(state)?;
     let signature = key_pair
         .sign(&SystemRandom::new(), canonical.as_bytes())
         .map_err(|_| NonoError::KeystoreAccess("failed to sign platform request".to_string()))?;

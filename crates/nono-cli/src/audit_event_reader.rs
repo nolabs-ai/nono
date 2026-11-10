@@ -32,7 +32,7 @@ pub(crate) struct CommandPolicyAuditRecord {
 /// "is this the last line?" against the live file instead would race a
 /// concurrent writer: a record completed after a torn read but before the
 /// check would turn the tolerated tail into a hard error.
-fn for_each_event_record(
+pub(crate) fn for_each_event_record(
     path: &Path,
     tolerate_partial_tail: bool,
     mut visit: impl FnMut(AuditEventRecord),
@@ -218,6 +218,42 @@ mod tests {
             })
             .unwrap();
         recorder
+    }
+
+    #[test]
+    fn readers_skip_payload_types_from_newer_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = mediating_recorder(dir.path());
+        recorder
+            .record_command_policy_event(
+                command_policy_event("gh", CommandPolicyDecision::Allowed),
+                CommandPolicyOutcome::Allowed,
+            )
+            .unwrap();
+        drop(recorder);
+        // Readers ignore hashes, so a plausible record shape is enough here;
+        // chain verification of unknown types is covered in the library.
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(AUDIT_EVENTS_FILENAME))
+            .unwrap();
+        let future = r#"{"type":"future_kind","index":0}"#;
+        let record = serde_json::json!({
+            "sequence": 3,
+            "prev_chain": null,
+            "leaf_hash": nono::audit::hash_event(future.as_bytes()),
+            "chain_hash": nono::audit::hash_chain(None, &nono::audit::hash_event(future.as_bytes())),
+            "event_json": future,
+            "event": serde_json::from_str::<serde_json::Value>(future).unwrap(),
+        });
+        writeln!(file, "{record}").unwrap();
+
+        let events = load_command_policy_events(dir.path()).unwrap();
+        assert_eq!(events.len(), 1);
+        let (summary, partial_tail) = recompute_command_policy_summary(dir.path()).unwrap();
+        assert!(summary.is_some());
+        assert!(!partial_tail);
+        assert!(load_capability_decisions(dir.path()).unwrap().is_empty());
     }
 
     #[test]

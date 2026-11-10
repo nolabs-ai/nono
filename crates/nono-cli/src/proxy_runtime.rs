@@ -152,6 +152,9 @@ struct ProxyCredentialCaptureBackend {
     /// directories from PATH before the credential-capture browser helper
     /// (an unsandboxed host-side process) resolves `open`/`xdg-open`.
     outer_caps: CapabilitySet,
+    /// Session secret registry (NEP-0010 §3.1). Every successfully captured
+    /// value is registered so terminal recordings can redact it.
+    secret_registry: Option<nono_proxy::SecretRegistry>,
 }
 
 struct ActiveCaptureGuard<'a> {
@@ -320,7 +323,13 @@ impl ProxyCredentialCaptureBackend {
             active_cv: Condvar::new(),
             redaction_policy: nono::ScrubPolicy::secure_default(),
             outer_caps,
+            secret_registry: None,
         })
+    }
+
+    fn with_secret_registry(mut self, registry: Option<nono_proxy::SecretRegistry>) -> Self {
+        self.secret_registry = registry;
+        self
     }
 
     fn capture_cache_scope(
@@ -748,6 +757,10 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
                 }
                 err
             })?;
+        // Register before the value is cached or returned for injection.
+        if let Some(registry) = &self.secret_registry {
+            register_capture_material(registry, &request.credential_name, &response.material);
+        }
         if !entry.ttl.is_zero() {
             let mut cache = self.cache.lock().map_err(|_| {
                 nono_proxy::capture::CredentialCaptureError::new(
@@ -769,6 +782,30 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
         }
         drop(guard);
         Ok(response)
+    }
+}
+
+/// Register captured credential material under the credential name. Header
+/// values are registered whole and, for `<scheme> <token>` values, as the
+/// bare token too. Names are never secret.
+fn register_capture_material(
+    registry: &nono_proxy::SecretRegistry,
+    credential_name: &str,
+    material: &nono_proxy::capture::CredentialCaptureMaterial,
+) {
+    match material {
+        nono_proxy::capture::CredentialCaptureMaterial::Secret(secret) => {
+            registry.register(credential_name, secret.as_str());
+        }
+        nono_proxy::capture::CredentialCaptureMaterial::Headers(headers) => {
+            for (header_name, value) in headers {
+                let name = format!("{credential_name}:{header_name}");
+                registry.register(&name, value.as_str());
+                if let Some((_, token)) = value.split_once(' ') {
+                    registry.register(&name, token.trim());
+                }
+            }
+        }
     }
 }
 
@@ -2562,14 +2599,24 @@ pub(crate) fn build_credential_capture_backend(
     session_id: String,
     outer_caps: CapabilitySet,
 ) -> Result<Option<Arc<dyn nono_proxy::capture::CredentialCaptureBackend>>> {
+    build_credential_capture_backend_with_registry(credential_capture, session_id, outer_caps, None)
+}
+
+/// Like [`build_credential_capture_backend`], registering every captured
+/// value in `secret_registry` for terminal-recording redaction.
+fn build_credential_capture_backend_with_registry(
+    credential_capture: &HashMap<String, crate::profile::CredentialCaptureEntry>,
+    session_id: String,
+    outer_caps: CapabilitySet,
+    secret_registry: Option<nono_proxy::SecretRegistry>,
+) -> Result<Option<Arc<dyn nono_proxy::capture::CredentialCaptureBackend>>> {
     if credential_capture.is_empty() {
         return Ok(None);
     }
-    Ok(Some(Arc::new(ProxyCredentialCaptureBackend::new(
-        credential_capture,
-        session_id,
-        outer_caps,
-    )?)))
+    Ok(Some(Arc::new(
+        ProxyCredentialCaptureBackend::new(credential_capture, session_id, outer_caps)?
+            .with_secret_registry(secret_registry),
+    )))
 }
 
 fn synthesize_credential_provider_proxy_config(
@@ -2987,9 +3034,15 @@ pub(crate) fn apply_tls_intercept_config(
     Ok(())
 }
 
+/// Start the session proxy (and any command-scoped proxies).
+///
+/// Every credential value the proxies load, refresh, or capture — and every
+/// supervisor-sourced credential in `proxy_source_env_vars` — is registered
+/// in `secret_registry` for terminal-recording redaction (NEP-0010 §3.1).
 pub(crate) fn start_proxy_runtime(
     intent: &NetworkIntent,
     caps: &mut CapabilitySet,
+    secret_registry: &nono_proxy::SecretRegistry,
     #[cfg(any(target_os = "linux", target_os = "macos"))] shared_broker: Option<
         crate::tool_sandbox::token_broker::SharedBroker,
     >,
@@ -3016,10 +3069,18 @@ pub(crate) fn start_proxy_runtime(
         });
     }
 
+    // Supervisor-loaded credential values handed to the proxy through the
+    // environment; register them before any proxy can use them.
+    for (env_var, value) in &proxy.proxy_source_env_vars {
+        secret_registry.register(env_var, value);
+    }
     let _source_env_guard = ScopedEnvVars::set(&proxy.proxy_source_env_vars);
     let mut proxy_config = build_proxy_config_from_flags(proxy)?;
     proxy_config.direct_connect_ports = caps.tcp_connect_ports().to_vec();
     proxy_config.outer_caps = Some(caps.clone());
+    // Cloned into the session and every command-scoped proxy config, so all
+    // listeners share one registry.
+    proxy_config.secret_registry = Some(secret_registry.clone());
 
     apply_tls_intercept_config(&mut proxy_config, proxy)?;
 
@@ -3060,10 +3121,11 @@ pub(crate) fn start_proxy_runtime(
             .as_ref()
             .and_then(|d| d.backend.clone()),
     )?;
-    let credential_capture_backend = build_credential_capture_backend(
+    let credential_capture_backend = build_credential_capture_backend_with_registry(
         &proxy.credential_capture,
         proxy.session_id.clone(),
         caps.clone(),
+        Some(secret_registry.clone()),
     )?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let nonce_resolver: Option<Arc<dyn nono_proxy::NonceResolver>> = shared_broker
@@ -4338,6 +4400,7 @@ mod tests {
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            session_recording: None,
             network_profile: None,
             allow_domain: Vec::new(),
             deny_domain: Vec::new(),
@@ -4419,6 +4482,7 @@ mod tests {
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            session_recording: None,
             network_profile: None,
             allow_domain: Vec::new(),
             deny_domain: Vec::new(),
@@ -4495,6 +4559,7 @@ mod tests {
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            session_recording: None,
             network_profile: None,
             allow_domain: Vec::new(),
             deny_domain: Vec::new(),
@@ -5078,6 +5143,77 @@ mod tests {
         assert_capture_secret(&second, "ghp_test");
         assert_eq!(second.metadata.cache_action, "cache_hit");
         Ok(())
+    }
+
+    #[test]
+    fn proxy_credential_capture_backend_registers_captured_secret() -> Result<()> {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "github".to_string(),
+            test_capture_entry(vec![
+                "/bin/echo".to_string(),
+                "ghp_registry_capture_1234".to_string(),
+            ]),
+        );
+        let registry = nono_proxy::SecretRegistry::new();
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-test".to_string(),
+            nono::CapabilitySet::default(),
+        )?
+        .with_secret_registry(Some(registry.clone()));
+        let request = nono_proxy::capture::CredentialCaptureRequest {
+            credential_name: "github".to_string(),
+            route_id: "github".to_string(),
+            request_host: "api.github.com".to_string(),
+            request_path: "/user".to_string(),
+            request_method: "GET".to_string(),
+            session_id: String::new(),
+            cache_scope: String::new(),
+        };
+        assert!(registry.is_empty());
+        let response = nono_proxy::capture::CredentialCaptureBackend::capture(&backend, request)
+            .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
+        assert_capture_secret(&response, "ghp_registry_capture_1234");
+        let (_, entries) = registry.snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "github");
+        assert_eq!(entries[0].value.as_str(), "ghp_registry_capture_1234");
+        Ok(())
+    }
+
+    #[test]
+    fn register_capture_material_registers_header_values_and_tokens() {
+        let registry = nono_proxy::SecretRegistry::new();
+        register_capture_material(
+            &registry,
+            "corp",
+            &nono_proxy::capture::CredentialCaptureMaterial::Headers(vec![
+                (
+                    "Authorization".to_string(),
+                    Zeroizing::new("Bearer corp-header-token-1".to_string()),
+                ),
+                (
+                    "X-Api-Key".to_string(),
+                    Zeroizing::new("corp-api-key-2".to_string()),
+                ),
+            ]),
+        );
+        let values: Vec<(String, String)> = registry
+            .snapshot()
+            .1
+            .into_iter()
+            .map(|e| (e.name, e.value.to_string()))
+            .collect();
+        assert!(values.contains(&(
+            "corp:Authorization".to_string(),
+            "Bearer corp-header-token-1".to_string()
+        )));
+        assert!(values.contains(&(
+            "corp:Authorization".to_string(),
+            "corp-header-token-1".to_string()
+        )));
+        assert!(values.contains(&("corp:X-Api-Key".to_string(), "corp-api-key-2".to_string())));
     }
 
     #[cfg(target_os = "linux")]

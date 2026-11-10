@@ -218,6 +218,13 @@ pub struct ProxyConfig {
     /// `nono proxy` command, which has no sandboxed child.
     #[serde(default, skip)]
     pub outer_caps: Option<nono::CapabilitySet>,
+
+    /// Session secret registry (NEP-0010 §3.1). When set, the proxy registers
+    /// every credential value it loads, refreshes, or captures so the
+    /// supervisor can redact it from terminal recordings. `None` leaves
+    /// behaviour unchanged. Skipped during (de)serialisation.
+    #[serde(default, skip)]
+    pub secret_registry: Option<crate::secret_registry::SecretRegistry>,
 }
 
 /// Pre-generated CA key material for cross-session CA reuse.
@@ -281,6 +288,7 @@ impl Default for ProxyConfig {
             enable_h2: false,
             enable_network_audit: default_enable_network_audit(),
             outer_caps: None,
+            secret_registry: None,
         }
     }
 }

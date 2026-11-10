@@ -573,12 +573,14 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
         &session.metadata,
         args.public_key_file.as_deref(),
     )?;
+    let recording = crate::terminal_capture::recording::verify(&session.dir)?;
 
     if args.json {
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "session": result,
             "ledger": ledger,
             "attestation": attestation,
+            "recording": recording,
         }))
         .map_err(|e| NonoError::Snapshot(format!("JSON serialization failed: {e}")))?;
         println!("{json}");
@@ -596,7 +598,8 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
         && ledger.session_found
         && ledger.session_digest_matches
         && ledger.ledger_chain_verified
-        && attestation_verified;
+        && attestation_verified
+        && (!recording.present || recording.verified());
     let status = if verified {
         "VERIFIED".green().bold()
     } else {
@@ -656,6 +659,9 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
             .map(|h| h.to_string())
             .unwrap_or_else(|| "-".to_string())
     );
+    if recording.present {
+        print_recording_verification(&recording);
+    }
     if attestation.present {
         let signed_status = if attestation_verified {
             if attestation.expected_public_key_matches.is_some() {
@@ -698,6 +704,47 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
         Err(NonoError::Snapshot(
             "Audit integrity verification failed".to_string(),
         ))
+    }
+}
+
+fn print_recording_verification(recording: &crate::terminal_capture::recording::RecordingReport) {
+    let status = if recording.verified() {
+        "verified".green().bold().to_string()
+    } else {
+        "mismatch".red().bold().to_string()
+    };
+    let mut details = vec![format!("chunks={}", recording.chunks)];
+    if recording.lost_events > 0 {
+        details.push(format!("lost={} (recorded)", recording.lost_events));
+    }
+    if recording.truncated {
+        details.push("truncated".to_string());
+    }
+    eprintln!("  Terminal: {} ({})", status, details.join(", "));
+    let list = |indexes: &[u64]| {
+        indexes
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !recording.missing.is_empty() {
+        eprintln!("    missing chunks: {}", list(&recording.missing));
+    }
+    if !recording.mismatched.is_empty() {
+        eprintln!("    altered chunks: {}", list(&recording.mismatched));
+    }
+    if recording.index_gaps {
+        eprintln!("    chunk indexes are not contiguous");
+    }
+    for (start, end) in &recording.unexplained_gaps {
+        eprintln!("    events {start}..{end} are missing without a recorded loss");
+    }
+    if !recording.unreferenced_files.is_empty() {
+        eprintln!(
+            "    not in the audit log: {}",
+            sanitize_for_terminal(&recording.unreferenced_files.join(", "))
+        );
     }
 }
 

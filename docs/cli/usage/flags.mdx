@@ -1279,6 +1279,43 @@ The flag adds to any `linux.isolate` set by the profile and cannot remove it. Su
   `--sandbox-policy external` provides no nono-managed TCP egress lockdown. Only use it when you have independently verified that the surrounding infrastructure forces outbound traffic through the intended proxy.
 </Warning>
 
+### Session Recording Flags
+
+Record the session's terminal into its audit log. These flags can only raise
+what the profile sets; they never turn recording off. They conflict with
+`--no-audit`. Supported by `nono run` and `nono shell`. See
+[Session Recording](/cli/features/session-recording).
+
+#### `--record`
+
+Turn session recording on. Env: `NONO_RECORD`.
+
+```bash
+nono run --record --allow-cwd -- my-agent
+```
+
+#### `--record-required`
+
+Make recording required: the agent does not run if recording cannot start, the
+session stops if recording fails, and nono exits with status 74 if the recording
+is incomplete. Implies `--record`. Env: `NONO_RECORD_REQUIRED`.
+
+#### `--record-file <PATH>`
+
+Also write the recording to `PATH`, with a chunk manifest at
+`PATH.manifest.json`. Both files must not already exist. Implies `--record`.
+Env: `NONO_RECORD_FILE`.
+
+```bash
+nono run --record-required --record-file ./artifacts/session.cast --profile ci-agent -- my-agent
+```
+
+#### `--deliver-to <RECEIVER>`
+
+Upload the recording to `RECEIVER` as it is made. The only receiver is
+`platform`, the platform this host is enrolled with. Implies `--record`. Env:
+`NONO_DELIVER_TO`.
+
 ### Operational Flags
 
 #### `--dry-run`

@@ -1942,6 +1942,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: Some(crate::config::EndpointPolicyConfig {
                 allow: vec![crate::config::EndpointPolicyRule {

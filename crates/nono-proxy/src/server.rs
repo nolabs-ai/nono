@@ -5588,6 +5588,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -5612,6 +5613,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![crate::config::EndpointRule {
                         method: "GET".to_string(),
                         path: "/**".to_string(),

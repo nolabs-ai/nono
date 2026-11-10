@@ -2923,6 +2923,14 @@ fn validate_credential(
             // Replicate the session-level validate_aws_auth checks so malformed
             // profile/region/service values don't propagate to the signing path.
             if let Some(ref aws) = credential.aws_auth {
+                if let Some(ref upstream) = credential.upstream
+                    && let Err(e) = nono_proxy::aws::endpoints::validate_aws_upstream(upstream, aws)
+                {
+                    report.error(
+                        "invalid_credential",
+                        format!("proxy credential '{name}': {e}"),
+                    );
+                }
                 if let Some(ref profile) = aws.profile
                     && (profile.is_empty() || profile.contains(char::is_whitespace))
                 {
@@ -7151,6 +7159,35 @@ mod tests {
             validate_one(&cred).errors.is_empty(),
             "well-formed proxy aws_auth should validate"
         );
+    }
+
+    #[test]
+    fn proxy_credential_wildcard_region_upstream_validated() {
+        let cred = |upstream: &str, region: Option<&str>| CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some(upstream.to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                region: region.map(str::to_string),
+                service: Some("eks".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred("https://eks.*.amazonaws.com", None))
+                .errors
+                .is_empty()
+        );
+        for (upstream, region) in [
+            ("https://eks.*.amazonaws.com", Some("us-east-1")),
+            ("https://eks.*.amazonaws.com.cn", None),
+            ("https://*.s3.*.amazonaws.com", None),
+        ] {
+            assert!(
+                !validate_one(&cred(upstream, region)).errors.is_empty(),
+                "{upstream} {region:?}"
+            );
+        }
     }
 
     #[test]

@@ -91,6 +91,10 @@ pub enum ApprovalRequest {
         path: String,
         /// The endpoint policy rule/default that triggered approval
         rule_label: String,
+        /// AWS operation name for `aws_auth` routes (`"Unknown"` when it
+        /// could not be determined); `None` for other routes.
+        #[serde(default)]
+        operation: Option<String>,
         /// Human-readable reason
         reason: Option<String>,
         /// PID of the requesting child process, if known
@@ -229,6 +233,10 @@ impl ApprovalDecision {
     }
 
     /// Collapse the session-scoped variants to their one-shot equivalents.
+    ///
+    /// Endpoint approvals are never cached locally. Any future endpoint grant
+    /// cache must key on `(route_id, upstream, method, path, operation)` so a
+    /// grant for one AWS operation cannot satisfy another.
     ///
     /// Session caching is only implemented on the network CONNECT path, which
     /// keys decisions by `(host, port)`. Every other approval consumer treats a

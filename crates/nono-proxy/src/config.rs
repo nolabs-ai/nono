@@ -1069,6 +1069,10 @@ pub struct EndpointPolicyRule {
     pub reason: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// AWS operation-name globs (`aws_auth` routes only). `Unknown` is the
+    /// literal name used when the operation cannot be determined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Vec<String>>,
 }
 
 /// Explicit L7 endpoint policy for a route.
@@ -1115,7 +1119,36 @@ struct CompiledPolicyRule {
     backend: Option<String>,
     reason: Option<String>,
     timeout_secs: Option<u64>,
+    operations: Option<globset::GlobSet>,
+    operations_src: Vec<String>,
 }
+
+impl CompiledPolicyRule {
+    fn label(&self) -> String {
+        if self.operations_src.is_empty() {
+            format!("{} {}", self.method, self.path)
+        } else {
+            format!(
+                "{} {} ops={}",
+                self.method,
+                self.path,
+                self.operations_src.join(",")
+            )
+        }
+    }
+}
+
+/// Request attributes evaluated by [`CompiledEndpointPolicy::evaluate_request`].
+#[derive(Debug, Clone, Copy)]
+pub struct EndpointRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    /// Resolved AWS operation name. `None` is evaluated as `Unknown`.
+    pub operation: Option<&'a str>,
+}
+
+/// Operation name used when the AWS operation cannot be determined.
+pub const UNKNOWN_OPERATION: &str = "Unknown";
 
 /// Result of evaluating a compiled endpoint policy.
 #[derive(Debug)]
@@ -1261,6 +1294,7 @@ impl CompiledEndpointPolicy {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             })
             .collect::<Vec<_>>();
         let default = if allow.is_empty() {
@@ -1314,6 +1348,49 @@ impl CompiledEndpointPolicy {
     /// policy constrains endpoints at all.
     #[must_use]
     pub fn evaluate<'a>(&'a self, method: &str, path: &str) -> EndpointPolicyOutcome<'a> {
+        self.evaluate_request(&EndpointRequest {
+            method,
+            path,
+            operation: None,
+        })
+    }
+
+    /// `true` when any rule constrains the AWS operation name.
+    #[must_use]
+    pub fn has_operation_rules(&self) -> bool {
+        self.deny
+            .iter()
+            .chain(&self.approve)
+            .chain(&self.allow)
+            .any(|r| r.operations.is_some())
+    }
+
+    /// `true` when a deny or approve rule with `operations` matches the
+    /// `Unknown` operation for some method and path.
+    #[must_use]
+    pub fn restrictive_rule_matches_unknown(&self) -> bool {
+        self.deny.iter().chain(&self.approve).any(|r| {
+            r.operations
+                .as_ref()
+                .is_some_and(|set| set.is_match(UNKNOWN_OPERATION))
+        })
+    }
+
+    /// `true` when the default decision is allow.
+    #[must_use]
+    pub fn default_allows(&self) -> bool {
+        self.default.decision == EndpointPolicyDecision::Allow
+    }
+
+    /// Evaluate a request using deny, approve, allow, default precedence.
+    #[must_use]
+    pub fn evaluate_request<'a>(&'a self, req: &EndpointRequest<'_>) -> EndpointPolicyOutcome<'a> {
+        let EndpointRequest {
+            method,
+            path,
+            operation,
+        } = *req;
+        let operation = operation.unwrap_or(UNKNOWN_OPERATION);
         if !self.allows_all_without_l7() && path_is_ambiguous(path) {
             return EndpointPolicyOutcome::Deny {
                 reason: Some(
@@ -1325,23 +1402,23 @@ impl CompiledEndpointPolicy {
             };
         }
         let normalized = normalize_path(path);
-        if let Some(rule) = first_policy_match(&self.deny, method, &normalized) {
+        if let Some(rule) = first_policy_match(&self.deny, method, &normalized, operation) {
             return EndpointPolicyOutcome::Deny {
                 reason: rule.reason.as_deref(),
-                rule_label: format!("endpoint_policy.deny[{} {}]", rule.method, rule.path),
+                rule_label: format!("endpoint_policy.deny[{}]", rule.label()),
             };
         }
-        if let Some(rule) = first_policy_match(&self.approve, method, &normalized) {
+        if let Some(rule) = first_policy_match(&self.approve, method, &normalized, operation) {
             return EndpointPolicyOutcome::Approve {
                 backend: rule.backend.as_deref(),
                 reason: rule.reason.as_deref(),
                 timeout_secs: rule.timeout_secs,
-                rule_label: format!("endpoint_policy.approve[{} {}]", rule.method, rule.path),
+                rule_label: format!("endpoint_policy.approve[{}]", rule.label()),
             };
         }
-        if let Some(rule) = first_policy_match(&self.allow, method, &normalized) {
+        if let Some(rule) = first_policy_match(&self.allow, method, &normalized, operation) {
             return EndpointPolicyOutcome::Allow {
-                rule_label: format!("endpoint_policy.allow[{} {}]", rule.method, rule.path),
+                rule_label: format!("endpoint_policy.allow[{}]", rule.label()),
             };
         }
 
@@ -1370,6 +1447,10 @@ fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPoli
             .literal_separator(true)
             .build()
             .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
+        let (operations, operations_src) = match &rule.operations {
+            Some(ops) => (Some(compile_operation_globs(ops)?), ops.clone()),
+            None => (None, Vec::new()),
+        };
         compiled.push(CompiledPolicyRule {
             method: rule.method.clone(),
             path: rule.path.clone(),
@@ -1377,19 +1458,71 @@ fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPoli
             backend: rule.backend.clone(),
             reason: rule.reason.clone(),
             timeout_secs: rule.timeout_secs,
+            operations,
+            operations_src,
         });
     }
     Ok(compiled)
+}
+
+/// Validate and compile `operations` patterns: non-empty list of 1-256 byte
+/// patterns over `[A-Za-z0-9_*?]` (no classes, alternation or separators).
+pub fn compile_operation_globs(patterns: &[String]) -> Result<globset::GlobSet, String> {
+    if patterns.is_empty() {
+        return Err("endpoint policy 'operations' must not be empty".to_string());
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for p in patterns {
+        validate_operation_pattern(p)?;
+        let glob = GlobBuilder::new(p)
+            .literal_separator(false)
+            .build()
+            .map_err(|e| format!("invalid operation pattern '{}': {}", p, e))?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("invalid operations: {}", e))
+}
+
+/// `true` when the patterns are valid and match the `Unknown` operation.
+#[must_use]
+pub fn operations_match_unknown(patterns: &[String]) -> bool {
+    compile_operation_globs(patterns).is_ok_and(|set| set.is_match(UNKNOWN_OPERATION))
+}
+
+/// Check a single `operations` pattern against the allowed charset.
+pub fn validate_operation_pattern(p: &str) -> Result<(), String> {
+    if p.is_empty() || p.len() > 256 {
+        return Err(format!(
+            "operation pattern must be 1-256 bytes (got {} bytes)",
+            p.len()
+        ));
+    }
+    if !p
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'*' | b'?'))
+    {
+        return Err(format!(
+            "operation pattern '{}' may only contain [A-Za-z0-9_*?]",
+            p
+        ));
+    }
+    Ok(())
 }
 
 fn first_policy_match<'a>(
     rules: &'a [CompiledPolicyRule],
     method: &str,
     normalized_path: &str,
+    operation: &str,
 ) -> Option<&'a CompiledPolicyRule> {
     rules.iter().find(|r| {
         (r.method == "*" || r.method.eq_ignore_ascii_case(method))
             && r.matcher.is_match(normalized_path)
+            && r.operations
+                .as_ref()
+                .is_none_or(|set| set.is_match(operation))
     })
 }
 
@@ -2126,6 +2259,7 @@ mod tests {
                 backend: None,
                 reason: Some("blocked".to_string()),
                 timeout_secs: None,
+                operations: None,
             }],
             approve: vec![EndpointPolicyRule {
                 method: "POST".to_string(),
@@ -2133,6 +2267,7 @@ mod tests {
                 backend: Some("terminal".to_string()),
                 reason: None,
                 timeout_secs: Some(5),
+                operations: None,
             }],
             allow: vec![EndpointPolicyRule {
                 method: "POST".to_string(),
@@ -2140,6 +2275,7 @@ mod tests {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
         };
         let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
@@ -2165,6 +2301,7 @@ mod tests {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
             ..EndpointPolicyConfig::default()
         };
@@ -2237,6 +2374,7 @@ mod tests {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
             ..EndpointPolicyConfig::default()
         };
@@ -2306,6 +2444,7 @@ mod tests {
                 backend: Some("terminal".to_string()),
                 reason: Some("sensitive endpoint".to_string()),
                 timeout_secs: Some(10),
+                operations: None,
             }],
             ..EndpointPolicyConfig::default()
         };
@@ -2320,6 +2459,203 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn op_rule(method: &str, path: &str, ops: &[&str]) -> EndpointPolicyRule {
+        EndpointPolicyRule {
+            method: method.to_string(),
+            path: path.to_string(),
+            backend: None,
+            reason: None,
+            timeout_secs: None,
+            operations: Some(ops.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    fn eval_op<'a>(
+        policy: &'a CompiledEndpointPolicy,
+        operation: Option<&str>,
+    ) -> EndpointPolicyOutcome<'a> {
+        policy.evaluate_request(&EndpointRequest {
+            method: "POST",
+            path: "/",
+            operation,
+        })
+    }
+
+    #[test]
+    fn test_operations_rule_requires_method_path_and_operation() {
+        let policy = EndpointPolicyConfig {
+            allow: vec![op_rule("POST", "/", &["Describe*", "GetParameter"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        assert!(matches!(
+            eval_op(&compiled, Some("DescribeInstances")),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            eval_op(&compiled, Some("GetParameter")),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            eval_op(&compiled, Some("TerminateInstances")),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        // Method and path must still match.
+        assert!(matches!(
+            compiled.evaluate_request(&EndpointRequest {
+                method: "GET",
+                path: "/",
+                operation: Some("DescribeInstances"),
+            }),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_operations_match_is_case_sensitive() {
+        let policy = EndpointPolicyConfig {
+            allow: vec![op_rule("POST", "/", &["Describe*"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        assert!(matches!(
+            eval_op(&compiled, Some("describeinstances")),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_operations_unknown_is_matchable() {
+        let allow_only = EndpointPolicyConfig {
+            allow: vec![op_rule("POST", "/", &["Describe*"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&allow_only), &[]).unwrap();
+        assert!(matches!(
+            eval_op(&compiled, None),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            eval_op(&compiled, Some("Unknown")),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+
+        let star = EndpointPolicyConfig {
+            allow: vec![op_rule("POST", "/", &["*"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&star), &[]).unwrap();
+        assert!(matches!(
+            eval_op(&compiled, None),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn test_operations_precedence_and_labels() {
+        let policy = EndpointPolicyConfig {
+            default: EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            },
+            deny: vec![op_rule("POST", "/", &["Delete*", "Put*"])],
+            allow: vec![op_rule("POST", "/", &["*"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        match eval_op(&compiled, Some("DeleteParameter")) {
+            EndpointPolicyOutcome::Deny { rule_label, .. } => {
+                assert_eq!(rule_label, "endpoint_policy.deny[POST / ops=Delete*,Put*]");
+            }
+            other => panic!("expected deny, got {other:?}"),
+        }
+        assert!(matches!(
+            eval_op(&compiled, Some("GetParameter")),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(compiled.has_operation_rules());
+        assert!(!compiled.restrictive_rule_matches_unknown());
+    }
+
+    #[test]
+    fn test_restrictive_rule_matches_unknown_detection() {
+        for (ops, expected) in [
+            (vec!["Unknown"], true),
+            (vec!["*"], true),
+            (vec!["U*"], true),
+            (vec!["Delete*"], false),
+        ] {
+            let policy = EndpointPolicyConfig {
+                deny: vec![op_rule("POST", "/", &ops)],
+                ..EndpointPolicyConfig::default()
+            };
+            let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+            assert_eq!(
+                compiled.restrictive_rule_matches_unknown(),
+                expected,
+                "{ops:?}"
+            );
+        }
+        // Allow rules never count as restricting `Unknown`.
+        let policy = EndpointPolicyConfig {
+            allow: vec![op_rule("POST", "/", &["*"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        assert!(!compiled.restrictive_rule_matches_unknown());
+    }
+
+    #[test]
+    fn test_operations_rules_without_operations_unchanged() {
+        let policy = EndpointPolicyConfig {
+            allow: vec![EndpointPolicyRule {
+                method: "POST".to_string(),
+                path: "/".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+                operations: None,
+            }],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        assert!(!compiled.has_operation_rules());
+        assert!(matches!(
+            eval_op(&compiled, Some("Anything")),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("POST", "/"),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn test_operations_compile_rejects_invalid_patterns() {
+        for ops in [
+            vec![],
+            vec![""],
+            vec!["Get[A]"],
+            vec!["a.b"],
+            vec!["a/b"],
+            vec!["{A,B}"],
+            vec!["Gét"],
+            vec!["a b"],
+        ] {
+            let policy = EndpointPolicyConfig {
+                allow: vec![op_rule("POST", "/", &ops)],
+                ..EndpointPolicyConfig::default()
+            };
+            assert!(
+                CompiledEndpointPolicy::compile(Some(&policy), &[]).is_err(),
+                "{ops:?} should be rejected"
+            );
+        }
+        let too_long = "a".repeat(257);
+        assert!(compile_operation_globs(&[too_long]).is_err());
     }
 
     #[test]

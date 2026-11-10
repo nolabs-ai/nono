@@ -992,6 +992,9 @@ pub struct EndpointRuleConfig {
     pub reason: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// AWS operation-name globs; valid only on `aws_auth` credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2028,11 +2031,16 @@ fn validate_sandbox(
         if let CommandCredentialGrantConfig::Policy(grant) = credential
             && let Some(endpoint_policy) = &grant.endpoint_policy
         {
+            let aws_auth = config
+                .credentials
+                .get(grant.name.as_str())
+                .is_some_and(|c| c.aws_auth.is_some());
             validate_endpoint_policy(
                 command_name,
                 caller,
                 grant.name.as_str(),
                 endpoint_policy,
+                aws_auth,
                 config,
                 report,
             );
@@ -2569,6 +2577,7 @@ fn validate_endpoint_policy(
     caller: &str,
     credential_name: &str,
     policy: &EndpointPolicyConfig,
+    aws_auth: bool,
     config: &CommandPoliciesConfig,
     report: &mut CommandPolicyValidationReport,
 ) {
@@ -2580,6 +2589,33 @@ fn validate_endpoint_policy(
         config,
         report,
     );
+    let has_operations = [&policy.deny, &policy.approve, &policy.allow]
+        .iter()
+        .any(|rules| rules.iter().any(|r| r.operations.is_some()));
+    let unknown_restricted = [&policy.deny, &policy.approve].iter().any(|rules| {
+        rules
+            .iter()
+            .filter_map(|r| r.operations.as_ref())
+            .any(|ops| nono_proxy::config::operations_match_unknown(ops))
+    });
+    if aws_auth
+        && has_operations
+        && !unknown_restricted
+        && matches!(
+            policy.default,
+            PolicyDecisionConfig::Decision(PolicyDecision::Allow)
+        )
+    {
+        report.warning(
+            "endpoint_policy_unknown_operation_allowed",
+            format!(
+                "command '{command_name}' from.{caller} credential '{credential_name}' uses \
+                 default: allow with operations rules but nothing denies or approves the \
+                 'Unknown' operation; requests whose operation cannot be determined will be \
+                 allowed. Prefer default: deny with allow rules."
+            ),
+        );
+    }
     for (bucket, rules) in [
         ("deny", policy.deny.as_slice()),
         ("approve", policy.approve.as_slice()),
@@ -2599,6 +2635,17 @@ fn validate_endpoint_policy(
             }
             if rule.method.contains('\0') || rule.path.contains('\0') {
                 report.error("invalid_endpoint_policy", format!("{label} contains NUL"));
+            }
+            if let Some(operations) = &rule.operations {
+                if !aws_auth {
+                    report.error(
+                        "invalid_endpoint_policy",
+                        format!("{label} sets operations, which requires an aws_auth credential"),
+                    );
+                }
+                if let Err(err) = nono_proxy::config::compile_operation_globs(operations) {
+                    report.error("invalid_endpoint_policy", format!("{label}: {err}"));
+                }
             }
         }
     }
@@ -6698,6 +6745,7 @@ mod tests {
                                         backend: None,
                                         reason: None,
                                         timeout_secs: Some(0),
+                                        operations: None,
                                     }],
                                     ..Default::default()
                                 }),
@@ -6733,6 +6781,141 @@ mod tests {
             timeout_errors, 5,
             "expected timeout validation on defaults, backend, invocation, endpoint, and intercept"
         );
+    }
+
+    fn config_with_operations_grant(ops: Vec<String>) -> CommandPoliciesConfig {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.sandbox = None;
+            git.from.insert(
+                "session".to_string(),
+                CommandFromConfig::Edge(Box::new(CommandEdgeConfig {
+                    sandbox: CommandSandboxConfig {
+                        credentials: vec![CommandCredentialGrantConfig::Policy(
+                            CommandCredentialGrantPolicyConfig {
+                                name: "github-api".to_string(),
+                                endpoint_policy: Some(EndpointPolicyConfig {
+                                    allow: vec![EndpointRuleConfig {
+                                        method: "POST".to_string(),
+                                        path: "/".to_string(),
+                                        backend: None,
+                                        reason: None,
+                                        timeout_secs: None,
+                                        operations: Some(ops),
+                                    }],
+                                    ..Default::default()
+                                }),
+                            },
+                        )],
+                        ..Default::default()
+                    },
+                    invocation_policy: None,
+                })),
+            );
+        }
+        config
+    }
+
+    fn endpoint_policy_errors(config: &CommandPoliciesConfig) -> Vec<String> {
+        validate_command_policies(Some(config), CommandPolicyValidationScope::Syntax)
+            .errors
+            .into_iter()
+            .filter(|finding| finding.code == "invalid_endpoint_policy")
+            .map(|finding| finding.message)
+            .collect()
+    }
+
+    #[test]
+    fn validate_default_allow_without_unknown_restriction_warns() {
+        let aws_credential = || CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://ssm.us-east-1.amazonaws.com".to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+            ..Default::default()
+        };
+        let warns = |config: &CommandPoliciesConfig| {
+            validate_command_policies(Some(config), CommandPolicyValidationScope::Syntax)
+                .warnings
+                .iter()
+                .any(|w| w.code == "endpoint_policy_unknown_operation_allowed")
+        };
+        let set_policy = |config: &mut CommandPoliciesConfig, deny_ops: Option<&str>| {
+            let Some(git) = config.commands.get_mut("git") else {
+                panic!("git command");
+            };
+            let Some(CommandFromConfig::Edge(edge)) = git.from.get_mut("session") else {
+                panic!("session edge");
+            };
+            let Some(CommandCredentialGrantConfig::Policy(grant)) =
+                edge.sandbox.credentials.first_mut()
+            else {
+                panic!("policy grant");
+            };
+            let Some(policy) = grant.endpoint_policy.as_mut() else {
+                panic!("endpoint policy");
+            };
+            policy.default = PolicyDecisionConfig::Decision(PolicyDecision::Allow);
+            policy.deny = deny_ops
+                .map(|op| {
+                    vec![EndpointRuleConfig {
+                        method: "POST".to_string(),
+                        path: "/".to_string(),
+                        backend: None,
+                        reason: None,
+                        timeout_secs: None,
+                        operations: Some(vec![op.to_string()]),
+                    }]
+                })
+                .unwrap_or_default();
+        };
+
+        let mut config = config_with_operations_grant(vec!["Describe*".to_string()]);
+        config
+            .credentials
+            .insert("github-api".to_string(), aws_credential());
+        set_policy(&mut config, None);
+        assert!(warns(&config), "default allow + allow-only ops must warn");
+        set_policy(&mut config, Some("Delete*"));
+        assert!(warns(&config), "deny not covering Unknown must warn");
+        set_policy(&mut config, Some("*"));
+        assert!(!warns(&config), "deny matching Unknown must not warn");
+    }
+
+    #[test]
+    fn validate_operations_requires_aws_auth_credential() {
+        let config = config_with_operations_grant(vec!["Describe*".to_string()]);
+        let errors = endpoint_policy_errors(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("aws_auth")),
+            "operations on a non-aws_auth credential must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_operations_accepts_aws_auth_credential_and_checks_patterns() {
+        let mut config = config_with_operations_grant(vec!["Describe*".to_string()]);
+        config.credentials.insert(
+            "github-api".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://ssm.us-east-1.amazonaws.com".to_string()),
+                aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+                ..Default::default()
+            },
+        );
+        assert!(endpoint_policy_errors(&config).is_empty());
+
+        let mut config = config_with_operations_grant(vec!["Get[A]".to_string()]);
+        config.credentials.insert(
+            "github-api".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://ssm.us-east-1.amazonaws.com".to_string()),
+                aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+                ..Default::default()
+            },
+        );
+        assert!(!endpoint_policy_errors(&config).is_empty());
     }
 
     #[test]

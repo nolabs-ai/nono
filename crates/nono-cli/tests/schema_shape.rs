@@ -673,7 +673,14 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
     assert_schema_properties(
         &schema,
         "EndpointRuleConfig",
-        &["backend", "method", "path", "reason", "timeout_secs"],
+        &[
+            "backend",
+            "method",
+            "operations",
+            "path",
+            "reason",
+            "timeout_secs",
+        ],
     );
     assert_schema_properties(
         &schema,

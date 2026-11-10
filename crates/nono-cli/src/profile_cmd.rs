@@ -988,6 +988,13 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             theme::fg(if elev { "enabled" } else { "disabled" }, t.text)
         );
     }
+    if let Some(enabled) = profile.security.session_socket_auth {
+        println!(
+            "  {} {}",
+            theme::fg("Session socket authentication:", t.subtext),
+            theme::fg(if enabled { "enabled" } else { "disabled" }, t.text)
+        );
+    }
     if let Some(policy) = profile.security.wsl2_proxy_policy {
         println!(
             "  {} {}",
@@ -1303,6 +1310,9 @@ fn profile_to_json(
     // Serialize with the right rename_all annotations, so values render as
     // snake_case (`isolated`, `allow_same_sandbox`, …).
     let mut security = serde_json::Map::new();
+    if let Some(enabled) = profile.security.session_socket_auth {
+        security.insert("session_socket_auth".into(), serde_json::json!(enabled));
+    }
     if let Some(v) = profile.security.signal_mode {
         security.insert("signal_mode".into(), serde_json::json!(v));
     }
@@ -1557,6 +1567,12 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
     }
 
     // Security scalar fields
+    any_diff |= diff_scalar_option(
+        "session_socket_auth",
+        &p1.security.session_socket_auth.map(|v| v.to_string()),
+        &p2.security.session_socket_auth.map(|v| v.to_string()),
+        t,
+    );
     any_diff |= diff_scalar_option(
         "capability_elevation",
         &p1.security.capability_elevation.map(|v| format!("{v}")),
@@ -2113,6 +2129,11 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "profile1": p1.security.capability_elevation,
             "profile2": p2.security.capability_elevation,
             "changed": p1.security.capability_elevation != p2.security.capability_elevation,
+        },
+        "session_socket_auth": {
+            "profile1": p1.security.session_socket_auth,
+            "profile2": p2.security.session_socket_auth,
+            "changed": p1.security.session_socket_auth != p2.security.session_socket_auth,
         },
         "wsl2_proxy_policy": {
             "profile1": p1.security.wsl2_proxy_policy,
@@ -2973,6 +2994,12 @@ fn resolve_to_manifest(
 ) -> Result<nono::manifest::CapabilityManifest> {
     use nono::manifest;
 
+    if prof.security.session_socket_auth == Some(true) {
+        return Err(NonoError::ConfigParse(
+            "session_socket_auth is CLI policy and cannot be represented in a capability manifest; use --profile to preserve it".to_string(),
+        ));
+    }
+
     // Helper: expand a path template and convert to string for the manifest
     let expand = |tmpl: &str| -> Result<String> {
         let expanded = profile::expand_vars(tmpl, workdir)?;
@@ -3389,6 +3416,32 @@ mod tests {
     use super::*;
     use crate::profile::Profile;
     use std::path::PathBuf;
+
+    #[test]
+    fn session_socket_auth_survives_profile_show_and_cannot_be_lost_in_manifest_export() {
+        for enabled in [None, Some(false), Some(true)] {
+            let mut profile = Profile::default();
+            profile.security.session_socket_auth = enabled;
+            let shown = profile_to_json("test", &profile, &None);
+            let restored: profile::SecurityConfig =
+                serde_json::from_value(shown["security"].clone()).expect("shown security settings");
+            assert_eq!(restored.session_socket_auth, enabled);
+            let manifest = resolve_to_manifest(&profile, std::path::Path::new("/tmp"));
+            if enabled == Some(true) {
+                assert!(
+                    manifest
+                        .expect_err("manifest cannot preserve authentication")
+                        .to_string()
+                        .contains("session_socket_auth")
+                );
+            } else {
+                assert!(
+                    manifest.is_ok(),
+                    "default manifest export remains compatible"
+                );
+            }
+        }
+    }
 
     /// The profile authoring guide is compiled into the binary and surfaced
     /// via `nono profile guide`. It must not instruct users to run the

@@ -105,6 +105,7 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
         &proxy.credential_capture,
         proxy.session_id.clone(),
         nono::CapabilitySet::default(),
+        proxy.session_socket_auth,
     )?;
     let approval_registry = crate::approval_runtime::build_proxy_approval_registry(
         proxy.command_policies.as_ref(),
@@ -417,6 +418,10 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
     let enable_h2 = args.allow_http2 || network.map(|n| n.allow_http2).unwrap_or(false);
 
     Ok(ProxyLaunchOptions {
+        session_socket_auth: loaded
+            .as_ref()
+            .and_then(|profile| profile.security.session_socket_auth)
+            .unwrap_or(false),
         domain_filter,
         endpoint_filter,
         credentials: credentials_intent,

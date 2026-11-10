@@ -130,6 +130,7 @@ fn supervise_with_backend(
 ) -> Result<i32> {
     let scrub = nono::ScrubPolicy::secure_default();
     let config = SupervisorConfig {
+        session_socket_auth: false,
         protected_roots: &[],
         deny_paths: &[],
         approval_backend: backend,
@@ -876,6 +877,7 @@ fn full_cli_supervisor_combined_path() -> Result<()> {
         config.threading = ThreadingContext::CryptoExpected;
         let scrub = nono::ScrubPolicy::secure_default();
         let supervisor = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &Deny,
@@ -943,6 +945,7 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
         let credentials = std::collections::BTreeSet::new();
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
+                session_socket_auth: false,
                 config: &policy,
                 initial_program: Path::new("/usr/bin/python3"),
                 resolved_command_binaries: None,

@@ -25,6 +25,7 @@ struct SessionRuntimeState {
 }
 
 pub(crate) struct SupervisedRuntimeContext<'a> {
+    pub(crate) session_socket_auth: bool,
     pub(crate) config: &'a exec_strategy::ExecConfig<'a>,
     pub(crate) caps: &'a CapabilitySet,
     /// Resolved deny paths; the supervisor never grants beneath them.
@@ -214,6 +215,7 @@ fn should_open_supervised_pty(
 
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
     let SupervisedRuntimeContext {
+        session_socket_auth,
         config,
         caps,
         deny_paths,
@@ -345,6 +347,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     let supervisor_session_id = build_supervisor_session_id(audit_state.as_ref());
     let supervisor_deny_paths = exec_strategy::supervisor_deny_paths(deny_paths);
     let supervisor_cfg = exec_strategy::SupervisorConfig {
+        session_socket_auth,
         protected_roots: protected_roots.as_paths(),
         deny_paths: &supervisor_deny_paths,
         approval_backend,

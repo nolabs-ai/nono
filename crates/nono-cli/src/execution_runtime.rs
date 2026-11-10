@@ -463,6 +463,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: command_policies,
+                session_socket_auth: flags.session_socket_auth,
                 initial_program: &resolved_program,
                 resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
                 audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
@@ -496,6 +497,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: command_policies,
+                session_socket_auth: flags.session_socket_auth,
                 resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
                 audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
                     flags.profile_display_name.clone(),
@@ -830,6 +832,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                     .and_then(|d| d.backend.clone()),
             )?;
             let exit_result = execute_supervised_runtime(SupervisedRuntimeContext {
+                session_socket_auth: flags.session_socket_auth,
                 config: &config,
                 caps: &caps,
                 deny_paths: &deny_paths,

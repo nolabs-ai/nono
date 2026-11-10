@@ -96,7 +96,10 @@ fn walk_ancestry(
             }
             return Ok(true);
         }
-        if process.parent <= 1 || process.parent == process.pid {
+        if process.parent == 0
+            || (process.parent == 1 && root != 1)
+            || process.parent == process.pid
+        {
             return Ok(false);
         }
         ancestry.push(process);
@@ -244,6 +247,51 @@ mod tests {
     fn ancestry_does_not_accept_an_unrelated_root() {
         let process = inspect(std::process::id()).expect("inspect self");
         assert!(!descends_from(process, u32::MAX).expect("walk"));
+    }
+
+    #[test]
+    fn authenticates_descendants_when_supervisor_is_pid_one() {
+        let root = Process {
+            pid: 1,
+            parent: 0,
+            birth: (0, 0),
+        };
+        let child = Process {
+            pid: 42,
+            parent: 1,
+            birth: (1, 0),
+        };
+        let grandchild = Process {
+            pid: 43,
+            parent: 42,
+            birth: (2, 0),
+        };
+        for caller in [child, grandchild] {
+            assert!(
+                walk_ancestry(caller, root.pid, |pid| match pid {
+                    1 => Ok(root),
+                    42 => Ok(child),
+                    43 => Ok(grandchild),
+                    _ => panic!("unexpected ancestor {pid}"),
+                })
+                .expect("walk to PID 1")
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_ancestry_that_ends_before_the_supervisor() {
+        for parent in [0, 1, 42] {
+            let caller = Process {
+                pid: 42,
+                parent,
+                birth: (1, 0),
+            };
+            assert!(
+                !walk_ancestry(caller, 44, |_| panic!("must not inspect past ancestry end"))
+                    .expect("unrelated ancestry")
+            );
+        }
     }
 
     #[test]

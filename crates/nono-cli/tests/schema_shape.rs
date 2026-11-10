@@ -113,6 +113,7 @@ fn test_schema_top_level_profile_matches_rust_model() {
             "hooks",
             "session_hooks",
             "rollback",
+            "session_recording",
             "open_urls",
             "allow_launch_services",
             "allow_gpu",
@@ -1189,6 +1190,23 @@ fn test_schema_validates_linux_sandbox_policy() {
 fn test_schema_workdir_config_matches_rust_model() {
     let schema = load_schema();
     assert_schema_properties(&schema, "WorkdirConfig", &["access"]);
+}
+
+#[test]
+fn test_schema_session_recording_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "SessionRecordingConfig",
+        &[
+            "enabled",
+            "required",
+            "input",
+            "max_bytes",
+            "file",
+            "delivery",
+        ],
+    );
 }
 
 #[test]

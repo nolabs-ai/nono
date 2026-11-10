@@ -15,6 +15,7 @@ use crate::config::{InjectMode, RouteConfig};
 use crate::diagnostic::{ProxyDiagnostic, ProxyDiagnosticCode};
 use crate::error::{ProxyError, Result};
 use crate::oauth2::{OAuth2ExchangeConfig, SpiffeAssertionTokenCache, TokenCache};
+use crate::secret_registry::SecretRegistry;
 use base64::Engine;
 use std::collections::HashMap;
 use tokio_rustls::TlsConnector;
@@ -76,6 +77,9 @@ pub struct CmdCredentialRoute {
     pub path_replacement: Option<String>,
     pub query_param_name: Option<String>,
     pub proxy_query_param_name: Option<String>,
+    /// Session secret registry; each captured value is registered on
+    /// materialization so it can be redacted from terminal recordings.
+    pub(crate) secret_registry: Option<SecretRegistry>,
 }
 
 impl CmdCredentialRoute {
@@ -104,7 +108,7 @@ impl CmdCredentialRoute {
             ),
         };
 
-        LoadedCredential {
+        let loaded = LoadedCredential {
             inject_mode: self.inject_mode.clone(),
             proxy_inject_mode: self.proxy_inject_mode.clone(),
             raw_credential,
@@ -117,6 +121,46 @@ impl CmdCredentialRoute {
             path_replacement: self.path_replacement.clone(),
             query_param_name: self.query_param_name.clone(),
             proxy_query_param_name: self.proxy_query_param_name.clone(),
+        };
+        if let Some(registry) = &self.secret_registry {
+            register_loaded_credential(registry, &self.credential_name, &loaded);
+        }
+        loaded
+    }
+}
+
+/// Register every secret value a loaded credential can put on the wire.
+///
+/// The raw value covers formatted headers such as `Bearer <raw>`, so the
+/// formatted header value is registered only when it does not contain the raw
+/// value (for example Basic auth, where the value is base64-encoded). Names
+/// are route prefixes or credential names, never values.
+pub(crate) fn register_loaded_credential(
+    registry: &SecretRegistry,
+    name: &str,
+    cred: &LoadedCredential,
+) {
+    registry.register(name, cred.raw_credential.as_str());
+    let header_value = cred.header_value.as_str();
+    if !header_value.is_empty()
+        && (cred.raw_credential.is_empty() || !header_value.contains(cred.raw_credential.as_str()))
+    {
+        register_header_value(registry, name, header_value);
+    }
+    for (header_name, value) in &cred.extra_headers {
+        let entry_name = format!("{name}:{header_name}");
+        register_header_value(registry, &entry_name, value.as_str());
+    }
+}
+
+/// Register a header value and, when it has the `<scheme> <token>` shape, the
+/// bare token as well so it is redacted wherever it appears on its own.
+fn register_header_value(registry: &SecretRegistry, name: &str, value: &str) {
+    registry.register(name, value);
+    if let Some((_, token)) = value.split_once(' ') {
+        let token = token.trim();
+        if !token.is_empty() && token != value {
+            registry.register(name, token);
         }
     }
 }
@@ -224,10 +268,25 @@ impl CredentialStore {
         tls_connector: &TlsConnector,
         outer_caps: Option<&nono::CapabilitySet>,
     ) -> Result<CredentialLoadOutcome> {
+        Self::load_with_registry(routes, tls_connector, outer_caps, None).await
+    }
+
+    /// Like [`Self::load_with_diagnostics`], additionally registering every
+    /// credential value the store holds or later obtains (OAuth2 refreshes,
+    /// command captures, AWS credential resolution) in `secret_registry`
+    /// so the supervisor can redact them from terminal recordings
+    /// (NEP-0010 §3.1). `None` behaves exactly like `load_with_diagnostics`.
+    pub async fn load_with_registry(
+        routes: &[RouteConfig],
+        tls_connector: &TlsConnector,
+        outer_caps: Option<&nono::CapabilitySet>,
+        secret_registry: Option<&SecretRegistry>,
+    ) -> Result<CredentialLoadOutcome> {
         let mut credentials = HashMap::new();
         let mut cmd_routes = HashMap::new();
         let mut oauth2_routes = HashMap::new();
         let mut aws_routes = AwsRouteTable::empty();
+        aws_routes.set_secret_registry(secret_registry.cloned());
         let mut spiffe_assertion_routes = HashMap::new();
         let mut diagnostics = Vec::new();
 
@@ -269,6 +328,7 @@ impl CredentialStore {
                                 .as_ref()
                                 .and_then(|p| p.query_param_name.clone())
                                 .or_else(|| route.query_param_name.clone()),
+                            secret_registry: secret_registry.cloned(),
                         },
                     );
                     continue;
@@ -333,39 +393,40 @@ impl CredentialStore {
                     InjectMode::UrlPath | InjectMode::QueryParam => Zeroizing::new(String::new()),
                 };
 
-                credentials.insert(
-                    normalized_prefix.clone(),
-                    LoadedCredential {
-                        inject_mode: route.inject_mode.clone(),
-                        proxy_inject_mode: route
-                            .proxy
-                            .as_ref()
-                            .and_then(|p| p.inject_mode.clone())
-                            .unwrap_or_else(|| route.inject_mode.clone()),
-                        raw_credential: secret,
-                        header_name: route.inject_header.clone(),
-                        proxy_header_name: route
-                            .proxy
-                            .as_ref()
-                            .and_then(|p| p.inject_header.clone())
-                            .unwrap_or_else(|| route.inject_header.clone()),
-                        header_value,
-                        extra_headers: Vec::new(),
-                        path_pattern: route.path_pattern.clone(),
-                        proxy_path_pattern: route
-                            .proxy
-                            .as_ref()
-                            .and_then(|p| p.path_pattern.clone())
-                            .or_else(|| route.path_pattern.clone()),
-                        path_replacement: route.path_replacement.clone(),
-                        query_param_name: route.query_param_name.clone(),
-                        proxy_query_param_name: route
-                            .proxy
-                            .as_ref()
-                            .and_then(|p| p.query_param_name.clone())
-                            .or_else(|| route.query_param_name.clone()),
-                    },
-                );
+                let loaded = LoadedCredential {
+                    inject_mode: route.inject_mode.clone(),
+                    proxy_inject_mode: route
+                        .proxy
+                        .as_ref()
+                        .and_then(|p| p.inject_mode.clone())
+                        .unwrap_or_else(|| route.inject_mode.clone()),
+                    raw_credential: secret,
+                    header_name: route.inject_header.clone(),
+                    proxy_header_name: route
+                        .proxy
+                        .as_ref()
+                        .and_then(|p| p.inject_header.clone())
+                        .unwrap_or_else(|| route.inject_header.clone()),
+                    header_value,
+                    extra_headers: Vec::new(),
+                    path_pattern: route.path_pattern.clone(),
+                    proxy_path_pattern: route
+                        .proxy
+                        .as_ref()
+                        .and_then(|p| p.path_pattern.clone())
+                        .or_else(|| route.path_pattern.clone()),
+                    path_replacement: route.path_replacement.clone(),
+                    query_param_name: route.query_param_name.clone(),
+                    proxy_query_param_name: route
+                        .proxy
+                        .as_ref()
+                        .and_then(|p| p.query_param_name.clone())
+                        .or_else(|| route.query_param_name.clone()),
+                };
+                if let Some(registry) = secret_registry {
+                    register_loaded_credential(registry, &normalized_prefix, &loaded);
+                }
+                credentials.insert(normalized_prefix.clone(), loaded);
                 continue;
             }
 
@@ -428,6 +489,12 @@ impl CredentialStore {
                         ))
                     }) {
                         Ok(cache) => {
+                            let cache = match secret_registry {
+                                Some(registry) => {
+                                    cache.with_secret_registry(registry.clone(), &normalized_prefix)
+                                }
+                                None => cache,
+                            };
                             spiffe_assertion_routes.insert(
                                 normalized_prefix.clone(),
                                 SpiffeAssertionRoute {
@@ -483,6 +550,13 @@ impl CredentialStore {
                         continue;
                     };
 
+                    if let Some(registry) = secret_registry {
+                        registry.register(
+                            &format!("{normalized_prefix}:oauth2_client_secret"),
+                            client_secret.as_str(),
+                        );
+                    }
+
                     let config = OAuth2ExchangeConfig {
                         token_url: oauth2.token_url.clone(),
                         client_id,
@@ -492,6 +566,12 @@ impl CredentialStore {
 
                     match TokenCache::new(config, tls_connector.clone()).await {
                         Ok(cache) => {
+                            let cache = match secret_registry {
+                                Some(registry) => {
+                                    cache.with_secret_registry(registry.clone(), &normalized_prefix)
+                                }
+                                None => cache,
+                            };
                             oauth2_routes.insert(
                                 normalized_prefix.clone(),
                                 OAuth2Route {
@@ -1486,6 +1566,147 @@ mod tests {
         assert_eq!(
             outcome.diagnostics[0].code,
             ProxyDiagnosticCode::OAuthTokenExchangeFailed
+        );
+    }
+
+    fn registered(registry: &SecretRegistry) -> Vec<(String, String)> {
+        registry
+            .snapshot()
+            .1
+            .into_iter()
+            .map(|e| (e.name, e.value.to_string()))
+            .collect()
+    }
+
+    fn file_route(prefix: &str, secret_path: &std::path::Path, mode: InjectMode) -> RouteConfig {
+        RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some(format!("file://{}", secret_path.display())),
+            inject_mode: mode,
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            ..RouteConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_with_registry_registers_loaded_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bearer_path = dir.path().join("bearer");
+        let basic_path = dir.path().join("basic");
+        std::fs::write(&bearer_path, "sk-bearer-registry-1234").expect("write");
+        std::fs::write(&basic_path, "user:basic-registry-5678").expect("write");
+        let routes = vec![
+            file_route("/bearer-api", &bearer_path, InjectMode::Header),
+            file_route("basic-api", &basic_path, InjectMode::BasicAuth),
+        ];
+        let registry = SecretRegistry::new();
+        let outcome = CredentialStore::load_with_registry(
+            &routes,
+            &test_tls_connector(),
+            None,
+            Some(&registry),
+        )
+        .await
+        .expect("credential load");
+        assert!(outcome.store.get("bearer-api").is_some());
+        assert!(outcome.store.get("basic-api").is_some());
+
+        let entries = registered(&registry);
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:basic-registry-5678");
+        assert!(entries.contains(&(
+            "bearer-api".to_string(),
+            "sk-bearer-registry-1234".to_string()
+        )));
+        assert!(entries.contains(&(
+            "basic-api".to_string(),
+            "user:basic-registry-5678".to_string()
+        )));
+        // Basic auth puts a base64 form on the wire; it must be covered too.
+        assert!(entries.contains(&("basic-api".to_string(), encoded)));
+        // `Bearer <raw>` is already covered by the raw value.
+        assert!(
+            !entries
+                .iter()
+                .any(|(_, v)| v == "Bearer sk-bearer-registry-1234")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_without_registry_is_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("secret");
+        std::fs::write(&path, "sk-no-registry-1234").expect("write");
+        let routes = vec![file_route("api", &path, InjectMode::Header)];
+        let store = CredentialStore::load_with_registry(&routes, &test_tls_connector(), None, None)
+            .await
+            .expect("credential load")
+            .store;
+        let cred = store.get("api").expect("route should be loaded");
+        assert_eq!(cred.header_value.as_str(), "Bearer sk-no-registry-1234");
+    }
+
+    #[tokio::test]
+    async fn test_cmd_materialize_registers_captured_values() {
+        let routes = vec![RouteConfig {
+            prefix: "github".to_string(),
+            upstream: "https://api.github.com".to_string(),
+            credential_key: Some("cmd://gh".to_string()),
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("token {}".to_string()),
+            ..RouteConfig::default()
+        }];
+        let registry = SecretRegistry::new();
+        let store = CredentialStore::load_with_registry(
+            &routes,
+            &test_tls_connector(),
+            None,
+            Some(&registry),
+        )
+        .await
+        .expect("credential load")
+        .store;
+        assert!(registry.is_empty(), "cmd routes capture lazily");
+        let cmd = store.get_cmd("github").expect("cmd route");
+
+        let _ = cmd.materialize(CredentialCaptureMaterial::Secret(Zeroizing::new(
+            "ghp_captured_secret_1".to_string(),
+        )));
+        let _ = cmd.materialize(CredentialCaptureMaterial::Headers(vec![(
+            "Authorization".to_string(),
+            Zeroizing::new("Bearer captured-header-token-2".to_string()),
+        )]));
+
+        let entries = registered(&registry);
+        assert!(entries.contains(&("gh".to_string(), "ghp_captured_secret_1".to_string())));
+        assert!(entries.contains(&(
+            "gh:Authorization".to_string(),
+            "Bearer captured-header-token-2".to_string()
+        )));
+        assert!(entries.contains(&(
+            "gh:Authorization".to_string(),
+            "captured-header-token-2".to_string()
+        )));
+        assert!(!entries.iter().any(|(_, v)| v.contains("token ghp_")));
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_cache_registers_initial_access_token() {
+        let registry = SecretRegistry::new();
+        let cache = make_test_token_cache(
+            "oauth-initial-token-1",
+            std::time::Duration::from_secs(3600),
+        )
+        .with_secret_registry(registry.clone(), "my-api");
+        assert_eq!(
+            cache.get_or_refresh().await.as_str(),
+            "oauth-initial-token-1"
+        );
+        assert!(
+            registered(&registry)
+                .contains(&("my-api".to_string(), "oauth-initial-token-1".to_string()))
         );
     }
 

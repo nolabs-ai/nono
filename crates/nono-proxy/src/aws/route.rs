@@ -30,6 +30,10 @@ pub struct AwsRoute {
 
     /// The identity (or operator-approved identities) this route signs with.
     pub credentials: AwsRouteCredentials,
+
+    /// Session secret registry. Each resolved secret access key and session
+    /// token is registered here before signing (NEP-0010 §3.1).
+    pub(crate) secret_registry: Option<crate::secret_registry::SecretRegistry>,
 }
 
 /// How an `AwsRoute` chooses the credentials it signs with.
@@ -56,6 +60,18 @@ pub struct ProfileProvider {
     pub profile: String,
     /// Shared with every other route that uses the same profile.
     pub provider: SharedCredentialsProvider,
+}
+
+impl AwsRoute {
+    /// Non-secret name resolved AWS credentials are registered under.
+    pub(crate) fn registry_name(&self) -> String {
+        match &self.credentials {
+            AwsRouteCredentials::Single { profile_key, .. } => {
+                format!("aws:{}", profile_key.as_deref().unwrap_or("default"))
+            }
+            AwsRouteCredentials::ByAccessKeyId(_) => "aws:profiles".to_string(),
+        }
+    }
 }
 
 /// The identity chosen for one request by [`AwsRoute::select_provider`].
@@ -163,6 +179,7 @@ pub struct AwsRouteTable {
     /// Profile-only providers for `aws_auth.profiles` entries, kept apart from
     /// `providers` because those resolve through the default chain.
     named_profile_providers: HashMap<String, SharedCredentialsProvider>,
+    secret_registry: Option<crate::secret_registry::SecretRegistry>,
 }
 
 impl AwsRouteTable {
@@ -173,7 +190,17 @@ impl AwsRouteTable {
             routes: HashMap::new(),
             providers: HashMap::new(),
             named_profile_providers: HashMap::new(),
+            secret_registry: None,
         }
+    }
+
+    /// Set the registry that routes inserted after this call register their
+    /// resolved AWS secrets in.
+    pub(crate) fn set_secret_registry(
+        &mut self,
+        registry: Option<crate::secret_registry::SecretRegistry>,
+    ) {
+        self.secret_registry = registry;
     }
 
     /// Return the `AwsRoute` for the given normalised prefix, if present.
@@ -266,6 +293,7 @@ impl AwsRouteTable {
                     profile_key: profile.map(str::to_owned),
                     provider,
                 },
+                secret_registry: self.secret_registry.clone(),
             },
         );
         Ok(())
@@ -313,6 +341,7 @@ impl AwsRouteTable {
                 service_label,
                 service,
                 credentials: AwsRouteCredentials::ByAccessKeyId(by_key),
+                secret_registry: self.secret_registry.clone(),
             },
         );
         Ok(())
@@ -404,6 +433,7 @@ mod tests {
             service_label: None,
             service: "sts".to_string(),
             credentials,
+            secret_registry: None,
         }
     }
 

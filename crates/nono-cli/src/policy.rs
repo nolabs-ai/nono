@@ -177,6 +177,7 @@ impl ProfileDef {
             hooks: self.hooks.clone(),
             session_hooks: profile::SessionHooks::default(),
             rollback: self.rollback.clone(),
+            session_recording: None,
             open_urls: self.open_urls.clone(),
             allow_launch_services: self.allow_launch_services,
             allow_gpu: self.allow_gpu,

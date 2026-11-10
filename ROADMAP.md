@@ -31,6 +31,8 @@ _Approved; implementation may proceed._
   Before nono reaches 1.0.0, we should remove the deprecations, dead code, backward-compat aliases, and library/CLI boundary drift that have built up since the project started.
 - **[NEP-0004: Opt-in Linux namespace isolation](neps/0004-opt-in-linux-namespace-isolation.md)** — _Non-breaking_
   Add an opt-in, permanently default-off Linux isolation layer that runs the sandboxed workload inside a set of unprivileged namespaces (user + network, later a minimal mount-mask), layered on top of the existing Landlock and seccomp enforcement.
+- **[NEP-0010: Session terminal capture](neps/0010-session-terminal-capture.md)** — _Non-breaking_
+  Let the nono supervisor capture what a session showed and was told: its terminal output, the input sent to it, and the terminal facts around them. nono keeps this as a tamper-evident recording linked into the audit log, and can deliver it, durably and live, to an external receiver over open protocols. nono captures, protects and delivers.
 
 ## Draft
 
@@ -40,8 +42,6 @@ _Under active authoring; not yet ready for a decision._
   Let nono split its supervisor across a virtual-machine boundary.
 - **[NEP-0008: Session flight recorder](neps/0008-session-flight-recorder.md)** — _Breaking: not yet assessed_
   Make the audit log a complete, self-describing record of an agent session: every access nono denied, from every enforcement layer, with the reason and the process responsible; every grant the agent held; every allowed access to paths an operator marked as sensitive; and a statement of which sources were live, so an operator can tell "nothing happened" apart from "nono could not see it".
-- **[NEP-0010: Session terminal capture](neps/0010-session-terminal-capture.md)** — _Breaking: not yet assessed_
-  Let the nono supervisor capture what a session showed and was told: its terminal output, the input sent to it, and the terminal facts around them. nono keeps this as a tamper-evident recording linked into the audit log, and can deliver it, durably and live, to an external receiver over open protocols. nono captures, protects and delivers.
 - **[NEP-0002: Tool Sandbox invocation-scoped filesystem approvals](neps/0002-invocation-scoped-commands.md)** — _Non-breaking_
   Extend the Tool Sandbox policy model so that a sandboxed command can request a narrowly scoped filesystem capability for one invocation without escaping the filesystem policy selected for that invocation.
 - **[NEP-0005: Windows enforcement backend](neps/0005-windows-enforcement-backend.md)** — _Non-breaking_

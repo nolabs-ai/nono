@@ -2642,6 +2642,179 @@ pub struct RollbackConfig {
     pub exclude_globs: Vec<String>,
 }
 
+/// Whether session recordings capture what is typed into the session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionRecordingInput {
+    On,
+    Off,
+}
+
+/// Session terminal recording (NEP-0010 §7).
+///
+/// Every field can only raise recording when profiles are merged: a child
+/// profile can turn recording on, make it required, capture input, raise the
+/// size limit or add a destination, but never undo what a base profile set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRecordingConfig {
+    /// Record the session's terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Stop the session rather than run it unrecorded. Implies `enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// Capture input (`on`) or only mark that input happened (`off`).
+    /// Defaults to `on` for terminal sessions and `off` for pipe sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<SessionRecordingInput>,
+    /// Uncompressed size at which the recording stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Extra copy of the finished recording, plus a chunk manifest, written
+    /// outside the sandbox. Relative paths resolve against the launch
+    /// directory. Implies `enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Upload chunks to a receiver as they close. Implies `enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<SessionRecordingDelivery>,
+}
+
+/// Where and how recording chunks are delivered (NEP-0010 §6.1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRecordingDelivery {
+    /// `platform`: the platform this host is enrolled with.
+    pub receiver: String,
+    /// Fail the session when chunks cannot be delivered by session end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// How long session end waits for undelivered chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_secs: Option<u64>,
+}
+
+/// The only receiver supported so far.
+pub const RECORDING_RECEIVER_PLATFORM: &str = "platform";
+/// Upper bound for `delivery.flush_timeout_secs`.
+pub const RECORDING_MAX_FLUSH_TIMEOUT_SECS: u64 = 600;
+
+impl SessionRecordingDelivery {
+    fn merge(base: Option<Self>, child: Option<Self>) -> Option<Self> {
+        match (base, child) {
+            (None, None) => None,
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            // The base receiver stays; the child can make it required or
+            // wait longer, never less.
+            (Some(base), Some(child)) => Some(Self {
+                receiver: base.receiver,
+                required: if base.required == Some(true) || child.required == Some(true) {
+                    Some(true)
+                } else {
+                    child.required.or(base.required)
+                },
+                flush_timeout_secs: match (base.flush_timeout_secs, child.flush_timeout_secs) {
+                    (Some(base), Some(child)) => Some(base.max(child)),
+                    (base, child) => child.or(base),
+                },
+            }),
+        }
+    }
+}
+
+impl SessionRecordingConfig {
+    /// Whether this block turns recording on.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled == Some(true)
+            || self.required == Some(true)
+            || self.file.is_some()
+            || self.delivery.is_some()
+    }
+
+    /// Merge a child block onto a base block. Settings can only be raised.
+    pub fn merge(base: Option<Self>, child: Option<Self>) -> Option<Self> {
+        let (base, child) = match (base, child) {
+            (None, None) => return None,
+            (Some(only), None) | (None, Some(only)) => return Some(only),
+            (Some(base), Some(child)) => (base, child),
+        };
+        let raise = |base: Option<bool>, child: Option<bool>| {
+            if base == Some(true) || child == Some(true) {
+                Some(true)
+            } else {
+                child.or(base)
+            }
+        };
+        let input = match (base.input, child.input) {
+            (Some(SessionRecordingInput::On), _) | (_, Some(SessionRecordingInput::On)) => {
+                Some(SessionRecordingInput::On)
+            }
+            (base, child) => child.or(base),
+        };
+        Some(Self {
+            enabled: raise(base.enabled, child.enabled),
+            required: raise(base.required, child.required),
+            input,
+            max_bytes: match (base.max_bytes, child.max_bytes) {
+                (Some(base), Some(child)) => Some(base.max(child)),
+                (base, child) => child.or(base),
+            },
+            // A base profile's destination cannot be replaced.
+            file: base.file.or(child.file),
+            delivery: SessionRecordingDelivery::merge(base.delivery, child.delivery),
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let invalid = |reason: &str| {
+            Err(NonoError::ProfileParse(format!(
+                "invalid session_recording: {reason}"
+            )))
+        };
+        if self.enabled == Some(false) && self.required == Some(true) {
+            return invalid("`required: true` cannot be combined with `enabled: false`");
+        }
+        if self.enabled == Some(false) && self.file.is_some() {
+            return invalid("`file` cannot be combined with `enabled: false`");
+        }
+        if self.max_bytes == Some(0) {
+            return invalid("`max_bytes` must be greater than zero");
+        }
+        if self
+            .file
+            .as_deref()
+            .is_some_and(|file| file.trim().is_empty())
+        {
+            return invalid("`file` must not be empty");
+        }
+        if let Some(delivery) = self.delivery.as_ref() {
+            if self.enabled == Some(false) {
+                return invalid("`delivery` cannot be combined with `enabled: false`");
+            }
+            if delivery.receiver != RECORDING_RECEIVER_PLATFORM {
+                return invalid(
+                    "`delivery.receiver` must be \"platform\" (the platform this host is enrolled with)",
+                );
+            }
+            if delivery
+                .flush_timeout_secs
+                .is_some_and(|secs| secs == 0 || secs > RECORDING_MAX_FLUSH_TIMEOUT_SECS)
+            {
+                return invalid("`delivery.flush_timeout_secs` must be between 1 and 600");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_profile_session_recording(profile: &Profile) -> Result<()> {
+    match profile.session_recording.as_ref() {
+        Some(recording) => recording.validate(),
+        None => Ok(()),
+    }
+}
+
 /// Controls which environment variables are passed to the sandboxed process.
 ///
 /// By default, all environment variables are inherited from the parent process.
@@ -2818,6 +2991,9 @@ pub struct Profile {
     pub session_hooks: SessionHooks,
     #[serde(default)]
     pub rollback: RollbackConfig,
+    /// Session terminal recording (NEP-0010). `None` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_recording: Option<SessionRecordingConfig>,
     /// Supervisor-delegated URL opening (e.g., for OAuth2 login flows).
     /// When `None` (absent from JSON), inherits from the base profile.
     /// When `Some`, replaces the base profile's config entirely, allowing
@@ -2979,6 +3155,8 @@ struct ProfileDeserialize {
     #[serde(default)]
     rollback: RollbackConfig,
     #[serde(default)]
+    session_recording: Option<SessionRecordingConfig>,
+    #[serde(default)]
     open_urls: Option<OpenUrlConfig>,
     #[serde(default)]
     allow_launch_services: Option<bool>,
@@ -3021,6 +3199,7 @@ impl From<ProfileDeserialize> for Profile {
             hooks: raw.hooks,
             session_hooks: raw.session_hooks,
             rollback: raw.rollback,
+            session_recording: raw.session_recording,
             open_urls: raw.open_urls,
             allow_launch_services: raw.allow_launch_services,
             allow_gpu: raw.allow_gpu,
@@ -3396,6 +3575,7 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     }
     validate_profile_env_var_patterns(&profile)?;
     validate_profile_network_denial_audit(&profile)?;
+    validate_profile_session_recording(&profile)?;
     validate_profile_domain_patterns(&profile)?;
     merge_implicit_default_groups(&mut profile)?;
     // Re-run after extends/platform overrides: base and child profiles can
@@ -3540,6 +3720,7 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     }
     validate_profile_env_var_patterns(&profile)?;
     validate_profile_network_denial_audit(&profile)?;
+    validate_profile_session_recording(&profile)?;
     validate_profile_domain_patterns(&profile)?;
 
     validate_command_policies(
@@ -3663,6 +3844,8 @@ fn resolve_extends(
         // Pop to restore the stack to the pre-base state. On the error path
         // above (? propagation), visited is abandoned so the missing pop is harmless.
         visited.pop();
+        let mut resolved_base = resolved_base;
+        drop_inherited_recording_file(&mut resolved_base);
 
         accumulated_base = Some(match accumulated_base {
             Some(acc) => merge_profiles(acc, resolved_base),
@@ -3754,6 +3937,40 @@ fn load_base_profile_raw(
         "base profile '{}' not found",
         name
     )))
+}
+
+/// `session_recording.file` makes the unsandboxed supervisor create a file
+/// on the host, so it is honoured only from the profile selected for the
+/// session, which `sandbox_prepare` further limits to user-authored profiles.
+/// A base reached through `extends` may be a package or built-in profile,
+/// so its destination, including any in its `platform_overrides`, is
+/// dropped before it is merged. Recording that the destination turned on
+/// stays on.
+fn drop_inherited_recording_file(base: &mut Profile) {
+    fn strip(recording: Option<&mut SessionRecordingConfig>) {
+        if let Some(recording) = recording
+            && recording.file.is_some()
+        {
+            let enabled = recording.is_enabled();
+            recording.file = None;
+            if enabled {
+                recording.enabled = Some(true);
+            }
+        }
+    }
+    strip(base.session_recording.as_mut());
+    if let Some(overrides) = base.platform_overrides.as_mut() {
+        for platform in [
+            overrides.macos.as_mut(),
+            overrides.linux.as_mut(),
+            overrides.windows.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            strip(platform.0.session_recording.as_mut());
+        }
+    }
 }
 
 /// Merge a resolved base profile with a child profile.
@@ -4083,6 +4300,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &child.rollback.exclude_globs,
             ),
         },
+        session_recording: SessionRecordingConfig::merge(
+            base.session_recording,
+            child.session_recording,
+        ),
         open_urls: match child.open_urls {
             Some(child_urls) => Some(child_urls),
             None => base.open_urls,
@@ -7122,6 +7343,7 @@ mod tests {
                 exclude_patterns: vec!["node_modules".to_string()],
                 exclude_globs: vec!["*.pyc".to_string()],
             },
+            session_recording: None,
             open_urls: Some(OpenUrlConfig {
                 allow_origins: vec!["https://base.example.com".to_string()],
                 allow_localhost: false,
@@ -7215,6 +7437,7 @@ mod tests {
                 exclude_patterns: vec![],
                 exclude_globs: vec![],
             },
+            session_recording: None,
             open_urls: Some(OpenUrlConfig {
                 allow_origins: vec!["https://child.example.com".to_string()],
                 allow_localhost: true,
@@ -12635,5 +12858,207 @@ mod tests {
                 .is_some_and(|u| u.allow_origins.contains(&"https://example.com".to_string())),
             "child override's own field must still apply"
         );
+    }
+
+    fn recording(json: serde_json::Value) -> SessionRecordingConfig {
+        serde_json::from_value(json).expect("valid session_recording block")
+    }
+
+    #[test]
+    fn session_recording_merge_can_only_raise() {
+        let base = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "enabled": true,
+                "required": true,
+                "input": "on",
+                "max_bytes": 4096,
+                "file": "/artifacts/base.cast",
+            }))),
+            ..Default::default()
+        };
+        let child = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "enabled": false,
+                "required": false,
+                "input": "off",
+                "max_bytes": 1024,
+                "file": "/artifacts/child.cast",
+            }))),
+            ..Default::default()
+        };
+        let merged = merge_profiles(base, child)
+            .session_recording
+            .expect("recording block kept");
+        assert_eq!(merged.enabled, Some(true));
+        assert_eq!(merged.required, Some(true));
+        assert_eq!(merged.input, Some(SessionRecordingInput::On));
+        assert_eq!(merged.max_bytes, Some(4096));
+        assert_eq!(merged.file.as_deref(), Some("/artifacts/base.cast"));
+    }
+
+    #[test]
+    fn inherited_recording_file_destinations_are_dropped() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("packaged.json"),
+            r#"{
+                "meta": { "name": "packaged" },
+                "extends": "default",
+                "session_recording": { "file": "/etc/cron.d/recording.cast" },
+                "platform_overrides": {
+                    "linux": { "session_recording": { "file": "/etc/linux.cast" } },
+                    "macos": { "session_recording": { "file": "/etc/macos.cast" } }
+                }
+            }"#,
+        )
+        .expect("write base");
+        let child_path = dir.path().join("local.json");
+        std::fs::write(
+            &child_path,
+            r#"{ "meta": { "name": "local" }, "extends": "packaged" }"#,
+        )
+        .expect("write child");
+        let recording = load_profile_from_path(&child_path)
+            .expect("load profile")
+            .session_recording
+            .expect("recording block kept");
+        assert_eq!(recording.file, None);
+        // The base turned recording on through its destination; it stays on.
+        assert!(recording.is_enabled());
+
+        // The selected profile's own destination is kept.
+        std::fs::write(
+            &child_path,
+            r#"{
+                "meta": { "name": "local" },
+                "extends": "packaged",
+                "session_recording": { "file": "/home/me/session.cast" }
+            }"#,
+        )
+        .expect("rewrite child");
+        let recording = load_profile_from_path(&child_path)
+            .expect("load profile")
+            .session_recording
+            .expect("recording block kept");
+        assert_eq!(recording.file.as_deref(), Some("/home/me/session.cast"));
+    }
+
+    #[test]
+    fn session_recording_child_can_turn_recording_on() {
+        let base = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "enabled": false,
+                "input": "off",
+            }))),
+            ..Default::default()
+        };
+        let child = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "required": true,
+                "max_bytes": 8192,
+                "file": "out.cast",
+            }))),
+            ..Default::default()
+        };
+        let merged = merge_profiles(base, child)
+            .session_recording
+            .expect("recording block kept");
+        assert!(merged.is_enabled());
+        assert_eq!(merged.required, Some(true));
+        assert_eq!(merged.input, Some(SessionRecordingInput::Off));
+        assert_eq!(merged.max_bytes, Some(8192));
+        assert_eq!(merged.file.as_deref(), Some("out.cast"));
+
+        let inherited = merge_profiles(
+            Profile {
+                session_recording: Some(recording(serde_json::json!({ "enabled": true }))),
+                ..Default::default()
+            },
+            Profile::default(),
+        );
+        assert!(inherited.session_recording.is_some_and(|r| r.is_enabled()));
+    }
+
+    #[test]
+    fn session_recording_rejects_unknown_and_later_phase_fields() {
+        for field in ["retention_days", "live", "bogus"] {
+            let json = format!(r#"{{ "session_recording": {{ "{field}": 1 }} }}"#);
+            assert!(
+                serde_json::from_str::<Profile>(&json).is_err(),
+                "session_recording.{field} must be rejected"
+            );
+        }
+        assert!(
+            serde_json::from_str::<Profile>(r#"{ "session_recording": { "input": "maybe" } }"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn session_recording_delivery_can_only_be_raised() {
+        let base = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "delivery": { "receiver": "platform", "required": true, "flush_timeout_secs": 30 }
+            }))),
+            ..Default::default()
+        };
+        let child = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "delivery": { "receiver": "platform", "required": false, "flush_timeout_secs": 5 }
+            }))),
+            ..Default::default()
+        };
+        let merged = merge_profiles(base, child)
+            .session_recording
+            .expect("recording block kept");
+        assert!(merged.is_enabled());
+        let delivery = merged.delivery.expect("delivery kept");
+        assert_eq!(delivery.required, Some(true));
+        assert_eq!(delivery.flush_timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn session_recording_validation_rejects_contradictions() {
+        for block in [
+            serde_json::json!({ "enabled": false, "required": true }),
+            serde_json::json!({ "enabled": false, "file": "x.cast" }),
+            serde_json::json!({ "max_bytes": 0 }),
+            serde_json::json!({ "file": "  " }),
+            serde_json::json!({ "delivery": { "receiver": "https://receiver.example" } }),
+            serde_json::json!({ "delivery": { "receiver": "platform", "flush_timeout_secs": 0 } }),
+            serde_json::json!({ "enabled": false, "delivery": { "receiver": "platform" } }),
+        ] {
+            let profile = Profile {
+                session_recording: Some(recording(block.clone())),
+                ..Default::default()
+            };
+            assert!(
+                validate_profile_session_recording(&profile).is_err(),
+                "{block} must be rejected"
+            );
+        }
+        let ok = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "required": true,
+                "input": "off",
+                "max_bytes": 1,
+                "file": "x.cast",
+            }))),
+            ..Default::default()
+        };
+        assert!(validate_profile_session_recording(&ok).is_ok());
+    }
+
+    #[test]
+    fn session_recording_is_validated_when_a_profile_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("recorded.json");
+        std::fs::write(
+            &path,
+            r#"{ "meta": { "name": "recorded" }, "session_recording": { "max_bytes": 0 } }"#,
+        )
+        .expect("write profile");
+        let err = load_profile_from_path(&path).expect_err("max_bytes 0 is invalid");
+        assert!(err.to_string().contains("session_recording"), "{err}");
     }
 }

@@ -64,6 +64,7 @@ A few fields have their own specific rules:
 | `network.credentials` | Leave it out to inherit. Set it to `[]` to explicitly disable inherited credentials. Otherwise your list is combined with the base. |
 | `network.network_profile` | Leave it out to inherit. Set it to `null` to explicitly clear the inherited proxy profile. |
 | `hooks`, `env_credentials`, `environment.set_vars` | Merged as key-value maps. Your keys win over the base on any conflict. |
+| `session_recording` | Can only be raised. You can turn recording on, make it required, record input, raise `max_bytes`, or set `file` when the base has none, but not undo what a base set. See [Session Recording](/cli/features/session-recording). |
 
 ### Extending multiple profiles
 

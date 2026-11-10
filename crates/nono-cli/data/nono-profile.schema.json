@@ -85,6 +85,10 @@
       "$ref": "#/$defs/RollbackConfig",
       "description": "Rollback snapshot configuration controlling which files are excluded from undo snapshots."
     },
+    "session_recording": {
+      "$ref": "#/$defs/SessionRecordingConfig",
+      "description": "Session terminal recording. Records the session's terminal into its audit log. Settings can only be raised by extending profiles and launch flags."
+    },
     "open_urls": {
       "oneOf": [
         { "$ref": "#/$defs/OpenUrlConfig" },
@@ -2549,6 +2553,59 @@
           "type": "integer",
           "minimum": 1,
           "description": "Optional timeout in seconds. If set, the hook is killed (SIGTERM then SIGKILL) after this duration. If absent, no timeout is enforced."
+        }
+      }
+    },
+    "SessionRecordingConfig": {
+      "type": "object",
+      "description": "Session terminal recording. Records terminal output, input and terminal facts as asciicast v2 chunks linked into the session's audit log. Known credential values are removed and password-mode input is never recorded. Every setting can only be raised: an extending profile or launch flag can turn recording on, make it required, record input, raise max_bytes or add a destination, but never undo what a base profile set.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Record the session's terminal. Requires the audit log."
+        },
+        "required": {
+          "type": "boolean",
+          "description": "Stop the session rather than run it unrecorded, and exit with status 74 if the recording is incomplete. Implies enabled."
+        },
+        "input": {
+          "type": "string",
+          "enum": ["on", "off"],
+          "description": "Record typed input (on), or only mark that input happened (off). Defaults to on for terminal sessions and off for sessions without a terminal."
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Uncompressed size at which the recording stops. Defaults to 268435456 (256 MiB)."
+        },
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Also write the recording to this new file, with a chunk manifest beside it at <file>.manifest.json. Relative paths resolve against the launch directory; $WORKDIR and ~ are expanded. The file must not already exist. Honoured only in user-authored profiles. Implies enabled."
+        },
+        "delivery": {
+          "type": "object",
+          "description": "Upload each recording chunk as it closes. Implies enabled.",
+          "additionalProperties": false,
+          "required": ["receiver"],
+          "properties": {
+            "receiver": {
+              "type": "string",
+              "enum": ["platform"],
+              "description": "platform: the platform this host is enrolled with."
+            },
+            "required": {
+              "type": "boolean",
+              "description": "Fail the session (exit status 74) when chunks cannot be delivered by session end. Also makes the recording required."
+            },
+            "flush_timeout_secs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 600,
+              "description": "How long session end waits for undelivered chunks. Defaults to 30."
+            }
+          }
         }
       }
     },

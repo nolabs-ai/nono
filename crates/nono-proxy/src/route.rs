@@ -234,6 +234,16 @@ impl RouteStore {
     /// does a regex match, not a glob compile. Routes with a `tls_ca` field
     /// get a per-route TLS connector built from the custom CA certificate.
     pub async fn load(routes: &[RouteConfig]) -> Result<Self> {
+        Self::load_with_registry(routes, None).await
+    }
+
+    /// Like [`Self::load`], additionally registering every SPIFFE JWT-SVID the
+    /// proxy injects on a route in `secret_registry` (NEP-0010 §3.1). `None`
+    /// behaves exactly like `load`.
+    pub async fn load_with_registry(
+        routes: &[RouteConfig],
+        secret_registry: Option<&crate::secret_registry::SecretRegistry>,
+    ) -> Result<Self> {
         let mut loaded = HashMap::new();
 
         let base_root_store = build_base_root_store();
@@ -393,6 +403,12 @@ impl RouteStore {
                     .map_err(|e| {
                         ProxyError::Config(format!("route '{}': {e}", normalized_prefix))
                     })?;
+                    let src = match secret_registry {
+                        Some(registry) => {
+                            src.with_secret_registry(registry.clone(), &normalized_prefix)
+                        }
+                        None => src,
+                    };
                     Some(Arc::new(crate::auth::ManagedUpstreamAuth::SpiffeJwt(
                         Arc::new(src),
                     )))

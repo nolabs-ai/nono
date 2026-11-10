@@ -24,6 +24,7 @@ mod config;
 mod connect_client;
 mod credential_runtime;
 mod deprecation_warnings;
+mod device_key;
 mod diagnostic;
 mod exec_strategy;
 mod execution_runtime;
@@ -37,6 +38,7 @@ mod launch_runtime;
 #[cfg(target_os = "linux")]
 mod lineage_cgroup;
 mod login_cmd;
+mod login_enrollment;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
@@ -87,6 +89,7 @@ mod temp_keepalive;
 mod terminal_approval;
 mod terminal_capture;
 mod terminal_prompt;
+mod terminal_selector;
 mod theme;
 mod timeouts;
 #[path = "tool-sandbox/mod.rs"]

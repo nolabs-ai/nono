@@ -8,10 +8,11 @@
 //! default flow is authorization code + PKCE on a loopback redirect; the device
 //! authorization grant is the fallback for SSH sessions, containers and
 //! machines without a display. Tokens are DPoP-bound to a key generated for
-//! the session. Nothing here enrolls a device.
+//! the session. A separate device key is enrolled unless `--no-enroll` is given.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aws_lc_rs::{rand::SystemRandom, signature::KeyPair};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nono::{NonoError, Result};
 use sha2::{Digest, Sha256};
@@ -77,13 +78,19 @@ pub(crate) fn run_login(args: LoginArgs) -> Result<()> {
                 record.platform_url
             )));
         }
+        let needs_enrollment_authorization = !args.no_enroll
+            && !record.enrollment_authorized
+            && client::discover(&record.platform_url)?
+                .enrollment_endpoint
+                .is_some();
+        if record.tenant_selection_pending && !needs_enrollment_authorization {
+            drop(lock);
+            return finish_login(&args, true);
+        }
         // Signed in already: confirm the session still works. An expired or
         // revoked one is cleared, and a fresh sign-in follows.
         match platform_oauth::session_access_locked(&lock, None) {
-            Ok(Some(_)) => {
-                if let Some(org) = &args.org {
-                    switch_organization(&lock, org)?;
-                }
+            Ok(Some(_)) if !needs_enrollment_authorization => {
                 let record = session::load_record()?.ok_or_else(|| {
                     NonoError::ConfigParse("the local sign-in disappeared".to_string())
                 })?;
@@ -91,9 +98,11 @@ pub(crate) fn run_login(args: LoginArgs) -> Result<()> {
                     "Already signed in to {} as {}.",
                     record.platform_url, record.user_display
                 );
-                print_organizations(&record);
+                drop(lock);
+                finish_login(&args, false)?;
                 return Ok(());
             }
+            Ok(Some(_)) => eprintln!("Authorize device enrollment to complete this login."),
             Ok(None) => {}
             Err(NonoError::ActionRequired(message)) => eprintln!("{message}"),
             Err(error) => return Err(error),
@@ -108,11 +117,16 @@ pub(crate) fn run_login(args: LoginArgs) -> Result<()> {
     let new_key = session::create_key()?;
     let key = &new_key.key;
     let device_name = device_name(None);
+    let mut scope = platform_oauth::login_scope();
+    if !args.no_enroll && server.enrollment_endpoint.is_some() {
+        scope.push(' ');
+        scope.push_str(crate::login_enrollment::ENROLLMENT_SCOPE);
+    }
     let mut authorized = authorize(
         &server,
         key,
         &platform_url,
-        &platform_oauth::login_scope(),
+        &scope,
         device_name.as_deref(),
         &args,
     )?;
@@ -127,20 +141,170 @@ pub(crate) fn run_login(args: LoginArgs) -> Result<()> {
             key,
             &identity,
             &authorized.tokens.session,
+            authorized.tokens.scope.as_deref().is_some_and(|scopes| {
+                scopes
+                    .split_whitespace()
+                    .any(|scope| scope == crate::login_enrollment::ENROLLMENT_SCOPE)
+            }),
         );
         let lock = session::lock()?;
+        let previous = session::load_record()?
+            .filter(|previous| previous.platform_url == record.platform_url)
+            .and_then(|_| {
+                session::load_key()
+                    .ok()
+                    .flatten()
+                    .zip(session::load_refresh_token().ok().flatten())
+            });
         session::store_session(&lock, &new_key, refresh_token.as_str(), &record)?;
+        if let Some((previous_key, previous_token)) = previous
+            && let Err(error) = OAuthClient::new(&server, &previous_key)
+                .revoke_refresh_token(previous_token.as_str())
+        {
+            eprintln!("Signed in, but the previous CLI session could not be revoked: {error}");
+        }
         Ok(identity)
     })();
     finish_browser(authorized.responder, &platform_url, outcome.is_ok())?;
     let identity = outcome?;
-    if let Some(org) = &args.org {
-        switch_organization(&session::lock()?, org)?;
-    }
-    let record = session::load_record()?
-        .ok_or_else(|| NonoError::ConfigParse("the local sign-in disappeared".to_string()))?;
     println!("Signed in to {platform_url} as {}.", identity.display);
+    finish_login(&args, true)
+}
+
+fn finish_login(args: &LoginArgs, select: bool) -> Result<()> {
+    let lock = session::lock()?;
+    let record = session::load_record()?.ok_or_else(not_signed_in)?;
+    let tenant = match &args.tenant {
+        Some(name) => Some(name.clone()),
+        None if select => select_tenant(&record)?,
+        None => None,
+    };
+    if let Some(tenant) = tenant {
+        switch_organization(&lock, &tenant)?;
+    }
+    let record = session::load_record()?.ok_or_else(not_signed_in)?;
+    platform_client::activate_login_enrollment(&record)?;
     print_organizations(&record);
+    if !args.no_enroll
+        && let Err(error) = enroll_device(&record)
+    {
+        eprintln!(
+            "Signed in, but this device was not enrolled: {error}\nRetry `nono login` to enroll, or use `nono login --no-enroll` to sign in only."
+        );
+    }
+    Ok(())
+}
+
+fn select_tenant(record: &session::SessionRecord) -> Result<Option<String>> {
+    use crate::terminal_selector::{self, Item, Picker};
+    use std::io::{self, IsTerminal};
+    if record.organizations.len() == 1 {
+        return Ok(Some(record.organizations[0].tenant_id.clone()));
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(NonoError::ActionRequired("multiple tenants are available; choose one with `nono login --tenant <slug|id|personal>`".into()));
+    }
+    let items = record
+        .organizations
+        .iter()
+        .map(|tenant| Item {
+            label: tenant.display_name.clone(),
+            context: tenant.slug.clone(),
+            status: if tenant.kind == "personal" {
+                "personal"
+            } else {
+                "organization"
+            }
+            .into(),
+            metadata: String::new(),
+            marker: None,
+        })
+        .collect::<Vec<_>>();
+    let selected = terminal_selector::select(
+        &Picker {
+            title: "NONO LOGIN",
+            context: &record.platform_url,
+            summary: &format!("{} tenants", items.len()),
+            prompt: "Choose a tenant",
+            confirm_label: "select",
+        },
+        &items,
+    )?
+    .ok_or_else(|| {
+        NonoError::ActionRequired(
+            "tenant selection cancelled; use `nono login --tenant <slug>`".into(),
+        )
+    })?;
+    record
+        .organizations
+        .get(selected)
+        .map(|tenant| Some(tenant.tenant_id.clone()))
+        .ok_or_else(|| NonoError::ConfigParse("tenant selection is out of range".into()))
+}
+
+fn enroll_device(record: &session::SessionRecord) -> Result<()> {
+    use crate::login_enrollment::{EnrollmentIntent, LoginEnrollmentRequest};
+    let server = client::discover(&record.platform_url)?;
+    if server.enrollment_endpoint.is_none() {
+        return Err(NonoError::ActionRequired(
+            "this platform does not support automatic enrollment; use `nono platform enroll`"
+                .into(),
+        ));
+    }
+    let login_key = session::load_key()?.ok_or_else(not_signed_in)?;
+    let refresh = session::load_refresh_token()?.ok_or_else(not_signed_in)?;
+    let (key_ref, key) =
+        crate::device_key::load_or_create(&record.issuer, &record.tenant_id, &record.user_subject)?;
+    let intent = EnrollmentIntent {
+        protocol_version: "1".into(),
+        issuer: record.issuer.clone(),
+        tenant_id: record.tenant_id.clone(),
+        user_id: record.user_subject.clone(),
+        login_key_thumbprint: login_key.thumbprint().to_string(),
+        public_key: URL_SAFE_NO_PAD.encode(key.public_key().as_ref()),
+        display_name: device_name(None).unwrap_or_else(|| "nono device".into()),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+    };
+    let signature = URL_SAFE_NO_PAD.encode(
+        key.sign(
+            &SystemRandom::new(),
+            &intent
+                .signing_bytes()
+                .map_err(|_| NonoError::ConfigParse("cannot encode enrollment proof".into()))?,
+        )
+        .map_err(|_| NonoError::KeystoreAccess("cannot sign enrollment proof".into()))?
+        .as_ref(),
+    );
+    let request = LoginEnrollmentRequest {
+        refresh_token: refresh.to_string(),
+        intent,
+        signature,
+    };
+    let response = OAuthClient::new(&server, &login_key).enroll(&request)?;
+    if response.protocol_version != "1"
+        || response.management_mode != "audit_only"
+        || response.subject_kind != "device"
+        || response.tenant_id != record.tenant_id
+    {
+        return Err(NonoError::ConfigParse(
+            "platform returned a mismatched enrollment".into(),
+        ));
+    }
+    platform_client::validate_wire_identifier("subject id", &response.subject_id)?;
+    let state = platform_client::PlatformState {
+        protocol_version: response.protocol_version,
+        platform_url: record.platform_url.clone(),
+        tenant_id: response.tenant_id,
+        subject_id: response.subject_id,
+        subject_kind: response.subject_kind,
+        management_mode: response.management_mode,
+        key_algorithm: platform_client::KEY_ALGORITHM.into(),
+        key_ref,
+        enrolled_at: response.enrolled_at,
+    };
+    platform_client::save_login_enrollment(state, &record.user_subject)?;
+    println!("Device enrolled for audit delivery.");
     Ok(())
 }
 
@@ -215,6 +379,7 @@ fn switch_organization(lock: &session::SessionLock, name: &str) -> Result<()> {
         platform_oauth::session_access_locked(lock, Some(name))?.ok_or_else(not_signed_in)?;
     let mut record = session::load_record()?.ok_or_else(not_signed_in)?;
     record.tenant_id = access.organization.tenant_id;
+    record.tenant_selection_pending = false;
     session::save_record(lock, &record)
 }
 
@@ -225,7 +390,7 @@ fn print_organizations(record: &session::SessionRecord) {
 }
 
 fn organizations_text(record: &session::SessionRecord) -> String {
-    let mut text = String::from("Organizations (* active):\n");
+    let mut text = String::from("Tenants (* active):\n");
     for org in &record.organizations {
         let marker = if org.tenant_id == record.tenant_id {
             '*'
@@ -244,7 +409,7 @@ fn organizations_text(record: &session::SessionRecord) -> String {
     }
     if record.organizations.len() > 1 {
         text.push_str(&format!(
-            "Switch with `nono login --org <slug>`, or set {} for one command.\n",
+            "Switch with `nono login --tenant <slug>`, or set {} for one command.\n",
             platform_oauth::ORG_ENV
         ));
     }
@@ -571,6 +736,7 @@ mod tests {
     fn server(browser: bool, device: bool) -> AuthorizationServer {
         let endpoint = |path: &str| Url::parse(&format!("https://nono.example.com{path}")).unwrap();
         AuthorizationServer {
+            enrollment_endpoint: None,
             issuer: "https://nono.example.com".to_string(),
             authorization_endpoint: browser.then(|| endpoint("/oauth/authorize")),
             token_endpoint: endpoint("/oauth/token"),
@@ -582,7 +748,8 @@ mod tests {
     fn args(browser: bool, device_code: bool) -> LoginArgs {
         LoginArgs {
             url: None,
-            org: None,
+            tenant: None,
+            no_enroll: false,
             browser,
             device_code,
             no_open: false,
@@ -746,17 +913,17 @@ mod fixture_tests {
         record.organizations[0].kind = "personal".to_string();
         assert_eq!(
             organizations_text(&record),
-            "Organizations (* active):\n\
+            "Tenants (* active):\n\
              \x20 * Alice (alice, personal)\n\
              \x20   Acme (acme)\n\
              \x20   ACME (acme-eu)\n\
-             Switch with `nono login --org <slug>`, or set NONO_ORG for one command.\n"
+             Switch with `nono login --tenant <slug>`, or set NONO_TENANT for one command.\n"
         );
         // With one organization there is nothing to switch to.
         record.organizations.truncate(1);
         assert_eq!(
             organizations_text(&record),
-            "Organizations (* active):\n  * Alice (alice, personal)\n"
+            "Tenants (* active):\n  * Alice (alice, personal)\n"
         );
     }
 }

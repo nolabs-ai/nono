@@ -416,6 +416,8 @@ fn a_refresh_for_another_organization_is_refused_but_the_rotation_is_kept() {
         )
     });
     let record = super::session::SessionRecord {
+        tenant_selection_pending: false,
+        enrollment_authorized: false,
         protocol_version: "1".to_string(),
         platform_url: origin.clone(),
         issuer: origin.clone(),

@@ -10,7 +10,6 @@
 //! token.
 
 use std::io::{self, IsTerminal, Write};
-use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -27,6 +26,7 @@ use zeroize::Zeroizing;
 
 use crate::cli::{ConnectArgs, PsArgs};
 use crate::platform_oauth::ApiCredential;
+use crate::terminal_selector::{self, RawTerminal, terminal_size};
 
 const RESPONSE_LIMIT_BYTES: u64 = 1024 * 1024;
 const DISCOVERY_PROTOCOL_V1: &str = "1";
@@ -36,8 +36,6 @@ const DEVICE_AUTH_CACHE_FILENAME: &str = "platform-console-auth.json";
 const DEFAULT_DETACH_SEQUENCE: &[u8] = &[0x1d, b'd'];
 const WEBSOCKET_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const TERMINAL_PROTOCOL_V1: &str = "nono.terminal.v1";
-const SELECTOR_HEADER_ROWS: u16 = 7;
-const SELECTOR_ROWS_PER_SESSION: u16 = 2;
 static REMOTE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Debug, Deserialize)]
@@ -244,7 +242,7 @@ pub(crate) struct ConsoleAccess {
 
 /// Choose the console credential: an explicit token file or
 /// `NONO_CONNECT_TOKEN` first, then the `nono login` session (for the
-/// organization `NONO_ORG` names, or the active one), then an enrolled
+/// organization `NONO_TENANT` names, or the active one), then an enrolled
 /// device's remote-attach-v1 authorization.
 pub(crate) fn console_access(token_file: Option<&Path>) -> Result<ConsoleAccess> {
     let explicit = token_file.is_some() || std::env::var_os("NONO_CONNECT_TOKEN").is_some();
@@ -1226,224 +1224,36 @@ fn select_interactively(sessions: &[RemoteSession], host: &str) -> Result<Remote
             "the console has no live sessions visible to this user".to_string(),
         ));
     }
-    let terminal = SelectionTerminal::enter()?;
-    let mut selected = 0;
-    loop {
-        draw_session_selector(sessions, selected, host)?;
-        match read_selector_key(&io::stdin())? {
-            SelectorKey::Up => selected = selected.checked_sub(1).unwrap_or(sessions.len() - 1),
-            SelectorKey::Down => selected = (selected + 1) % sessions.len(),
-            SelectorKey::Home => selected = 0,
-            SelectorKey::End => selected = sessions.len() - 1,
-            SelectorKey::Select => {
-                drop(terminal);
-                return sessions.get(selected).map(clone_session).ok_or_else(|| {
-                    NonoError::ConfigParse("session selection is out of range".to_string())
-                });
+    let items = sessions
+        .iter()
+        .map(|session| {
+            let row = RemoteDisplayRow::from_session(session);
+            let marker = Some(remote_status_dot(&row));
+            let metadata = row.metadata().unwrap_or_default();
+            terminal_selector::Item {
+                label: row.name,
+                context: host.to_string(),
+                status: row.status,
+                metadata,
+                marker,
             }
-            SelectorKey::Cancel => {
-                return Err(NonoError::ActionRequired(
-                    "remote session selection cancelled".to_string(),
-                ));
-            }
-            SelectorKey::Ignore => {}
-        }
-    }
-}
-
-struct SelectionTerminal {
-    _raw_terminal: RawTerminal,
-}
-
-impl SelectionTerminal {
-    fn enter() -> Result<Self> {
-        let raw_terminal = RawTerminal::enter()?;
-        let mut stdout = io::stdout().lock();
-        stdout
-            .write_all(b"\x1b[?1049h\x1b[?25l")
-            .map_err(NonoError::Io)?;
-        stdout.flush().map_err(NonoError::Io)?;
-        Ok(Self {
-            _raw_terminal: raw_terminal,
         })
-    }
-}
-
-impl Drop for SelectionTerminal {
-    fn drop(&mut self) {
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(b"\x1b[?25h\x1b[?1049l");
-        let _ = stdout.flush();
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SelectorKey {
-    Up,
-    Down,
-    Home,
-    End,
-    Select,
-    Cancel,
-    Ignore,
-}
-
-fn draw_session_selector(sessions: &[RemoteSession], selected: usize, host: &str) -> Result<()> {
-    let (columns, rows) = terminal_size();
-    let columns = usize::from(columns);
-    let visible = usize::from(
-        rows.saturating_sub(SELECTOR_HEADER_ROWS)
-            .checked_div(SELECTOR_ROWS_PER_SESSION)
-            .unwrap_or(1)
-            .max(1),
-    )
-    .min(sessions.len());
-    let mut first = selected.saturating_sub(visible / 2);
-    first = first.min(sessions.len().saturating_sub(visible));
-    let last = first + visible;
-    let theme = crate::theme::current();
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(b"\x1b[2J\x1b[H").map_err(NonoError::Io)?;
-    write_terminal_line(
-        &mut stdout,
-        &format!(
-            "  {}  {}  {}",
-            "NONO CONNECT".bold(),
-            host.bold(),
-            format!("{} live", sessions.len()).dimmed(),
-        ),
-    )?;
-    write_terminal_line(&mut stdout, "")?;
-    write_terminal_line(
-        &mut stdout,
-        &format!("  {}", "Choose a session to connect to".bold()),
-    )?;
-    write_terminal_line(
-        &mut stdout,
-        &format!(
-            "  {}",
-            "↑/↓ or j/k move  ·  enter connect  ·  q cancel".dimmed()
-        ),
-    )?;
-    write_terminal_line(&mut stdout, "")?;
-
-    for (index, session) in sessions.iter().enumerate().take(last).skip(first) {
-        let row = RemoteDisplayRow::from_session(session);
-        let active = index == selected;
-        let pointer = if active {
-            crate::theme::fg("❯", theme.brand).bold().to_string()
-        } else {
-            " ".to_string()
-        };
-        // `name  host  status`, each part truncated against what remains of
-        // the line so styling never splits a truncated string.
-        let mut budget = columns.saturating_sub(8).max(12);
-        let name = crate::command_display::truncate_chars(&row.name, budget);
-        budget = budget.saturating_sub(name.chars().count() + 2);
-        let host_text = crate::command_display::truncate_chars(host, budget);
-        budget = budget.saturating_sub(host_text.chars().count() + 2);
-        let status = crate::command_display::truncate_chars(&row.status, budget);
-        let name = if active {
-            name.bold().to_string()
-        } else {
-            name
-        };
-        write_terminal_line(
-            &mut stdout,
-            &format!(
-                "  {pointer} {} {name}  {}  {status}",
-                remote_status_dot(&row),
-                host_text.dimmed(),
-            ),
-        )?;
-        // Always draw the second line so every entry keeps the fixed height
-        // the scroll window assumes.
-        let metadata = crate::command_display::truncate_chars(
-            &row.metadata().unwrap_or_default(),
-            columns.saturating_sub(7).max(12),
-        );
-        write_terminal_line(&mut stdout, &format!("      {}", metadata.dimmed()))?;
-    }
-
-    if visible < sessions.len() {
-        write_terminal_line(
-            &mut stdout,
-            &format!(
-                "  {}",
-                format!("showing {}–{} of {}", first + 1, last, sessions.len()).dimmed()
-            ),
-        )?;
-    }
-    stdout.flush().map_err(NonoError::Io)
-}
-
-fn write_terminal_line(output: &mut impl Write, line: &str) -> Result<()> {
-    output.write_all(line.as_bytes()).map_err(NonoError::Io)?;
-    output.write_all(b"\r\n").map_err(NonoError::Io)
-}
-
-// Read directly from the descriptor that we poll. Buffered stdin can read ahead
-// past Escape, making an arrow key look like a standalone Escape to poll().
-fn read_selector_byte(input: &impl AsFd) -> Result<u8> {
-    let mut byte = [0_u8; 1];
-    loop {
-        match nix::unistd::read(input, &mut byte) {
-            Ok(0) => {
-                return Err(NonoError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "terminal input closed",
-                )));
-            }
-            Ok(_) => return Ok(byte[0]),
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(error) => return Err(NonoError::Io(error.into())),
-        }
-    }
-}
-
-fn read_selector_key(input: &impl AsFd) -> Result<SelectorKey> {
-    match read_selector_byte(input)? {
-        b'k' | b'K' => Ok(SelectorKey::Up),
-        b'j' | b'J' => Ok(SelectorKey::Down),
-        b'g' => Ok(SelectorKey::Home),
-        b'G' => Ok(SelectorKey::End),
-        b'\r' | b'\n' => Ok(SelectorKey::Select),
-        b'q' | b'Q' | 0x03 => Ok(SelectorKey::Cancel),
-        0x1b => read_escape_key(input),
-        _ => Ok(SelectorKey::Ignore),
-    }
-}
-
-fn read_escape_key(input: &impl AsFd) -> Result<SelectorKey> {
-    if !selector_input_pending(input, 40)? {
-        return Ok(SelectorKey::Cancel);
-    }
-    let prefix = read_selector_byte(input)?;
-    if !matches!(prefix, b'[' | b'O') {
-        return Ok(SelectorKey::Ignore);
-    }
-    match read_selector_byte(input)? {
-        b'A' => Ok(SelectorKey::Up),
-        b'B' => Ok(SelectorKey::Down),
-        b'H' => Ok(SelectorKey::Home),
-        b'F' => Ok(SelectorKey::End),
-        _ => Ok(SelectorKey::Ignore),
-    }
-}
-
-fn selector_input_pending(input: &impl AsFd, timeout_ms: i32) -> Result<bool> {
-    let mut descriptor = nix::libc::pollfd {
-        fd: input.as_fd().as_raw_fd(),
-        events: nix::libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: `descriptor` points to one initialized `pollfd`, the count is
-    // exactly one, and `poll` only mutates its `revents` field.
-    let result = unsafe { nix::libc::poll(&mut descriptor, 1, timeout_ms) };
-    if result < 0 {
-        return Err(NonoError::Io(io::Error::last_os_error()));
-    }
-    Ok(result > 0 && descriptor.revents & nix::libc::POLLIN != 0)
+        .collect::<Vec<_>>();
+    let selected = terminal_selector::select(
+        &terminal_selector::Picker {
+            title: "NONO CONNECT",
+            context: host,
+            summary: &format!("{} live", sessions.len()),
+            prompt: "Choose a session to connect to",
+            confirm_label: "connect",
+        },
+        &items,
+    )?
+    .ok_or_else(|| NonoError::ActionRequired("remote session selection cancelled".into()))?;
+    sessions
+        .get(selected)
+        .map(clone_session)
+        .ok_or_else(|| NonoError::ConfigParse("session selection is out of range".to_string()))
 }
 
 fn print_connect_target(session: &RemoteSession, host: &str) {
@@ -1856,62 +1666,6 @@ where
         .map_err(ws_error)
 }
 
-struct RawTerminal {
-    original: nix::sys::termios::Termios,
-    screen: crate::pty_proxy::AltScreenTracker,
-}
-
-impl RawTerminal {
-    fn enter() -> Result<Self> {
-        use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
-        let stdin = io::stdin();
-        let original = tcgetattr(&stdin).map_err(|error| {
-            NonoError::ConfigParse(format!("could not read terminal mode: {error}"))
-        })?;
-        let mut raw = original.clone();
-        cfmakeraw(&mut raw);
-        tcsetattr(&stdin, SetArg::TCSANOW, &raw).map_err(|error| {
-            NonoError::ConfigParse(format!("could not enter raw terminal mode: {error}"))
-        })?;
-        Ok(Self {
-            original,
-            screen: Default::default(),
-        })
-    }
-}
-
-impl Drop for RawTerminal {
-    fn drop(&mut self) {
-        crate::pty_proxy::restore_terminal_modes_after_attach(
-            self.screen.in_alt_screen,
-            terminal_size().1,
-        );
-        let stdin = io::stdin();
-        let _ = nix::sys::termios::tcsetattr(
-            &stdin,
-            nix::sys::termios::SetArg::TCSANOW,
-            &self.original,
-        );
-    }
-}
-
-fn terminal_size() -> (u16, u16) {
-    let mut size = nix::libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: TIOCGWINSZ only writes the fixed-size `winsize` structure.
-    let result =
-        unsafe { nix::libc::ioctl(nix::libc::STDOUT_FILENO, nix::libc::TIOCGWINSZ, &mut size) };
-    if result == 0 && size.ws_col > 0 && size.ws_row > 0 {
-        (size.ws_col, size.ws_row)
-    } else {
-        (80, 24)
-    }
-}
-
 struct DetachMatch {
     forward: Vec<u8>,
     detach: bool,
@@ -2040,34 +1794,6 @@ impl DetachMatcher {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn selector_reads_queued_arrow_sequences_without_cancelling() -> Result<()> {
-        let (input, mut writer) = std::os::unix::net::UnixStream::pair().map_err(NonoError::Io)?;
-        writer
-            .write_all(b"\x1b[B\x1b[A\x1bOB\x1bOA\x1b[H\x1b[F\r")
-            .map_err(NonoError::Io)?;
-        for expected in [
-            SelectorKey::Down,
-            SelectorKey::Up,
-            SelectorKey::Down,
-            SelectorKey::Up,
-            SelectorKey::Home,
-            SelectorKey::End,
-            SelectorKey::Select,
-        ] {
-            assert_eq!(read_selector_key(&input)?, expected);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn selector_standalone_escape_still_cancels() -> Result<()> {
-        let (input, mut writer) = std::os::unix::net::UnixStream::pair().map_err(NonoError::Io)?;
-        writer.write_all(b"\x1b").map_err(NonoError::Io)?;
-        assert_eq!(read_selector_key(&input)?, SelectorKey::Cancel);
-        Ok(())
-    }
 
     /// Regression: with both rustls providers enabled there is no process
     /// default, and `connect_async` panicked building its TLS config. The

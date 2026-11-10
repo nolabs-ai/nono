@@ -43,6 +43,7 @@ const MAX_IDENTIFIER_LEN: usize = 200;
 #[derive(Debug, Clone)]
 pub(crate) struct AuthorizationServer {
     pub(crate) issuer: String,
+    pub(crate) enrollment_endpoint: Option<Url>,
     pub(crate) authorization_endpoint: Option<Url>,
     pub(crate) token_endpoint: Url,
     pub(crate) device_authorization_endpoint: Option<Url>,
@@ -51,6 +52,7 @@ pub(crate) struct AuthorizationServer {
 
 #[derive(Debug, Deserialize)]
 struct RawMetadata {
+    nono_enrollment_endpoint: Option<String>,
     issuer: String,
     authorization_endpoint: Option<String>,
     token_endpoint: Option<String>,
@@ -167,6 +169,7 @@ fn validate_metadata(platform_url: &str, raw: RawMetadata) -> Result<Authorizati
     let token_endpoint = endpoint(raw.token_endpoint)?
         .ok_or_else(|| NonoError::ConfigParse("metadata omits token_endpoint".to_string()))?;
     Ok(AuthorizationServer {
+        enrollment_endpoint: endpoint(raw.nono_enrollment_endpoint)?,
         issuer: raw.issuer,
         authorization_endpoint: endpoint(raw.authorization_endpoint)?,
         token_endpoint,
@@ -490,6 +493,41 @@ impl<'a> OAuthClient<'a> {
     /// POST a form with a DPoP proof, retrying once if the server demands a
     /// nonce (RFC 9449 §8).
     fn post_form(&mut self, endpoint: &Url, form: &str) -> Result<FormResponse> {
+        self.post_body(endpoint, "application/x-www-form-urlencoded", form)
+    }
+
+    pub(crate) fn enroll(
+        &mut self,
+        request: &crate::login_enrollment::LoginEnrollmentRequest,
+    ) -> Result<crate::platform_client::EnrollmentExchangeResponse> {
+        let endpoint = self.server.enrollment_endpoint.clone().ok_or_else(|| {
+            NonoError::ActionRequired(
+                "this platform does not support enrollment during login".into(),
+            )
+        })?;
+        let body = Zeroizing::new(
+            serde_json::to_string(request)
+                .map_err(|_| NonoError::ConfigParse("cannot encode enrollment request".into()))?,
+        );
+        let response = self.post_body(&endpoint, "application/json", &body)?;
+        if response.status != 200 {
+            let message = parse_oauth_error(&response.body)
+                .map(|error| error.to_string())
+                .unwrap_or_else(|_| format!("HTTP {}", response.status));
+            return Err(NonoError::ActionRequired(format!(
+                "device enrollment failed: {message}"
+            )));
+        }
+        serde_json::from_str(&response.body)
+            .map_err(|_| NonoError::ConfigParse("invalid enrollment response".into()))
+    }
+
+    fn post_body(
+        &mut self,
+        endpoint: &Url,
+        content_type: &str,
+        body: &str,
+    ) -> Result<FormResponse> {
         let mut retried = false;
         loop {
             let proof = self
@@ -501,10 +539,10 @@ impl<'a> OAuthClient<'a> {
                 .max_redirects(0)
                 .http_status_as_error(false)
                 .build()
-                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("Content-Type", content_type)
                 .header("Accept", "application/json")
                 .header("DPoP", &proof)
-                .send(form.as_bytes())
+                .send(body.as_bytes())
                 .map_err(|error| {
                     NonoError::ConfigParse(format!("authorization server request failed: {error}"))
                 })?;
@@ -834,6 +872,7 @@ mod tests {
 
     fn raw_metadata(issuer: &str) -> RawMetadata {
         RawMetadata {
+            nono_enrollment_endpoint: None,
             issuer: issuer.to_string(),
             authorization_endpoint: Some(format!("{issuer}/oauth/authorize")),
             token_endpoint: Some(format!("{issuer}/oauth/token")),

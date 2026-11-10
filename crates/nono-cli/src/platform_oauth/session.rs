@@ -44,11 +44,15 @@ pub(crate) struct SessionRecord {
     pub(crate) key_thumbprint: String,
     pub(crate) user_subject: String,
     pub(crate) user_display: String,
-    /// The organization remote commands use unless `NONO_ORG` says otherwise.
+    /// The organization remote commands use unless `NONO_TENANT` says otherwise.
     pub(crate) tenant_id: String,
     pub(crate) organizations: Vec<Organization>,
     pub(crate) console_url: Option<String>,
     pub(crate) signed_in_at: String,
+    #[serde(default)]
+    pub(crate) tenant_selection_pending: bool,
+    #[serde(default)]
+    pub(crate) enrollment_authorized: bool,
 }
 
 impl SessionRecord {
@@ -61,6 +65,15 @@ impl SessionRecord {
     /// Resolve an organization by ID, slug, or (unambiguous, case-insensitive)
     /// display name.
     pub(crate) fn find_organization(&self, name: &str) -> Result<&Organization> {
+        if name == "personal" {
+            return self
+                .organizations
+                .iter()
+                .find(|tenant| tenant.kind == "personal")
+                .ok_or_else(|| {
+                    NonoError::ActionRequired("this account has no personal tenant".into())
+                });
+        }
         if let Some(org) = self
             .organizations
             .iter()
@@ -160,6 +173,7 @@ pub(crate) fn new_record(
     key: &DpopKey,
     identity: &super::client::Identity,
     session: &super::client::SessionInfo,
+    enrollment_authorized: bool,
 ) -> SessionRecord {
     SessionRecord {
         protocol_version: SESSION_PROTOCOL_V1.to_string(),
@@ -171,6 +185,8 @@ pub(crate) fn new_record(
         tenant_id: session.tenant_id.clone(),
         organizations: session.organizations.clone(),
         console_url: session.console_url.as_ref().map(|url| url.to_string()),
+        tenant_selection_pending: true,
+        enrollment_authorized,
         signed_in_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     }
 }
@@ -385,6 +401,8 @@ pub(crate) mod tests {
             ],
             console_url: None,
             signed_in_at: "2026-11-02T00:00:00Z".to_string(),
+            tenant_selection_pending: false,
+            enrollment_authorized: true,
         }
     }
 

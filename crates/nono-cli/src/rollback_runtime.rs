@@ -273,6 +273,7 @@ pub(crate) fn create_audit_state(
     }
 
     let (session_id, session_dir) = ensure_audit_session_dir(session_id)?;
+    audit_client::capture_enrollment(&session_dir)?;
 
     Ok(Some(AuditState {
         session_id,

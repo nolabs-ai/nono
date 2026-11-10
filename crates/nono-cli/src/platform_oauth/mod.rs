@@ -4,8 +4,8 @@
 //! (`client_id=nono-cli`). The session is a refresh token bound with DPoP to
 //! a key the CLI generates for it, both kept in nono's protected state
 //! directory. Remote commands turn the session into short-lived access tokens
-//! for the active organization, or the one `NONO_ORG` names. Nothing here
-//! enrolls a device. `login_cmd` drives `nono login` and `nono logout`.
+//! for the active organization, or the one `NONO_TENANT` names. Nothing here
+//! enrolls a device directly; `login_cmd` coordinates separate device enrollment.
 
 pub(crate) mod client;
 pub(crate) mod dpop;
@@ -103,10 +103,15 @@ pub(crate) struct SessionAccess {
 
 /// Environment variable naming the organization (name, slug or ID) for one
 /// remote command, instead of the active one.
-pub(crate) const ORG_ENV: &str = "NONO_ORG";
+pub(crate) const ORG_ENV: &str = "NONO_TENANT";
 
-/// The organization `NONO_ORG` names, if set. Empty means unset.
+/// The organization `NONO_TENANT` names, if set. Empty means unset.
 pub(crate) fn org_override() -> Result<Option<String>> {
+    if std::env::var_os("NONO_ORG").is_some() {
+        return Err(NonoError::ActionRequired(
+            "NONO_ORG has been replaced by NONO_TENANT; update your environment".into(),
+        ));
+    }
     match std::env::var(ORG_ENV) {
         Ok(value) if value.trim().is_empty() => Ok(None),
         Ok(value) => Ok(Some(value.trim().to_string())),
@@ -118,7 +123,7 @@ pub(crate) fn org_override() -> Result<Option<String>> {
 }
 
 /// Exchange the stored session for an access token for the organization
-/// `NONO_ORG` names, else the active organization.
+/// `NONO_TENANT` names, else the active organization.
 ///
 /// Returns `Ok(None)` when nobody is signed in, so callers can fall back to
 /// other credentials. A session the platform no longer accepts is removed
@@ -137,6 +142,11 @@ pub(crate) fn session_access_locked(
     let Some(mut record) = session::load_record()? else {
         return Ok(None);
     };
+    if record.tenant_selection_pending && org.is_none() {
+        return Err(NonoError::ActionRequired(
+            "choose a tenant with `nono login --tenant <slug|id|personal>`".into(),
+        ));
+    }
     let tenant_id = match org {
         Some(name) => record.find_organization(name)?.tenant_id.clone(),
         None => record.tenant_id.clone(),
@@ -167,7 +177,7 @@ pub(crate) fn session_access_locked(
             NonoError::ConfigParse("platform returned an unknown organization".to_string())
         })?;
     // Keep the organization list and console current; the active organization
-    // changes only with `nono login --org`.
+    // changes only with `nono login --tenant`.
     record.organizations = response.session.organizations.clone();
     record.console_url = response.session.console_url.as_ref().map(Url::to_string);
     if record.active_organization().is_none() {

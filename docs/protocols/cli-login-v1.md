@@ -6,9 +6,10 @@ both the CLI and the platform. It does not define how the platform signs people
 in (GitHub, Google, or other providers), how it onboards new accounts, or any
 sandbox behaviour.
 
-`nono login` signs in a person. It does not enroll a device; device enrollment
-and audit delivery are specified separately in
-[audit-delivery-v1](audit-delivery-v1.md).
+`nono login` signs in a person and, by default, registers a separate device
+identity through the optional [login enrollment extension](login-enrollment-v1.md).
+`--no-enroll` requests sign-in only. Manual token enrollment and audit delivery
+remain specified in [audit-delivery-v1](audit-delivery-v1.md).
 
 The CLI is an OAuth 2.0 public native client:
 
@@ -31,7 +32,9 @@ unrelated to any device enrollment key.
 | `nono:connect` | Access tokens accepted by nono-console: list sessions and attach to them. |
 | `nono:runs` | Access tokens accepted by the platform Runs API: launch and read runs; and by nono-console to list the workspaces a run can target. |
 
-The CLI requests all three. The platform rejects any other scope value.
+The CLI requests all three. With automatic enrollment enabled and the extension
+advertised, it also requests `nono:enroll`. That scope authorizes the dedicated
+enrollment endpoint; it does not expand console or Runs API access.
 
 A console accepts these tokens only for `GET /api/v1/sessions`,
 `GET /api/v1/sessions/{id}/terminal` and `GET /api/v1/workspaces`, and still
@@ -130,8 +133,9 @@ Resource servers must reject a DPoP-bound access token presented as `Bearer`.
 2. The platform signs the person in. Someone without an account signs in with
    one of the platform's providers, and the platform creates the account and
    runs its onboarding before returning to this request. The consent screen
-   shows the client, the scopes, the key fingerprint, and the organization that
-   will be active, which a member of several organizations can change.
+   shows the client, the scopes and the key fingerprint. After sign-in the CLI
+   selects the sole accessible tenant, or presents a terminal picker. `--tenant`
+   explicitly selects a tenant by slug, ID, display name, or `personal`.
 
 3. The platform redirects to the redirect URI with `code`, `state` and `iss`
    (RFC 9207), or with `error`, `state` and `iss`.

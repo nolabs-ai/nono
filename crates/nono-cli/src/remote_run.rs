@@ -119,7 +119,7 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         .as_deref()
         .ok_or_else(|| action("--agent is required"))?;
     // Run API credential: an explicit personal access token, else the
-    // `nono login` session for the organization NONO_ORG names (or the
+    // `nono login` session for the organization NONO_TENANT names (or the
     // active one).
     let (run_token, session_platform) = match options.run_token_file.as_deref() {
         Some(path) => (connect_client::load_token(Some(path))?, None),

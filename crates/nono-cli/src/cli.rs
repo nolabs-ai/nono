@@ -296,7 +296,7 @@ pub enum Commands {
 ")]
     Platform(PlatformArgs),
 
-    /// Sign in to a nono platform as yourself
+    /// Sign in to a nono platform and enroll this device for audit delivery
     #[command(help_template = "\
 {about}
 
@@ -315,9 +315,13 @@ pub enum Commands {
     # Sign in to a self-hosted platform
     nono login --url https://nono.example.com
 
-    # See your account and organizations, or work in another organization
+    # Select an organization or your personal tenant
     nono login
-    nono login --org acme
+    nono login --tenant acme
+    nono login --tenant personal
+
+    # Authenticate the CLI without enrolling this device
+    nono login --no-enroll
 ")]
     Login(LoginArgs),
 
@@ -2801,10 +2805,14 @@ pub struct LoginArgs {
     #[arg(long, env = "NONO_PLATFORM_URL")]
     pub url: Option<String>,
 
-    /// Organization to work in (name, slug or ID); when already signed in,
-    /// switches to it without a browser. NONO_ORG overrides it for one command
+    /// Tenant to work in (name, slug, ID, or personal); switches without a browser
+    /// when already signed in. NONO_TENANT overrides it for one remote command
     #[arg(long)]
-    pub org: Option<String>,
+    pub tenant: Option<String>,
+
+    /// Sign in without enrolling this device; existing enrollment is retained
+    #[arg(long)]
+    pub no_enroll: bool,
 
     /// Sign in through a local browser and a loopback redirect
     #[arg(long, conflicts_with = "device_code")]

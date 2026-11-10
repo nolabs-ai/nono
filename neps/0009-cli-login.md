@@ -5,7 +5,7 @@ authors:
   - lukehinds
 status: draft
 created: 2026-10-31
-breaking: false
+breaking: true
 superseded-by:
 ---
 
@@ -22,8 +22,10 @@ it use the platform on that person's behalf: launch remote runs
 them (`nono connect`), in their personal account or in any organization they
 belong to.
 
-`nono login` signs in a person, not a machine. It does not enroll a device and
-does not touch audit delivery; device enrollment stays `nono platform enroll`.
+`nono login` signs in a person and automatically enrolls a separate device
+identity unless `--no-enroll` is supplied. The coordinated extension is described
+in [login-enrollment-v1](../docs/protocols/login-enrollment-v1.md). Manual enrollment
+remains available through `nono platform enroll`.
 
 The CLI is a standard OAuth 2.0 public native client: authorization code with
 PKCE on a loopback redirect ([RFC 8252], [RFC 7636]), with the device
@@ -34,7 +36,7 @@ DPoP ([RFC 9449]).
 ## Implementation status
 
 Implemented in `nono-cli` by PR #2250, pending acceptance of this NEP:
-`nono login` (browser and device-code flows, `--org`), `nono logout`, session
+`nono login` (browser and device-code flows, `--tenant`), `nono logout`, session
 use by `nono run --remote`, `nono ps --remote` and `nono connect`, the
 `cli-login-v1` protocol document and conformance fixtures. Open questions
 below remain open.
@@ -76,9 +78,8 @@ once, and the CLI can act as them.
 
 ### Non-Goals
 
-- Device enrollment and audit delivery. These stay with
-  `nono platform enroll`; a machine can be enrolled, signed in, both, or
-  neither.
+- Mandatory auditing and full terminal recording. Enrollment enables automatic
+  audit delivery but leaves existing audit opt-outs intact.
 - Signing in to an identity provider other than through the platform. The
   platform is the only OAuth authorization server the CLI talks to.
 - Any change to sandbox enforcement, capabilities, profiles, Landlock or
@@ -91,7 +92,7 @@ once, and the CLI can act as them.
 ### CLI surface (`nono-cli` only)
 
 ```text
-nono login   [--url <origin>] [--org <name>] [--browser | --device-code] [--no-open]
+nono login   [--url <origin>] [--tenant <name>] [--no-enroll] [--browser | --device-code] [--no-open]
 nono logout
 ```
 
@@ -106,14 +107,17 @@ managed in the platform's web console.
   exists.
 - Over SSH (`SSH_CONNECTION`/`SSH_TTY`), with no display, or when the loopback
   listener cannot bind, the CLI uses the device-code flow.
-- The active organization is the one chosen on the consent screen.
-  `nono login --org <name>` makes another one active; on a signed-in machine it
+- After authentication, the CLI selects the only accessible tenant or displays
+  a terminal picker shared with `nono connect`. `--tenant personal` selects the
+  personal tenant.
+  `nono login --tenant <name>` makes another one active; on a signed-in machine it
   does so without a browser, after the platform confirms membership.
 - `nono login` on a signed-in machine reports who is signed in, lists the
-  person's organizations with the active one marked, and exits. This is the
+  person's tenants with the active one marked, and ensures device enrollment
+  unless `--no-enroll` is given. This is the
   CLI's only organization listing.
-- The `NONO_ORG` environment variable names an organization for one command
-  (`NONO_ORG=acme nono ps --remote`) without changing the active one.
+- The `NONO_TENANT` environment variable names an organization for one command
+  (`NONO_TENANT=acme nono ps --remote`) without changing the active one.
   `nono run --remote`, `nono ps --remote` and `nono connect` take no
   organization flag.
 
@@ -183,7 +187,8 @@ DPoP key recorded when the device authorization starts.
   `NONO_CONNECT_TOKEN` and `--token-file` behave as today.
 - A device-enrolled machine without a `nono login` session keeps using
   remote-attach-v1 for `nono connect`. Deprecating that flow is a follow-up.
-- `nono platform enroll` and audit delivery are unchanged.
+- Manual token enrollment is retained. Login enrollment and fixed audit provenance
+  are specified in `login-enrollment-v1`.
 
 ### Protocol specification
 
@@ -215,7 +220,7 @@ issuing and holding human credentials.
   `gh` or `gcloud` file storage; DPoP still prevents replay of a token
   captured in transit, in logs, or by a server. Secrets are held in
   `Zeroizing` types and never logged.
-- **Sandboxed agents.** `nono login` (including `--org`) and `nono logout`
+- **Sandboxed agents.** `nono login` (including `--tenant`) and `nono logout`
   refuse to run inside a nono sandbox. Remote commands launched by an agent
   inside a sandbox cannot use the session, because they cannot read it.
 - **Organization scoping.** The organization comes from the person's
@@ -245,12 +250,12 @@ issuing and holding human credentials.
   where the CLI is often used. A keyring backend can be added later as an
   option.
 - **Fix the organization at login.** Simpler, but members of several
-  organizations would sign in repeatedly. `nono login --org` keeps the
+  organizations would sign in repeatedly. `nono login --tenant` keeps the
   organization a sign-in setting while switching through a token refresh
   instead of a new sign-in.
 - **A `nono org list` / `nono org switch` command group.** Rejected to keep
   the CLI from growing platform-administration commands; `nono login` already
-  lists organizations and `--org` switches.
+  lists organizations and `--tenant` switches.
 - **Organization-free tokens.** A token covering every organization, with
   the platform inferring the organization from each request, would remove the
   concept from the CLI entirely. Rejected: the console and its row-level
@@ -265,10 +270,8 @@ issuing and holding human credentials.
   security settings?
 - What lifetime should a CLI session have, and should an organization's
   policy (for example required MFA) cap it?
-- Should `nono login --enroll` also enroll the device, for people who want
-  audit delivery in the same step?
-- Deprecation timeline for remote-attach-v1 and `NONO_RUN_TOKEN` for
-  interactive use.
+
+
 
 [RFC 7009]: https://www.rfc-editor.org/rfc/rfc7009
 [RFC 7636]: https://www.rfc-editor.org/rfc/rfc7636

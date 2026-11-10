@@ -53,13 +53,13 @@ struct EnrollmentExchangeRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct EnrollmentExchangeResponse {
-    protocol_version: String,
-    tenant_id: String,
-    subject_id: String,
-    subject_kind: String,
-    management_mode: String,
-    enrolled_at: String,
+pub(crate) struct EnrollmentExchangeResponse {
+    pub protocol_version: String,
+    pub tenant_id: String,
+    pub subject_id: String,
+    pub subject_kind: String,
+    pub management_mode: String,
+    pub enrolled_at: String,
 }
 
 pub(crate) fn run_platform(args: PlatformArgs) -> Result<()> {
@@ -81,32 +81,7 @@ fn enroll(args: PlatformEnrollArgs) -> Result<()> {
     }
 
     let key_ref = TrustKeyRef::parse(&args.keyref)?;
-    let key_label = key_ref.key_id()?;
-    let key_pair =
-        if trust_keystore::contains_secret_for_ref(&key_ref, PLATFORM_KEY_SERVICE, &key_label)? {
-            load_signing_key_for_ref(&key_ref)?
-        } else {
-            let rng = SystemRandom::new();
-            let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
-                .map_err(|_| {
-                    NonoError::KeystoreAccess("failed to generate platform key".to_string())
-                })?;
-            let key_pair =
-                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
-                    .map_err(|_| {
-                        NonoError::KeystoreAccess(
-                            "failed to load generated platform key".to_string(),
-                        )
-                    })?;
-            let private_key = Zeroizing::new(STANDARD.encode(pkcs8.as_ref()));
-            trust_keystore::store_secret_for_ref(
-                &key_ref,
-                PLATFORM_KEY_SERVICE,
-                &key_label,
-                private_key.as_str(),
-            )?;
-            key_pair
-        };
+    let key_pair = load_or_create_signing_key_for_ref(&key_ref)?;
 
     let request = EnrollmentExchangeRequest {
         protocol_version: ENROLLMENT_PROTOCOL_V1.to_string(),
@@ -199,10 +174,29 @@ fn unenroll(args: PlatformUnenrollArgs) -> Result<()> {
         let key_label = key_ref.key_id()?;
         trust_keystore::remove_secret_for_ref(&key_ref, PLATFORM_KEY_SERVICE, &key_label)?;
     }
-    fs::remove_file(&state_path).map_err(|source| NonoError::ConfigWrite {
-        path: state_path.clone(),
-        source,
-    })?;
+    let active = read_state(&state_path)?;
+    let user = crate::platform_oauth::session::load_record()?
+        .map(|session| session.user_subject)
+        .or_else(|| {
+            active
+                .as_ref()
+                .and_then(|stored| stored.login_user_id.clone())
+        });
+    if let Some(user) = user {
+        let path = scoped_state_path(&state.platform_url, &state.tenant_id, &user)?;
+        if path.exists() {
+            fs::remove_file(&path).map_err(|source| NonoError::ConfigWrite { path, source })?;
+        }
+    }
+    if active
+        .as_ref()
+        .is_some_and(|stored| stored.state.subject_id == state.subject_id)
+    {
+        fs::remove_file(&state_path).map_err(|source| NonoError::ConfigWrite {
+            path: state_path.clone(),
+            source,
+        })?;
+    }
     println!("Unenrolled from {}.", state.platform_url);
     println!(
         "  Subject {} stays registered with tenant {} until an operator revokes it.",
@@ -216,7 +210,7 @@ fn unenroll(args: PlatformUnenrollArgs) -> Result<()> {
     if queued > 0 {
         println!(
             "  {queued} audit session(s) remain queued and will be delivered after the next \
-             enrollment."
+             enrollment; evidence remains bound to its original identity."
         );
     }
     Ok(())
@@ -260,35 +254,143 @@ fn post_enrollment(
         .map_err(|error| NonoError::ConfigParse(format!("invalid enrollment response: {error}")))
 }
 
-pub(crate) fn load_state() -> Result<Option<PlatformState>> {
-    let path = state_path()?;
+#[derive(Serialize, Deserialize)]
+struct StoredEnrollment {
+    #[serde(flatten)]
+    state: PlatformState,
+    #[serde(default)]
+    login_user_id: Option<String>,
+}
+
+pub(crate) fn enrollment_scope_id(platform: &str, tenant: &str, user: &str) -> Result<String> {
+    let scope = serde_json::to_vec(&(platform, tenant, user))
+        .map_err(|_| NonoError::ConfigParse("invalid enrollment scope".into()))?;
+    Ok(sha256_hex(&scope))
+}
+
+fn scoped_state_path(platform: &str, tenant: &str, user: &str) -> Result<PathBuf> {
+    Ok(crate::state_paths::user_state_dir()?
+        .join("platform-enrollments")
+        .join(format!(
+            "{}.json",
+            enrollment_scope_id(platform, tenant, user)?
+        )))
+}
+
+fn read_state(path: &Path) -> Result<Option<StoredEnrollment>> {
     if !path.exists() {
         return Ok(None);
     }
-    let contents = fs::read_to_string(&path).map_err(|source| NonoError::ConfigRead {
-        path: path.clone(),
+    let contents = fs::read_to_string(path).map_err(|source| NonoError::ConfigRead {
+        path: path.to_path_buf(),
         source,
     })?;
-    let state = serde_json::from_str::<PlatformState>(&contents)
-        .map_err(|error| NonoError::ConfigParse(format!("invalid {}: {error}", path.display())))?;
+    let stored: StoredEnrollment = serde_json::from_str(&contents)
+        .map_err(|_| NonoError::ConfigParse("invalid platform enrollment state".into()))?;
+    let state = &stored.state;
     if state.protocol_version != ENROLLMENT_PROTOCOL_V1
         || state.key_algorithm != KEY_ALGORITHM
         || state.management_mode != "audit_only"
     {
         return Err(NonoError::ConfigParse(
-            "unsupported local platform enrollment state".to_string(),
+            "unsupported local platform enrollment state".into(),
         ));
     }
-    // Re-validated on every load, not just at enrollment, so a tampered state
-    // file cannot inject bytes into signed request headers either.
+    validate_platform_url(&state.platform_url)?;
     validate_wire_identifier("tenant id", &state.tenant_id)?;
     validate_wire_identifier("subject id", &state.subject_id)?;
-    Ok(Some(state))
+    Ok(Some(stored))
+}
+
+pub(crate) fn save_login_enrollment(state: PlatformState, user: &str) -> Result<()> {
+    let path = scoped_state_path(&state.platform_url, &state.tenant_id, user)?;
+    let stored = StoredEnrollment {
+        state,
+        login_user_id: Some(user.to_string()),
+    };
+    write_json_secure(&path, &stored)?;
+    write_json_secure(&state_path()?, &stored)
+}
+
+fn selected_enrollment(
+    session: &crate::platform_oauth::session::SessionRecord,
+) -> Result<Option<StoredEnrollment>> {
+    let path = scoped_state_path(
+        &session.platform_url,
+        &session.tenant_id,
+        &session.user_subject,
+    )?;
+    let stored = read_state(&path)?;
+    if stored.as_ref().is_some_and(|stored| {
+        stored.state.platform_url != session.platform_url
+            || stored.state.tenant_id != session.tenant_id
+            || stored.login_user_id.as_deref() != Some(session.user_subject.as_str())
+    }) {
+        return Err(NonoError::ConfigParse(
+            "enrollment scope does not match the login".into(),
+        ));
+    }
+    Ok(stored)
+}
+
+pub(crate) fn activate_login_enrollment(
+    session: &crate::platform_oauth::session::SessionRecord,
+) -> Result<()> {
+    if let Some(stored) = selected_enrollment(session)? {
+        write_json_secure(&state_path()?, &stored)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn load_state() -> Result<Option<PlatformState>> {
+    if let Some(session) = crate::platform_oauth::session::load_record()? {
+        if session.tenant_selection_pending {
+            return Ok(None);
+        }
+        if let Some(stored) = selected_enrollment(&session)? {
+            return Ok(Some(stored.state));
+        }
+        return Ok(read_state(&state_path()?)?
+            .filter(|stored| {
+                stored.state.platform_url == session.platform_url
+                    && stored.state.tenant_id == session.tenant_id
+                    && stored
+                        .login_user_id
+                        .as_deref()
+                        .is_none_or(|user| user == session.user_subject)
+            })
+            .map(|stored| stored.state));
+    }
+    Ok(read_state(&state_path()?)?.map(|stored| stored.state))
 }
 
 pub(crate) fn load_signing_key(state: &PlatformState) -> Result<EcdsaKeyPair> {
-    let key_ref = TrustKeyRef::parse(&state.key_ref)?;
-    load_signing_key_for_ref(&key_ref)
+    load_signing_key_for_ref(&TrustKeyRef::parse(&state.key_ref)?)
+}
+
+pub(crate) fn load_or_create_signing_key_for_ref(key_ref: &TrustKeyRef) -> Result<EcdsaKeyPair> {
+    let key_label = key_ref.key_id()?;
+    if trust_keystore::contains_secret_for_ref(key_ref, PLATFORM_KEY_SERVICE, &key_label)? {
+        load_signing_key_for_ref(key_ref)
+    } else {
+        let rng = SystemRandom::new();
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).map_err(|_| {
+                NonoError::KeystoreAccess("failed to generate platform key".to_string())
+            })?;
+        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
+            .map_err(|_| {
+            NonoError::KeystoreAccess("failed to load generated platform key".to_string())
+        })?;
+        let private_key = Zeroizing::new(STANDARD.encode(pkcs8.as_ref()));
+        trust_keystore::store_secret_for_ref(
+            key_ref,
+            PLATFORM_KEY_SERVICE,
+            &key_label,
+            private_key.as_str(),
+        )?;
+        Ok(key_pair)
+    }
 }
 
 fn load_signing_key_for_ref(key_ref: &TrustKeyRef) -> Result<EcdsaKeyPair> {
@@ -377,7 +479,7 @@ fn current_timestamp_ms() -> Result<u128> {
         })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -423,7 +525,7 @@ pub(crate) fn http_agent(global_timeout: Duration) -> ureq::Agent {
 /// HTTP headers or the newline-delimited canonical signing string. A malicious
 /// platform must not be able to smuggle CRLF or separator bytes through
 /// `subject_id`/`tenant_id` into later signed requests.
-fn validate_wire_identifier(name: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_wire_identifier(name: &str, value: &str) -> Result<()> {
     let valid = !value.is_empty()
         && value.len() <= 200
         && value
@@ -539,6 +641,79 @@ mod tests {
         request_id: String,
         body_digest: String,
         canonical: String,
+    }
+
+    #[test]
+    fn enrollment_scope_separates_instances_tenants_and_users() {
+        let original = enrollment_scope_id("https://one.example", "acme", "alice").unwrap();
+        for (issuer, tenant, user) in [
+            ("https://two.example", "acme", "alice"),
+            ("https://one.example", "personal", "alice"),
+            ("https://one.example", "acme", "bob"),
+        ] {
+            assert_ne!(original, enrollment_scope_id(issuer, tenant, user).unwrap());
+        }
+    }
+
+    #[test]
+    fn enrollment_selection_is_scoped_and_unenrollment_preserves_other_tenants() {
+        use crate::platform_oauth::session;
+        use crate::test_env::{ENV_LOCK, EnvVarGuard};
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config");
+        let state_home = home.path().join("state");
+        fs::create_dir_all(&config).unwrap();
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", config.to_str().unwrap()),
+            ("XDG_STATE_HOME", state_home.to_str().unwrap()),
+        ]);
+        let mut login = session::tests::record();
+        let lock = session::lock().unwrap();
+        session::save_record(&lock, &login).unwrap();
+        let first = PlatformState {
+            protocol_version: "1".into(),
+            platform_url: login.platform_url.clone(),
+            tenant_id: "t-1".into(),
+            subject_id: "device-one".into(),
+            subject_kind: "device".into(),
+            management_mode: "audit_only".into(),
+            key_algorithm: KEY_ALGORITHM.into(),
+            key_ref: "keystore://fixture".into(),
+            enrolled_at: "2026-11-10T00:00:00Z".into(),
+        };
+        save_login_enrollment(first.clone(), "u").unwrap();
+        login.tenant_id = "t-2".into();
+        session::save_record(&lock, &login).unwrap();
+        assert!(load_state().unwrap().is_none());
+        let second = PlatformState {
+            tenant_id: "t-2".into(),
+            subject_id: "device-two".into(),
+            ..first.clone()
+        };
+        save_login_enrollment(second, "u").unwrap();
+        login.tenant_id = "t-1".into();
+        session::save_record(&lock, &login).unwrap();
+        assert_eq!(load_state().unwrap().unwrap().subject_id, "device-one");
+        login.user_subject = "another-user".into();
+        session::save_record(&lock, &login).unwrap();
+        assert!(load_state().unwrap().is_none());
+        login.user_subject = "u".into();
+        login.tenant_selection_pending = true;
+        session::save_record(&lock, &login).unwrap();
+        assert!(load_state().unwrap().is_none());
+        login.tenant_selection_pending = false;
+        session::save_record(&lock, &login).unwrap();
+        unenroll(PlatformUnenrollArgs {
+            delete_key: false,
+            help: None,
+        })
+        .unwrap();
+        assert!(load_state().unwrap().is_none());
+        login.tenant_id = "t-2".into();
+        session::save_record(&lock, &login).unwrap();
+        assert_eq!(load_state().unwrap().unwrap().subject_id, "device-two");
     }
 
     #[test]

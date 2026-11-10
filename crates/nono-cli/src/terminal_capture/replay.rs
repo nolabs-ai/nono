@@ -9,9 +9,10 @@
 //!
 //! The viewer's terminal is rarely the size the session was recorded at.
 //! Each frame is drawn row by row with explicit cursor positioning and
-//! clipped to the viewer's terminal, so a recording wider or taller than it
-//! never wraps or scrolls the viewer's screen out of step with the model;
-//! the top-left part that fits is shown.
+//! clipped to the viewer's terminal as it is when the frame is drawn, so a
+//! recording wider or taller than it never wraps or scrolls the viewer's
+//! screen out of step with the model; the top-left part that fits is shown.
+//! Resizing the terminal during a replay redraws the screen at the new size.
 
 use super::recording::{CastEvent, Recording, parse_marker};
 use nono::{NonoError, Result};
@@ -61,10 +62,11 @@ pub(crate) struct ReplayOptions {
     pub(crate) speed: f64,
     pub(crate) idle_limit: Option<f64>,
     pub(crate) start: ReplayStart,
-    /// The viewer's terminal as `(cols, rows)`; `None` when output is not a
-    /// terminal, in which case the whole recorded screen is drawn.
-    pub(crate) viewport: Option<(u16, u16)>,
 }
+
+/// The viewer's terminal as `(cols, rows)`; `None` when output is not a
+/// terminal, in which case the whole recorded screen is drawn.
+pub(crate) type Viewport = Option<(u16, u16)>;
 
 fn size(value: u16) -> NonZeroU16 {
     NonZeroU16::new(value).unwrap_or(NonZeroU16::MIN)
@@ -117,44 +119,59 @@ fn catch_interrupt() {
     let _ = unsafe { nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGINT, &action) };
 }
 
-fn wait(seconds: f64) {
+/// Sleep for `seconds`, stopping early on Ctrl-C. `tick` runs every step,
+/// so a resized terminal is redrawn without waiting for the next frame.
+fn wait(seconds: f64, mut tick: impl FnMut() -> Result<()>) -> Result<()> {
     let mut remaining = Duration::from_secs_f64(seconds.max(0.0));
     let step = Duration::from_millis(50);
     while !remaining.is_zero() && !INTERRUPTED.load(Ordering::SeqCst) {
         let nap = remaining.min(step);
         std::thread::sleep(nap);
         remaining = remaining.saturating_sub(nap);
+        tick()?;
     }
+    Ok(())
 }
 
 /// Rows already on the viewer's screen, so unchanged rows are not resent.
 #[derive(Default)]
 struct Drawn {
     rows: Vec<String>,
+    /// The viewport the rows were drawn for; `None` before the first draw.
+    viewport: Option<Viewport>,
 }
 
 impl Drawn {
     /// Append to `out` the bytes that bring the viewer's screen to `screen`,
     /// clipped to `viewport`. Every changed row is cleared and rewritten
     /// from its first column at an absolute position, and no row is wider
-    /// than the viewer's terminal, so the viewer never wraps or scrolls.
-    fn draw(
-        &mut self,
-        screen: &vt100::Screen,
-        viewport: Option<(u16, u16)>,
-        full: bool,
-        out: &mut String,
-    ) {
+    /// than the viewer's terminal, so the viewer never wraps or scrolls. The
+    /// screen is cleared and drawn in full on the first draw, when `full` is
+    /// set, and when the viewport has changed.
+    fn draw(&mut self, screen: &vt100::Screen, viewport: Viewport, full: bool, out: &mut String) {
         let (rows, cols) = screen.size();
         let (mut show_cols, mut show_rows) = (cols.get(), rows.get());
         if let Some((view_cols, view_rows)) = viewport {
             show_cols = show_cols.min(view_cols.max(1));
             show_rows = show_rows.min(view_rows.max(1));
         }
-        if full {
+        if full || self.viewport != Some(viewport) {
             out.push_str("\x1b[0m\x1b[H\x1b[2J");
             self.rows.clear();
+            self.viewport = Some(viewport);
         }
+        // A two-column character starting in the last visible column would
+        // spill past it, wrapping and scrolling the viewer's screen. Such a
+        // row is drawn one column narrower, leaving the character out.
+        let edge = show_cols.saturating_sub(1);
+        let spills =
+            |row: u16| edge > 0 && screen.cell(row, edge).is_some_and(vt100::Cell::is_wide);
+        let narrow: Option<Vec<String>> = (0..show_rows).any(spills).then(|| {
+            screen
+                .rows_formatted(0, edge)
+                .take(usize::from(show_rows))
+                .collect()
+        });
         // A cleared row and a blank row format the same, so a row the
         // viewer has never been sent counts as blank.
         self.rows.resize(usize::from(show_rows), String::new());
@@ -163,6 +180,12 @@ impl Drawn {
             .take(usize::from(show_rows))
             .enumerate()
         {
+            let row = match &narrow {
+                Some(narrow) if u16::try_from(index).is_ok_and(spills) => {
+                    narrow.get(index).cloned().unwrap_or_default()
+                }
+                _ => row,
+            };
             if self.rows[index] == row {
                 continue;
             }
@@ -198,95 +221,190 @@ fn largest_size(recording: &Recording) -> (u16, u16) {
         })
 }
 
-/// Produce the frames of a replay: the delay before each frame and the
-/// bytes to write. Kept separate from the clock so it can be tested.
-pub(crate) fn frames(recording: &Recording, options: &ReplayOptions) -> Result<Vec<(f64, String)>> {
-    let first = start_index(recording, &options.start)?;
-    let mut parser = vt100::Parser::new(size(recording.rows), size(recording.cols), 0);
-    let mut drawn = Drawn::default();
-    let mut frames = Vec::new();
-    let mut pending = String::new();
-    let mut last_time: Option<f64> = None;
-    for (position, event) in recording.events.iter().enumerate() {
-        let live = position >= first;
-        let mut redraw = false;
-        match event {
-            CastEvent::Output { data, .. } => parser.process(data.as_bytes()),
-            CastEvent::Resize { cols, rows, .. } => {
-                parser.set_size(size(*rows), size(*cols));
-                redraw = true;
-            }
-            CastEvent::Input { .. } | CastEvent::Marker { .. } => continue,
-        }
-        if !live {
-            continue;
-        }
-        // The first frame clears the viewer's screen and draws in full.
-        let full = redraw || last_time.is_none();
-        drawn.draw(parser.screen(), options.viewport, full, &mut pending);
-        let time = event.time();
-        let mut delay = match last_time {
-            Some(previous) => (time - previous).max(0.0),
-            None => 0.0,
-        };
-        if let Some(limit) = options.idle_limit {
-            delay = delay.min(limit);
-        }
-        frames.push((delay / options.speed, std::mem::take(&mut pending)));
-        last_time = Some(time);
+/// Steps through a recording one frame at a time. Each frame is drawn when
+/// it is shown, at the viewport current then, so playback follows the
+/// viewer's terminal as it is resized.
+struct Replayer<'a> {
+    events: &'a [CastEvent],
+    /// First event shown in real time; earlier ones are applied at once.
+    first: usize,
+    /// The next event to consider.
+    next: usize,
+    speed: f64,
+    idle_limit: Option<f64>,
+    parser: vt100::Parser,
+    drawn: Drawn,
+    last_time: Option<f64>,
+    /// The recorded terminal was resized since the last draw.
+    resized: bool,
+    shown_any: bool,
+}
+
+impl<'a> Replayer<'a> {
+    fn new(recording: &'a Recording, options: &ReplayOptions) -> Result<Self> {
+        Ok(Self {
+            events: &recording.events,
+            first: start_index(recording, &options.start)?,
+            next: 0,
+            speed: options.speed,
+            idle_limit: options.idle_limit,
+            parser: vt100::Parser::new(size(recording.rows), size(recording.cols), 0),
+            drawn: Drawn::default(),
+            last_time: None,
+            resized: false,
+            shown_any: false,
+        })
     }
-    if frames.is_empty() {
-        // Nothing after the start point: show the screen as it stood.
-        drawn.draw(parser.screen(), options.viewport, true, &mut pending);
-        frames.push((0.0, pending));
+
+    fn apply(&mut self, event: &CastEvent) {
+        match event {
+            CastEvent::Output { data, .. } => self.parser.process(data.as_bytes()),
+            CastEvent::Resize { cols, rows, .. } => {
+                self.parser.set_size(size(*rows), size(*cols));
+                self.resized = true;
+            }
+            CastEvent::Input { .. } | CastEvent::Marker { .. } => {}
+        }
+    }
+
+    /// The delay before the next frame, or `None` when the replay is over.
+    /// Events before the start point are applied at once, without frames.
+    fn next_delay(&mut self) -> Option<f64> {
+        let events = self.events;
+        while let Some(event) = events.get(self.next) {
+            if matches!(event, CastEvent::Input { .. } | CastEvent::Marker { .. }) {
+                self.next += 1;
+                continue;
+            }
+            if self.next < self.first {
+                self.apply(event);
+                self.next += 1;
+                continue;
+            }
+            let mut delay = match self.last_time {
+                Some(previous) => (event.time() - previous).max(0.0),
+                None => 0.0,
+            };
+            if let Some(limit) = self.idle_limit {
+                delay = delay.min(limit);
+            }
+            return Some(delay / self.speed);
+        }
+        // Nothing after the start point: show the screen as it stood, once.
+        (!self.shown_any).then_some(0.0)
+    }
+
+    /// Apply the event `next_delay` found and draw the frame at `viewport`.
+    fn frame(&mut self, viewport: Viewport) -> String {
+        let events = self.events;
+        if let Some(event) = events.get(self.next) {
+            self.apply(event);
+            self.last_time = Some(event.time());
+            self.next += 1;
+        }
+        self.shown_any = true;
+        self.redraw(viewport, false)
+    }
+
+    /// Draw the current screen at `viewport`; only what changed, unless
+    /// `full` or the recorded or viewer's terminal was resized.
+    fn redraw(&mut self, viewport: Viewport, full: bool) -> String {
+        let full = full || std::mem::take(&mut self.resized);
+        let mut out = String::new();
+        self.drawn
+            .draw(self.parser.screen(), viewport, full, &mut out);
+        out
+    }
+
+    /// Rows of the screen currently shown, for leaving the cursor below it.
+    fn shown_rows(&self, viewport: Viewport) -> u16 {
+        let rows = self.parser.screen().size().0.get();
+        viewport.map_or(rows, |(_, view_rows)| rows.min(view_rows))
+    }
+}
+
+/// Produce the frames of a replay at a fixed viewport: the delay before
+/// each frame and the bytes to write, without the clock.
+#[cfg(test)]
+fn frames(
+    recording: &Recording,
+    options: &ReplayOptions,
+    viewport: Viewport,
+) -> Result<Vec<(f64, String)>> {
+    let mut replayer = Replayer::new(recording, options)?;
+    let mut frames = Vec::new();
+    while let Some(delay) = replayer.next_delay() {
+        frames.push((delay, replayer.frame(viewport)));
     }
     Ok(frames)
 }
 
-/// Play a recording to stdout.
-pub(crate) fn play(recording: &Recording, options: &ReplayOptions) -> Result<()> {
-    let frames = frames(recording, options)?;
+/// Play a recording to stdout. `viewport` reports the viewer's terminal and
+/// is asked before every frame and while waiting, so a resize is followed.
+pub(crate) fn play(
+    recording: &Recording,
+    options: &ReplayOptions,
+    mut viewport: impl FnMut() -> Viewport,
+) -> Result<()> {
+    let mut replayer = Replayer::new(recording, options)?;
     catch_interrupt();
     let mut stdout = std::io::stdout().lock();
     let io = |e: std::io::Error| NonoError::Snapshot(format!("replay output failed: {e}"));
-    for (delay, bytes) in frames {
-        wait(delay);
+    let mut current = viewport();
+    let mut smallest = current;
+    while let Some(delay) = replayer.next_delay() {
+        if replayer.shown_any {
+            wait(delay, || {
+                let now = viewport();
+                if now == current {
+                    return Ok(());
+                }
+                current = now;
+                smallest = narrowest(smallest, now);
+                stdout
+                    .write_all(replayer.redraw(now, true).as_bytes())
+                    .and_then(|()| stdout.flush())
+                    .map_err(io)
+            })?;
+        }
         if INTERRUPTED.load(Ordering::SeqCst) {
             break;
         }
-        stdout.write_all(bytes.as_bytes()).map_err(io)?;
+        current = viewport();
+        smallest = narrowest(smallest, current);
+        stdout
+            .write_all(replayer.frame(current).as_bytes())
+            .map_err(io)?;
         stdout.flush().map_err(io)?;
     }
     // Leave the cursor below the replayed screen, visible, with default
     // attributes.
-    let mut rows = recording
-        .events
-        .iter()
-        .rev()
-        .find_map(|e| match e {
-            CastEvent::Resize { rows, .. } => Some(*rows),
-            _ => None,
-        })
-        .unwrap_or(recording.rows);
-    if let Some((_, view_rows)) = options.viewport {
-        rows = rows.min(view_rows);
-    }
+    let rows = replayer.shown_rows(current);
     write!(stdout, "\x1b[0m\x1b[?25h\x1b[{rows};1H\r\n").map_err(io)?;
     stdout.flush().map_err(io)?;
     if INTERRUPTED.load(Ordering::SeqCst) {
         eprintln!("[nono] Replay stopped.");
     }
-    if let Some((view_cols, view_rows)) = options.viewport {
+    if let Some((view_cols, view_rows)) = smallest {
         let (cols, rows) = largest_size(recording);
         if cols > view_cols || rows > view_rows {
             eprintln!(
-                "[nono] The session was recorded at {cols}x{rows} and this terminal is \
+                "[nono] The session was recorded at {cols}x{rows} and this terminal was \
                  {view_cols}x{view_rows}; only the top-left part was shown. Enlarge the \
                  terminal, or use `nono transcript` to read the whole session."
             );
         }
     }
     Ok(())
+}
+
+/// The smaller of two viewports in each dimension, for the clipping notice.
+fn narrowest(a: Viewport, b: Viewport) -> Viewport {
+    match (a, b) {
+        (Some((ac, ar)), Some((bc, br))) => Some((ac.min(bc), ar.min(br))),
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
@@ -316,7 +434,6 @@ mod tests {
             speed: 1.0,
             idle_limit: None,
             start,
-            viewport: None,
         }
     }
 
@@ -326,7 +443,7 @@ mod tests {
             0.0,
             "\x1b]52;c;cm0gLXJmIH4=\x07\x1b]0;evil title\x07\x1b[?1000h\x1bP+q544e\x1b\\hello",
         )]);
-        let all: String = frames(&rec, &options(ReplayStart::Beginning))
+        let all: String = frames(&rec, &options(ReplayStart::Beginning), None)
             .unwrap()
             .into_iter()
             .map(|(_, bytes)| bytes)
@@ -344,9 +461,12 @@ mod tests {
             speed: 2.0,
             idle_limit: Some(2.0),
             start: ReplayStart::Beginning,
-            viewport: None,
         };
-        let delays: Vec<f64> = frames(&rec, &opts).unwrap().iter().map(|f| f.0).collect();
+        let delays: Vec<f64> = frames(&rec, &opts, None)
+            .unwrap()
+            .iter()
+            .map(|f| f.0)
+            .collect();
         assert_eq!(delays, vec![0.0, 0.5, 1.0]);
     }
 
@@ -361,17 +481,30 @@ mod tests {
             out(6.0, "two\r\n"),
             out(9.0, "three\r\n"),
         ]);
-        let frames = frames(&rec, &options(ReplayStart::Marker("suspended".to_string()))).unwrap();
+        let frames = frames(
+            &rec,
+            &options(ReplayStart::Marker("suspended".to_string())),
+            None,
+        )
+        .unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].0, 0.0, "first frame is shown at once");
         assert!(frames[0].1.contains("one") && frames[0].1.contains("two"));
         assert_eq!(frames[1].0, 3.0);
 
-        let by_time = super::frames(&rec, &options(ReplayStart::parse("0:09").unwrap())).unwrap();
+        let by_time =
+            super::frames(&rec, &options(ReplayStart::parse("0:09").unwrap()), None).unwrap();
         assert_eq!(by_time.len(), 1);
         assert!(by_time[0].1.contains("three"));
 
-        assert!(super::frames(&rec, &options(ReplayStart::Marker("nope".to_string()))).is_err());
+        assert!(
+            super::frames(
+                &rec,
+                &options(ReplayStart::Marker("nope".to_string())),
+                None
+            )
+            .is_err()
+        );
     }
 
     /// Play `frames` into a terminal of `cols` x `rows` and return its rows.
@@ -399,9 +532,7 @@ mod tests {
             ),
             out(2.0, "\x1b[2J\x1b[1;3Hnew"),
         ]);
-        let mut opts = options(ReplayStart::Beginning);
-        opts.viewport = Some((8, 3));
-        let frames = frames(&rec, &opts).unwrap();
+        let frames = frames(&rec, &options(ReplayStart::Beginning), Some((8, 3))).unwrap();
 
         let mut model = vt100::Parser::new(size(4), size(20), 0);
         for (index, event) in rec.events.iter().enumerate() {
@@ -420,12 +551,69 @@ mod tests {
             out(0.0, "first line\r\nsecond\r\nthird\r\nfourth"),
             out(1.0, "\x1b[2;1H\x1b[2Kreplaced"),
         ]);
-        let mut opts = options(ReplayStart::Beginning);
-        opts.viewport = Some((20, 4));
-        let frames = frames(&rec, &opts).unwrap();
+        let frames = frames(&rec, &options(ReplayStart::Beginning), Some((20, 4))).unwrap();
         assert_eq!(
             viewer_rows(&frames, 20, 4),
             vec!["first line", "replaced", "third", "fourth"]
+        );
+    }
+
+    #[test]
+    fn a_wide_character_at_the_clipped_edge_is_left_out() {
+        // The bottom row's last visible column starts a two-column
+        // character. Drawn, it would spill past the viewer's edge, wrap and
+        // scroll the top row away.
+        let rec = recording(vec![out(0.0, "top\r\nmiddle\r\n1234567界xyz")]);
+        let clipped = frames(&rec, &options(ReplayStart::Beginning), Some((8, 3))).unwrap();
+        assert_eq!(
+            viewer_rows(&clipped, 8, 3),
+            vec!["top", "middle", "1234567"]
+        );
+
+        // Inside the viewport it is drawn as usual.
+        let fits = frames(&rec, &options(ReplayStart::Beginning), Some((9, 3))).unwrap();
+        assert_eq!(viewer_rows(&fits, 9, 3), vec!["top", "middle", "1234567界"]);
+    }
+
+    #[test]
+    fn frames_follow_the_viewport_as_it_changes() {
+        let rec = recording(vec![
+            out(0.0, "abcdefghijklmnop\r\nsecond line here"),
+            out(1.0, "\x1b[1;1HABC"),
+            out(2.0, "\x1b[2;1HSECOND"),
+        ]);
+        let mut model = vt100::Parser::new(size(4), size(20), 0);
+        let mut replayer = Replayer::new(&rec, &options(ReplayStart::Beginning)).unwrap();
+        // Shrink, then grow, between frames; the viewer's terminal is
+        // recreated at each size, as resizing a real one would reflow it.
+        let mut sent = String::new();
+        for (index, (cols, rows)) in [(20, 4), (6, 2), (12, 3)].into_iter().enumerate() {
+            assert!(replayer.next_delay().is_some());
+            sent = replayer.frame(Some((cols, rows)));
+            if let CastEvent::Output { data, .. } = &rec.events[index] {
+                model.process(data.as_bytes());
+            }
+            let mut viewer = vt100::Parser::new(size(rows), size(cols), 0);
+            viewer.process(sent.as_bytes());
+            let shown: Vec<String> = viewer.screen().rows(0, cols).collect();
+            let want: Vec<String> = model
+                .screen()
+                .rows(0, cols)
+                .take(usize::from(rows))
+                .collect();
+            assert_eq!(shown, want, "frame {index} at {cols}x{rows}");
+        }
+        // A changed viewport redraws in full: growing reveals what was cut.
+        assert!(sent.contains("\x1b[2J"));
+        assert!(replayer.next_delay().is_none());
+
+        // Resized while idle: the current screen is redrawn at the new size.
+        let redrawn = replayer.redraw(Some((20, 4)), true);
+        let mut viewer = vt100::Parser::new(size(4), size(20), 0);
+        viewer.process(redrawn.as_bytes());
+        assert_eq!(
+            viewer.screen().rows(0, 20).take(2).collect::<Vec<_>>(),
+            vec!["ABCdefghijklmnop", "SECOND line here"]
         );
     }
 

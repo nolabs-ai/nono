@@ -81,9 +81,11 @@ pub(crate) fn run_replay(args: &ReplayArgs) -> Result<()> {
             Some(from) => ReplayStart::parse(from)?,
             None => ReplayStart::Beginning,
         },
-        viewport: crate::pty_proxy::get_terminal_winsize().map(|ws| (ws.ws_col, ws.ws_row)),
     };
-    super::replay::play(&loaded, &options)
+    // Asked before every frame, so a resized terminal is followed.
+    super::replay::play(&loaded, &options, || {
+        crate::pty_proxy::get_terminal_winsize().map(|ws| (ws.ws_col, ws.ws_row))
+    })
 }
 
 pub(crate) fn run_transcript(args: &TranscriptArgs) -> Result<()> {

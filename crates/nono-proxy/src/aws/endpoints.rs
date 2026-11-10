@@ -234,6 +234,49 @@ pub fn derive_region(host: &str, port: u16, service_label: &str) -> Option<Strin
     }
 }
 
+/// AWS endpoint domains: commercial, China, and dual-stack.
+const AWS_DOMAIN_SUFFIXES: [&[&str]; 3] = [
+    &["amazonaws", "com"],
+    &["amazonaws", "com", "cn"],
+    &["api", "aws"],
+];
+
+/// `true` when `host` (a hostname or `*.`-style pattern) is under an AWS
+/// endpoint domain, compared label by label so `evilamazonaws.com` is not.
+/// The bare suffix itself (`amazonaws.com`) is not an endpoint.
+#[must_use]
+pub fn is_aws_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    AWS_DOMAIN_SUFFIXES.iter().any(|suffix| {
+        labels.len() > suffix.len()
+            && labels[labels.len() - suffix.len()..] == **suffix
+            && labels.iter().all(|l| !l.is_empty())
+    })
+}
+
+/// `operations` rules need a route that speaks AWS: one with `aws_auth`, or an
+/// upstream on an AWS domain (see [`is_aws_host`]).
+///
+/// # Errors
+///
+/// Returns a human-readable message when neither holds.
+pub fn validate_operations_upstream(upstream: &str, has_aws_auth: bool) -> Result<(), String> {
+    if has_aws_auth {
+        return Ok(());
+    }
+    let host = url::Url::parse(upstream)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+    if is_aws_host(&host) {
+        return Ok(());
+    }
+    Err(format!(
+        "endpoint_policy `operations` requires `aws_auth` or an AWS upstream (amazonaws.com, amazonaws.com.cn or api.aws), got '{host}'"
+    ))
+}
+
 /// Resolve the SigV4 `(region, service)` pair for an AWS route.
 ///
 /// Config values in `aws_auth` take precedence. When either is absent, the
@@ -630,6 +673,30 @@ mod tests {
             ("bucket.s3.us-east-1.amazonaws.com", 443),
         ] {
             assert_eq!(derive_region(host, port, "eks"), None, "{host}:{port}");
+        }
+    }
+
+    #[test]
+    fn is_aws_host_matches_aws_domains_by_label() {
+        for host in [
+            "ec2.us-east-1.amazonaws.com",
+            "*.amazonaws.com",
+            "SSM.US-EAST-1.AMAZONAWS.COM.",
+            "ec2.cn-north-1.amazonaws.com.cn",
+            "ec2.us-east-1.api.aws",
+        ] {
+            assert!(is_aws_host(host), "{host}");
+        }
+        for host in [
+            "amazonaws.com",
+            "evilamazonaws.com",
+            "amazonaws.com.evil.com",
+            "ec2.amazonaws.co",
+            "api.aws",
+            "example.com",
+            "ec2..amazonaws.com",
+        ] {
+            assert!(!is_aws_host(host), "{host}");
         }
     }
 }

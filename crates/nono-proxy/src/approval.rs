@@ -34,6 +34,9 @@ pub struct ApprovalBackendRegistry {
     default_backend: Option<String>,
     backends: Arc<BTreeMap<String, Arc<dyn ApprovalBackend>>>,
     session_id: Option<Arc<str>>,
+    /// Endpoint approval session answers and in-flight prompts. Shared by
+    /// clones, so one registry is one proxy session.
+    endpoint_sessions: Arc<crate::endpoint_approval::EndpointSessionState>,
 }
 
 impl ApprovalBackendRegistry {
@@ -47,6 +50,7 @@ impl ApprovalBackendRegistry {
             default_backend,
             backends: Arc::new(backends),
             session_id: None,
+            endpoint_sessions: Arc::default(),
         }
     }
 
@@ -66,6 +70,10 @@ impl ApprovalBackendRegistry {
         self.session_id
             .as_deref()
             .unwrap_or(UNATTRIBUTED_SESSION_ID)
+    }
+
+    pub(crate) fn endpoint_sessions(&self) -> &crate::endpoint_approval::EndpointSessionState {
+        &self.endpoint_sessions
     }
 
     /// Build a compatibility registry for callers that have one backend.

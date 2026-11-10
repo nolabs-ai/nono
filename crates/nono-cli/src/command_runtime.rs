@@ -467,6 +467,10 @@ mod tests {
 
     #[test]
     fn shell_dry_run_rejects_block_net_with_upstream_proxy() {
+        // Sandbox preparation reads HOME and profile dirs that other tests swap.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let args = ShellArgs {
             sandbox: SandboxArgs {
                 dry_run: true,

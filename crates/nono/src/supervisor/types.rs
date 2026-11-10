@@ -83,6 +83,12 @@ pub enum ApprovalRequest {
         request_id: String,
         /// Stable configured route identifier, e.g. `"github-api"`
         route_id: String,
+        /// Credential route that will inject a credential into the approved
+        /// request, or `None` when the request is forwarded without one.
+        /// Equals `route_id` when the approval comes from a credential
+        /// route's own policy.
+        #[serde(default)]
+        credential_route: Option<String>,
         /// Upstream URL for the route, without credentials
         upstream: String,
         /// HTTP method being requested
@@ -193,9 +199,10 @@ pub enum ApprovalDecision {
     /// approvals this explicitly permits local reuse without consulting the
     /// backend again; each connection still undergoes its own address checks.
     ///
-    /// Callers that do not implement session caching (e.g. the L7 endpoint
-    /// approval path) MUST treat this exactly as [`ApprovalDecision::Granted`];
-    /// see [`ApprovalDecision::without_session_scope`].
+    /// Callers that do not implement session caching (e.g. L7 endpoint
+    /// approvals for credential routes) MUST treat this exactly as
+    /// [`ApprovalDecision::Granted`]; see
+    /// [`ApprovalDecision::without_session_scope`].
     GrantedForSession,
     /// Access was denied with a reason.
     Denied {
@@ -234,14 +241,13 @@ impl ApprovalDecision {
 
     /// Collapse the session-scoped variants to their one-shot equivalents.
     ///
-    /// Endpoint approvals are never cached locally. Any future endpoint grant
-    /// cache must key on `(route_id, upstream, method, path, operation)` so a
-    /// grant for one AWS operation cannot satisfy another.
-    ///
-    /// Session caching is only implemented on the network CONNECT path, which
-    /// keys decisions by `(host, port)`. Every other approval consumer treats a
-    /// decision as a single yes/no; calling this keeps those `match` sites total
-    /// and fail-secure without teaching them about session persistence.
+    /// Session caching is implemented on the network CONNECT path, keyed by
+    /// `(host, port)`, and for `allow_domain` endpoint approvals, keyed by the
+    /// approval scope. An endpoint scope includes the AWS operation so a grant
+    /// for one operation cannot satisfy another. Every other approval consumer
+    /// treats a decision as a single yes/no; calling this keeps those `match`
+    /// sites total and fail-secure without teaching them about session
+    /// persistence.
     #[must_use]
     pub fn without_session_scope(self) -> Self {
         match self {

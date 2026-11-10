@@ -340,23 +340,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .unwrap_or_default();
     let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = all_domain_entries
         .iter()
-        .filter_map(|e| match e {
-            crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints }
-                if !endpoints.is_empty() =>
-            {
-                Some(sandbox_state::DomainEndpointState {
-                    domain: domain.clone(),
-                    endpoints: endpoints
-                        .iter()
-                        .map(|r| sandbox_state::EndpointRuleState {
-                            method: r.method.clone(),
-                            path: r.path.clone(),
-                        })
-                        .collect(),
-                })
-            }
-            _ => None,
-        })
+        .filter_map(|e| sandbox_state::DomainEndpointState::from_allow_domain(e))
         .collect();
     let cap_file = write_capability_state_file(
         &caps,

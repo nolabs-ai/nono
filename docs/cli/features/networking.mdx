@@ -91,6 +91,71 @@ When `--allow-domain` is given a URL with a path (e.g., `https://github.com/org/
 
 Use `nono why --self --host https://github.com/some/path` inside the sandbox to check whether a specific URL is permitted and see the configured endpoint rules.
 
+### Endpoint Approvals
+
+In a profile, an `allow_domain` entry can carry an `endpoint_policy` instead of
+`endpoints`, with the same shape credential routes use. Requests matching an
+`approve` rule ask the approval backend instead of being refused:
+
+```json
+{
+  "network": {
+    "allow_domain": [
+      {
+        "domain": "github.com",
+        "endpoint_policy": {
+          "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }],
+          "approve": [{ "method": "*", "path": "/*/*/**", "reason": "repository access" }],
+          "default": { "decision": "deny" }
+        }
+      }
+    ],
+    "approval_backends": { "review": { "type": "terminal" } },
+    "approval_defaults": { "backend": "review" }
+  }
+}
+```
+
+- `network.approval_backends` also turns on host approval: a CONNECT to a host
+  that is not allowed asks instead of being refused, and an approved host gets
+  a plain tunnel with no endpoint rules. Deny hosts you never want reachable
+  with `deny_domain`. When `command_policies` declares approval backends,
+  endpoint requests use those instead.
+- `endpoints` stays the shorthand: an allow list with default deny. An entry
+  sets one or the other, not both.
+- Rules are checked `deny`, then `approve`, then `allow`, then `default`. A
+  path matching both an `approve` and an `allow` rule asks, so keep `allow`
+  rules out of the `approve` patterns.
+- `deny` rules never reach the backend, and a credential route on the same host
+  cannot allow what this policy denies, through either CONNECT or its
+  `*_BASE_URL` reverse proxy.
+- Entries for the same domain are merged, including `--allow-domain` flags: a
+  flag adds its path to the `allow` rules and keeps the profile's `deny` and
+  `approve` rules. In an inherited profile, a `default` left out keeps the
+  base profile's.
+- An approved request is handled like an allowed one: a credential route that
+  covers it injects its credential under its own rules; otherwise the request
+  goes out unchanged. When this policy and the credential route would both
+  ask, nono asks once.
+- An "always" answer lasts for the proxy session and covers the request's
+  method on its host, for the matched rule with its `*` segments filled in. For
+  `/*/*/**`, approving `GET /torvalds/linux/info/refs` also covers
+  `GET /torvalds/linux/HEAD` but asks again for
+  `POST /torvalds/linux/git-upload-pack` and for `/torvalds/other/...`. The
+  prompt's rule label shows that scope (`GET /torvalds/linux/**`). When the
+  `default` asks, an answer covers only that exact method and path. A session
+  answer never overrides a `deny` rule or the `default`.
+- Approvals asked by a credential route's own `endpoint_policy` are always
+  one-shot: "always" counts for that request only.
+- On an AWS domain (`amazonaws.com`, `amazonaws.com.cn` or `api.aws`), rules
+  can also match the AWS operation with `operations`, as on an `aws_auth`
+  credential (see [Matching AWS operations](/cli/features/credential-injection#matching-aws-operations)).
+  This filters requests the agent signs with its own AWS credentials; nono
+  forwards them unchanged. An "always" answer then also covers only the
+  operation it was given for. Such a domain is served over HTTP/1.1 and its
+  request bodies are buffered (up to 16 MiB). `operations` on any other domain
+  is rejected.
+
 ![Proxy architecture flow](/assets/proxy-flow.png)
 
 ### Runtime Host Approval

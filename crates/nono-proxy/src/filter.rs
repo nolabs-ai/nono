@@ -22,6 +22,27 @@ pub struct CheckResult {
     pub resolved_addrs: Vec<SocketAddr>,
 }
 
+/// Test-only DNS entries consulted before real resolution, so tests can point
+/// a real hostname (e.g. an AWS endpoint) at a local server.
+#[cfg(test)]
+pub(crate) static TEST_HOSTS: std::sync::Mutex<Vec<(String, IpAddr)>> =
+    std::sync::Mutex::new(Vec::new());
+
+async fn lookup(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    #[cfg(test)]
+    if let Some((_, ip)) = TEST_HOSTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(h, _)| h == host)
+    {
+        return Ok(vec![SocketAddr::new(*ip, port)]);
+    }
+    Ok(tokio::net::lookup_host(format!("{host}:{port}"))
+        .await?
+        .collect())
+}
+
 /// Async wrapper around `HostFilter` that performs DNS resolution.
 #[derive(Debug, Clone)]
 pub struct ProxyFilter {
@@ -90,9 +111,8 @@ impl ProxyFilter {
             });
         }
 
-        let addr_str = format!("{}:{}", host, port);
-        let resolved: Vec<SocketAddr> = match tokio::net::lookup_host(&addr_str).await {
-            Ok(addrs) => addrs.collect(),
+        let resolved: Vec<SocketAddr> = match lookup(host, port).await {
+            Ok(addrs) => addrs,
             Err(e) => {
                 debug!("DNS resolution failed for {}: {}", host, e);
                 Vec::new()

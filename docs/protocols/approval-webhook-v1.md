@@ -154,9 +154,22 @@ Both variants `POST` the same JSON body:
 | --- | --- |
 | `capability` | `path`, `access` (`Read`, `Write`, `ReadWrite`) |
 | `network` | `host`, `port`, `protocol`, `resolved_ips` |
-| `endpoint` | `route_id`, `upstream`, `method`, `path`, `rule_label` |
+| `endpoint` | `route_id`, `upstream`, `method`, `path`, `rule_label`, `operation` (nullable) |
 | `command` | `command`, `args`, `caller`, `intercept_rule` |
 | `unix_socket` | `path`, `op` (`connect`, `bind`) |
+
+Receivers MUST ignore request fields they do not recognize, so fields can be
+added within v1.
+
+`operation` is set on requests for `aws_auth` routes: the AWS operation name
+(for example `TerminateInstances`), or `"Unknown"` when it could not be
+determined. It is `null` for other routes.
+
+**Endpoint grant scope.** A server that holds standing grants for `endpoint`
+requests MUST key them on `(route_id, upstream, method, path, operation)`. A
+grant for `DescribeInstances` does not satisfy `TerminateInstances`, a grant for
+`"Unknown"` covers only `Unknown`, and a grant for `operation: null` never
+satisfies a non-null operation.
 
 Every variant also carries `request_id`, `session_id`, `reason` (nullable), and
 `child_pid`. Endpoint requests carry the session that owns the proxy; only an

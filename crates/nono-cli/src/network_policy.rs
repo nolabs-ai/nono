@@ -248,6 +248,7 @@ pub fn resolve_credentials(
                 query_param_name: cred.query_param_name.clone(),
                 proxy: cred.proxy.clone(),
                 env_var: cred.env_var.clone(),
+                phantom_format: cred.phantom_format.clone(),
                 endpoint_rules: cred.endpoint_rules.clone(),
                 endpoint_policy: cred.endpoint_policy.clone(),
                 tls_ca: cred
@@ -303,6 +304,7 @@ pub fn resolve_credentials(
                 query_param_name: None,
                 proxy: None,
                 env_var: cred.env_var.clone(),
+                phantom_format: None,
                 endpoint_rules: cred.endpoint_rules.clone(),
                 endpoint_policy: None,
                 tls_ca: None, // Built-in credentials don't support custom CAs
@@ -317,6 +319,12 @@ pub fn resolve_credentials(
         }
         // We already validated existence above, so this else branch won't be hit
     }
+
+    nono_proxy::server::validate_phantom_formats(
+        &routes,
+        &nono_proxy::config::default_intercept_ca_env_vars(),
+    )
+    .map_err(|e| NonoError::ConfigParse(e.to_string()))?;
 
     Ok(routes)
 }
@@ -466,6 +474,7 @@ pub fn partition_allow_domain(
                         query_param_name: None,
                         proxy: None,
                         env_var: None,
+                        phantom_format: None,
                         endpoint_rules: endpoints.clone(),
                         endpoint_policy: None,
                         tls_ca: None,
@@ -635,6 +644,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -680,6 +690,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -721,6 +732,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -772,6 +784,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -863,6 +876,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -901,6 +915,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -939,6 +954,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -982,6 +998,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("OPENAI_API_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1001,6 +1018,71 @@ mod tests {
             Some("OPENAI_API_KEY".to_string()),
             "env_var must be propagated from CustomCredentialDef to RouteConfig"
         );
+    }
+
+    fn phantom_cred(env_var: &str, fmt: Option<&str>) -> crate::profile::CustomCredentialDef {
+        crate::profile::CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://CRED".to_string()),
+            auth: None,
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: Some(env_var.to_string()),
+            phantom_format: fmt.map(str::to_string),
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_credentials_propagates_phantom_format() {
+        let policy = load_network_policy(embedded_network_policy_json()).expect("policy loads");
+        let mut custom = HashMap::new();
+        custom.insert(
+            "github".to_string(),
+            phantom_cred("GH_TOKEN", Some("ghp_{}")),
+        );
+        let routes =
+            resolve_credentials(&policy, &["github".to_string()], &custom).expect("resolves");
+        assert_eq!(routes[0].phantom_format.as_deref(), Some("ghp_{}"));
+    }
+
+    #[test]
+    fn test_resolve_credentials_rejects_conflicting_phantom_formats() {
+        let policy = load_network_policy(embedded_network_policy_json()).expect("policy loads");
+        let mut custom = HashMap::new();
+        custom.insert(
+            "one".to_string(),
+            phantom_cred("SHARED_TOKEN", Some("ghp_{}")),
+        );
+        custom.insert("two".to_string(), phantom_cred("SHARED_TOKEN", None));
+        let names = vec!["one".to_string(), "two".to_string()];
+        assert!(resolve_credentials(&policy, &names, &custom).is_err());
+    }
+
+    #[test]
+    fn test_resolve_credentials_rejects_phantom_format_on_base_url_var() {
+        let policy = load_network_policy(embedded_network_policy_json()).expect("policy loads");
+        let mut custom = HashMap::new();
+        custom.insert(
+            "one".to_string(),
+            phantom_cred("TWO_BASE_URL", Some("ghp_{}")),
+        );
+        custom.insert("two".to_string(), phantom_cred("TWO_TOKEN", None));
+        let names = vec!["one".to_string(), "two".to_string()];
+        assert!(resolve_credentials(&policy, &names, &custom).is_err());
     }
 
     #[test]
@@ -1119,6 +1201,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("LD_PRELOAD".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1214,6 +1297,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1267,6 +1351,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1429,6 +1514,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("MOCK_API_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1473,6 +1559,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("SVC_A_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1498,6 +1585,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("SVC_B_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,

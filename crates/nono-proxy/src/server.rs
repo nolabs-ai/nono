@@ -729,35 +729,15 @@ impl ProxyHandle {
                 continue;
             }
 
-            // API key set to session token (phantom token pattern).
-            // Use explicit env_var if set (required for URI manager refs), otherwise
-            // fall back to uppercasing the credential_key (e.g., "openai_api_key" -> "OPENAI_API_KEY").
-            if let Some(ref env_var) = route.env_var {
-                vars.push((env_var.clone(), self.token.to_string()));
-            } else if let Some(ref cred_key) = route.credential_key {
-                // Skip URI-format keys (e.g. env://, op://, apple-password://) —
-                // uppercasing a URI produces a nonsensical env var name. These
-                // routes must declare an explicit env_var to get phantom token injection.
-                if !cred_key.contains("://") {
-                    let api_key_name = cred_key.to_uppercase();
-                    vars.push((api_key_name, self.token.to_string()));
+            // API key set to the session token (phantom token pattern), wrapped
+            // in the route's `phantom_format` when one is configured.
+            if let Some(name) = phantom_env_name(route, prefix) {
+                match phantom_value(route, &self.token) {
+                    Some(value) => vars.push((name, value)),
+                    // Never fall back to the bare token: the client would hold
+                    // a value the route rejects.
+                    None => warn!("Route '{}': invalid phantom_format; no phantom set", prefix),
                 }
-            } else if route.spiffe.is_some() {
-                // SPIFFE routes use the same phantom token pattern for SDK-style
-                // `*_BASE_URL` clients even though upstream auth is SPIFFE.
-                let api_key_name = format!("{}_API_KEY", prefix.to_uppercase());
-                vars.push((api_key_name, self.token.to_string()));
-            } else if route
-                .oauth2
-                .as_ref()
-                .and_then(|o| o.client_assertion.as_ref())
-                .is_some()
-            {
-                // OAuth2 jwt-bearer assertion routes need the same phantom token
-                // pattern — the proxy validates session integrity before injecting
-                // the exchanged access token, so the child process must present it.
-                let api_key_name = format!("{}_API_KEY", prefix.to_uppercase());
-                vars.push((api_key_name, self.token.to_string()));
             }
         }
         vars
@@ -1136,6 +1116,97 @@ impl crate::token::NonceResolver for CompositeNonceResolver {
     }
 }
 
+/// Env var name carrying a route's phantom token, if the route has one.
+///
+/// Uses explicit `env_var` if set (required for URI manager refs), otherwise the
+/// uppercased `credential_key` (e.g., "openai_api_key" -> "OPENAI_API_KEY").
+/// URI-format keys (env://, op://, apple-password://) are skipped because
+/// uppercasing a URI yields a nonsensical name.
+fn phantom_env_name(route: &crate::config::RouteConfig, prefix: &str) -> Option<String> {
+    if let Some(ref env_var) = route.env_var {
+        return Some(env_var.clone());
+    }
+    if let Some(ref cred_key) = route.credential_key {
+        return (!cred_key.contains("://")).then(|| cred_key.to_uppercase());
+    }
+    // SPIFFE and OAuth2 jwt-bearer assertion routes use the same phantom
+    // pattern: the proxy validates session integrity before injecting the
+    // exchanged token, so the child must present it.
+    let uses_assertion = route
+        .oauth2
+        .as_ref()
+        .and_then(|o| o.client_assertion.as_ref())
+        .is_some();
+    (route.spiffe.is_some() || uses_assertion).then(|| format!("{}_API_KEY", prefix.to_uppercase()))
+}
+
+/// Phantom value for a route: the session token, wrapped in `phantom_format`
+/// when set. `None` means the template is invalid.
+fn phantom_value(route: &crate::config::RouteConfig, token: &str) -> Option<String> {
+    match route.phantom_format.as_deref() {
+        None => Some(token.to_string()),
+        Some(fmt) => crate::token::PhantomTemplate::parse_route(fmt)
+            .ok()
+            .map(|t| t.render(token)),
+    }
+}
+
+/// Reject `phantom_format` configurations that would make the injected
+/// environment ambiguous or clobber env vars nono sets itself.
+pub fn validate_phantom_formats(
+    routes: &[crate::config::RouteConfig],
+    intercept_ca_env_vars: &[String],
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    let base_url_names: std::collections::HashSet<String> = routes
+        .iter()
+        .map(|r| format!("{}_BASE_URL", r.prefix.trim_matches('/').to_uppercase()))
+        .collect();
+    let mut formats: HashMap<String, Option<&str>> = HashMap::new();
+    for route in routes {
+        let prefix = route.prefix.trim_matches('/');
+        let Some(name) = phantom_env_name(route, prefix) else {
+            // The route would reject the bare token yet no env var carries the
+            // formatted phantom, leaving it unusable.
+            if route.phantom_format.is_some() {
+                return Err(ProxyError::Config(format!(
+                    "route '{prefix}': `phantom_format` needs an `env_var` (none can be derived)"
+                )));
+            }
+            continue;
+        };
+        if let Some(fmt) = route.phantom_format.as_deref() {
+            let upper = name.to_ascii_uppercase();
+            let reserved = matches!(
+                upper.as_str(),
+                "HTTP_PROXY" | "HTTPS_PROXY" | "NO_PROXY" | "ALL_PROXY" | "NODE_USE_ENV_PROXY"
+            ) || upper.starts_with("NONO_")
+                || base_url_names.contains(&name)
+                || intercept_ca_env_vars.iter().any(|v| v == &name);
+            if reserved {
+                return Err(ProxyError::Config(format!(
+                    "route '{prefix}': `phantom_format` cannot target reserved env var '{name}'"
+                )));
+            }
+            if let Err(e) = crate::token::PhantomTemplate::parse_route(fmt) {
+                return Err(ProxyError::Config(format!("route '{prefix}': {e}")));
+            }
+        }
+        match formats.get(&name) {
+            Some(prev) if *prev != route.phantom_format.as_deref() => {
+                return Err(ProxyError::Config(format!(
+                    "env var '{name}' is shared by routes with different `phantom_format` values"
+                )));
+            }
+            _ => {
+                formats.insert(name, route.phantom_format.as_deref());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Start the proxy server.
 ///
 /// Binds to `config.bind_addr:config.bind_port` (port 0 = OS-assigned),
@@ -1216,6 +1287,7 @@ pub async fn start_with_network_approval(
     network_session_id: String,
 ) -> Result<ProxyHandle> {
     validate_no_proxy_config(&config)?;
+    validate_phantom_formats(&config.routes, &config.intercept_ca_env_vars)?;
 
     // Load route-level configuration (upstream, L7 filtering, custom TLS CA)
     // for ALL routes, regardless of credential presence. This happens before
@@ -2612,6 +2684,283 @@ async fn enforce_forward_http_endpoint_rules(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    /// Mock origin that records each full request head it receives.
+    async fn spawn_recording_upstream() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heads_handle = std::sync::Arc::clone(&heads);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let heads_handle = std::sync::Arc::clone(&heads_handle);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    if let Ok(n) = sock.read(&mut buf).await {
+                        heads_handle
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                    }
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("127.0.0.1:{}", addr.port()), heads)
+    }
+
+    /// End to end: a route with `phantom_format` accepts only the rendered
+    /// phantom, swaps in the real credential, and never forwards the phantom.
+    #[tokio::test]
+    async fn test_phantom_format_reverse_route_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("secret");
+        std::fs::write(&secret_path, "real-upstream-secret").unwrap();
+
+        let (upstream, heads) = spawn_recording_upstream().await;
+        let token = "c".repeat(64);
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.credential_key = Some(format!("file://{}", secret_path.display()));
+        route.credential_format = Some("Bearer {}".to_string());
+        route.phantom_format = Some("ghp_{}".to_string());
+        route.env_var = Some("GH_TOKEN".to_string());
+        let config = ProxyConfig {
+            routes: vec![route],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            session_token: Some(Zeroizing::new(token.clone())),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+
+        let vars = handle.credential_env_vars(&config);
+        assert!(vars.contains(&("GH_TOKEN".to_string(), format!("ghp_{token}"))));
+
+        let request = |auth: &str| {
+            format!(
+                "GET /svc/x HTTP/1.1\r\nHost: h\r\nAuthorization: {auth}\r\nConnection: close\r\n\r\n"
+            )
+        };
+
+        // The bare session token and a wrong body are rejected.
+        for bad in [
+            format!("Bearer {token}"),
+            format!("Bearer ghp_{}", "d".repeat(64)),
+        ] {
+            let resp = send_raw_request(handle.port, request(&bad).as_bytes()).await;
+            assert!(resp.starts_with("HTTP/1.1 401"), "{bad}: {resp:?}");
+        }
+        assert!(
+            heads.lock().unwrap().is_empty(),
+            "rejected requests must not reach upstream"
+        );
+
+        // The rendered phantom is accepted and swapped for the real credential.
+        let resp = send_raw_request(
+            handle.port,
+            request(&format!("Bearer ghp_{token}")).as_bytes(),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
+        let seen = heads.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].contains("Bearer real-upstream-secret"),
+            "{}",
+            seen[0]
+        );
+        assert!(!seen[0].contains(&token), "phantom must not be forwarded");
+
+        // No audit event or response carries the token.
+        let events = format!("{:?}", handle.drain_audit_events());
+        assert!(!events.contains(&token));
+
+        handle.shutdown();
+    }
+
+    /// Regression: a route without `phantom_format` keeps requiring the bare token.
+    #[tokio::test]
+    async fn test_unformatted_reverse_route_still_requires_bare_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("secret");
+        std::fs::write(&secret_path, "real-upstream-secret").unwrap();
+
+        let (upstream, heads) = spawn_recording_upstream().await;
+        let token = "e".repeat(64);
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.credential_key = Some(format!("file://{}", secret_path.display()));
+        route.credential_format = Some("Bearer {}".to_string());
+        let config = ProxyConfig {
+            routes: vec![route],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            session_token: Some(Zeroizing::new(token.clone())),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let request = |auth: &str| {
+            format!(
+                "GET /svc/x HTTP/1.1\r\nHost: h\r\nAuthorization: {auth}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let resp = send_raw_request(
+            handle.port,
+            request(&format!("Bearer ghp_{token}")).as_bytes(),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 401"), "{resp:?}");
+        let resp =
+            send_raw_request(handle.port, request(&format!("Bearer {token}")).as_bytes()).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
+        assert_eq!(heads.lock().unwrap().len(), 1);
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_start_rejects_invalid_phantom_format() {
+        let mut route = declarative_route("https://api.example.com");
+        route.credential_key = Some("env://NONO_TEST_MISSING".to_string());
+        route.phantom_format = Some("Bearer {}".to_string());
+        let config = ProxyConfig {
+            routes: vec![route],
+            ..Default::default()
+        };
+        assert!(start(config).await.is_err());
+    }
+
+    fn phantom_route(
+        prefix: &str,
+        env_var: Option<&str>,
+        phantom_format: Option<&str>,
+    ) -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://CRED".to_string()),
+            env_var: env_var.map(str::to_string),
+            phantom_format: phantom_format.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn handle_with_token(loaded: &[&str]) -> ProxyHandle {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        ProxyHandle {
+            listener_attach: None,
+            port: 12345,
+            token: Zeroizing::new("tok".to_string()),
+            audit_log: Some(audit::new_audit_log()),
+            shutdown_tx,
+            loaded_routes: loaded.iter().map(|s| s.to_string()).collect(),
+            no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            diagnostics: vec![],
+        }
+    }
+
+    #[test]
+    fn test_phantom_format_env_vars() {
+        let handle = handle_with_token(&["gh", "oa"]);
+        let config = ProxyConfig {
+            routes: vec![
+                phantom_route("gh", Some("GH_TOKEN"), Some("ghp_{}")),
+                phantom_route("oa", Some("OA_KEY"), None),
+            ],
+            ..Default::default()
+        };
+        let vars = handle.credential_env_vars(&config);
+        let get = |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("GH_TOKEN"), Some("ghp_tok"));
+        assert_eq!(get("OA_KEY"), Some("tok"));
+
+        // A route whose credential did not load gets no phantom.
+        let handle = handle_with_token(&[]);
+        assert!(
+            handle
+                .credential_env_vars(&config)
+                .iter()
+                .all(|(k, _)| k.ends_with("_BASE_URL"))
+        );
+    }
+
+    #[test]
+    fn test_phantom_format_derived_env_name() {
+        let handle = handle_with_token(&["gh"]);
+        let mut route = phantom_route("gh", None, Some("ghp_{}"));
+        route.credential_key = Some("gh_token".to_string());
+        let config = ProxyConfig {
+            routes: vec![route],
+            ..Default::default()
+        };
+        let vars = handle.credential_env_vars(&config);
+        assert!(vars.contains(&("GH_TOKEN".to_string(), "ghp_tok".to_string())));
+    }
+
+    #[test]
+    fn test_validate_phantom_formats() {
+        let ca = crate::config::default_intercept_ca_env_vars();
+        let ok = |routes: Vec<crate::config::RouteConfig>| validate_phantom_formats(&routes, &ca);
+
+        // Same env var with identical formats (or none) is allowed.
+        assert!(
+            ok(vec![
+                phantom_route("a", Some("X_TOKEN"), Some("ghp_{}")),
+                phantom_route("b", Some("X_TOKEN"), Some("ghp_{}")),
+            ])
+            .is_ok()
+        );
+        assert!(
+            ok(vec![
+                phantom_route("a", Some("X_TOKEN"), None),
+                phantom_route("b", Some("X_TOKEN"), None),
+            ])
+            .is_ok()
+        );
+        // Differing formats on one env var are ambiguous.
+        assert!(
+            ok(vec![
+                phantom_route("a", Some("X_TOKEN"), Some("ghp_{}")),
+                phantom_route("b", Some("X_TOKEN"), Some("gho_{}")),
+            ])
+            .is_err()
+        );
+        assert!(
+            ok(vec![
+                phantom_route("a", Some("X_TOKEN"), Some("ghp_{}")),
+                phantom_route("b", Some("X_TOKEN"), None),
+            ])
+            .is_err()
+        );
+        // Reserved env vars.
+        for name in [
+            "NONO_PROXY_TOKEN",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "NODE_USE_ENV_PROXY",
+            "SSL_CERT_FILE",
+            "OTHER_BASE_URL",
+        ] {
+            let routes = vec![
+                phantom_route("a", Some(name), Some("ghp_{}")),
+                phantom_route("other", Some("OTHER_KEY"), None),
+            ];
+            assert!(ok(routes).is_err(), "{name}");
+        }
+        // No derivable env var (URI key, no env_var) leaves a formatted route dead.
+        let mut uri = phantom_route("a", None, Some("ghp_{}"));
+        uri.credential_key = Some("op://v/i/f".to_string());
+        assert!(ok(vec![uri]).is_err());
+        // Unformatted routes keep today's behavior.
+        assert!(ok(vec![phantom_route("a", Some("HTTPS_PROXY"), None)]).is_ok());
+    }
     use super::*;
     use tokio::io::AsyncReadExt;
 
@@ -2822,6 +3171,441 @@ mod tests {
             .await
             .unwrap();
         });
+    }
+
+    enum AwsStep {
+        Send(Vec<u8>),
+        /// Read from the client side until the bytes seen so far contain this.
+        ExpectRead(&'static [u8]),
+    }
+
+    struct AwsCaseResult {
+        /// Raw bytes the client read back from the proxy.
+        client: Vec<u8>,
+        /// Raw request (head and body) the upstream received, if any.
+        upstream: Option<Vec<u8>>,
+    }
+
+    /// Run one request through the CONNECT-intercept AWS path against a mock
+    /// upstream. `steps` gets the upstream port for the Host header.
+    fn run_aws_case(
+        endpoint_policy: serde_json::Value,
+        steps: impl FnOnce(u16) -> Vec<AwsStep>,
+    ) -> AwsCaseResult {
+        run_aws_case_with_routes(endpoint_policy, |_, _| Vec::new(), steps)
+    }
+
+    /// Like [`run_aws_case`] with extra routes on the same upstream. The
+    /// closure gets the upstream port and the upstream CA file path.
+    fn run_aws_case_with_routes(
+        endpoint_policy: serde_json::Value,
+        extra_routes: impl FnOnce(u16, &std::path::Path) -> Vec<serde_json::Value>,
+        steps: impl FnOnce(u16) -> Vec<AwsStep>,
+    ) -> AwsCaseResult {
+        use base64::Engine;
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let empty_profile = dir.path().join("aws-empty");
+        std::fs::write(&empty_profile, "").unwrap();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+            (
+                "AWS_SECRET_ACCESS_KEY",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            ),
+            ("AWS_SESSION_TOKEN", "fake-session-token"),
+            ("AWS_REGION", "us-east-1"),
+            ("AWS_CONFIG_FILE", empty_profile.to_str().unwrap()),
+            (
+                "AWS_SHARED_CREDENTIALS_FILE",
+                empty_profile.to_str().unwrap(),
+            ),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let ca = Arc::new(EphemeralCa::generate().unwrap());
+                let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+                let acceptor = tokio_rustls::TlsAcceptor::from(
+                    tls_intercept::acceptor::build_server_config(cache, true).unwrap(),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream_port = listener.local_addr().unwrap().port();
+
+                let captured: Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let captured_task = Arc::clone(&captured);
+                let upstream = tokio::spawn(async move {
+                    let (sock, _) = listener.accept().await.unwrap();
+                    let mut tls = acceptor.accept(sock).await.unwrap();
+                    let mut request = Vec::new();
+                    let header_end = loop {
+                        let mut byte = [0];
+                        tls.read_exact(&mut byte).await.unwrap();
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break request.len();
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                    let mut body = vec![0; len];
+                    tls.read_exact(&mut body).await.unwrap();
+                    request.extend_from_slice(&body);
+                    // Whatever else the proxy sent counts as forwarded too.
+                    let mut extra = Vec::new();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        tls.read_buf(&mut extra),
+                    )
+                    .await;
+                    request.extend_from_slice(&extra);
+                    *captured_task.lock().unwrap() = Some(request);
+                    tls.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+                    tls.shutdown().await.unwrap();
+                });
+
+                let ca_file = dir.path().join("upstream-ca.pem");
+                std::fs::write(&ca_file, ca.cert_pem()).unwrap();
+                let mut route = serde_json::json!({
+                    "prefix": "aws",
+                    "upstream": format!("https://localhost:{upstream_port}"),
+                    "aws_auth": {"region": "us-east-1", "service": "ssm"},
+                    "tls_ca": ca_file,
+                });
+                if endpoint_policy.is_null() {
+                    // Legacy allow-list: non-explicit, so a miss lets other
+                    // routes on this host handle the request.
+                    route["endpoint_rules"] =
+                        serde_json::json!([{"method": "GET", "path": "/never"}]);
+                } else {
+                    route["endpoint_policy"] = endpoint_policy;
+                }
+                let route = serde_json::from_value(route).unwrap();
+                let mut routes = vec![route];
+                for extra in extra_routes(upstream_port, &ca_file) {
+                    routes.push(serde_json::from_value(extra).unwrap());
+                }
+                let handle = start(ProxyConfig {
+                    routes,
+                    enable_h2: true,
+                    intercept_ca_dir: Some(dir.path().to_path_buf()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+                let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+                    .await
+                    .unwrap();
+                let auth = base64::engine::general_purpose::STANDARD
+                    .encode(format!("nono:{}", handle.token.as_str()));
+                sock.write_all(
+                    format!(
+                        "CONNECT localhost:{upstream_port} HTTP/1.1\r\nHost: localhost:{upstream_port}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+                let mut response = Vec::new();
+                while !response.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    sock.read_exact(&mut byte).await.unwrap();
+                    response.push(byte[0]);
+                }
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+
+                let bundle = std::fs::read(handle.intercept_ca_path().unwrap()).unwrap();
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in CertificateDer::pem_slice_iter(&bundle) {
+                    roots.add(cert.unwrap()).unwrap();
+                }
+                let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+                client.alpn_protocols = vec![b"http/1.1".to_vec()];
+                let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+                    .connect(ServerName::try_from("localhost").unwrap(), sock)
+                    .await
+                    .unwrap();
+
+                let mut seen = Vec::new();
+                for step in steps(upstream_port) {
+                    match step {
+                        AwsStep::Send(bytes) => {
+                            tls.write_all(&bytes).await.unwrap();
+                            tls.flush().await.unwrap();
+                        }
+                        AwsStep::ExpectRead(needle) => {
+                            while !seen.windows(needle.len()).any(|w| w == needle) {
+                                let mut buf = [0u8; 1024];
+                                let n = tls.read(&mut buf).await.unwrap();
+                                assert!(n > 0, "closed before {:?}", String::from_utf8_lossy(needle));
+                                seen.extend_from_slice(&buf[..n]);
+                            }
+                        }
+                    }
+                }
+                let mut rest = Vec::new();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tls.read_to_end(&mut rest),
+                )
+                .await;
+                seen.extend_from_slice(&rest);
+
+                // Let an in-flight upstream finish capturing before aborting.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                upstream.abort();
+                handle.shutdown();
+                let upstream = captured.lock().unwrap().clone();
+                AwsCaseResult {
+                    client: seen,
+                    upstream,
+                }
+            })
+            .await
+            .unwrap()
+        })
+    }
+
+    fn allow_ops_policy(ops: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "default": {"decision": "deny"},
+            "allow": [{"method": "POST", "path": "/", "operations": ops}]
+        })
+    }
+
+    fn json_request(port: u16, target: &str, body: &[u8], extra: &str) -> Vec<u8> {
+        let mut req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: {target}\r\nAuthorization: agent-signature\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(body);
+        req
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Split an upstream capture into (lowercased head, body).
+    fn split_capture(raw: &[u8]) -> (String, Vec<u8>) {
+        let end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        (
+            String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase(),
+            raw[end..].to_vec(),
+        )
+    }
+
+    fn assert_signed_body(head: &str, body: &[u8]) {
+        assert!(head.contains(&format!("x-amz-content-sha256: {}", sha256_hex(body))));
+        assert!(head.contains("aws4-hmac-sha256 credential=akiaiosfodnn7example/"));
+        assert!(!head.contains("agent-signature"));
+    }
+
+    #[test]
+    fn aws_operations_allowed_op_is_signed_and_forwarded_verbatim() {
+        let body = br#"{"Path":"/prod"}"#;
+        let result = run_aws_case(allow_ops_policy(&["Describe*", "GetParameter"]), |port| {
+            vec![AwsStep::Send(json_request(
+                port,
+                "AmazonSSM.GetParameter",
+                body,
+                "",
+            ))]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 200"));
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert_signed_body(&head, body);
+        let signed = head
+            .lines()
+            .find(|l| l.starts_with("authorization:"))
+            .unwrap();
+        assert!(signed.contains("x-amz-target"));
+    }
+
+    #[test]
+    fn aws_operations_denied_op_gets_403_and_no_upstream() {
+        let result = run_aws_case(allow_ops_policy(&["Describe*"]), |port| {
+            vec![AwsStep::Send(json_request(
+                port,
+                "AmazonSSM.DeleteParameter",
+                b"{}",
+                "",
+            ))]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 403"));
+        assert!(result.upstream.is_none());
+    }
+
+    #[test]
+    fn aws_operations_cross_protocol_request_is_unknown_and_denied() {
+        let result = run_aws_case(allow_ops_policy(&["Describe*"]), |port| {
+            let mut req = json_request(port, "AmazonSSM.DescribeParameters", b"{}", "");
+            let line_end = req.windows(2).position(|w| w == b"\r\n").unwrap();
+            req.splice(
+                ..line_end,
+                b"POST /?Action=DeleteParameter HTTP/1.1".to_vec(),
+            );
+            vec![AwsStep::Send(req)]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 403"));
+        assert!(result.upstream.is_none());
+    }
+
+    #[test]
+    fn aws_operations_query_form_body_is_signed() {
+        let body = b"Action=DescribeInstances&Version=2016-11-15";
+        let result = run_aws_case(allow_ops_policy(&["DescribeInstances"]), |port| {
+            let mut req = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            vec![AwsStep::Send(req)]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 200"));
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert_signed_body(&head, body);
+    }
+
+    #[test]
+    fn aws_operations_query_gzip_body_is_unknown_and_denied() {
+        let result = run_aws_case(allow_ops_policy(&["DescribeInstances"]), |port| {
+            let body = b"Action=DescribeInstances";
+            let mut req = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            vec![AwsStep::Send(req)]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 403"));
+        assert!(result.upstream.is_none());
+    }
+
+    #[test]
+    fn aws_operations_chunked_body_is_decoded_once_and_signed() {
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let req = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+            );
+            vec![AwsStep::Send(req.into_bytes())]
+        });
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, b"hello world");
+        assert!(!head.contains("transfer-encoding"));
+        assert!(head.contains("content-length: 11"));
+        assert_signed_body(&head, b"hello world");
+    }
+
+    #[test]
+    fn aws_operations_expect_continue_is_answered_and_stripped() {
+        let body = br#"{"Name":"x"}"#;
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let head = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nExpect: 100-continue\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            vec![
+                AwsStep::Send(head.into_bytes()),
+                AwsStep::ExpectRead(b"HTTP/1.1 100 Continue\r\n\r\n"),
+                AwsStep::Send(body.to_vec()),
+            ]
+        });
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert!(!head.contains("expect:"));
+        assert_eq!(forwarded, body);
+        assert_signed_body(&head, body);
+    }
+
+    #[test]
+    fn aws_operations_pipelined_bytes_are_not_forwarded() {
+        let body = br#"{"Name":"x"}"#;
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let mut req = json_request(port, "AmazonSSM.GetParameter", body, "");
+            req.extend_from_slice(&json_request(port, "AmazonSSM.DeleteParameter", b"{}", ""));
+            vec![AwsStep::Send(req)]
+        });
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert!(!head.contains("deleteparameter"));
+    }
+
+    /// A non-AWS route sharing the AWS host reuses the pre-read body and is
+    /// forwarded unsigned.
+    #[test]
+    fn aws_host_non_aws_route_forwards_pre_read_body() {
+        let body = b"plain-body";
+        let result = run_aws_case_with_routes(
+            // AWS route with a legacy allow-list that misses, so it steps aside.
+            serde_json::Value::Null,
+            |port, ca| {
+                vec![serde_json::json!({
+                    "prefix": "plain",
+                    "upstream": format!("https://localhost:{port}"),
+                    "tls_ca": ca,
+                    "endpoint_rules": [{"method": "POST", "path": "/public"}]
+                })]
+            },
+            |port| {
+                let mut req = format!(
+                    "POST /public HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                req.extend_from_slice(body);
+                vec![AwsStep::Send(req)]
+            },
+        );
+        assert!(result.client.starts_with(b"HTTP/1.1 200"));
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert!(!head.contains("aws4-hmac-sha256"));
+    }
+
+    #[test]
+    fn aws_operations_oversized_body_gets_413() {
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let head = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                16 * 1024 * 1024 + 1
+            );
+            vec![AwsStep::Send(head.into_bytes())]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 413"));
+        assert!(result.upstream.is_none());
     }
 
     /// Run one intercepted POST through the proxy and return the status line,
@@ -3115,6 +3899,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: Vec::new(),
             endpoint_policy: None,
             tls_ca: None,
@@ -3294,6 +4079,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -3703,6 +4489,7 @@ mod tests {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
             ..EndpointPolicyConfig::default()
         });
@@ -3950,6 +4737,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4030,6 +4818,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4120,6 +4909,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4172,6 +4962,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4196,6 +4987,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4260,6 +5052,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4285,6 +5078,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![endpoint_rule.clone(), endpoint_rule],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4349,6 +5143,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4374,6 +5169,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![endpoint_rule],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4427,6 +5223,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -4476,6 +5273,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -4595,6 +5393,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4653,6 +5452,7 @@ mod tests {
                 proxy: None,
                 env_var: None, // No explicit env_var — should fall back to uppercase
                 endpoint_rules: vec![],
+                phantom_format: None,
                 endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
@@ -4718,6 +5518,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("OPENAI_API_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4789,6 +5590,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4813,6 +5615,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![crate::config::EndpointRule {
                         method: "GET".to_string(),
                         path: "/**".to_string(),
@@ -4881,6 +5684,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4905,6 +5709,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: Some("GITHUB_TOKEN".to_string()),
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4973,6 +5778,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5039,6 +5845,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5079,6 +5886,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5142,6 +5950,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5194,6 +6003,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("ANTHROPIC_API_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5474,6 +6284,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5521,6 +6332,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5592,6 +6404,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5633,6 +6446,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5676,6 +6490,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5876,6 +6691,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6805,6 +7621,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6894,6 +7711,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6993,6 +7811,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -7121,6 +7940,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "GET".to_string(),
                 path: "/get".to_string(),
@@ -7441,6 +8261,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,

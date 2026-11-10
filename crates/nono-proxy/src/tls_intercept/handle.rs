@@ -281,6 +281,63 @@ struct ParsedRequest {
     header_bytes: Vec<u8>,
     /// Bytes already pulled into the `BufReader` buffer beyond the headers.
     buffered: Vec<u8>,
+    /// Request body, pre-read when the upstream has an `aws_auth` route so
+    /// the AWS operation can be resolved before policy evaluation.
+    body: Option<Vec<u8>>,
+}
+
+/// Return the pre-read body if present, otherwise read it from the stream.
+async fn take_or_read_body<S>(stream: &mut S, req: &ParsedRequest) -> Result<Option<Vec<u8>>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match &req.body {
+        Some(body) => Ok(Some(body.clone())),
+        None => reverse::read_request_body(stream, &req.header_bytes, &req.buffered).await,
+    }
+}
+
+/// Answer `Expect: 100-continue` ourselves and drop the header, since the
+/// proxy consumes the body and re-frames the upstream request. Any other
+/// expectation is refused with 417. Returns `false` once the response was sent.
+async fn handle_expect_continue<S>(stream: &mut S, req: &mut ParsedRequest) -> Result<bool>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Ok(text) = std::str::from_utf8(&req.header_bytes) else {
+        return Ok(true);
+    };
+    let mut expects = Vec::new();
+    let mut kept = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        match line.split_once(':') {
+            Some((name, value)) if name.trim().eq_ignore_ascii_case("expect") => {
+                expects.push(value.trim().to_ascii_lowercase());
+            }
+            _ => kept.push_str(line),
+        }
+    }
+    if expects.is_empty() {
+        return Ok(true);
+    }
+    if expects.iter().any(|v| v != "100-continue") {
+        reverse::send_error_generic(stream, 417, "Expectation Failed").await?;
+        return Ok(false);
+    }
+    // Refuse an oversized upload before inviting it.
+    if reverse::extract_content_length(&req.header_bytes)
+        .is_some_and(|len| len > reverse::MAX_REQUEST_BODY)
+    {
+        reverse::send_error_generic(stream, 413, "Payload Too Large").await?;
+        return Ok(false);
+    }
+    // Nothing to wait for when the client already sent (part of) the body.
+    if req.buffered.is_empty() {
+        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        stream.flush().await?;
+    }
+    req.header_bytes = kept.into_bytes();
+    Ok(true)
 }
 
 /// Denial reason for a wildcard-region AWS route whose host yields no valid
@@ -384,6 +441,7 @@ where
         version,
         header_bytes,
         buffered,
+        body: None,
     }))
 }
 
@@ -410,6 +468,9 @@ pub(crate) struct InterceptRouteRequest<'a> {
     pub method: &'a str,
     pub path: &'a str,
     pub websocket_path: Option<&'a str>,
+    /// Resolved AWS operation, set only when the body was pre-read for an
+    /// upstream with an `aws_auth` route. `None` evaluates as `Unknown`.
+    pub operation: Option<&'a crate::aws::operation::ResolvedOperation>,
 }
 
 /// Evaluate endpoint policy for every candidate route on an intercepted
@@ -468,13 +529,32 @@ pub(crate) async fn select_intercept_route<'a>(
             }
             continue;
         }
-        match route.endpoint_policy.evaluate(method, path) {
+        // Only `aws_auth` routes may carry `operations` rules; other routes
+        // are evaluated without an operation.
+        let operation_name: Option<&str> = route.aws_auth.then(|| {
+            request
+                .operation
+                .map_or(crate::config::UNKNOWN_OPERATION, |op| op.name.as_str())
+        });
+        let operation_protocol: Option<&str> = request
+            .operation
+            .filter(|_| route.aws_auth)
+            .map(|op| op.protocol.as_str());
+        match route
+            .endpoint_policy
+            .evaluate_request(&crate::config::EndpointRequest {
+                method,
+                path,
+                operation: operation_name,
+            }) {
             EndpointPolicyOutcome::Allow { rule_label } => {
                 audit::log_l7_policy_decision(
                     audit_log,
                     audit::ProxyMode::ConnectIntercept,
                     &audit::EventContext {
                         route_id: Some(prefix),
+                        endpoint_operation: operation_name,
+                        endpoint_protocol: operation_protocol,
                         endpoint_policy_action: Some("allow"),
                         endpoint_policy_rule: Some(&rule_label),
                         upstream: Some(&route.upstream),
@@ -516,6 +596,8 @@ pub(crate) async fn select_intercept_route<'a>(
                                 nono::undo::NetworkAuditDenialCategory::EndpointPolicy,
                             ),
                             route_id: Some(prefix),
+                            endpoint_operation: operation_name,
+                            endpoint_protocol: operation_protocol,
                             endpoint_policy_action: Some("approve"),
                             endpoint_policy_rule: Some(&rule_label),
                             upstream: Some(&route.upstream),
@@ -541,6 +623,8 @@ pub(crate) async fn select_intercept_route<'a>(
                                     nono::undo::NetworkAuditDenialCategory::EndpointPolicy,
                                 ),
                                 route_id: Some(prefix),
+                                endpoint_operation: operation_name,
+                                endpoint_protocol: operation_protocol,
                                 endpoint_policy_action: Some("approve"),
                                 endpoint_policy_rule: Some(&rule_label),
                                 upstream: Some(&route.upstream),
@@ -560,8 +644,13 @@ pub(crate) async fn select_intercept_route<'a>(
                 };
                 let mut request_reason = reason.map(str::to_string).unwrap_or_else(|| {
                     format!(
-                        "endpoint approval required by {} for {} {}",
-                        rule_label, method, path
+                        "endpoint approval required by {} for {} {}{}",
+                        rule_label,
+                        method,
+                        path,
+                        operation_name
+                            .map(|op| format!(" (operation {op})"))
+                            .unwrap_or_default()
                     )
                 });
                 // Wildcard upstreams: show the concrete host, and for AWS
@@ -604,6 +693,8 @@ pub(crate) async fn select_intercept_route<'a>(
                 }
                 let approval_ctx = audit::EventContext {
                     route_id: Some(prefix),
+                    endpoint_operation: operation_name,
+                    endpoint_protocol: operation_protocol,
                     endpoint_policy_action: Some("approve"),
                     endpoint_policy_rule: Some(&rule_label),
                     approval_backend: Some(&backend_name),
@@ -630,6 +721,7 @@ pub(crate) async fn select_intercept_route<'a>(
                     method: method.to_string(),
                     path: path.to_string(),
                     rule_label: rule_label.clone(),
+                    operation: operation_name.map(str::to_string),
                     reason: Some(request_reason),
                     child_pid: 0,
                     session_id: approval_backends.session_id().to_string(),
@@ -647,7 +739,8 @@ pub(crate) async fn select_intercept_route<'a>(
                 .await;
                 // L7 endpoint approval has no per-connection session cache, so
                 // collapse the session-scoped decision variants to their
-                // one-shot equivalents and keep the match below total.
+                // one-shot equivalents and keep the match below total. A future
+                // cache must key on (route, upstream, method, path, operation).
                 let decision = decision.map(|joined| {
                     joined.map(|approved| {
                         approved.map(nono::supervisor::ApprovalDecision::without_session_scope)
@@ -835,6 +928,8 @@ pub(crate) async fn select_intercept_route<'a>(
                     audit::ProxyMode::ConnectIntercept,
                     &audit::EventContext {
                         route_id: Some(prefix),
+                        endpoint_operation: operation_name,
+                        endpoint_protocol: operation_protocol,
                         denial_category: Some(
                             nono::undo::NetworkAuditDenialCategory::EndpointPolicy,
                         ),
@@ -1143,11 +1238,48 @@ async fn handle_inner_request<S>(tls_stream: &mut S, ctx: &InterceptCtx<'_>) -> 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let req = match parse_inner_request(tls_stream).await? {
+    let mut req = match parse_inner_request(tls_stream).await? {
         Some(r) => r,
         None => return Ok(()),
     };
     debug!("tls_intercept: inner request {} {}", req.method, req.path);
+
+    // For upstreams with an `aws_auth` route, buffer the body before policy
+    // evaluation so the AWS operation can be resolved. The same body, header
+    // list and path are then signed and forwarded, so what policy inspected is
+    // exactly what is sent.
+    let host_port_key = format!("{}:{}", ctx.host.to_lowercase(), ctx.port);
+    let has_aws_route = ctx
+        .route_store
+        .lookup_all_by_upstream(&host_port_key)
+        .iter()
+        .any(|(_, route)| route.aws_auth);
+    let mut aws_headers: Option<Vec<(String, String)>> = None;
+    let mut resolved_operation: Option<crate::aws::operation::ResolvedOperation> = None;
+    if has_aws_route {
+        if !handle_expect_continue(tls_stream, &mut req).await? {
+            return Ok(());
+        }
+        let strict_ok = super::http1::parse_header_fields(&req.header_bytes).is_ok();
+        // Keep the agent's auth headers: signing-profile selection reads them.
+        let agent_headers = reverse::filter_headers(&req.header_bytes, "");
+        let mut headers = agent_headers.clone();
+        headers.retain(|(name, _)| !crate::aws::sign::is_aws_auth_header(name));
+        let Some(body) =
+            reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await?
+        else {
+            return Ok(());
+        };
+        resolved_operation = Some(crate::aws::operation::resolve(
+            &req.method,
+            &req.path,
+            &headers,
+            strict_ok,
+            &body,
+        ));
+        aws_headers = Some(agent_headers);
+        req.body = Some(body);
+    }
 
     // Detect and validate an HTTP `Upgrade` attempt before any route lookup,
     // credential resolution, or upstream connection. Malformed attempts fail
@@ -1198,6 +1330,7 @@ where
                 method: &method,
                 path: &path,
                 websocket_path: is_websocket_upgrade.then_some(path.as_str()),
+                operation: resolved_operation.as_ref(),
             },
             ctx.audit_log,
             ctx.approval_backends.as_ref(),
@@ -1259,7 +1392,17 @@ where
     // before resolve_managed_credential.
     let aws_route = service.and_then(|s| ctx.credential_store.get_aws(s));
     if let Some(aws) = aws_route {
-        return handle_inner_request_aws(tls_stream, ctx, aws, route, service, &req).await;
+        // `has_aws_route` guarantees the pre-read for any host with an AWS route.
+        let (Some(headers), Some(operation)) = (aws_headers, resolved_operation.as_ref()) else {
+            reverse::send_error_generic(tls_stream, 500, "Internal Server Error").await?;
+            return Ok(());
+        };
+        debug!(
+            "tls_intercept: AWS operation={} protocol={}",
+            operation.name,
+            operation.protocol.as_str()
+        );
+        return handle_inner_request_aws(tls_stream, ctx, aws, route, service, &req, headers).await;
     }
 
     // Managed credential gating and command-backed capture are shared with the
@@ -1345,11 +1488,10 @@ where
         filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
         filtered_headers.push(("Accept-Encoding".to_string(), "identity".to_string()));
     }
-    let body =
-        match reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await? {
-            Some(b) => b,
-            None => return Ok(()),
-        };
+    let body = match take_or_read_body(tls_stream, &req).await? {
+        Some(b) => b,
+        None => return Ok(()),
+    };
     let body = if let Some(endpoint) = oauth_endpoint {
         ctx.oauth_capture_store
             .rewrite_request_body(endpoint, &body)?
@@ -1675,11 +1817,10 @@ where
 
     let strip_header = inject_header.as_deref().unwrap_or("");
     let filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
-    let body =
-        match reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await? {
-            Some(b) => b,
-            None => return Ok(()),
-        };
+    let body = match take_or_read_body(tls_stream, req).await? {
+        Some(b) => b,
+        None => return Ok(()),
+    };
 
     let upstream_authority = reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port);
     let mut request = Zeroizing::new(format!(
@@ -1840,11 +1981,12 @@ async fn handle_inner_request_aws<S>(
     route: Option<&crate::route::LoadedRoute>,
     service: Option<&str>,
     req: &ParsedRequest,
+    agent_headers: Vec<(String, String)>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let mut filtered_headers = reverse::filter_headers(&req.header_bytes, "");
+    let mut filtered_headers = agent_headers;
 
     // Pick the signing identity before the agent's auth headers are stripped:
     // a multi-profile route selects it by the placeholder access key ID the
@@ -1883,7 +2025,7 @@ where
     // x-amz-* headers (X-Amz-Target, meta, etc.) are preserved and signed.
     filtered_headers.retain(|(name, _)| !crate::aws::sign::is_aws_auth_header(name));
 
-    // Resolve the SigV4 region before reading the body or touching the network.
+    // Resolve the SigV4 region before touching the network.
     // Wildcard-region routes derive it from the raw CONNECT host only (never the
     // inner `Host` header or client SNI) and deny hosts that yield none.
     let concrete_upstream = format!(
@@ -1927,11 +2069,12 @@ where
         }
     };
 
-    let body =
-        match reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await? {
-            Some(b) => b,
-            None => return Ok(()),
-        };
+    // The body was read before policy evaluation; sign and forward that exact
+    // buffer.
+    let Some(body) = req.body.as_deref() else {
+        reverse::send_error_generic(tls_stream, 500, "Internal Server Error").await?;
+        return Ok(());
+    };
 
     // --- Resolve upstream IPs (DNS-rebind-safe via filter) ---
     let resolved_addrs = match resolve_upstream_or_deny(
@@ -1989,7 +2132,7 @@ where
         &req.method,
         &full_url,
         &filtered_headers,
-        &body,
+        body,
     )
     .await
     {
@@ -2074,7 +2217,7 @@ where
     if let Err(e) = forward::forward_request(
         tls_stream,
         request.as_bytes(),
-        &body,
+        body,
         upstream_spec,
         audit_ctx,
     )
@@ -2872,6 +3015,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "*".to_string(),
                 path: "/**".to_string(),
@@ -2909,6 +3053,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "GET".to_string(),
                     path: path.to_string(),
@@ -2930,6 +3075,7 @@ mod tests {
                 method,
                 path,
                 websocket_path: None,
+                operation: None,
             }
         }
 
@@ -2998,6 +3144,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "GET".to_string(),
                     path: path.to_string(),
@@ -3028,6 +3175,7 @@ mod tests {
                 method: "GET",
                 path,
                 websocket_path: None,
+                operation: None,
             };
             match select_intercept_route(&store, "example.com", 443, request, None, None).await {
                 RouteSelection::Selected(Some(selected)) => {
@@ -3057,6 +3205,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "GET".to_string(),
                 path: "/foo".to_string(),
@@ -3086,6 +3235,7 @@ mod tests {
                 method,
                 path,
                 websocket_path: None,
+                operation: None,
             }
         }
 
@@ -3155,6 +3305,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             upgrades: vec![],
             tls_ca: None,
@@ -3171,6 +3322,7 @@ mod tests {
                     backend: None,
                     reason: None,
                     timeout_secs: Some(2),
+                    operations: None,
                 }],
                 allow: vec![],
             }),
@@ -3211,6 +3363,7 @@ mod tests {
                 method: "GET",
                 path: "/gated",
                 websocket_path: None,
+                operation: None,
             },
             None,
             Some(&registry),
@@ -3271,6 +3424,7 @@ mod tests {
                 method: "GET",
                 path: "/gated",
                 websocket_path: None,
+                operation: None,
             },
             None,
             Some(&registry),
@@ -3282,6 +3436,303 @@ mod tests {
             *backend.sessions.lock().unwrap(),
             vec!["sess-intercept".to_string()]
         );
+    }
+
+    use tokio::io::AsyncReadExt as _;
+
+    /// Records the `operation` of each endpoint approval request.
+    struct OperationRecordingBackend {
+        operations: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl nono::ApprovalBackend for OperationRecordingBackend {
+        fn request_approval(
+            &self,
+            request: &nono::ApprovalRequest,
+        ) -> nono::Result<nono::ApprovalDecision> {
+            if let nono::ApprovalRequest::Endpoint { operation, .. } = request {
+                self.operations
+                    .lock()
+                    .map_err(|_| nono::NonoError::SandboxInit("poisoned".to_string()))?
+                    .push(operation.clone());
+            }
+            Ok(nono::ApprovalDecision::Granted)
+        }
+
+        fn backend_name(&self) -> &str {
+            "operation-recording"
+        }
+    }
+
+    fn aws_ops_route(
+        deny: &[&str],
+        approve: &[&str],
+        allow: &[&str],
+    ) -> crate::config::RouteConfig {
+        let rules = |ops: &[&str]| -> Vec<crate::config::EndpointPolicyRule> {
+            if ops.is_empty() {
+                return vec![];
+            }
+            vec![crate::config::EndpointPolicyRule {
+                method: "POST".to_string(),
+                path: "/".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: Some(2),
+                operations: Some(ops.iter().map(|s| s.to_string()).collect()),
+            }]
+        };
+        let mut route = approval_gated_route("ssm");
+        route.upstream = "https://ssm.us-east-1.amazonaws.com".to_string();
+        route.credential_key = None;
+        route.aws_auth = Some(crate::config::AwsAuthConfig::default());
+        route.endpoint_policy = Some(crate::config::EndpointPolicyConfig {
+            default: crate::config::EndpointPolicyDefault::default(),
+            deny: rules(deny),
+            approve: rules(approve),
+            allow: rules(allow),
+        });
+        route
+    }
+
+    fn resolved(name: &str) -> crate::aws::operation::ResolvedOperation {
+        crate::aws::operation::ResolvedOperation {
+            name: name.to_string(),
+            protocol: crate::aws::operation::AwsProtocol::Json,
+        }
+    }
+
+    async fn select_aws(
+        store: &RouteStore,
+        operation: Option<&crate::aws::operation::ResolvedOperation>,
+        audit_log: Option<&audit::SharedAuditLog>,
+        registry: Option<&crate::approval::ApprovalBackendRegistry>,
+    ) -> u16 {
+        match select_intercept_route(
+            store,
+            "ssm.us-east-1.amazonaws.com",
+            443,
+            InterceptRouteRequest {
+                method: "POST",
+                path: "/",
+                websocket_path: None,
+                operation,
+            },
+            audit_log,
+            registry,
+        )
+        .await
+        {
+            RouteSelection::Rejected(status) => status,
+            RouteSelection::Selected(_) => 200,
+        }
+    }
+
+    #[tokio::test]
+    async fn aws_route_allow_and_deny_follow_the_resolved_operation() {
+        let store = RouteStore::load(&[aws_ops_route(&[], &[], &["Describe*"])])
+            .await
+            .unwrap();
+        assert_eq!(
+            select_aws(&store, Some(&resolved("DescribeParameters")), None, None).await,
+            200
+        );
+        assert_eq!(
+            select_aws(&store, Some(&resolved("DeleteParameter")), None, None).await,
+            403
+        );
+        // No resolved operation evaluates as `Unknown`.
+        assert_eq!(select_aws(&store, None, None, None).await, 403);
+        assert_eq!(
+            select_aws(&store, Some(&resolved("Unknown")), None, None).await,
+            403
+        );
+    }
+
+    #[tokio::test]
+    async fn aws_route_deny_rule_blocks_operation_and_is_audited() {
+        let store = RouteStore::load(&[aws_ops_route(&["Delete*"], &[], &["*"])])
+            .await
+            .unwrap();
+        let log = audit::new_audit_log();
+        assert_eq!(
+            select_aws(&store, Some(&resolved("DeleteParameter")), Some(&log), None).await,
+            403
+        );
+        let events = audit::drain_audit_events(&log);
+        let event = events.last().expect("audit event");
+        assert_eq!(event.endpoint_operation.as_deref(), Some("DeleteParameter"));
+        assert_eq!(event.endpoint_protocol.as_deref(), Some("json"));
+        assert_eq!(
+            event.endpoint_policy_rule.as_deref(),
+            Some("endpoint_policy.deny[POST / ops=Delete*]")
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_request_carries_operation() {
+        let store = RouteStore::load(&[aws_ops_route(&[], &["Terminate*", "Unknown"], &[])])
+            .await
+            .unwrap();
+        let backend = std::sync::Arc::new(OperationRecordingBackend {
+            operations: std::sync::Mutex::new(Vec::new()),
+        });
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+        let log = audit::new_audit_log();
+
+        assert_eq!(
+            select_aws(
+                &store,
+                Some(&resolved("TerminateInstances")),
+                Some(&log),
+                Some(&registry)
+            )
+            .await,
+            200
+        );
+        assert_eq!(select_aws(&store, None, None, Some(&registry)).await, 200);
+        assert_eq!(
+            *backend.operations.lock().unwrap(),
+            vec![
+                Some("TerminateInstances".to_string()),
+                Some("Unknown".to_string())
+            ]
+        );
+        assert!(
+            audit::drain_audit_events(&log)
+                .iter()
+                .all(|e| e.endpoint_operation.as_deref() == Some("TerminateInstances"))
+        );
+    }
+
+    #[tokio::test]
+    async fn non_aws_route_approval_has_no_operation() {
+        let store = RouteStore::load(&[approval_gated_route("gated")])
+            .await
+            .unwrap();
+        let backend = std::sync::Arc::new(OperationRecordingBackend {
+            operations: std::sync::Mutex::new(Vec::new()),
+        });
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+        // A resolved operation must not leak onto a non-AWS route.
+        let op = resolved("TerminateInstances");
+        let selection = select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            InterceptRouteRequest {
+                method: "GET",
+                path: "/gated",
+                websocket_path: None,
+                operation: Some(&op),
+            },
+            None,
+            Some(&registry),
+        )
+        .await;
+        assert!(matches!(selection, RouteSelection::Selected(_)));
+        assert_eq!(*backend.operations.lock().unwrap(), vec![None]);
+    }
+
+    fn parsed(header_bytes: &[u8], buffered: &[u8], body: Option<&[u8]>) -> ParsedRequest {
+        ParsedRequest {
+            method: "POST".to_string(),
+            path: "/".to_string(),
+            version: "HTTP/1.1".to_string(),
+            header_bytes: header_bytes.to_vec(),
+            buffered: buffered.to_vec(),
+            body: body.map(<[u8]>::to_vec),
+        }
+    }
+
+    #[tokio::test]
+    async fn take_or_read_body_prefers_pre_read_body() {
+        let (_client, mut server) = tokio::io::duplex(64);
+        let req = parsed(b"Content-Length: 5\r\n\r\n", b"", Some(b"hello"));
+        let body = take_or_read_body(&mut server, &req).await.unwrap();
+        assert_eq!(body.as_deref(), Some(b"hello".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn take_or_read_body_reads_stream_when_not_pre_read() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(b"world").await.unwrap();
+        let req = parsed(b"Content-Length: 5\r\n\r\n", b"", None);
+        let body = take_or_read_body(&mut server, &req).await.unwrap();
+        assert_eq!(body.as_deref(), Some(b"world".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn expect_continue_is_answered_and_header_dropped() {
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let mut req = parsed(
+            b"Host: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n",
+            b"",
+            None,
+        );
+        assert!(handle_expect_continue(&mut server, &mut req).await.unwrap());
+        drop(server);
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"HTTP/1.1 100 Continue\r\n\r\n");
+        let kept = String::from_utf8(req.header_bytes).unwrap();
+        assert!(!kept.to_ascii_lowercase().contains("expect"));
+        assert!(kept.contains("Host: x") && kept.contains("Content-Length: 2"));
+    }
+
+    #[tokio::test]
+    async fn expect_continue_skips_100_when_body_already_buffered() {
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let mut req = parsed(b"Expect: 100-continue\r\n\r\n", b"ab", None);
+        assert!(handle_expect_continue(&mut server, &mut req).await.unwrap());
+        drop(server);
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        assert!(out.is_empty());
+        assert!(
+            !String::from_utf8(req.header_bytes)
+                .unwrap()
+                .contains("Expect")
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_expectation_gets_417() {
+        let (mut client, mut server) = tokio::io::duplex(512);
+        let mut req = parsed(b"Expect: something-else\r\n\r\n", b"", None);
+        assert!(!handle_expect_continue(&mut server, &mut req).await.unwrap());
+        drop(server);
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 417"));
+    }
+
+    #[tokio::test]
+    async fn expect_continue_with_oversized_length_gets_413_without_100() {
+        let (mut client, mut server) = tokio::io::duplex(512);
+        let mut req = parsed(
+            b"Expect: 100-continue\r\nContent-Length: 99999999999\r\n\r\n",
+            b"",
+            None,
+        );
+        assert!(!handle_expect_continue(&mut server, &mut req).await.unwrap());
+        drop(server);
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 413"));
+        assert!(!String::from_utf8_lossy(&out).contains("100 Continue"));
+    }
+
+    #[tokio::test]
+    async fn no_expect_header_is_a_no_op() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let mut req = parsed(b"Host: x\r\n\r\n", b"", None);
+        assert!(handle_expect_continue(&mut server, &mut req).await.unwrap());
+        assert_eq!(req.header_bytes, b"Host: x\r\n\r\n");
+        drop(server);
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        assert!(out.is_empty());
     }
 
     /// An approval backend failure must fail closed, mirroring the reverse
@@ -3305,6 +3756,7 @@ mod tests {
                 method: "GET",
                 path: "/gated",
                 websocket_path: None,
+                operation: None,
             },
             None,
             Some(&registry),
@@ -3337,6 +3789,7 @@ mod tests {
                 method: "GET",
                 path: "/gated",
                 websocket_path: None,
+                operation: None,
             },
             Some(&audit_log),
             Some(&registry),
@@ -3379,6 +3832,7 @@ mod tests {
                 method: "GET",
                 path: "/gated",
                 websocket_path: None,
+                operation: None,
             },
             None,
             Some(&registry),
@@ -3671,6 +4125,7 @@ mod tests {
             )
             .into_bytes(),
             buffered: Vec::new(),
+            body: None,
         };
         assert!(
             build_websocket_upstream_request(
@@ -3703,6 +4158,7 @@ mod tests {
             )
             .into_bytes(),
             buffered: Vec::new(),
+            body: None,
         };
         let outbound = build_websocket_upstream_request(
             &request,
@@ -3751,6 +4207,7 @@ mod tests {
             )
             .into_bytes(),
             buffered: Vec::new(),
+            body: None,
         }
     }
 
@@ -3815,6 +4272,7 @@ mod tests {
                 method: "GET",
                 path: "/other",
                 websocket_path: Some("/other"),
+                operation: None,
             },
             None,
             None,
@@ -3872,6 +4330,7 @@ mod tests {
             version: "HTTP/1.1".to_string(),
             header_bytes: Vec::new(),
             buffered: b"early-client-frame".to_vec(),
+            body: None,
         };
 
         let tunnel_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -3975,6 +4434,7 @@ mod tests {
             version: "HTTP/1.1".to_string(),
             header_bytes: Vec::new(),
             buffered: Vec::new(),
+            body: None,
         };
 
         let bogus_response = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: not-the-right-value=\r\n\r\n";
@@ -4831,6 +5291,7 @@ mod tests {
                 method: "GET",
                 path: "/gated",
                 websocket_path: None,
+                operation: None,
             },
             None,
             Some(&registry),
@@ -4875,6 +5336,7 @@ mod tests {
                     method: "GET",
                     path: "/gated",
                     websocket_path: None,
+                    operation: None,
                 },
                 None,
                 Some(&registry),

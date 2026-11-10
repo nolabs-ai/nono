@@ -1682,6 +1682,8 @@ fn network_denial_event(
         denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
         endpoint_policy_action: None,
         endpoint_policy_rule: None,
+        endpoint_operation: None,
+        endpoint_protocol: None,
         approval_backend: None,
         credential_capture_action: None,
         credential_capture_name: None,

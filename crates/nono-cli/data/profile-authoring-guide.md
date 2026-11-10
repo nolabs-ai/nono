@@ -154,6 +154,8 @@ Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_fil
 
 An effective command sandbox whose network policy includes `network.allow_domain` receives a dedicated loopback proxy and a fresh proxy credential. Its proxy policy does not inherit the session sandbox's broader domain allowlist: the session sandbox may allow `"*"`, while the effective command sandbox for controlled `curl` invocations is limited to `github.com`. The session network policy's domain denials still apply. The supervisor replaces proxy-control environment variables immediately before execution, and the command sandbox may connect only to its dedicated proxy. Changing those variables, opting out with `NO_PROXY`, or using direct sockets does not grant access to the session proxy or direct network unless the command sandbox policy separately grants raw TCP access.
 
+Endpoint policy rules on `aws_auth` credentials may add `operations`, a list of AWS operation-name globs (`[A-Za-z0-9_*?]`, case-sensitive). Requests whose operation cannot be determined match the name `Unknown`; prefer `default: deny` plus allow rules. See the AWS SigV4 section of the credential injection docs.
+
 Proxy credentials granted by the same effective command sandbox are served by that dedicated proxy. Their reverse routes may reach their configured upstreams and still enforce `endpoint_policy`, but those upstreams are not added to the command's domain allowlist: direct or ordinary forward-proxy access remains denied unless `network.allow_domain` also permits it.
 
 A command sandbox policy that grants a proxy credential without `network.allow_domain` also receives a dedicated proxy. Its domain allowlist is empty, so only its explicitly granted credential routes are usable.

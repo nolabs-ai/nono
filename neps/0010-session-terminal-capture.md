@@ -393,10 +393,15 @@ child's environment before exec.
 
 ### 9. Library and CLI split
 
-- **Library (`nono`):** audit payload types (`terminal_chunk`,
-  `recording_lost`, `terminal_recording_truncated`) only.
+- **Library (`nono`):** no recording types. The audit recorder gains one
+  generic method that appends an event whose type the caller defines. It
+  refuses the library's own event types, so an extension can never pass for
+  one, and the verifier checks these records by their hash without
+  interpreting them.
 - **CLI (`nono-cli`):** capture, protections, recording, sinks, delivery,
-  identity, configuration, replay and transcript.
+  identity, configuration, replay and transcript, and the audit payload
+  types (`terminal_chunk`, `recording_lost`, `terminal_recording_truncated`),
+  written through that method.
 
 ### 10. Phasing
 

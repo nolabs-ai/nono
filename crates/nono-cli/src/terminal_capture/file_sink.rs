@@ -154,7 +154,7 @@ impl Sink for FileSink {
         let event = &chunk.event;
         self.chunks.push(json!({
             "index": event.index,
-            "file": nono::audit::terminal_chunk_file_name(event.index),
+            "file": super::audit_events::terminal_chunk_file_name(event.index),
             "sha256": event.sha256,
             "raw_sha256": hex_digest(&chunk.raw),
             "offset": self.offset,
@@ -183,7 +183,7 @@ impl Sink for FileSink {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use nono::audit::TerminalChunkEvent;
+    use crate::terminal_capture::audit_events::TerminalChunkEvent;
 
     fn chunk(index: u64, raw: &[u8]) -> ChunkInfo {
         ChunkInfo {

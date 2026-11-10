@@ -7,12 +7,13 @@
 //! index order gives a single zstd stream that decompresses to one complete
 //! asciicast v2 file.
 
+use super::audit_events::{
+    RecordingLostEvent, TERMINAL_RECORDING_DIRNAME, TerminalChunkEvent,
+    TerminalRecordingTruncatedEvent, record_recording_lost, record_terminal_chunk,
+    record_terminal_recording_truncated, terminal_chunk_file_name,
+};
 use super::events::{CaptureEvent, ProtectedEvent, SessionEnd};
 use crate::audit_integrity::AuditRecorder;
-use nono::audit::{
-    RecordingLostEvent, TERMINAL_RECORDING_DIRNAME, TerminalChunkEvent,
-    TerminalRecordingTruncatedEvent, terminal_chunk_file_name,
-};
 use nono::{NonoError, Result};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
@@ -120,9 +121,7 @@ impl Sink for AuditLinkSink {
         Ok(())
     }
     fn chunk_closed(&mut self, chunk: &ChunkInfo) -> Result<()> {
-        with_recorder(&self.recorder, |r| {
-            r.record_terminal_chunk(chunk.event.clone())
-        })
+        with_recorder(&self.recorder, |r| record_terminal_chunk(r, &chunk.event))
     }
     fn close(&mut self, _end: &SessionEnd) -> Result<()> {
         Ok(())
@@ -421,7 +420,7 @@ impl Writer {
             recorded_bytes: self.total_raw,
         };
         if let Err(e) = with_recorder(&self.config.audit, |r| {
-            r.record_terminal_recording_truncated(event)
+            record_terminal_recording_truncated(r, &event)
         }) {
             tracing::warn!("failed to record terminal recording truncation: {e}");
         }
@@ -516,7 +515,7 @@ impl Writer {
             seq_end,
             reason: reason.to_string(),
         };
-        if let Err(e) = with_recorder(&self.config.audit, |r| r.record_recording_lost(event)) {
+        if let Err(e) = with_recorder(&self.config.audit, |r| record_recording_lost(r, &event)) {
             tracing::warn!("failed to record terminal recording loss: {e}");
             if self.config.required {
                 set_fatal(

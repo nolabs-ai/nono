@@ -96,25 +96,11 @@ pub enum AuditEventPayload {
         /// Command policy decision event.
         event: Box<CommandPolicyAuditEvent>,
     },
-    /// A terminal recording chunk was closed (NEP-0010).
-    TerminalChunk {
-        /// Chunk reference and the window it covers.
-        chunk: Box<TerminalChunkEvent>,
-    },
-    /// Terminal capture events a sink failed to keep (NEP-0010).
-    RecordingLost {
-        /// Lost `seq` range and the reason.
-        event: RecordingLostEvent,
-    },
-    /// Terminal recording stopped at its size limit (NEP-0010).
-    TerminalRecordingTruncated {
-        /// Where recording stopped and why.
-        event: TerminalRecordingTruncatedEvent,
-    },
-    /// A payload type this build does not know, written by a newer nono.
+    /// A payload type this build does not know: written by a newer nono, or
+    /// an extension event recorded with
+    /// [`AuditRecorder::record_extension_event`].
     ///
-    /// Readers keep these records so that logs written by newer releases still
-    /// verify: the record's leaf hash covers its stored `event_json` bytes, so
+    /// Readers keep these records so that such logs still verify: the record's leaf hash covers its stored `event_json` bytes, so
     /// its integrity is checked without understanding its content. Known types
     /// with malformed fields still fail to parse. This variant is never
     /// serialized, so the recorder cannot write one.
@@ -128,75 +114,6 @@ impl AuditEventPayload {
     pub fn is_unrecognized(&self) -> bool {
         matches!(self, Self::Unrecognized)
     }
-}
-
-/// Directory, inside an audit session directory, holding terminal chunks.
-pub const TERMINAL_RECORDING_DIRNAME: &str = "terminal";
-
-/// File name of terminal recording chunk `index` inside
-/// [`TERMINAL_RECORDING_DIRNAME`].
-///
-/// The name is derived from the index only, so a log record can never point
-/// a verifier at an arbitrary path.
-#[must_use]
-pub fn terminal_chunk_file_name(index: u64) -> String {
-    format!("chunk-{index:08}.cast.zst")
-}
-
-/// A closed terminal recording chunk (NEP-0010 §4).
-///
-/// Ranges are half-open: `[start, end)`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TerminalChunkEvent {
-    /// Chunk index, starting at 0, contiguous within a session.
-    pub index: u64,
-    /// First capture `seq` in the chunk.
-    pub seq_start: u64,
-    /// One past the last capture `seq` in the chunk.
-    pub seq_end: u64,
-    /// Offset of the first event from session start, in microseconds.
-    pub start_offset_us: u64,
-    /// Offset of the last event from session start, in microseconds.
-    pub end_offset_us: u64,
-    /// First audit record sequence number written during the chunk window.
-    pub audit_seq_start: u64,
-    /// One past the last audit record sequence number written during the
-    /// chunk window (this chunk's own record is not included).
-    pub audit_seq_end: u64,
-    /// Uncompressed chunk size in bytes.
-    pub raw_bytes: u64,
-    /// Stored (compressed) chunk size in bytes.
-    pub stored_bytes: u64,
-    /// SHA-256 of the stored chunk file, lowercase hex.
-    pub sha256: String,
-    /// Number of credential values replaced in this chunk.
-    pub credential_redactions: u64,
-    /// Number of input events whose content was not captured.
-    pub suppressed_inputs: u64,
-}
-
-/// Capture events a sink could not keep (NEP-0010 §5).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordingLostEvent {
-    /// Sink that lost the events.
-    pub sink: String,
-    /// First lost capture `seq`.
-    pub seq_start: u64,
-    /// One past the last lost capture `seq`.
-    pub seq_end: u64,
-    /// Why the events were lost.
-    pub reason: String,
-}
-
-/// Recording stopped at its configured size limit (NEP-0010 §4).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TerminalRecordingTruncatedEvent {
-    /// First capture `seq` not recorded.
-    pub seq: u64,
-    /// Configured limit in uncompressed bytes.
-    pub max_bytes: u64,
-    /// Uncompressed bytes recorded before the limit.
-    pub recorded_bytes: u64,
 }
 
 /// Sandbox runtime metadata captured in the audit log.
@@ -639,24 +556,46 @@ impl AuditRecorder {
         self.command_policy_summary.clone().finish()
     }
 
-    /// Record a closed terminal recording chunk.
-    pub fn record_terminal_chunk(&mut self, chunk: TerminalChunkEvent) -> Result<()> {
-        self.append_event(AuditEventPayload::TerminalChunk {
-            chunk: Box::new(chunk),
-        })
-    }
-
-    /// Record capture events a sink could not keep.
-    pub fn record_recording_lost(&mut self, event: RecordingLostEvent) -> Result<()> {
-        self.append_event(AuditEventPayload::RecordingLost { event })
-    }
-
-    /// Record that terminal recording stopped at its size limit.
-    pub fn record_terminal_recording_truncated(
+    /// Record an event whose payload type the caller defines.
+    ///
+    /// The event is written as `{"type": event_type, ...payload fields}`, hash
+    /// linked like every other record, and read back by this library as
+    /// [`AuditEventPayload::Unrecognized`]: the chain verifies it without
+    /// interpreting it, and the caller parses its own type from the record's
+    /// `event_json`.
+    ///
+    /// `event_type` must be a lowercase `snake_case` name that this library
+    /// does not itself define, so an extension can never be taken for one of
+    /// the library's own events (such as `session_ended`). A type the library
+    /// adds later would make older extension records of that name
+    /// ambiguous, so the library must not add a type an extension uses.
+    /// `payload` must serialize to a JSON object without a `type` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the name or payload is not allowed, or if the
+    /// event cannot be written.
+    pub fn record_extension_event<T: Serialize>(
         &mut self,
-        event: TerminalRecordingTruncatedEvent,
+        event_type: &str,
+        payload: &T,
     ) -> Result<()> {
-        self.append_event(AuditEventPayload::TerminalRecordingTruncated { event })
+        validate_extension_event_type(event_type)?;
+        let fields = serde_json::to_value(payload).map_err(|e| {
+            NonoError::Snapshot(format!("Failed to serialize audit extension event: {e}"))
+        })?;
+        match fields.as_object() {
+            Some(object) if !object.contains_key("type") => {}
+            _ => {
+                return Err(NonoError::Snapshot(format!(
+                    "Audit extension event '{event_type}' must be a JSON object without a `type` field"
+                )));
+            }
+        }
+        self.append_serialized(&ExtensionEvent {
+            event_type,
+            payload,
+        })
     }
 
     /// Sequence number the next appended record will receive.
@@ -685,25 +624,32 @@ impl AuditRecorder {
     }
 
     fn append_event(&mut self, event: AuditEventPayload) -> Result<()> {
+        self.append_serialized(&event)
+    }
+
+    /// Append one record for `event`, which serializes to the canonical event
+    /// JSON. The record line has the same shape as [`AuditEventRecord`].
+    fn append_serialized<E: Serialize>(&mut self, event: &E) -> Result<()> {
         if self.ended {
             return Err(NonoError::Snapshot(
                 "Audit log is closed: session already ended".to_string(),
             ));
         }
-        let event_bytes = serde_json::to_vec(&event)
+        let event_bytes = serde_json::to_vec(event)
             .map_err(|e| NonoError::Snapshot(format!("Failed to serialize audit event: {e}")))?;
         let leaf_hash = hash_event(&event_bytes);
         let chain_hash = hash_chain(self.previous_chain.as_ref(), &leaf_hash);
-        let record = AuditEventRecord {
+        let event_json = String::from_utf8(event_bytes).map_err(|e| {
+            NonoError::Snapshot(format!(
+                "Failed to encode canonical audit event JSON as UTF-8: {e}"
+            ))
+        })?;
+        let record = RecordLine {
             sequence: self.next_sequence,
             prev_chain: self.previous_chain,
             leaf_hash,
             chain_hash,
-            event_json: Some(String::from_utf8(event_bytes.clone()).map_err(|e| {
-                NonoError::Snapshot(format!(
-                    "Failed to encode canonical audit event JSON as UTF-8: {e}"
-                ))
-            })?),
+            event_json: &event_json,
             event,
         };
         let line = serde_json::to_vec(&record)
@@ -717,6 +663,55 @@ impl AuditRecorder {
         self.previous_chain = Some(chain_hash);
         self.leaf_hashes.push(leaf_hash);
         Ok(())
+    }
+}
+
+/// The serialized form of an [`AuditEventRecord`], borrowing its event so
+/// library and extension events share one writer.
+#[derive(Serialize)]
+struct RecordLine<'a, E: Serialize> {
+    sequence: u64,
+    prev_chain: Option<ContentHash>,
+    leaf_hash: ContentHash,
+    chain_hash: ContentHash,
+    event_json: &'a str,
+    event: &'a E,
+}
+
+/// An extension event: its type first, then the payload's fields, the same
+/// layout the library's own internally tagged events have.
+#[derive(Serialize)]
+struct ExtensionEvent<'a, T: Serialize> {
+    #[serde(rename = "type")]
+    event_type: &'a str,
+    #[serde(flatten)]
+    payload: &'a T,
+}
+
+/// Longest extension event type name.
+const EXTENSION_EVENT_TYPE_MAX_LEN: usize = 64;
+
+/// An extension event type must be a `snake_case` name the library does not
+/// define. Whether the library defines it is decided by the library's own
+/// parser, so every current and future library type is refused.
+fn validate_extension_event_type(event_type: &str) -> Result<()> {
+    let well_formed = !event_type.is_empty()
+        && event_type.len() <= EXTENSION_EVENT_TYPE_MAX_LEN
+        && event_type.starts_with(|c: char| c.is_ascii_lowercase())
+        && event_type
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !well_formed {
+        return Err(NonoError::Snapshot(format!(
+            "Invalid audit extension event type '{event_type}'"
+        )));
+    }
+    let probe = serde_json::json!({ "type": event_type });
+    match serde_json::from_value::<AuditEventPayload>(probe) {
+        Ok(payload) if payload.is_unrecognized() => Ok(()),
+        _ => Err(NonoError::Snapshot(format!(
+            "Audit extension event type '{event_type}' is reserved by the audit log"
+        ))),
     }
 }
 
@@ -1778,6 +1773,126 @@ mod tests {
     use std::io::BufReader;
     use std::time::{Duration, UNIX_EPOCH};
 
+    #[derive(Serialize)]
+    struct ExampleExtension {
+        value: u64,
+        note: &'static str,
+    }
+
+    #[test]
+    fn extension_events_are_chained_verified_and_read_back_unrecognized() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        recorder
+            .record_extension_event(
+                "example_extension",
+                &ExampleExtension {
+                    value: 7,
+                    note: "z",
+                },
+            )
+            .unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
+            .unwrap();
+        let summary = recorder.finalize().unwrap();
+        let result = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert_eq!(result.event_count, 3);
+
+        let text = std::fs::read_to_string(dir.path().join(AUDIT_EVENTS_FILENAME)).unwrap();
+        let line = text.lines().nth(1).unwrap();
+        let record: AuditEventRecord = serde_json::from_str(line).unwrap();
+        assert!(record.event.is_unrecognized());
+        // The type comes first, then the payload's fields in their order.
+        assert_eq!(
+            record.event_json.as_deref(),
+            Some(r#"{"type":"example_extension","value":7,"note":"z"}"#)
+        );
+    }
+
+    #[test]
+    fn extension_events_cannot_take_a_library_event_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        let payload = ExampleExtension {
+            value: 1,
+            note: "x",
+        };
+        for reserved in [
+            "session_started",
+            "session_ended",
+            "capability_decision",
+            "url_open",
+            "network",
+            "sandbox_runtime",
+            "command_policy",
+        ] {
+            let err = recorder
+                .record_extension_event(reserved, &payload)
+                .err()
+                .unwrap_or_else(|| panic!("{reserved} was accepted"));
+            assert!(err.to_string().contains("reserved"), "{reserved}: {err}");
+        }
+        for malformed in [
+            "",
+            "Upper",
+            "1st",
+            "with-dash",
+            "space here",
+            &"a".repeat(65),
+        ] {
+            assert!(
+                recorder
+                    .record_extension_event(malformed, &payload)
+                    .is_err(),
+                "{malformed:?} was accepted"
+            );
+        }
+        // Nothing was written.
+        assert_eq!(recorder.event_count(), 0);
+    }
+
+    #[test]
+    fn extension_payloads_must_be_objects_without_a_type_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        assert!(
+            recorder
+                .record_extension_event("example_extension", &5u32)
+                .is_err()
+        );
+        assert!(
+            recorder
+                .record_extension_event(
+                    "example_extension",
+                    &serde_json::json!({ "type": "session_ended" })
+                )
+                .is_err()
+        );
+        assert_eq!(recorder.event_count(), 0);
+    }
+
+    #[test]
+    fn extension_events_are_refused_after_the_session_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
+            .unwrap();
+        let payload = ExampleExtension {
+            value: 1,
+            note: "x",
+        };
+        assert!(
+            recorder
+                .record_extension_event("example_extension", &payload)
+                .is_err()
+        );
+    }
+
     #[test]
     fn recorder_produces_integrity_summary() {
         let dir = tempfile::tempdir().unwrap();
@@ -1906,67 +2021,6 @@ mod tests {
         assert_eq!(verified.event_count, 5);
         assert_eq!(verified.merkle_scheme, "alpha");
         assert!(verified.records_verified);
-    }
-
-    fn sample_terminal_chunk() -> TerminalChunkEvent {
-        TerminalChunkEvent {
-            index: 2,
-            seq_start: 40,
-            seq_end: 75,
-            start_offset_us: 20_000_000,
-            end_offset_us: 29_500_000,
-            audit_seq_start: 6,
-            audit_seq_end: 9,
-            raw_bytes: 4096,
-            stored_bytes: 812,
-            sha256: "5d41402abc4b2a76b9719d911017c592aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            credential_redactions: 1,
-            suppressed_inputs: 2,
-        }
-    }
-
-    #[test]
-    fn verifier_round_trips_terminal_capture_payloads() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
-        recorder
-            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
-            .unwrap();
-        assert_eq!(recorder.next_sequence(), 1);
-        recorder
-            .record_terminal_chunk(sample_terminal_chunk())
-            .unwrap();
-        recorder
-            .record_recording_lost(RecordingLostEvent {
-                sink: "recording".to_string(),
-                seq_start: 75,
-                seq_end: 90,
-                reason: "queue_full".to_string(),
-            })
-            .unwrap();
-        recorder
-            .record_terminal_recording_truncated(TerminalRecordingTruncatedEvent {
-                seq: 90,
-                max_bytes: 100,
-                recorded_bytes: 99,
-            })
-            .unwrap();
-        assert_eq!(recorder.next_sequence(), 4);
-
-        let summary = recorder.finalize().unwrap();
-        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
-        assert_eq!(verified.event_count, 4);
-        assert!(verified.records_verified);
-    }
-
-    #[test]
-    fn terminal_chunk_file_names_depend_only_on_index() {
-        assert_eq!(terminal_chunk_file_name(0), "chunk-00000000.cast.zst");
-        assert_eq!(terminal_chunk_file_name(12), "chunk-00000012.cast.zst");
-        assert_eq!(
-            terminal_chunk_file_name(u64::MAX),
-            "chunk-18446744073709551615.cast.zst"
-        );
     }
 
     /// A payload a newer nono might write, unknown to this build.
@@ -2707,42 +2761,6 @@ mod tests {
                 "{label}: leaf hash mismatch"
             );
         }
-
-        check(
-            "TerminalChunk",
-            &AuditEventPayload::TerminalChunk {
-                chunk: Box::new(sample_terminal_chunk()),
-            },
-            r#"{"type":"terminal_chunk","chunk":{"index":2,"seq_start":40,"seq_end":75,"start_offset_us":20000000,"end_offset_us":29500000,"audit_seq_start":6,"audit_seq_end":9,"raw_bytes":4096,"stored_bytes":812,"sha256":"5d41402abc4b2a76b9719d911017c592aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","credential_redactions":1,"suppressed_inputs":2}}"#,
-            "58a3c2bb093ef3faf394eb0939ad58ce44fd870717c8f6765abf87390a3a26c6",
-        );
-
-        check(
-            "RecordingLost",
-            &AuditEventPayload::RecordingLost {
-                event: RecordingLostEvent {
-                    sink: "recording".to_string(),
-                    seq_start: 75,
-                    seq_end: 90,
-                    reason: "queue_full".to_string(),
-                },
-            },
-            r#"{"type":"recording_lost","event":{"sink":"recording","seq_start":75,"seq_end":90,"reason":"queue_full"}}"#,
-            "83698e8df2e8ac376e3e368467b98f5d53bd2cbaa2191793a3b0f02516320c90",
-        );
-
-        check(
-            "TerminalRecordingTruncated",
-            &AuditEventPayload::TerminalRecordingTruncated {
-                event: TerminalRecordingTruncatedEvent {
-                    seq: 90,
-                    max_bytes: 268_435_456,
-                    recorded_bytes: 268_435_000,
-                },
-            },
-            r#"{"type":"terminal_recording_truncated","event":{"seq":90,"max_bytes":268435456,"recorded_bytes":268435000}}"#,
-            "1871ac463e4cb49eb5094470648627f84959b932ecacc65108519cd5423eeacf",
-        );
 
         check(
             "SessionStarted",

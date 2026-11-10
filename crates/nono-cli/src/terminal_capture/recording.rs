@@ -11,9 +11,11 @@
 //! every chunk is hash-checked before it is decompressed. Decompression is
 //! bounded by the recorded raw size.
 
+use super::audit_events::{
+    RecordingAuditEvent, RecordingLostEvent, TerminalChunkEvent, parse_recording_event,
+    terminal_chunk_file_name,
+};
 use super::writer::{hex_digest, recording_dir};
-use crate::audit_integrity::AuditEventPayload;
-use nono::audit::{RecordingLostEvent, TerminalChunkEvent, terminal_chunk_file_name};
 use nono::{NonoError, Result};
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -82,15 +84,26 @@ fn read_index(session_dir: &Path) -> Result<RecordingIndex> {
     if !path.exists() {
         return Ok(index);
     }
+    // The first malformed recording record; reading stops being trusted there.
+    let mut malformed: Option<NonoError> = None;
     index.partial_log = crate::audit_event_reader::for_each_event_record(&path, true, |record| {
-        match record.event {
-            AuditEventPayload::TerminalChunk { chunk } => index.chunks.push(*chunk),
-            AuditEventPayload::RecordingLost { event } => index.lost.push(event),
-            AuditEventPayload::TerminalRecordingTruncated { .. } => index.truncated = true,
-            _ => {}
+        if malformed.is_some() {
+            return;
+        }
+        match parse_recording_event(&record) {
+            Ok(Some(RecordingAuditEvent::TerminalChunk { chunk })) => index.chunks.push(chunk),
+            Ok(Some(RecordingAuditEvent::RecordingLost { event })) => index.lost.push(event),
+            Ok(Some(RecordingAuditEvent::TerminalRecordingTruncated { .. })) => {
+                index.truncated = true;
+            }
+            Ok(None) => {}
+            Err(e) => malformed = Some(e),
         }
     })?;
-    Ok(index)
+    match malformed {
+        Some(e) => Err(e),
+        None => Ok(index),
+    }
 }
 
 /// Check the stored recording against the audit log.

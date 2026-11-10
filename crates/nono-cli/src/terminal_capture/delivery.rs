@@ -12,6 +12,7 @@
 //! audit log reaches it and its `terminal_chunk` events match the bytes.
 //! Request bodies are never logged.
 
+use super::audit_events::{TerminalChunkEvent, terminal_chunk_file_name};
 use super::events::{ProtectedEvent, SessionEnd};
 use super::settings::DeliverySettings;
 use super::writer::{ChunkInfo, Sink, hex_digest};
@@ -19,7 +20,6 @@ use crate::platform_client::{self, PlatformState};
 use aws_lc_rs::signature::EcdsaKeyPair;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use nono::audit::{TerminalChunkEvent, terminal_chunk_file_name};
 use nono::{NonoError, Result};
 use std::collections::VecDeque;
 use std::path::PathBuf;

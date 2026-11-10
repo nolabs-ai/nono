@@ -10,6 +10,7 @@
 //! Capture is passive. Nothing here changes the bytes the agent or the user
 //! receives; the protections apply only to what is recorded.
 
+pub(crate) mod audit_events;
 pub(crate) mod commands;
 pub(crate) mod delivery;
 pub(crate) mod events;
@@ -748,9 +749,12 @@ fn strip_focus_reports(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::audit_events::{
+        RecordingAuditEvent, TerminalChunkEvent, parse_recording_event, terminal_chunk_file_name,
+    };
     use super::*;
-    use crate::audit_integrity::{AUDIT_EVENTS_FILENAME, AuditEventPayload, AuditRecorder};
-    use nono::audit::{TerminalChunkEvent, terminal_chunk_file_name, verify_audit_log};
+    use crate::audit_integrity::{AUDIT_EVENTS_FILENAME, AuditRecorder};
+    use nono::audit::verify_audit_log;
     use sha2::{Digest, Sha256};
 
     const SECRET: &str = "ghp_abcdefghijklmnop0123456789";
@@ -814,8 +818,8 @@ mod tests {
                 .filter_map(|line| {
                     let record: crate::audit_integrity::AuditEventRecord =
                         serde_json::from_str(line).unwrap();
-                    match record.event {
-                        AuditEventPayload::TerminalChunk { chunk } => Some(*chunk),
+                    match parse_recording_event(&record).unwrap() {
+                        Some(RecordingAuditEvent::TerminalChunk { chunk }) => Some(chunk),
                         _ => None,
                     }
                 })

@@ -961,6 +961,7 @@ mod tests {
             method: "POST".to_string(),
             path: "/v1/tasks/1/comments".to_string(),
             rule_label: "endpoint_policy.approve[POST /v1/tasks/*/comments]".to_string(),
+            operation: None,
             reason: None,
             child_pid: 0,
             session_id: "proxy".to_string(),

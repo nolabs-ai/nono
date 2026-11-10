@@ -31,6 +31,29 @@ network-level model — see [Known limitation](#known-limitation) below for why.
 5. **Network-layer mediation** — wrapping `aws` in `sh -c` does not bypass the policy: enforcement is on the intercepted network traffic, not the process tree.
 6. **Audit trail** — `nono audit list` / `nono audit show` surface the recorded policy decisions.
 
+## Restricting JSON/Query services by operation
+
+S3 is REST, so method and path rules are enough. SSM, EC2, STS and similar services send every
+call as `POST /`, so add `operations` to the route's `endpoint_policy` to match the AWS operation
+name instead:
+
+```json
+"ssm": {
+  "upstream": "https://ssm.us-east-1.amazonaws.com",
+  "aws_auth": { "region": "us-east-1", "service": "ssm" },
+  "endpoint_policy": {
+    "default": { "decision": "deny" },
+    "allow": [
+      { "method": "POST", "path": "/", "operations": ["Describe*", "GetParametersByPath"] }
+    ]
+  }
+}
+```
+
+`aws ssm describe-parameters` succeeds; `aws ssm delete-parameter` gets `403` and the audit record
+shows `endpoint_operation=DeleteParameter`. Requests whose operation cannot be determined are
+treated as `Unknown` and denied by `default: deny`.
+
 ## Known limitation
 
 `aws_auth` SigV4 signing is currently only wired into nono's **TLS-interception** path (matching

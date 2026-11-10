@@ -293,6 +293,19 @@ fn validate_credential_provider_references(profile: &Profile) -> Result<()> {
                 route.name, route.provider
             )));
         };
+        if let Some(policy) = &route.endpoint_policy
+            && policy
+                .deny
+                .iter()
+                .chain(&policy.approve)
+                .chain(&policy.allow)
+                .any(|r| r.operations.is_some())
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_routes.{}.endpoint_policy 'operations' is only valid on aws_auth credentials",
+                route.name
+            )));
+        }
         for (index, rule) in route.upgrades.iter().enumerate() {
             let context = format!("credential_routes.{}.upgrades[{index}]", route.name);
             validate_provider_origin(&format!("{context}.origin"), &rule.origin)?;
@@ -566,5 +579,30 @@ mod tests {
         // Raw-token header + empty request_nonce_fields (capture-only) is valid.
         let profile = provider_with(Some("X-Vault-Token"), Some("{}"));
         validate_credential_provider_entries(&profile).expect("valid provider");
+    }
+
+    #[test]
+    fn credential_route_operations_are_rejected() {
+        let mut profile = provider_with(Some("X-Vault-Token"), Some("{}"));
+        profile.credential_routes.push(CredentialRouteDef {
+            name: "vault".to_string(),
+            provider: "vault_oidc".to_string(),
+            env_var: None,
+            base_url_env_var: None,
+            endpoint_policy: Some(nono_proxy::config::EndpointPolicyConfig {
+                allow: vec![nono_proxy::config::EndpointPolicyRule {
+                    method: "POST".to_string(),
+                    path: "/".to_string(),
+                    backend: None,
+                    reason: None,
+                    timeout_secs: None,
+                    operations: Some(vec!["Describe*".to_string()]),
+                }],
+                ..Default::default()
+            }),
+            upgrades: vec![],
+        });
+        let err = validate_credential_provider_references(&profile).expect_err("must reject");
+        assert!(err.to_string().contains("operations"), "{err}");
     }
 }

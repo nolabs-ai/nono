@@ -154,6 +154,8 @@ mod tests {
                 injection_mode: None,
                 denial_category: None,
                 endpoint_policy_action: Some("deny".to_string()),
+                endpoint_operation: None,
+                endpoint_protocol: None,
                 endpoint_policy_rule: Some("endpoint_policy.default".to_string()),
                 approval_backend: None,
                 credential_capture_action: None,

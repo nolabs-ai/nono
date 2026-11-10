@@ -47,6 +47,8 @@ struct ScopeKey {
     credential_route: Option<String>,
     /// Scoped rule label, which names the request method.
     rule_label: String,
+    /// AWS operation, so a grant for one operation cannot satisfy another.
+    operation: Option<String>,
 }
 
 /// Per-proxy-session endpoint approval state. Owned by the
@@ -98,6 +100,11 @@ pub(crate) struct PendingApproval<'a> {
     pub session_scope: bool,
     /// Region derived from the host for AWS wildcard-region routes.
     pub aws_region: Option<String>,
+    /// AWS operation for `aws_auth` routes (`Unknown` when unresolved);
+    /// `None` for other routes.
+    pub operation: Option<&'a str>,
+    /// AWS protocol the operation was resolved from, for audit.
+    pub operation_protocol: Option<&'a str>,
 }
 
 /// The request being approved and where its audit events go.
@@ -206,6 +213,7 @@ fn scope_key(approval: &PendingApproval<'_>, target: &ApprovalTarget<'_>) -> Sco
         upstream: target.upstream.to_ascii_lowercase(),
         credential_route: target.credential_route.map(str::to_string),
         rule_label: approval.rule_label.clone(),
+        operation: approval.operation.map(str::to_string),
     }
 }
 
@@ -408,6 +416,7 @@ async fn run_prompt(
         method: target.method.to_string(),
         path: target.path.to_string(),
         rule_label: shown.rule_label.clone(),
+        operation: shown.operation.map(str::to_string),
         reason: Some(reasons.join("; ")),
         child_pid: 0,
         session_id: registry.session_id().to_string(),
@@ -511,8 +520,14 @@ fn describe(
 fn request_reason(approval: &PendingApproval<'_>, target: &ApprovalTarget<'_>) -> String {
     let mut reason = approval.reason.map(str::to_string).unwrap_or_else(|| {
         format!(
-            "endpoint approval required by {} for {} {}",
-            approval.rule_label, target.method, target.path
+            "endpoint approval required by {} for {} {}{}",
+            approval.rule_label,
+            target.method,
+            target.path,
+            approval
+                .operation
+                .map(|op| format!(" (operation {op})"))
+                .unwrap_or_default()
         )
     });
     if let Some(region) = &approval.aws_region {
@@ -531,6 +546,8 @@ fn log_outcome(
 ) {
     let ctx = audit::EventContext {
         route_id: Some(approval.route_id),
+        endpoint_operation: approval.operation,
+        endpoint_protocol: approval.operation_protocol,
         denial_category: policy_denial.then_some(NetworkAuditDenialCategory::EndpointPolicy),
         endpoint_policy_action: Some("approve"),
         endpoint_policy_rule: Some(&approval.rule_label),
@@ -614,6 +631,8 @@ mod tests {
             rule_label: rule_label.to_string(),
             session_scope: true,
             aws_region: None,
+            operation: None,
+            operation_protocol: None,
         }
     }
 
@@ -627,6 +646,8 @@ mod tests {
             rule_label: rule_label.to_string(),
             session_scope: false,
             aws_region: None,
+            operation: None,
+            operation_protocol: None,
         }
     }
 
@@ -812,6 +833,7 @@ mod tests {
             upstream: "https://example.com".to_string(),
             credential_route: None,
             rule_label: format!("endpoint_policy.approve[GET /{i}/**]"),
+            operation: None,
         };
         for i in 0..MAX_SESSION_DECISIONS {
             state.remember(&key(i), true);

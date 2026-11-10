@@ -2016,6 +2016,18 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
                     new.env_var
                 );
             }
+            if old.phantom_format != new.phantom_format {
+                println!(
+                    "      {} phantom_format: {:?}",
+                    theme::fg("-", t.red),
+                    old.phantom_format
+                );
+                println!(
+                    "      {} phantom_format: {:?}",
+                    theme::fg("+", t.green),
+                    new.phantom_format
+                );
+            }
         }
     }
 
@@ -2357,6 +2369,12 @@ fn diff_custom_credentials_json(
             detail.insert(
                 "env_var".into(),
                 serde_json::json!({"profile1": old.env_var, "profile2": new.env_var}),
+            );
+        }
+        if old.phantom_format != new.phantom_format {
+            detail.insert(
+                "phantom_format".into(),
+                serde_json::json!({"profile1": old.phantom_format, "profile2": new.phantom_format}),
             );
         }
         changed_details.insert((*k).clone(), serde_json::Value::Object(detail));
@@ -3317,6 +3335,12 @@ fn resolve_to_manifest(
             })
             .collect::<Result<Vec<_>>>()?;
 
+        if cred.phantom_format.is_some() {
+            eprintln!(
+                "warning: custom credential '{name}': `phantom_format` is not representable in the capability manifest and was omitted"
+            );
+        }
+
         credentials.push(manifest::Credential {
             name: name
                 .parse()
@@ -3411,6 +3435,26 @@ fn make_fs_grant(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_diff_custom_credentials_json_reports_phantom_format() {
+        let base: profile::CustomCredentialDef = serde_json::from_str(
+            r#"{"upstream":"https://api.github.com","credential_key":"k","env_var":"GH_TOKEN"}"#,
+        )
+        .unwrap();
+        let formatted = profile::CustomCredentialDef {
+            phantom_format: Some("ghp_{}".to_string()),
+            ..base.clone()
+        };
+        let old = std::collections::HashMap::from([("github".to_string(), base)]);
+        let new = std::collections::HashMap::from([("github".to_string(), formatted)]);
+        let diff = diff_custom_credentials_json(&old, &new);
+        assert_eq!(
+            diff["changed"]["github"]["phantom_format"],
+            serde_json::json!({"profile1": null, "profile2": "ghp_{}"})
+        );
+    }
     use super::*;
     use crate::profile::Profile;
     use std::path::PathBuf;

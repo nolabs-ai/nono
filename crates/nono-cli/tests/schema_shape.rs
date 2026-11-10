@@ -483,6 +483,7 @@ fn test_schema_custom_credential_def_matches_rust_model() {
             "query_param_name",
             "proxy",
             "env_var",
+            "phantom_format",
             "endpoint_rules",
             "endpoint_policy",
             "tls_ca",
@@ -520,6 +521,31 @@ fn test_schema_validates_custom_credential_with_spiffe_and_endpoint_policy() {
     validator
         .validate(&profile)
         .expect("custom credential with spiffe and endpoint_policy should validate");
+}
+
+#[test]
+fn test_schema_validates_custom_credential_phantom_format() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = |fmt: &str| {
+        json!({
+            "network": { "custom_credentials": { "github": {
+                "upstream": "https://api.github.com",
+                "credential_key": "cmd://github",
+                "env_var": "GH_TOKEN",
+                "phantom_format": fmt
+            } } }
+        })
+    };
+
+    assert!(validator.is_valid(&profile("ghp_{}")));
+    assert!(validator.is_valid(&profile("pre-{}-post")));
+    for bad in ["{}", "Bearer {}", "a/{}", "no placeholder", "a{}{}"] {
+        assert!(
+            !validator.is_valid(&profile(bad)),
+            "{bad} should be rejected"
+        );
+    }
 }
 
 #[test]
@@ -673,7 +699,14 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
     assert_schema_properties(
         &schema,
         "EndpointRuleConfig",
-        &["backend", "method", "path", "reason", "timeout_secs"],
+        &[
+            "backend",
+            "method",
+            "operations",
+            "path",
+            "reason",
+            "timeout_secs",
+        ],
     );
     assert_schema_properties(
         &schema,

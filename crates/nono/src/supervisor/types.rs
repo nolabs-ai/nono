@@ -97,6 +97,10 @@ pub enum ApprovalRequest {
         path: String,
         /// The endpoint policy rule/default that triggered approval
         rule_label: String,
+        /// AWS operation name for `aws_auth` routes (`"Unknown"` when it
+        /// could not be determined); `None` for other routes.
+        #[serde(default)]
+        operation: Option<String>,
         /// Human-readable reason
         reason: Option<String>,
         /// PID of the requesting child process, if known
@@ -239,9 +243,11 @@ impl ApprovalDecision {
     ///
     /// Session caching is implemented on the network CONNECT path, keyed by
     /// `(host, port)`, and for `allow_domain` endpoint approvals, keyed by the
-    /// approval scope. Every other approval consumer treats a decision as a
-    /// single yes/no; calling this keeps those `match` sites total and
-    /// fail-secure without teaching them about session persistence.
+    /// approval scope. An endpoint scope includes the AWS operation so a grant
+    /// for one operation cannot satisfy another. Every other approval consumer
+    /// treats a decision as a single yes/no; calling this keeps those `match`
+    /// sites total and fail-secure without teaching them about session
+    /// persistence.
     #[must_use]
     pub fn without_session_scope(self) -> Self {
         match self {

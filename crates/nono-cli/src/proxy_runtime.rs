@@ -1935,6 +1935,7 @@ fn collect_tool_sandbox_proxy_grants(
             query_param_name: None,
             proxy: None,
             env_var,
+            phantom_format: None,
             endpoint_rules: Vec::new(),
             endpoint_policy: Some(endpoint_policy),
             tls_ca: credential
@@ -2267,6 +2268,7 @@ fn endpoint_rule_to_proxy(
         backend: rule.backend.clone(),
         reason: rule.reason.clone(),
         timeout_secs: resolve_approval_timeout(config, rule.backend.as_deref(), rule.timeout_secs),
+        operations: rule.operations.clone(),
     }
 }
 
@@ -2621,6 +2623,7 @@ fn synthesize_credential_provider_proxy_config(
                 query_param_name: None,
                 proxy: None,
                 env_var: route.env_var.clone(),
+                phantom_format: None,
                 endpoint_rules: if endpoint_policy.is_none() {
                     vec![nono_proxy::config::EndpointRule {
                         method: "*".to_string(),
@@ -4307,6 +4310,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("MOCK_API_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4592,6 +4596,7 @@ mod tests {
                                     backend: None,
                                     reason: None,
                                     timeout_secs: None,
+                                    operations: None,
                                 }],
                                 ..EndpointPolicyConfig::default()
                             }),
@@ -4818,6 +4823,7 @@ mod tests {
                 backend: None,
                 reason: Some("destructive endpoint".to_string()),
                 timeout_secs: None,
+                operations: None,
             }],
             approve: vec![EndpointRuleConfig {
                 method: "POST".to_string(),
@@ -4825,6 +4831,7 @@ mod tests {
                 backend: Some("terminal".to_string()),
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
             allow: vec![EndpointRuleConfig {
                 method: "GET".to_string(),
@@ -4832,6 +4839,7 @@ mod tests {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
         };
 
@@ -4847,6 +4855,20 @@ mod tests {
             Some("terminal".to_string())
         );
         assert_eq!(proxy_policy.allow.len(), 1);
+    }
+
+    #[test]
+    fn tool_sandbox_proxy_endpoint_rule_maps_operations() {
+        let rule = EndpointRuleConfig {
+            method: "POST".to_string(),
+            path: "/".to_string(),
+            backend: None,
+            reason: None,
+            timeout_secs: None,
+            operations: Some(vec!["Describe*".to_string()]),
+        };
+        let mapped = endpoint_rule_to_proxy(&CommandPoliciesConfig::default(), &rule);
+        assert_eq!(mapped.operations, Some(vec!["Describe*".to_string()]));
     }
 
     #[test]
@@ -4888,6 +4910,7 @@ mod tests {
                                     backend: None,
                                     reason: Some("comment write".to_string()),
                                     timeout_secs: Some(5),
+                                    operations: None,
                                 }],
                                 ..EndpointPolicyConfig::default()
                             }),
@@ -4951,6 +4974,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: Some("GITHUB_TOKEN".to_string()),
+            phantom_format: None,
             endpoint_rules: Vec::new(),
             endpoint_policy: None,
             tls_ca: None,

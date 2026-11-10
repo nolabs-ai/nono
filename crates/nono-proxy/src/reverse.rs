@@ -36,7 +36,7 @@ use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 /// Maximum request body size (16 MiB). Prevents DoS from malicious Content-Length.
-const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 
 pub(crate) fn auth_mechanism_for_inject_mode(
     mode: &InjectMode,
@@ -339,7 +339,7 @@ pub async fn handle_reverse_proxy(
                 &cred.proxy_header_name,
                 cred.proxy_path_pattern.as_deref(),
                 cred.proxy_query_param_name.as_deref(),
-                ctx.session_token,
+                &route.expected_phantom(ctx.session_token),
             ) {
                 let deny_ctx = audit::EventContext {
                     auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
@@ -367,7 +367,7 @@ pub async fn handle_reverse_proxy(
                 &cmd.proxy_header_name,
                 cmd.proxy_path_pattern.as_deref(),
                 cmd.proxy_query_param_name.as_deref(),
-                ctx.session_token,
+                &route.expected_phantom(ctx.session_token),
             ) {
                 let deny_ctx = audit::EventContext {
                     auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
@@ -1135,6 +1135,8 @@ fn host_endpoint_policies<'a>(
                     rule_label,
                     session_scope: true,
                     aws_region: None,
+                    operation: None,
+                    operation_protocol: None,
                 });
                 continue;
             }
@@ -1289,6 +1291,10 @@ async fn enforce_endpoint_policy(
                 rule_label,
                 session_scope: false,
                 aws_region: None,
+                // Reverse proxy cannot resolve AWS operations (it returns 501
+                // for `aws_auth` routes), so those evaluate as `Unknown`.
+                operation: route.aws_auth.then_some(crate::config::UNKNOWN_OPERATION),
+                operation_protocol: None,
             });
         }
     }
@@ -1393,7 +1399,11 @@ async fn handle_oauth2_like(
     buffered_body: &[u8],
     ctx: &ReverseProxyCtx<'_>,
 ) -> Result<()> {
-    if let Err(e) = validate_phantom_token(remaining_header, inject_header, ctx.session_token) {
+    if let Err(e) = validate_phantom_token(
+        remaining_header,
+        inject_header,
+        &route.expected_phantom(ctx.session_token),
+    ) {
         let (auth_mechanism, injection_mode) = if spiffe_context.is_some() {
             (
                 nono::undo::NetworkAuditAuthMechanism::SpiffeOAuthAssertion,
@@ -3002,6 +3012,74 @@ mod tests {
         ));
     }
 
+    fn formatted_phantom(template: &str, token: &str) -> Zeroizing<String> {
+        let t = token::PhantomTemplate::parse_route(template).unwrap();
+        Zeroizing::new(t.render(token))
+    }
+
+    #[test]
+    fn test_phantom_format_header_mode() {
+        let tok = "a".repeat(64);
+        let expected = formatted_phantom("ghp_{}", &tok);
+        let ok = |v: &str| {
+            validate_phantom_token(
+                format!("Authorization: {v}\r\n\r\n").as_bytes(),
+                "Authorization",
+                &expected,
+            )
+            .is_ok()
+        };
+        assert!(ok(&format!("Bearer ghp_{tok}")));
+        assert!(ok(&format!("ghp_{tok}")));
+        // Strict: the bare token, a different body, trailing bytes, other case
+        // and an unsupported scheme are all rejected.
+        assert!(!ok(&tok));
+        assert!(!ok(&format!("ghp_{}", "b".repeat(64))));
+        assert!(!ok(&format!("ghp_{tok}x")));
+        assert!(!ok(&format!("GHP_{tok}")));
+        assert!(!ok(&format!("token ghp_{tok}")));
+    }
+
+    #[test]
+    fn test_phantom_format_basic_mode() {
+        use base64::engine::general_purpose::STANDARD;
+        let tok = "a".repeat(64);
+        let expected = formatted_phantom("ghp_{}", &tok);
+        let check = |pw: &str| {
+            let header = format!(
+                "Authorization: Basic {}\r\n\r\n",
+                STANDARD.encode(format!("user:{pw}"))
+            );
+            validate_phantom_token_basic(header.as_bytes(), "Authorization", &expected).is_ok()
+        };
+        assert!(check(&format!("ghp_{tok}")));
+        assert!(!check(&tok));
+    }
+
+    #[test]
+    fn test_phantom_format_path_and_query_modes() {
+        let tok = "a".repeat(64);
+        let expected = formatted_phantom("ghp_{}", &tok);
+        assert!(
+            validate_phantom_token_in_path(&format!("/bot/ghp_{tok}/getMe"), "/bot/{}/", &expected)
+                .is_ok()
+        );
+        assert!(
+            validate_phantom_token_in_path(&format!("/bot/{tok}/getMe"), "/bot/{}/", &expected)
+                .is_err()
+        );
+        assert!(
+            validate_phantom_token_in_query(&format!("/x?key=ghp_{tok}"), "key", &expected).is_ok()
+        );
+        assert!(
+            validate_phantom_token_in_query(&format!("/x?key=ghp%5F{tok}"), "key", &expected)
+                .is_ok()
+        );
+        assert!(
+            validate_phantom_token_in_query(&format!("/x?key={tok}"), "key", &expected).is_err()
+        );
+    }
+
     #[test]
     fn test_validate_phantom_token_bearer_valid() {
         let token = Zeroizing::new("secret123".to_string());
@@ -3445,6 +3523,7 @@ mod tests {
             backend: None,
             reason: None,
             timeout_secs: None,
+            operations: None,
         };
         let base = |prefix: &str| crate::config::RouteConfig {
             prefix: prefix.to_string(),
@@ -3459,6 +3538,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: Vec::new(),
             endpoint_policy: None,
             tls_ca: None,

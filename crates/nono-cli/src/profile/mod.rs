@@ -322,6 +322,14 @@ pub struct CustomCredentialDef {
     #[serde(default)]
     pub env_var: Option<String>,
 
+    /// Template for the phantom token placed in `env_var`, with `{}` replaced by
+    /// the session token (e.g., "ghp_{}"), for clients that reject tokens
+    /// lacking a known prefix. The route then accepts only the rendered value.
+    /// A compatibility shim, not a per-route secret. Independent of
+    /// `credential_format`, which shapes the outbound real credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phantom_format: Option<String>,
+
     /// Optional L7 endpoint rules for method+path filtering.
     /// When non-empty, only matching method+path combinations are allowed.
     #[serde(default)]
@@ -569,6 +577,61 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
     }
 }
 
+/// Env var names nono sets itself; a formatted phantom must not overwrite them.
+fn is_reserved_phantom_env_var(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("NONO_")
+        || matches!(
+            upper.as_str(),
+            "HTTP_PROXY" | "HTTPS_PROXY" | "NO_PROXY" | "ALL_PROXY" | "NODE_USE_ENV_PROXY"
+        )
+        || upper.ends_with("_BASE_URL")
+}
+
+/// Validate `phantom_format`: template shape, compatible auth mode, and a
+/// phantom env var that does not collide with nono's own.
+fn validate_phantom_format(name: &str, cred: &CustomCredentialDef) -> Result<()> {
+    let Some(ref fmt) = cred.phantom_format else {
+        return Ok(());
+    };
+    nono_proxy::token::PhantomTemplate::parse_route(fmt).map_err(|e| {
+        NonoError::ProfileParse(format!(
+            "custom credential '{name}': invalid phantom_format: {e}"
+        ))
+    })?;
+    if cred.credential_key.is_none() && cred.auth.is_none() {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{name}': 'phantom_format' requires 'credential_key' or 'auth' \
+             (not valid with 'aws_auth' or 'redeem_phantoms' alone)"
+        )));
+    }
+    let env_name = match (&cred.env_var, &cred.credential_key) {
+        (Some(ev), _) => Some(ev.clone()),
+        (None, Some(key)) if !key.contains("://") => Some(key.to_uppercase()),
+        // Matches the proxy's derivation for OAuth2 jwt-bearer assertion routes.
+        (None, None)
+            if cred
+                .auth
+                .as_ref()
+                .is_some_and(|a| a.client_assertion.is_some()) =>
+        {
+            Some(format!("{}_API_KEY", name.to_uppercase()))
+        }
+        _ => None,
+    };
+    let Some(ev) = env_name else {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{name}': 'phantom_format' needs an explicit 'env_var'"
+        )));
+    };
+    if is_reserved_phantom_env_var(&ev) {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{name}': 'phantom_format' cannot target reserved env var '{ev}'"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a custom credential definition for security issues.
 ///
 /// Checks:
@@ -670,6 +733,10 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
             .map_err(|e| NonoError::ProfileParse(format!("custom credential '{}': {}", name, e)))?;
     }
 
+    if let Some(ref policy) = cred.endpoint_policy {
+        validate_endpoint_policy_operations(name, policy, cred.aws_auth.is_some())?;
+    }
+
     // Validate credential_key if present
     if let Some(ref key) = cred.credential_key {
         validate_credential_key(name, key)?;
@@ -710,6 +777,8 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
             )));
         }
     }
+
+    validate_phantom_format(name, cred)?;
 
     // Validate upstream URL (HTTPS required, HTTP only for loopback)
     validate_upstream_url(&cred.upstream, name)?;
@@ -916,6 +985,56 @@ fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// `operations` rules are valid only on `aws_auth` credentials and must use
+/// the restricted glob charset. Warns when a default-allow policy has no
+/// deny/approve rule that matches `Unknown`, since an unidentifiable request
+/// would then be allowed.
+fn validate_endpoint_policy_operations(
+    name: &str,
+    policy: &nono_proxy::config::EndpointPolicyConfig,
+    has_aws_auth: bool,
+) -> Result<()> {
+    let mut has_operations = false;
+    for rule in policy
+        .deny
+        .iter()
+        .chain(&policy.approve)
+        .chain(&policy.allow)
+    {
+        let Some(ops) = &rule.operations else {
+            continue;
+        };
+        has_operations = true;
+        if !has_aws_auth {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{}' sets endpoint_policy 'operations', which requires 'aws_auth'",
+                name
+            )));
+        }
+        nono_proxy::config::compile_operation_globs(ops)
+            .map_err(|e| NonoError::ProfileParse(format!("custom credential '{}': {}", name, e)))?;
+    }
+    if has_operations
+        && policy.default.decision == nono_proxy::config::EndpointPolicyDecision::Allow
+    {
+        let unknown_restricted = policy
+            .deny
+            .iter()
+            .chain(&policy.approve)
+            .filter_map(|r| r.operations.as_ref())
+            .any(|ops| nono_proxy::config::operations_match_unknown(ops));
+        if !unknown_restricted {
+            tracing::warn!(
+                "custom credential '{}' uses default: allow with operations rules but nothing \
+                 denies or approves the 'Unknown' operation; requests whose operation cannot \
+                 be determined will be allowed. Prefer default: deny with allow rules.",
+                name
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1260,6 +1379,7 @@ fn custom_credential_from_manifest_entry(cred: &nono::manifest::Credential) -> C
             .env_var
             .as_ref()
             .map(|value| value.as_str().to_string()),
+        phantom_format: None,
         endpoint_rules,
         endpoint_policy: None,
         tls_ca: None,
@@ -4171,6 +4291,7 @@ pub(crate) fn merge_allow_domain(
                         backend: None,
                         reason: None,
                         timeout_secs: None,
+                        operations: None,
                     }
                 }));
                 AllowDomainEntry::WithEndpoints {
@@ -5807,6 +5928,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -5816,6 +5938,57 @@ mod tests {
             spiffe: None,
             rate_limit: None,
         }
+    }
+
+    #[test]
+    fn test_validate_phantom_format() {
+        let with = |fmt: &str| CustomCredentialDef {
+            phantom_format: Some(fmt.to_string()),
+            ..header_cred_builder()
+        };
+        assert!(validate_custom_credential("t", &with("ghp_{}")).is_ok());
+        for bad in ["{}", "Bearer {}", "a/{}", "nono_{}", "noplaceholder"] {
+            assert!(
+                validate_custom_credential("t", &with(bad)).is_err(),
+                "{bad}"
+            );
+        }
+
+        // Requires a session-phantom credential source.
+        let mut no_source = with("ghp_{}");
+        no_source.credential_key = None;
+        no_source.redeem_phantoms = vec!["x".to_string()];
+        assert!(validate_custom_credential("t", &no_source).is_err());
+
+        // Reserved env vars, explicit or derived from the credential key.
+        for name in ["NONO_PROXY_TOKEN", "HTTPS_PROXY", "OPENAI_BASE_URL"] {
+            let mut c = with("ghp_{}");
+            c.env_var = Some(name.to_string());
+            assert!(validate_custom_credential("t", &c).is_err(), "{name}");
+        }
+        let mut derived = with("ghp_{}");
+        derived.credential_key = Some("https_proxy".to_string());
+        assert!(validate_custom_credential("t", &derived).is_err());
+
+        // A URI credential key cannot derive an env var name.
+        let mut uri = with("ghp_{}");
+        uri.credential_key = Some("op://v/i/f".to_string());
+        assert!(validate_custom_credential("t", &uri).is_err());
+        uri.env_var = Some("GH_TOKEN".to_string());
+        assert!(validate_custom_credential("t", &uri).is_ok());
+    }
+
+    #[test]
+    fn test_phantom_format_deserializes_and_rejects_unknown_format_key() {
+        let ok: CustomCredentialDef = serde_json::from_str(
+            r#"{"upstream":"https://a.example.com","credential_key":"k","phantom_format":"ghp_{}"}"#,
+        )
+        .unwrap();
+        assert_eq!(ok.phantom_format.as_deref(), Some("ghp_{}"));
+        let err = serde_json::from_str::<CustomCredentialDef>(
+            r#"{"upstream":"https://a.example.com","credential_key":"k","format":"ghp_{}"}"#,
+        );
+        assert!(err.is_err());
     }
 
     #[test]
@@ -6114,6 +6287,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6160,6 +6334,47 @@ mod tests {
         let err = validate_custom_credential("test", &cred)
             .expect_err("redeem_phantoms + aws_auth must be rejected");
         assert!(err.to_string().contains("redeem_phantoms"));
+    }
+
+    fn ops_policy(ops: &[&str]) -> nono_proxy::config::EndpointPolicyConfig {
+        nono_proxy::config::EndpointPolicyConfig {
+            allow: vec![nono_proxy::config::EndpointPolicyRule {
+                method: "POST".to_string(),
+                path: "/".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+                operations: Some(ops.iter().map(|s| s.to_string()).collect()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_operations_requires_aws_auth() {
+        let mut cred = header_cred_builder();
+        cred.endpoint_policy = Some(ops_policy(&["Describe*"]));
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("operations without aws_auth must be rejected");
+        assert!(err.to_string().contains("aws_auth"));
+
+        cred.credential_key = None;
+        cred.aws_auth = Some(nono_proxy::config::AwsAuthConfig::default());
+        validate_custom_credential("test", &cred).expect("operations with aws_auth is valid");
+    }
+
+    #[test]
+    fn test_validate_operations_rejects_bad_patterns() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.aws_auth = Some(nono_proxy::config::AwsAuthConfig::default());
+        for bad in [vec![], vec!["Get[A]"], vec!["a.b"], vec!["{A,B}"]] {
+            cred.endpoint_policy = Some(ops_policy(&bad));
+            assert!(
+                validate_custom_credential("test", &cred).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -6230,6 +6445,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6257,6 +6473,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6286,6 +6503,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6315,6 +6533,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6342,6 +6561,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6371,6 +6591,7 @@ mod tests {
             query_param_name: Some("key".to_string()),
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6398,6 +6619,7 @@ mod tests {
             query_param_name: None, // Missing required field
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6427,6 +6649,7 @@ mod tests {
             query_param_name: Some("".to_string()), // Empty
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6456,6 +6679,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6664,6 +6888,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -7618,6 +7843,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -7645,6 +7871,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -7809,6 +8036,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -7836,6 +8064,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -10247,6 +10476,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -10277,6 +10507,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -10310,6 +10541,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -10343,6 +10575,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -10408,6 +10641,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -10902,6 +11136,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -11713,6 +11948,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,

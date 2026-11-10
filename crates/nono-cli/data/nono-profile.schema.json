@@ -1184,6 +1184,13 @@
           ],
           "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op://, bw://, apple-password://, file://, or cmd://). Optional for env:// (derived from the URI)."
         },
+        "phantom_format": {
+          "oneOf": [
+            { "type": "string", "pattern": "^[A-Za-z0-9._~-]+\\{\\}[A-Za-z0-9._~-]*$", "maxLength": 66 },
+            { "type": "null" }
+          ],
+          "description": "Optional template for the phantom token placed in env_var; '{}' is replaced by the session token (e.g. 'ghp_{}'). For clients that reject tokens without a known prefix. The proxy then accepts only this exact value on the route. A compatibility shim, not a per-route secret. Independent of credential_format (outbound). Requires credential_key or auth; not valid with aws_auth, spiffe, or redeem_phantoms alone."
+        },
         "endpoint_rules": {
           "type": "array",
           "items": {

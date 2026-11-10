@@ -15,6 +15,7 @@ use crate::config::{
     SpiffeAuthConfig,
 };
 use crate::error::{ProxyError, Result};
+use crate::token::PhantomTemplate;
 use nono::undo::{NetworkAuditAuthMechanism, NetworkAuditInjectionMode};
 use rustls::pki_types::pem::PemObject;
 use std::collections::HashMap;
@@ -111,6 +112,20 @@ pub struct LoadedRoute {
     pub rate_limiter: Option<std::sync::Arc<crate::rate_limit::RouteRateLimiter>>,
     /// See [`crate::config::RouteConfig::redeem_phantoms`].
     pub redeem_phantoms: Vec<String>,
+    /// Parsed [`crate::config::RouteConfig::phantom_format`].
+    pub phantom_template: Option<PhantomTemplate>,
+}
+
+impl LoadedRoute {
+    /// The phantom value a client must present on this route: the session token
+    /// wrapped in the route's template, or the bare token when none is set.
+    #[must_use]
+    pub fn expected_phantom(&self, session_token: &Zeroizing<String>) -> Zeroizing<String> {
+        match &self.phantom_template {
+            Some(t) => Zeroizing::new(t.render(session_token.as_str())),
+            None => session_token.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -132,7 +147,8 @@ impl std::fmt::Debug for LoadedRoute {
             .field("managed_auth_mechanism", &self.managed_auth_mechanism)
             .field("managed_injection_mode", &self.managed_injection_mode)
             .field("has_rate_limiter", &self.rate_limiter.is_some())
-            .field("redeem_phantoms", &self.redeem_phantoms);
+            .field("redeem_phantoms", &self.redeem_phantoms)
+            .field("phantom_template", &self.phantom_template);
         let managed_auth_type = self.managed_auth.as_ref().map(|a| match a.as_ref() {
             crate::auth::ManagedUpstreamAuth::SpiffeJwt(_) => "spiffe_jwt",
         });
@@ -318,6 +334,23 @@ impl RouteStore {
                 )));
             }
 
+            // A session phantom is only validated on routes that inject a
+            // credential; elsewhere the field would be silently ignored.
+            let phantom_template = match route.phantom_format.as_deref() {
+                None => None,
+                Some(fmt) => {
+                    if route.credential_key.is_none() && route.oauth2.is_none() {
+                        return Err(ProxyError::Config(format!(
+                            "route '{}': `phantom_format` requires `credential_key` or `oauth2` (not valid with `aws_auth`, `spiffe`, or `redeem_phantoms` alone)",
+                            normalized_prefix
+                        )));
+                    }
+                    Some(PhantomTemplate::parse_route(fmt).map_err(|e| {
+                        ProxyError::Config(format!("route '{}': {e}", normalized_prefix))
+                    })?)
+                }
+            };
+
             // A multi-profile route selects its identity from the agent's
             // access key ID; reject maps that could never match, and a
             // `profile` that would otherwise be silently ignored.
@@ -418,6 +451,7 @@ impl RouteStore {
                     managed_auth,
                     rate_limiter,
                     redeem_phantoms: route.redeem_phantoms.clone(),
+                    phantom_template,
                 },
             );
         }
@@ -1051,6 +1085,61 @@ fn build_tls_connector_with_ca(ca_path: &str) -> Result<tokio_rustls::TlsConnect
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    fn phantom_route(phantom_format: Option<&str>, credential_key: Option<&str>) -> RouteConfig {
+        RouteConfig {
+            prefix: "github".to_string(),
+            upstream: "https://api.github.com".to_string(),
+            credential_key: credential_key.map(str::to_string),
+            phantom_format: phantom_format.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_phantom_format_loads_and_renders() {
+        let store = RouteStore::load(&[phantom_route(Some("ghp_{}"), Some("env://GH"))])
+            .await
+            .unwrap();
+        let route = store.get("github").unwrap();
+        let token = Zeroizing::new("t".repeat(64));
+        assert_eq!(
+            route.expected_phantom(&token).as_str(),
+            format!("ghp_{}", "t".repeat(64))
+        );
+        let dbg = format!("{route:?}");
+        assert!(!dbg.contains(&"t".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn test_no_phantom_format_expects_bare_token() {
+        let store = RouteStore::load(&[phantom_route(None, Some("env://GH"))])
+            .await
+            .unwrap();
+        let token = Zeroizing::new("tok".to_string());
+        assert_eq!(
+            store
+                .get("github")
+                .unwrap()
+                .expected_phantom(&token)
+                .as_str(),
+            "tok"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_phantom_format_rejects_bad_template_and_credentialless_route() {
+        assert!(
+            RouteStore::load(&[phantom_route(Some("Bearer {}"), Some("env://GH"))])
+                .await
+                .is_err()
+        );
+        assert!(
+            RouteStore::load(&[phantom_route(Some("ghp_{}"), None)])
+                .await
+                .is_err()
+        );
+    }
     use super::*;
     use crate::config::EndpointRule;
 
@@ -1078,6 +1167,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![
                 EndpointRule {
                     method: "POST".to_string(),
@@ -1132,6 +1222,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1164,6 +1255,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1201,6 +1293,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![EndpointRule {
                     method: "GET".to_string(),
                     path: "/get".to_string(),
@@ -1266,6 +1359,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1290,6 +1384,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1377,6 +1472,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1423,6 +1519,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1569,6 +1666,7 @@ mod tests {
     fn test_loaded_route_debug() {
         let route = LoadedRoute {
             redeem_phantoms: Vec::new(),
+            phantom_template: None,
             upstream: "https://api.openai.com".to_string(),
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
@@ -1611,6 +1709,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1652,6 +1751,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: Some("INTERNAL_API_TOKEN".to_string()),
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1698,6 +1798,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![EndpointRule {
                 method: "GET".to_string(),
                 path: "/v1/items".to_string(),
@@ -1737,6 +1838,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1770,6 +1872,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1808,6 +1911,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1882,6 +1986,7 @@ mod tests {
     async fn test_missing_managed_credential_policy() {
         let managed = LoadedRoute {
             redeem_phantoms: Vec::new(),
+            phantom_template: None,
             upstream: "https://api.openai.com".to_string(),
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
@@ -1908,6 +2013,7 @@ mod tests {
 
         let l7_only = LoadedRoute {
             redeem_phantoms: Vec::new(),
+            phantom_template: None,
             upstream: "https://internal.example.com".to_string(),
             upstream_host_port: Some("internal.example.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
@@ -1944,6 +2050,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1979,6 +2086,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("GH_TOKEN_A".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "*".to_string(),
                     path: "/org-a/**".to_string(),
@@ -2006,6 +2114,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("GH_TOKEN_B".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "*".to_string(),
                     path: "/org-b/**".to_string(),
@@ -2087,6 +2196,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some(env.to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "*".to_string(),
                     path: path.to_string(),
@@ -2504,6 +2614,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,

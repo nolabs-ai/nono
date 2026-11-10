@@ -4387,6 +4387,78 @@ mod tests {
         String::from_utf8_lossy(&resp).to_string()
     }
 
+    /// The reverse proxy does not resolve AWS operations, so a request on a
+    /// route whose own policy, or whose host's `allow_domain` policy, has
+    /// `operations` rules gets 501 instead of being evaluated as `Unknown`.
+    #[tokio::test]
+    async fn test_reverse_proxy_returns_501_when_operation_rules_apply() {
+        let host = "ssm.us-east-1.amazonaws.com";
+        crate::filter::TEST_HOSTS
+            .lock()
+            .unwrap()
+            .push((host.to_string(), std::net::Ipv4Addr::LOCALHOST.into()));
+        let (upstream, heads) = spawn_recording_upstream().await;
+        let port = upstream.rsplit(':').next().unwrap();
+        let aws_upstream = format!("http://{host}:{port}");
+        let deny_delete: crate::config::EndpointPolicyConfig =
+            serde_json::from_value(serde_json::json!({
+                "default": {"decision": "allow"},
+                "deny": [{"method": "POST", "path": "/", "operations": ["DeleteParameter"]}]
+            }))
+            .unwrap();
+        let mut own_policy = declarative_route(&aws_upstream);
+        own_policy.endpoint_policy = Some(deny_delete.clone());
+        let mut host_policy = declarative_route(&aws_upstream);
+        host_policy.prefix = format!("_ep_{host}");
+        host_policy.endpoint_policy = Some(deny_delete);
+        let request = |prefix: &str| {
+            format!(
+                "POST /{prefix}/ HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Amz-Target: AmazonSSM.DeleteParameter\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+        };
+
+        for (name, routes) in [
+            ("route policy", vec![own_policy]),
+            (
+                "host policy",
+                vec![declarative_route(&aws_upstream), host_policy],
+            ),
+        ] {
+            let handle = start(ProxyConfig {
+                routes,
+                allowed_hosts: vec![host.to_string()],
+                require_auth: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let response = send_raw_request(handle.port, request("svc").as_bytes()).await;
+            assert!(
+                response.starts_with("HTTP/1.1 501"),
+                "{name}: expected 501, got {response:?}"
+            );
+            handle.shutdown();
+        }
+        assert!(
+            heads.lock().unwrap().is_empty(),
+            "refused requests must not reach upstream"
+        );
+
+        // Without operation rules the same request is forwarded.
+        let handle = start(ProxyConfig {
+            routes: vec![declarative_route(&aws_upstream)],
+            allowed_hosts: vec![host.to_string()],
+            require_auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let response = send_raw_request(handle.port, request("svc").as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response:?}");
+        assert_eq!(heads.lock().unwrap().len(), 1);
+        handle.shutdown();
+    }
+
     #[tokio::test]
     async fn test_websocket_upgrade_returns_501_without_reaching_upstream() {
         // A structurally valid WebSocket handshake must be rejected

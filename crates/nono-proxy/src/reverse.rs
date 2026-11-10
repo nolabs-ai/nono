@@ -254,6 +254,18 @@ pub async fn handle_reverse_proxy(
         return Ok(());
     }
 
+    // The reverse proxy does not resolve AWS operations, so `operations`
+    // rules cannot be enforced here. Refuse before policy evaluation (and any
+    // approval prompt), as `aws_auth` routes are refused below.
+    if operation_rules_apply(route, ctx.route_store) {
+        warn!(
+            "reverse proxy: refusing {} {} on route '{}': AWS operation rules are only enforced on CONNECT",
+            method, upstream_path, service
+        );
+        send_error(stream, 501, "Not Implemented").await?;
+        return Ok(());
+    }
+
     if !enforce_endpoint_policy(
         route,
         &service,
@@ -1054,6 +1066,22 @@ pub(crate) async fn capture_cmd_credential(
             Err(ProxyError::Credential(err.reason))
         }
     }
+}
+
+/// `true` when `route`'s policy, or any policy of another route on its
+/// upstream (such as an `allow_domain` `_ep_<domain>` route), has AWS
+/// `operations` rules.
+fn operation_rules_apply(route: &crate::route::LoadedRoute, route_store: &RouteStore) -> bool {
+    route.endpoint_policy.has_operation_rules()
+        || route
+            .upstream_host_port
+            .as_deref()
+            .is_some_and(|host_port| {
+                route_store
+                    .lookup_all_by_upstream(host_port)
+                    .iter()
+                    .any(|(_, r)| r.endpoint_policy.has_operation_rules())
+            })
 }
 
 /// Evaluate the endpoint policies of the credential-less routes on the

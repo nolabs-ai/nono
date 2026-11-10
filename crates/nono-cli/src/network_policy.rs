@@ -5,7 +5,9 @@
 
 use crate::profile::CustomCredentialDef;
 use nono::{NonoError, Result};
-use nono_proxy::config::{EndpointRule, InjectMode, ProxyConfig, RouteConfig};
+use nono_proxy::config::{
+    ENDPOINT_ROUTE_PREFIX, EndpointRule, InjectMode, ProxyConfig, RouteConfig,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::debug;
@@ -445,7 +447,7 @@ pub fn partition_allow_domain(
                                 .to_string(),
                         ));
                     }
-                    let prefix = format!("_ep_{}", domain);
+                    let prefix = format!("{ENDPOINT_ROUTE_PREFIX}{domain}");
                     let scheme = if is_loopback_domain(domain) {
                         "http"
                     } else {
@@ -1355,7 +1357,10 @@ mod tests {
         assert_eq!(endpoint_routes.len(), 1);
 
         let route = &endpoint_routes[0];
-        assert_eq!(route.prefix, "_ep_api.github.com");
+        assert_eq!(
+            route.prefix,
+            format!("{ENDPOINT_ROUTE_PREFIX}api.github.com")
+        );
         assert_eq!(route.upstream, "https://api.github.com");
         assert!(route.credential_key.is_none());
         assert_eq!(route.endpoint_rules.len(), 2);

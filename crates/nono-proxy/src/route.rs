@@ -82,6 +82,10 @@ pub struct LoadedRoute {
     /// Retained even when credential loading fails.
     pub requires_http1: bool,
 
+    /// Service label of a `{service}.*.amazonaws.com` `aws_auth` upstream.
+    /// `Some` means the SigV4 region is derived from each request's host.
+    pub aws_wildcard_service_label: Option<String>,
+
     /// Audit auth mechanism implied by the managed credential configuration.
     /// Kept even if credential material failed to load so fail-closed denial
     /// events can describe what auth shape the route expected.
@@ -352,6 +356,16 @@ impl RouteStore {
                 || !route.redeem_phantoms.is_empty()
                 || !endpoint_policy.allows_all_without_l7()
                 || !upgrade_rules.is_empty();
+            let aws_wildcard_service_label = match &route.aws_auth {
+                Some(aws_auth) => {
+                    crate::aws::endpoints::validate_aws_upstream(&route.upstream, aws_auth)
+                        .map_err(|e| {
+                            ProxyError::Config(format!("route '{}': {e}", normalized_prefix))
+                        })?
+                        .map(|p| p.service_label)
+                }
+                None => None,
+            };
             let managed_auth_mechanism = auth_mechanism_for_route(route);
             let managed_injection_mode = injection_mode_for_route(route);
 
@@ -378,6 +392,7 @@ impl RouteStore {
                     requires_intercept,
                     requires_managed_credential,
                     requires_http1: route.aws_auth.is_some(),
+                    aws_wildcard_service_label,
                     managed_auth_mechanism,
                     managed_injection_mode,
                     managed_auth,
@@ -1545,6 +1560,7 @@ mod tests {
             requires_intercept: false,
             requires_managed_credential: false,
             requires_http1: false,
+            aws_wildcard_service_label: None,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
@@ -1802,6 +1818,7 @@ mod tests {
             requires_intercept: true,
             requires_managed_credential: true,
             requires_http1: false,
+            aws_wildcard_service_label: None,
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
             managed_auth: None,
@@ -1826,6 +1843,7 @@ mod tests {
             requires_intercept: true,
             requires_managed_credential: false,
             requires_http1: false,
+            aws_wildcard_service_label: None,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
@@ -2443,5 +2461,68 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         .unwrap();
         let store = RouteStore::load(&[route]).await.unwrap();
         assert!(store.get("chat").unwrap().requires_intercept);
+    }
+
+    fn wildcard_aws_route(upstream: &str, region: Option<&str>) -> RouteConfig {
+        serde_json::from_value(serde_json::json!({
+            "prefix": "eks",
+            "upstream": upstream,
+            "aws_auth": {"region": region, "service": "eks"},
+            "endpoint_rules": [{"method": "GET", "path": "/clusters"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn load_accepts_wildcard_region_aws_route() {
+        let store = RouteStore::load(&[wildcard_aws_route("https://eks.*.amazonaws.com", None)])
+            .await
+            .unwrap();
+        assert!(store.requires_http1("eks.us-west-2.amazonaws.com:443"));
+        assert!(!store.requires_http1("eks.us-west-2.amazonaws.com:8443"));
+        assert!(!store.requires_http1("a.eks.us-west-2.amazonaws.com:443"));
+        let route = store
+            .lookup_all_by_upstream("eks.us-west-2.amazonaws.com:443")
+            .into_iter()
+            .next()
+            .unwrap()
+            .1;
+        assert_eq!(route.aws_wildcard_service_label.as_deref(), Some("eks"));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_malformed_wildcard_aws_routes() {
+        for (upstream, region) in [
+            ("https://eks.*.amazonaws.com", Some("us-east-1")),
+            ("https://*.s3.*.amazonaws.com", None),
+            ("https://eks.*.amazonaws.com.cn", None),
+            ("https://*.amazonaws.com", None),
+        ] {
+            let err = RouteStore::load(&[wildcard_aws_route(upstream, region)])
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{upstream} {region:?} should be rejected"));
+            assert!(matches!(err, ProxyError::Config(_)), "{err:?}");
+        }
+    }
+
+    /// A wildcard route and a concrete route for the same service both match,
+    /// so selection stays ambiguous (fail closed) rather than picking one.
+    #[tokio::test]
+    async fn wildcard_and_concrete_aws_routes_are_ambiguous() {
+        let mut concrete = wildcard_aws_route("https://eks.us-east-1.amazonaws.com", None);
+        concrete.prefix = "eks-east".to_string();
+        let store = RouteStore::load(&[
+            wildcard_aws_route("https://eks.*.amazonaws.com", None),
+            concrete,
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .lookup_all_by_upstream("eks.us-east-1.amazonaws.com:443")
+                .len(),
+            2
+        );
     }
 }

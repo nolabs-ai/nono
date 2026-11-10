@@ -781,7 +781,9 @@ the selected profile, so `AWS_PROFILE` would not switch identities. See
 grant must include an `endpoint_policy`. See
 [AWS SigV4 Signing](/cli/features/credential-injection#aws-sigv4-signing) for the
 profile, region, service, and credential-resolution behavior shared with
-session-level routes.
+session-level routes. A single route can cover every commercial region with a
+`https://{service}.*.amazonaws.com` upstream; see
+[wildcard-region endpoints](/cli/features/credential-injection#region-pinned-and-wildcard-region-endpoints).
 
 ### Shaping an ambient credential's phantom
 

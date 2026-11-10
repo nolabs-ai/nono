@@ -147,6 +147,14 @@ In a profile, an `allow_domain` entry can carry an `endpoint_policy` instead of
   answer never overrides a `deny` rule or the `default`.
 - Approvals asked by a credential route's own `endpoint_policy` are always
   one-shot: "always" counts for that request only.
+- On an AWS domain (`amazonaws.com`, `amazonaws.com.cn` or `api.aws`), rules
+  can also match the AWS operation with `operations`, as on an `aws_auth`
+  credential (see [Matching AWS operations](/cli/features/credential-injection#matching-aws-operations)).
+  This filters requests the agent signs with its own AWS credentials; nono
+  forwards them unchanged. An "always" answer then also covers only the
+  operation it was given for. Such a domain is served over HTTP/1.1 and its
+  request bodies are buffered (up to 16 MiB). `operations` on any other domain
+  is rejected.
 
 ![Proxy architecture flow](/assets/proxy-flow.png)
 

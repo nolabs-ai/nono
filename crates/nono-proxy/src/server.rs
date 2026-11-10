@@ -1969,7 +1969,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                         let requires_http1 = state.route_store.requires_http1(&host_port);
                         if state.enable_h2 && requires_http1 {
                             debug!(
-                                "tls_intercept: disabling h2 for {}:{}: AWS SigV4 requires HTTP/1.1",
+                                "tls_intercept: disabling h2 for {}:{}: AWS SigV4 or operation policy requires HTTP/1.1",
                                 host, port
                             );
                         }

@@ -117,6 +117,15 @@ pub struct LoadedRoute {
 }
 
 impl LoadedRoute {
+    /// `true` if requests on this route must have their AWS operation
+    /// resolved before policy evaluation: `aws_auth` routes, and routes whose
+    /// policy has `operations` rules (load validation allows those only on
+    /// `aws_auth` routes and AWS upstreams).
+    #[must_use]
+    pub fn resolves_aws_operation(&self) -> bool {
+        self.aws_auth || self.endpoint_policy.has_operation_rules()
+    }
+
     /// The phantom value a client must present on this route: the session token
     /// wrapped in the route's template, or the bare token when none is set.
     #[must_use]
@@ -272,19 +281,12 @@ impl RouteStore {
                 &route.endpoint_rules,
             )
             .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
-            if route.aws_auth.is_none()
-                && route.endpoint_policy.as_ref().is_some_and(|p| {
-                    p.deny
-                        .iter()
-                        .chain(&p.approve)
-                        .chain(&p.allow)
-                        .any(|r| r.operations.is_some())
-                })
-            {
-                return Err(ProxyError::Config(format!(
-                    "route '{}': endpoint_policy `operations` requires `aws_auth`",
-                    normalized_prefix
-                )));
+            if endpoint_policy.has_operation_rules() {
+                crate::aws::endpoints::validate_operations_upstream(
+                    &route.upstream,
+                    route.aws_auth.is_some(),
+                )
+                .map_err(|e| ProxyError::Config(format!("route '{}': {e}", normalized_prefix)))?;
             }
             let upgrade_rules = CompiledUpgradeRules::compile(&route.upgrades)
                 .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
@@ -437,6 +439,8 @@ impl RouteStore {
                 }
                 None => None,
             };
+            // Operations are resolved only on the HTTP/1.1 path.
+            let requires_http1 = route.aws_auth.is_some() || endpoint_policy.has_operation_rules();
             let managed_auth_mechanism = auth_mechanism_for_route(route);
             let managed_injection_mode = injection_mode_for_route(route);
 
@@ -462,7 +466,7 @@ impl RouteStore {
                     tls_config_key,
                     requires_intercept,
                     requires_managed_credential,
-                    requires_http1: route.aws_auth.is_some(),
+                    requires_http1,
                     aws_auth: route.aws_auth.is_some(),
                     aws_wildcard_service_label,
                     managed_auth_mechanism,
@@ -1986,11 +1990,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_operations_rejected_without_aws_auth() {
-        let err = RouteStore::load(&[operations_route(false)])
+    async fn test_operations_load_on_credential_free_aws_route() {
+        let store = RouteStore::load(&[operations_route(false)]).await.unwrap();
+        let (_, route) = store
+            .lookup_by_upstream("ssm.us-east-1.amazonaws.com:443")
+            .unwrap();
+        assert!(!route.aws_auth);
+        assert!(!route.requires_managed_credential);
+        assert!(route.resolves_aws_operation());
+        assert!(store.requires_http1("ssm.us-east-1.amazonaws.com:443"));
+    }
+
+    #[tokio::test]
+    async fn test_operations_rejected_on_non_aws_upstream() {
+        let mut route = operations_route(false);
+        route.upstream = "https://evilamazonaws.com".to_string();
+        let err = RouteStore::load(&[route])
             .await
-            .expect_err("operations without aws_auth must be rejected");
-        assert!(err.to_string().contains("operations"));
+            .expect_err("operations on a non-AWS upstream must be rejected");
+        assert!(err.to_string().contains("AWS upstream"));
+    }
+
+    #[tokio::test]
+    async fn test_route_without_operations_does_not_resolve_them() {
+        let mut route = operations_route(false);
+        route.endpoint_policy = None;
+        let store = RouteStore::load(&[route]).await.unwrap();
+        let (_, route) = store
+            .lookup_by_upstream("ssm.us-east-1.amazonaws.com:443")
+            .unwrap();
+        assert!(!route.resolves_aws_operation());
     }
 
     #[tokio::test]

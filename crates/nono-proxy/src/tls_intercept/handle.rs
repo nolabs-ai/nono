@@ -533,16 +533,17 @@ pub(crate) async fn select_intercept_route<'a>(
             }
             continue;
         }
-        // Only `aws_auth` routes may carry `operations` rules; other routes
-        // are evaluated without an operation.
-        let operation_name: Option<&str> = route.aws_auth.then(|| {
+        // Only routes that resolve AWS operations may carry `operations`
+        // rules; other routes are evaluated without an operation.
+        let resolves_operation = route.resolves_aws_operation();
+        let operation_name: Option<&str> = resolves_operation.then(|| {
             request
                 .operation
                 .map_or(crate::config::UNKNOWN_OPERATION, |op| op.name.as_str())
         });
         let operation_protocol: Option<&str> = request
             .operation
-            .filter(|_| route.aws_auth)
+            .filter(|_| resolves_operation)
             .map(|op| op.protocol.as_str());
         match route
             .endpoint_policy
@@ -1040,16 +1041,17 @@ where
         return Ok(());
     }
 
-    // For upstreams with an `aws_auth` route, buffer the body before policy
-    // evaluation so the AWS operation can be resolved. The same body, header
-    // list and path are then signed and forwarded, so what policy inspected is
-    // exactly what is sent.
+    // For upstreams with a route that resolves AWS operations, buffer the
+    // body before policy evaluation so the operation can be resolved. The
+    // same body, header list and path are then signed (or, on a
+    // credential-free route, forwarded under the agent's own signature), so
+    // what policy inspected is exactly what is sent.
     let host_port_key = format!("{}:{}", ctx.host.to_lowercase(), ctx.port);
     let has_aws_route = ctx
         .route_store
         .lookup_all_by_upstream(&host_port_key)
         .iter()
-        .any(|(_, route)| route.aws_auth);
+        .any(|(_, route)| route.resolves_aws_operation());
     let mut aws_headers: Option<Vec<(String, String)>> = None;
     let mut resolved_operation: Option<crate::aws::operation::ResolvedOperation> = None;
     if has_aws_route {
@@ -3434,6 +3436,94 @@ mod tests {
         .await;
         assert!(matches!(selection, RouteSelection::Selected(_)));
         assert_eq!(*backend.operations.lock().unwrap(), vec![None]);
+    }
+
+    /// Credential-free `_ep_` route from an `allow_domain` entry: the agent
+    /// signs its own requests and the proxy only filters by operation.
+    fn ep_aws_ops_route(approve: &[&str], allow: &[&str]) -> crate::config::RouteConfig {
+        let mut route = aws_ops_route(&[], approve, allow);
+        route.prefix = format!(
+            "{}ssm.us-east-1.amazonaws.com",
+            crate::config::ENDPOINT_ROUTE_PREFIX
+        );
+        route.aws_auth = None;
+        route
+    }
+
+    #[tokio::test]
+    async fn ep_aws_route_filters_by_operation_without_signing() {
+        let store = RouteStore::load(&[ep_aws_ops_route(&[], &["Describe*"])])
+            .await
+            .unwrap();
+        let (_, route) = store
+            .lookup_by_upstream("ssm.us-east-1.amazonaws.com:443")
+            .unwrap();
+        assert!(!route.requires_managed_credential);
+        assert!(route.resolves_aws_operation());
+        assert_eq!(
+            select_aws(&store, Some(&resolved("DescribeParameters")), None, None).await,
+            200
+        );
+        assert_eq!(
+            select_aws(&store, Some(&resolved("DeleteParameter")), None, None).await,
+            403
+        );
+        assert_eq!(select_aws(&store, None, None, None).await, 403);
+    }
+
+    /// Grants every endpoint request for the session and records its operation.
+    struct SessionGrantingBackend {
+        operations: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl nono::ApprovalBackend for SessionGrantingBackend {
+        fn request_approval(
+            &self,
+            request: &nono::ApprovalRequest,
+        ) -> nono::Result<nono::ApprovalDecision> {
+            if let nono::ApprovalRequest::Endpoint { operation, .. } = request {
+                self.operations
+                    .lock()
+                    .map_err(|_| nono::NonoError::SandboxInit("poisoned".to_string()))?
+                    .push(operation.clone());
+            }
+            Ok(nono::ApprovalDecision::GrantedForSession)
+        }
+
+        fn backend_name(&self) -> &str {
+            "session-granting"
+        }
+    }
+
+    #[tokio::test]
+    async fn ep_aws_session_grant_covers_only_its_operation() {
+        let store = RouteStore::load(&[ep_aws_ops_route(&["Terminate*"], &[])])
+            .await
+            .unwrap();
+        let backend = std::sync::Arc::new(SessionGrantingBackend {
+            operations: std::sync::Mutex::new(Vec::new()),
+        });
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+        for op in [
+            "TerminateInstances",
+            "TerminateInstances",
+            "TerminateDBInstance",
+        ] {
+            assert_eq!(
+                select_aws(&store, Some(&resolved(op)), None, Some(&registry)).await,
+                200,
+                "{op}"
+            );
+        }
+        // The repeat is answered from the session cache; the other operation
+        // under the same rule asks again.
+        assert_eq!(
+            *backend.operations.lock().unwrap(),
+            vec![
+                Some("TerminateInstances".to_string()),
+                Some("TerminateDBInstance".to_string())
+            ]
+        );
     }
 
     fn parsed(header_bytes: &[u8], buffered: &[u8], body: Option<&[u8]>) -> ParsedRequest {

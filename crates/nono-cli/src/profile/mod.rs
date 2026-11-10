@@ -734,7 +734,12 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
     }
 
     if let Some(ref policy) = cred.endpoint_policy {
-        validate_endpoint_policy_operations(name, policy, cred.aws_auth.is_some())?;
+        validate_endpoint_policy_operations(
+            &format!("custom credential '{name}'"),
+            policy,
+            &cred.upstream,
+            cred.aws_auth.is_some(),
+        )?;
     }
 
     // Validate credential_key if present
@@ -988,13 +993,14 @@ fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
     Ok(())
 }
 
-/// `operations` rules are valid only on `aws_auth` credentials and must use
-/// the restricted glob charset. Warns when a default-allow policy has no
+/// `operations` rules need `aws_auth` or an AWS upstream and must use the
+/// restricted glob charset. Warns when a default-allow policy has no
 /// deny/approve rule that matches `Unknown`, since an unidentifiable request
 /// would then be allowed.
 fn validate_endpoint_policy_operations(
-    name: &str,
+    subject: &str,
     policy: &nono_proxy::config::EndpointPolicyConfig,
+    upstream: &str,
     has_aws_auth: bool,
 ) -> Result<()> {
     let mut has_operations = false;
@@ -1008,14 +1014,10 @@ fn validate_endpoint_policy_operations(
             continue;
         };
         has_operations = true;
-        if !has_aws_auth {
-            return Err(NonoError::ProfileParse(format!(
-                "custom credential '{}' sets endpoint_policy 'operations', which requires 'aws_auth'",
-                name
-            )));
-        }
+        nono_proxy::aws::endpoints::validate_operations_upstream(upstream, has_aws_auth)
+            .map_err(|e| NonoError::ProfileParse(format!("{subject}: {e}")))?;
         nono_proxy::config::compile_operation_globs(ops)
-            .map_err(|e| NonoError::ProfileParse(format!("custom credential '{}': {}", name, e)))?;
+            .map_err(|e| NonoError::ProfileParse(format!("{subject}: {e}")))?;
     }
     if has_operations
         && policy.default.decision == nono_proxy::config::EndpointPolicyDecision::Allow
@@ -1028,10 +1030,10 @@ fn validate_endpoint_policy_operations(
             .any(|ops| nono_proxy::config::operations_match_unknown(ops));
         if !unknown_restricted {
             tracing::warn!(
-                "custom credential '{}' uses default: allow with operations rules but nothing \
+                "{} uses default: allow with operations rules but nothing \
                  denies or approves the 'Unknown' operation; requests whose operation cannot \
                  be determined will be allowed. Prefer default: deny with allow rules.",
-                name
+                subject
             );
         }
     }
@@ -1446,12 +1448,26 @@ fn validate_profile_env_var_patterns(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
-/// Validate `network.allow_domain`/`deny_domain` hostname patterns.
+/// Validate `network.allow_domain`/`deny_domain` hostname patterns, and
+/// `operations` rules in `allow_domain` endpoint policies.
 fn validate_profile_domain_patterns(profile: &Profile) -> Result<()> {
     for entry in &profile.network.allow_domain {
         nono::net_filter::validate_host_pattern(entry.domain()).map_err(|err| {
             NonoError::ProfileParse(format!("network.allow_domain entry invalid: {err}"))
         })?;
+        if let AllowDomainEntry::WithEndpoints {
+            domain,
+            endpoint_policy: Some(policy),
+            ..
+        } = entry
+        {
+            validate_endpoint_policy_operations(
+                &format!("network.allow_domain entry '{domain}'"),
+                &policy.to_proxy(),
+                &format!("https://{domain}"),
+                false,
+            )?;
+        }
     }
     for pattern in &profile.network.deny_domain {
         nono::net_filter::validate_host_pattern(pattern).map_err(|err| {
@@ -6364,6 +6380,15 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_operations_allowed_on_aws_upstream_without_aws_auth() {
+        let mut cred = header_cred_builder();
+        cred.upstream = "https://ssm.us-east-1.amazonaws.com".to_string();
+        cred.endpoint_policy = Some(ops_policy(&["Describe*"]));
+        validate_custom_credential("test", &cred)
+            .expect("operations on an AWS upstream are valid without aws_auth");
+    }
+
+    #[test]
     fn test_validate_operations_rejects_bad_patterns() {
         let mut cred = header_cred_builder();
         cred.credential_key = None;
@@ -9822,6 +9847,40 @@ mod tests {
         assert!(encoded["endpoint_policy"].get("default").is_none());
         let decoded: AllowDomainEntry = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, entry);
+    }
+
+    fn profile_with_allow_domain(entry: &str) -> Profile {
+        let mut profile = Profile::default();
+        profile.network.allow_domain = vec![serde_json::from_str(entry).unwrap()];
+        profile
+    }
+
+    #[test]
+    fn test_allow_domain_operations_require_aws_domain() {
+        let ops = r#""endpoint_policy": { "allow": [{ "method": "POST", "path": "/", "operations": ["Describe*"] }] } }"#;
+        for domain in ["ssm.us-east-1.amazonaws.com", "*.amazonaws.com"] {
+            let profile = profile_with_allow_domain(&format!(r#"{{ "domain": "{domain}", {ops}"#));
+            validate_profile_domain_patterns(&profile).unwrap_or_else(|e| panic!("{domain}: {e}"));
+        }
+        for domain in ["api.github.com", "evilamazonaws.com"] {
+            let profile = profile_with_allow_domain(&format!(r#"{{ "domain": "{domain}", {ops}"#));
+            let err = validate_profile_domain_patterns(&profile)
+                .expect_err("operations on a non-AWS domain must be rejected");
+            assert!(err.to_string().contains("AWS upstream"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_allow_domain_operations_reject_bad_patterns() {
+        let profile = profile_with_allow_domain(
+            r#"{ "domain": "ssm.us-east-1.amazonaws.com", "endpoint_policy": { "deny": [{ "method": "POST", "path": "/", "operations": ["Delete[a]"] }] } }"#,
+        );
+        let err = validate_profile_domain_patterns(&profile)
+            .expect_err("operation patterns outside the charset must be rejected");
+        assert!(
+            err.to_string().contains("ssm.us-east-1.amazonaws.com"),
+            "{err}"
+        );
     }
 
     #[test]

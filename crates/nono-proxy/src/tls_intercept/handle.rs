@@ -2837,7 +2837,7 @@ mod tests {
             phantom_format: None,
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "*".to_string(),
-                path: "/**".to_string(),
+                path: "/**".into(),
             }],
             tls_ca: tls_ca.map(str::to_string),
             tls_client_cert: None,
@@ -2875,7 +2875,7 @@ mod tests {
                 phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "GET".to_string(),
-                    path: path.to_string(),
+                    path: path.into(),
                 }],
                 tls_ca: None,
                 tls_client_cert: None,
@@ -2966,7 +2966,7 @@ mod tests {
                 phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "GET".to_string(),
-                    path: path.to_string(),
+                    path: path.into(),
                 }],
                 tls_ca: None,
                 tls_client_cert: None,
@@ -3027,7 +3027,7 @@ mod tests {
             phantom_format: None,
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "GET".to_string(),
-                path: "/foo".to_string(),
+                path: "/foo".into(),
             }],
             tls_ca: None,
             tls_client_cert: None,
@@ -3137,7 +3137,7 @@ mod tests {
                 deny: vec![],
                 approve: vec![crate::config::EndpointPolicyRule {
                     method: "GET".to_string(),
-                    path: "/gated".to_string(),
+                    path: "/gated".into(),
                     backend: None,
                     reason: None,
                     timeout_secs: Some(2),
@@ -3294,7 +3294,7 @@ mod tests {
             }
             vec![crate::config::EndpointPolicyRule {
                 method: "POST".to_string(),
-                path: "/".to_string(),
+                path: "/".into(),
                 backend: None,
                 reason: None,
                 timeout_secs: Some(2),
@@ -3763,7 +3763,7 @@ mod tests {
     ) -> crate::config::EndpointPolicyRule {
         crate::config::EndpointPolicyRule {
             method: method.to_string(),
-            path: path.to_string(),
+            path: path.into(),
             backend: None,
             reason: reason.map(str::to_string),
             timeout_secs: Some(5),

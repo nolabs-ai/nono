@@ -824,7 +824,7 @@ mod tests {
             phantom_format: None,
             endpoint_rules: vec![EndpointRule {
                 method: "*".to_string(),
-                path: "/**".to_string(),
+                path: "/**".into(),
             }],
             tls_ca: None,
             tls_client_cert: None,
@@ -1156,7 +1156,7 @@ mod tests {
             upstream_port,
             vec![EndpointRule {
                 method: "*".to_string(),
-                path: "/**".to_string(),
+                path: "/**".into(),
             }],
         )
         .await;
@@ -1244,7 +1244,7 @@ mod tests {
             upstream_port,
             vec![EndpointRule {
                 method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
+                path: "/v1/chat/completions".into(),
             }],
         )
         .await;
@@ -1688,7 +1688,7 @@ mod tests {
             upstream_port,
             vec![EndpointRule {
                 method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
+                path: "/v1/chat/completions".into(),
             }],
         )
         .await;
@@ -1817,7 +1817,7 @@ mod tests {
             phantom_format: None,
             endpoint_rules: vec![EndpointRule {
                 method: "*".to_string(),
-                path: "/**".to_string(),
+                path: "/**".into(),
             }],
             tls_ca: None,
             tls_client_cert: None,
@@ -2215,7 +2215,7 @@ mod tests {
                 phantom_format: None,
                 endpoint_rules: vec![EndpointRule {
                     method: "*".to_string(),
-                    path: "/v1/**".to_string(),
+                    path: "/v1/**".into(),
                 }],
                 tls_ca: None,
                 tls_client_cert: None,
@@ -2243,7 +2243,7 @@ mod tests {
                 phantom_format: None,
                 endpoint_rules: vec![EndpointRule {
                     method: "*".to_string(),
-                    path: "/v1/**".to_string(),
+                    path: "/v1/**".into(),
                 }],
                 tls_ca: None,
                 tls_client_cert: None,
@@ -2332,7 +2332,7 @@ mod tests {
             upstream_port,
             vec![EndpointRule {
                 method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
+                path: "/v1/chat/completions".into(),
             }],
         )
         .await;
@@ -2450,7 +2450,7 @@ mod tests {
             upstream_port,
             vec![EndpointRule {
                 method: "GET".to_string(),
-                path: "/repos/my-org/**".to_string(),
+                path: "/repos/my-org/**".into(),
             }],
         )
         .await;
@@ -2570,7 +2570,7 @@ mod tests {
                 approve: Vec::new(),
                 allow: vec![EndpointPolicyRule {
                     method: "GET".to_string(),
-                    path: "/repos/my-org/**".to_string(),
+                    path: "/repos/my-org/**".into(),
                     backend: None,
                     reason: None,
                     timeout_secs: None,
@@ -2662,7 +2662,7 @@ mod tests {
             upstream_port,
             vec![EndpointRule {
                 method: "GET".to_string(),
-                path: "/repos/my-org/**".to_string(),
+                path: "/repos/my-org/**".into(),
             }],
         )
         .await;
@@ -2793,11 +2793,11 @@ mod tests {
                 endpoint_rules: vec![
                     EndpointRule {
                         method: "*".to_string(),
-                        path: "/repos/my-org/**".to_string(),
+                        path: "/repos/my-org/**".into(),
                     },
                     EndpointRule {
                         method: "*".to_string(),
-                        path: "/graphql".to_string(),
+                        path: "/graphql".into(),
                     },
                 ],
                 tls_ca: None,
@@ -2896,7 +2896,7 @@ mod tests {
             upstream_port,
             vec![EndpointRule {
                 method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
+                path: "/v1/chat/completions".into(),
             }],
         )
         .await;
@@ -2997,7 +2997,7 @@ mod tests {
             upstream_port,
             vec![EndpointRule {
                 method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
+                path: "/v1/chat/completions".into(),
             }],
         )
         .await;
@@ -3100,7 +3100,7 @@ mod tests {
             upstream_port,
             vec![EndpointRule {
                 method: "POST".to_string(),
-                path: "/pkg.Svc/BidiStream".to_string(),
+                path: "/pkg.Svc/BidiStream".into(),
             }],
         )
         .await;

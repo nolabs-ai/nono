@@ -3660,7 +3660,7 @@ mod tests {
     fn host_policy_routes() -> Vec<crate::config::RouteConfig> {
         let rule = |method: &str, path: &str| crate::config::EndpointPolicyRule {
             method: method.to_string(),
-            path: path.to_string(),
+            path: path.into(),
             backend: None,
             reason: None,
             timeout_secs: None,
@@ -3712,7 +3712,7 @@ mod tests {
             prefix: "_ep_api.example.com".to_string(),
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "GET".to_string(),
-                path: "/acme/**".to_string(),
+                path: "/acme/**".into(),
             }],
             ..routes[0].clone()
         });

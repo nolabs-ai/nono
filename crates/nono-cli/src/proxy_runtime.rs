@@ -2301,7 +2301,7 @@ fn endpoint_rule_to_proxy(
 ) -> ProxyEndpointPolicyRule {
     ProxyEndpointPolicyRule {
         method: rule.method.clone(),
-        path: rule.path.clone(),
+        path: rule.path.as_str().into(),
         backend: rule.backend.clone(),
         reason: rule.reason.clone(),
         timeout_secs: resolve_approval_timeout(config, rule.backend.as_deref(), rule.timeout_secs),
@@ -2349,7 +2349,7 @@ pub(crate) fn parse_allow_domain_arg(input: &str) -> crate::profile::AllowDomain
                 domain,
                 endpoints: vec![nono_proxy::config::EndpointRule {
                     method: "*".to_string(),
-                    path: path.to_string(),
+                    path: path.into(),
                 }],
                 endpoint_policy: None,
             }
@@ -2397,7 +2397,7 @@ pub(crate) fn parse_allow_endpoint_arg(
         service.to_string(),
         nono_proxy::config::EndpointRule {
             method: method.to_string(),
-            path: path.to_string(),
+            path: path.into(),
         },
     ))
 }
@@ -2674,7 +2674,7 @@ fn synthesize_credential_provider_proxy_config(
                 endpoint_rules: if endpoint_policy.is_none() {
                     vec![nono_proxy::config::EndpointRule {
                         method: "*".to_string(),
-                        path: "/**".to_string(),
+                        path: "/**".into(),
                     }]
                 } else {
                     Vec::new()
@@ -6415,7 +6415,7 @@ mod tests {
             service.to_string(),
             nono_proxy::config::EndpointRule {
                 method: method.to_string(),
-                path: path.to_string(),
+                path: path.into(),
             },
         )
     }

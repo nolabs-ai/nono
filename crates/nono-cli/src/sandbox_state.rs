@@ -164,8 +164,8 @@ impl DomainEndpointState {
 pub struct EndpointRuleState {
     /// HTTP method ("GET", "POST", "*", etc.)
     pub method: String,
-    /// URL path glob pattern
-    pub path: String,
+    /// URL path glob pattern, normalized like the proxy's rule paths
+    pub path: nono_proxy::config::EndpointPath,
 }
 
 /// Serializable filesystem capability state

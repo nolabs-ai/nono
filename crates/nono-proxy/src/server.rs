@@ -3200,12 +3200,29 @@ mod tests {
         extra_routes: impl FnOnce(u16, &std::path::Path) -> Vec<serde_json::Value>,
         steps: impl FnOnce(u16) -> Vec<AwsStep>,
     ) -> AwsCaseResult {
+        run_aws_case_at("localhost", true, endpoint_policy, extra_routes, steps)
+    }
+
+    /// Like [`run_aws_case_with_routes`] with the upstream at `host` (mapped to
+    /// the local mock upstream) and, when `aws_auth` is false, a
+    /// credential-free main route.
+    fn run_aws_case_at(
+        host: &str,
+        aws_auth: bool,
+        endpoint_policy: serde_json::Value,
+        extra_routes: impl FnOnce(u16, &std::path::Path) -> Vec<serde_json::Value>,
+        steps: impl FnOnce(u16) -> Vec<AwsStep>,
+    ) -> AwsCaseResult {
         use base64::Engine;
         use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
         use tokio::io::AsyncWriteExt;
         use tokio::net::{TcpListener, TcpStream};
 
         let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        crate::filter::TEST_HOSTS
+            .lock()
+            .unwrap()
+            .push((host.to_string(), std::net::Ipv4Addr::LOCALHOST.into()));
         let dir = tempfile::tempdir().unwrap();
         let empty_profile = dir.path().join("aws-empty");
         std::fs::write(&empty_profile, "").unwrap();
@@ -3283,10 +3300,13 @@ mod tests {
                 std::fs::write(&ca_file, ca.cert_pem()).unwrap();
                 let mut route = serde_json::json!({
                     "prefix": "aws",
-                    "upstream": format!("https://localhost:{upstream_port}"),
+                    "upstream": format!("https://{host}:{upstream_port}"),
                     "aws_auth": {"region": "us-east-1", "service": "ssm"},
                     "tls_ca": ca_file,
                 });
+                if !aws_auth {
+                    route.as_object_mut().unwrap().remove("aws_auth");
+                }
                 if endpoint_policy.is_null() {
                     // Legacy allow-list: non-explicit, so a miss lets other
                     // routes on this host handle the request.
@@ -3316,7 +3336,7 @@ mod tests {
                     .encode(format!("nono:{}", handle.token.as_str()));
                 sock.write_all(
                     format!(
-                        "CONNECT localhost:{upstream_port} HTTP/1.1\r\nHost: localhost:{upstream_port}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+                        "CONNECT {host}:{upstream_port} HTTP/1.1\r\nHost: {host}:{upstream_port}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
                     )
                     .as_bytes(),
                 )
@@ -3344,7 +3364,7 @@ mod tests {
                 .with_no_client_auth();
                 client.alpn_protocols = vec![b"http/1.1".to_vec()];
                 let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
-                    .connect(ServerName::try_from("localhost").unwrap(), sock)
+                    .connect(ServerName::try_from(host.to_string()).unwrap(), sock)
                     .await
                     .unwrap();
 
@@ -3448,6 +3468,33 @@ mod tests {
             .find(|l| l.starts_with("authorization:"))
             .unwrap();
         assert!(signed.contains("x-amz-target"));
+    }
+
+    /// A credential-free `allow_domain` route on an AWS host filters by
+    /// operation and forwards the agent's own signed request unchanged.
+    #[test]
+    fn ep_aws_route_forwards_agent_signed_request_verbatim() {
+        let host = "ssm.us-east-1.amazonaws.com";
+        let run = |target: &'static str, body: &'static [u8]| {
+            run_aws_case_at(
+                host,
+                false,
+                allow_ops_policy(&["Describe*"]),
+                |_, _| Vec::new(),
+                move |port| vec![AwsStep::Send(json_request(port, target, body, ""))],
+            )
+        };
+        let body = br#"{"MaxResults":1}"#;
+        let allowed = run("AmazonSSM.DescribeParameters", body);
+        assert!(allowed.client.starts_with(b"HTTP/1.1 200"));
+        let (head, forwarded) = split_capture(&allowed.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert!(head.contains("authorization: agent-signature"));
+        assert!(!head.contains("aws4-hmac-sha256"));
+
+        let denied = run("AmazonSSM.DeleteParameter", b"{}");
+        assert!(denied.client.starts_with(b"HTTP/1.1 403"));
+        assert!(denied.upstream.is_none());
     }
 
     #[test]

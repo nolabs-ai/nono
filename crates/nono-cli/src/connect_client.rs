@@ -3,7 +3,7 @@
 //! The open wire contract is documented in `docs/protocols/remote-attach-v1.md`.
 //! Human authentication is deliberately separate from device enrollment. A
 //! console token comes from an explicit protected file or `NONO_CONNECT_TOKEN`.
-//! Otherwise a device signed in with `nono login` (NEP-0009) refreshes a
+//! Otherwise a device signed in with `nono platform login` (NEP-0009) refreshes a
 //! DPoP-bound OAuth access token; a token-enrolled device without such a
 //! session runs the remote-attach-v1 browser-approved authorization, caches a
 //! device-bound opaque credential, and exchanges it for a short-lived bearer
@@ -11,6 +11,7 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use colored::Colorize;
@@ -24,7 +25,8 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::cli::{ConnectArgs, PsArgs};
+use crate::cli::{ConnectArgs, RemoteListArgs};
+use crate::output::{SummaryKind, summary_heading, summary_row};
 use crate::platform_oauth::ApiCredential;
 use crate::terminal_selector::{self, RawTerminal, terminal_size};
 
@@ -152,11 +154,15 @@ pub(crate) fn run_connect(args: ConnectArgs) -> Result<()> {
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(NonoError::ActionRequired(
-            "nono connect requires an interactive terminal".to_string(),
+            "nono remote connect requires an interactive terminal".to_string(),
         ));
     }
 
-    let access = console_access(args.token_file.as_deref())?;
+    let access = console_access(args.token_file.as_deref(), args.tenant.as_deref())?;
+    run_connect_with_access(args, access)
+}
+
+pub(crate) fn run_connect_with_access(args: ConnectArgs, access: ConsoleAccess) -> Result<()> {
     let attach_url = resolve_attach_url(args.target.as_deref(), args.console.as_deref(), &access)?;
     validate_transport_url(&attach_url)?;
     let detach_sequence = crate::launch_runtime::load_configured_detach_sequence()?
@@ -180,8 +186,8 @@ pub(crate) fn run_connect(args: ConnectArgs) -> Result<()> {
     Ok(())
 }
 
-/// List sessions visible through the enrolled tenant's nono-console.
-pub(crate) fn run_remote_ps(args: &PsArgs) -> Result<()> {
+/// List sessions visible in the current CLI tenant.
+pub(crate) fn run_remote_ps(args: &RemoteListArgs) -> Result<()> {
     // Resolve the environment equivalents here rather than through clap. That
     // keeps a globally configured remote console from affecting local `nono ps`.
     let token_file_env = args
@@ -191,7 +197,7 @@ pub(crate) fn run_remote_ps(args: &PsArgs) -> Result<()> {
         .flatten()
         .map(std::path::PathBuf::from);
     let token_file = args.token_file.as_deref().or(token_file_env.as_deref());
-    let access = console_access(token_file)?;
+    let access = console_access(token_file, args.tenant.as_deref())?;
     let console_env = if args.console.is_none() {
         match std::env::var("NONO_CONSOLE_URL") {
             Ok(value) => Some(value),
@@ -230,39 +236,56 @@ pub(crate) fn take_remote_exit_code() -> Option<i32> {
     }
 }
 
-/// The credential for console requests, and the console a `nono login`
-/// session names.
+/// Credentials and tenant resolved once for a remote command.
 #[derive(Debug)]
 pub(crate) struct ConsoleAccess {
-    pub(crate) credential: ApiCredential,
+    pub(crate) credential: Arc<ApiCredential>,
     pub(crate) session_console: Option<Url>,
-    /// The platform a `nono login` session is signed in to. Display only.
     pub(crate) session_platform: Option<String>,
+    pub(crate) session_tenant: Option<crate::platform_oauth::client::Organization>,
 }
 
-/// Choose the console credential: an explicit token file or
-/// `NONO_CONNECT_TOKEN` first, then the `nono login` session (for the
-/// organization `NONO_TENANT` names, or the active one), then an enrolled
-/// device's remote-attach-v1 authorization.
-pub(crate) fn console_access(token_file: Option<&Path>) -> Result<ConsoleAccess> {
+pub(crate) fn console_access(
+    token_file: Option<&Path>,
+    tenant: Option<&str>,
+) -> Result<ConsoleAccess> {
+    let tenant = crate::platform_oauth::tenant_override(tenant)?;
     let explicit = token_file.is_some() || std::env::var_os("NONO_CONNECT_TOKEN").is_some();
-    if !explicit && let Some(session) = crate::platform_oauth::session_access()? {
+    if explicit && tenant.is_some() {
+        return Err(NonoError::ActionRequired(
+            "tenant selection requires `nono platform login`; explicit console tokens already have their own scope".into(),
+        ));
+    }
+    let session = if explicit {
+        None
+    } else {
+        crate::platform_oauth::session_access(tenant.as_deref())?
+    };
+    if session.is_none() && tenant.is_some() {
+        return Err(NonoError::ActionRequired(
+            "tenant selection requires a platform sign-in; run `nono platform login`".into(),
+        ));
+    }
+    console_access_from_session(token_file, session)
+}
+
+pub(crate) fn console_access_from_session(
+    token_file: Option<&Path>,
+    session: Option<crate::platform_oauth::SessionAccess>,
+) -> Result<ConsoleAccess> {
+    if let Some(session) = session {
         return Ok(ConsoleAccess {
             credential: session.credential,
             session_console: session.console_url,
             session_platform: Some(session.platform_url),
+            session_tenant: Some(session.organization),
         });
     }
-    if !explicit && crate::platform_oauth::org_override()?.is_some() {
-        return Err(NonoError::ActionRequired(format!(
-            "{} needs a platform sign-in; run `nono login`",
-            crate::platform_oauth::ORG_ENV
-        )));
-    }
     Ok(ConsoleAccess {
-        credential: load_token(token_file)?,
+        credential: Arc::new(load_token(token_file)?),
         session_console: None,
         session_platform: None,
+        session_tenant: None,
     })
 }
 
@@ -272,6 +295,9 @@ pub(crate) fn resolve_console(explicit: Option<&str>, access: &ConsoleAccess) ->
     match (explicit, &access.session_console) {
         (Some(console), _) => validate_console_url(console),
         (None, Some(console)) => validate_console_url(console.as_str()),
+        (None, None) if access.session_platform.is_some() => Err(NonoError::ActionRequired(
+            "remote sessions are not configured on this platform; ask your administrator to configure nono-console".into(),
+        )),
         (None, None) => discover_console(),
     }
 }
@@ -282,6 +308,9 @@ fn resolve_attach_url(
     access: &ConsoleAccess,
 ) -> Result<Url> {
     let token = &access.credential;
+    if console.is_none() && access.session_platform.is_some() && access.session_console.is_none() {
+        resolve_console(None, access)?;
+    }
     if let Some(target) = target
         && let Ok(url) = Url::parse(target)
         && matches!(url.scheme(), "ws" | "wss")
@@ -358,7 +387,8 @@ pub(crate) fn load_token(path: Option<&Path>) -> Result<ApiCredential> {
 fn acquire_console_credential() -> Result<Zeroizing<String>> {
     let state = crate::platform_client::load_state()?.ok_or_else(|| {
         NonoError::ActionRequired(
-            "not signed in; run `nono login --url <platform>` or provide --token-file".to_string(),
+            "not signed in; run `nono platform login --url <platform>` or provide --token-file"
+                .to_string(),
         )
     })?;
     if state.subject_kind != "device" {
@@ -438,7 +468,7 @@ fn authorize_device(state: &crate::platform_client::PlatformState) -> Result<Zer
     loop {
         if started.elapsed() >= std::time::Duration::from_secs(code.expires_in) {
             return Err(NonoError::ActionRequired(
-                "human authorization expired; run `nono connect` again".to_string(),
+                "human authorization expired; run `nono remote connect` again".to_string(),
             ));
         }
         std::thread::sleep(std::time::Duration::from_secs(code.interval));
@@ -469,7 +499,7 @@ fn authorize_device(state: &crate::platform_client::PlatformState) -> Result<Zer
             }
             "expired" => {
                 return Err(NonoError::ActionRequired(
-                    "human authorization expired; run `nono connect` again".to_string(),
+                    "human authorization expired; run `nono remote connect` again".to_string(),
                 ));
             }
             "authorized" => {
@@ -494,7 +524,7 @@ fn authorize_device(state: &crate::platform_client::PlatformState) -> Result<Zer
                 let token = exchange_console_access_token(state, &cached.credential)?
                     .ok_or_else(|| {
                         NonoError::ActionRequired(
-                            "the new human authorization could not be exchanged; run `nono connect` again"
+                            "the new human authorization could not be exchanged; run `nono remote connect` again"
                                 .to_string(),
                         )
                     })?;
@@ -783,7 +813,7 @@ fn attach_origin_is_authorized(url: &Url, authorized: &[Url]) -> bool {
 /// A direct `wss://` target is taken verbatim from the command line, so it can
 /// be a link the operator was sent rather than one the console issued.
 /// `validate_direct_attach_url` only checks the URL's shape; without an origin
-/// check, `nono connect wss://evil.example/api/v1/sessions/...` opens a socket
+/// check, `nono remote connect wss://evil.example/api/v1/sessions/...` opens a socket
 /// to an attacker and puts `Authorization: Bearer <console token>` in the
 /// upgrade request, handing over live console access for the tenant.
 ///
@@ -828,8 +858,8 @@ fn verify_attach_origin(
     }
 
     Err(NonoError::ActionRequired(format!(
-        "refusing to send console credentials to '{}': it is not the enrolled platform or its \
-         console. Run `nono connect` with no target to choose a session from the enrolled console, \
+        "refusing to send console credentials to '{}': it is not an authorized console. \
+         Run `nono remote connect` with no target to choose a session from your tenant's console, \
          or pass --console to name the console that issued this session.",
         url.host_str().unwrap_or("<no host>")
     )))
@@ -1128,12 +1158,16 @@ fn remote_host_label(access: &ConsoleAccess, console: &Url) -> String {
             .flatten()
             .map(|state| state.platform_url)
     });
-    platform
+    let host = platform
         .as_deref()
         .and_then(|value| Url::parse(value).ok())
         .filter(|url| url.host_str().is_some())
         .map(|url| console_label(&url))
-        .unwrap_or_else(|| console_label(console))
+        .unwrap_or_else(|| console_label(console));
+    match &access.session_tenant {
+        Some(tenant) => format!("{host} · {}", crate::platform_client::tenant_label(tenant)),
+        None => host,
+    }
 }
 
 fn terminal_text(value: &str) -> String {
@@ -1149,7 +1183,7 @@ fn remote_name(session: &RemoteSession) -> &str {
 }
 
 /// The session name, or its global ID when the runtime recorded no name, so
-/// the row still names something `nono connect` accepts.
+/// the row still names something `nono remote connect` accepts.
 fn remote_display_name(session: &RemoteSession) -> &str {
     session
         .record
@@ -1258,18 +1292,13 @@ fn select_interactively(sessions: &[RemoteSession], host: &str) -> Result<Remote
 
 fn print_connect_target(session: &RemoteSession, host: &str) {
     let row = RemoteDisplayRow::from_session(session);
-    let theme = crate::theme::current();
-    eprintln!();
-    eprintln!(
-        "  {} {}",
-        crate::theme::fg("◆", theme.brand),
-        row.name.bold(),
-    );
-    let details = match row.metadata() {
-        Some(metadata) => format!("{metadata} · {host}"),
-        None => host.to_string(),
-    };
-    eprintln!("    {}", details.dimmed());
+    let mut text = summary_heading("Connecting to remote session", SummaryKind::Info);
+    text.push_str(&summary_row("Session", &row.name));
+    text.push_str(&summary_row("Platform", host));
+    if let Some(metadata) = row.metadata() {
+        text.push_str(&summary_row("Details", &metadata));
+    }
+    eprintln!("{text}");
 }
 
 fn clone_session(session: &RemoteSession) -> RemoteSession {
@@ -1452,7 +1481,7 @@ fn format_detach_sequence(sequence: &[u8]) -> String {
 
 async fn attach(
     mut url: Url,
-    token: ApiCredential,
+    token: Arc<ApiCredential>,
     detach_sequence: Vec<u8>,
 ) -> Result<AttachOutcome> {
     let (initial_cols, initial_rows) = terminal_size();
@@ -1971,13 +2000,39 @@ mod tests {
     #[test]
     fn remote_host_label_prefers_signed_in_platform() {
         let access = ConsoleAccess {
-            credential: ApiCredential::Bearer(Zeroizing::new("token".to_string())),
+            credential: Arc::new(ApiCredential::Bearer(Zeroizing::new("token".to_string()))),
             session_console: None,
             session_platform: Some("https://app.nolabs.dev".to_string()),
+            session_tenant: None,
         };
         let console = Url::parse("https://console.internal.example:8443").unwrap();
 
         assert_eq!(remote_host_label(&access, &console), "app.nolabs.dev");
+    }
+
+    #[test]
+    fn signed_in_platform_without_console_does_not_discover_from_enrollment() {
+        let access = ConsoleAccess {
+            credential: Arc::new(ApiCredential::Bearer(Zeroizing::new("token".into()))),
+            session_console: None,
+            session_platform: Some("https://platform.example.com".into()),
+            session_tenant: None,
+        };
+        for result in [
+            resolve_console(None, &access),
+            resolve_attach_url(
+                Some("wss://other.example.com/api/v1/sessions/x/terminal"),
+                None,
+                &access,
+            ),
+        ] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("remote sessions are not configured")
+            );
+        }
     }
 
     #[test]

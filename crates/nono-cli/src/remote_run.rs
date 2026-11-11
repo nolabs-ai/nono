@@ -1,6 +1,7 @@
 //! Persistent Runs API launch followed by the open remote-attach protocol.
 
 use std::io::{self, IsTerminal, Write};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nono::{NonoError, Result};
@@ -8,50 +9,13 @@ use serde::{Deserialize, de::DeserializeOwned};
 use url::Url;
 use zeroize::Zeroizing;
 
+use crate::output::{SummaryKind, summary_heading, summary_row};
 use crate::platform_oauth::ApiCredential;
 
-use crate::cli::{ConnectArgs, RunArgs};
+use crate::cli::{ConnectArgs, RemoteLaunchArgs};
 use crate::{connect_client, platform_client};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Reject explicitly supplied local options instead of silently ignoring policy.
-pub(crate) fn validate_matches(matches: &clap::ArgMatches) -> Result<()> {
-    let Some(("run", args)) = matches.subcommand() else {
-        return Ok(());
-    };
-    if !args.get_flag("remote") {
-        return Ok(());
-    }
-    for id in args.ids() {
-        if matches!(
-            args.value_source(id.as_str()),
-            Some(clap::parser::ValueSource::CommandLine | clap::parser::ValueSource::EnvVariable)
-        ) && !matches!(
-            id.as_str(),
-            "remote"
-                | "agent"
-                | "workspace"
-                | "platform_url"
-                | "console"
-                | "run_token_file"
-                | "connect_token_file"
-                | "detached"
-                | "command"
-                | "silent"
-                | "theme"
-                | "help"
-                | "RemoteRunArgs"
-                | "RunArgs"
-        ) {
-            return Err(NonoError::ActionRequired(format!(
-                "--remote does not accept local option '{}'; execution policy is selected by the server",
-                id.as_str().replace('_', "-")
-            )));
-        }
-    }
-    Ok(())
-}
 
 #[derive(Debug, Deserialize)]
 struct Workspace {
@@ -88,8 +52,8 @@ struct Failure {
     code: String,
 }
 
-pub(crate) fn run(args: RunArgs) -> Result<()> {
-    let options = &args.remote_options;
+pub(crate) fn run(args: RemoteLaunchArgs) -> Result<()> {
+    let options = &args;
     if options.workspace.is_none() && (!io::stdin().is_terminal() || !io::stderr().is_terminal()) {
         return Err(action(
             "--workspace is required without an interactive terminal",
@@ -114,15 +78,34 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
     if prompt.len() > 64 * 1024 {
         return Err(action("the initial instruction exceeds 64 KiB"));
     }
-    let agent = options
-        .agent
-        .as_deref()
-        .ok_or_else(|| action("--agent is required"))?;
-    // Run API credential: an explicit personal access token, else the
-    // `nono login` session for the organization NONO_TENANT names (or the
-    // active one).
+    let agent = &options.agent;
+    let connect_token_file = options
+        .connect_token_file
+        .clone()
+        .or_else(|| std::env::var_os("NONO_CONNECT_TOKEN_FILE").map(std::path::PathBuf::from));
+    let explicit_run =
+        options.run_token_file.is_some() || std::env::var_os("NONO_RUN_TOKEN").is_some();
+    let explicit_connect =
+        connect_token_file.is_some() || std::env::var_os("NONO_CONNECT_TOKEN").is_some();
+    let tenant = crate::platform_oauth::tenant_override(options.tenant.as_deref())?;
+    if tenant.is_some() && (explicit_run || explicit_connect) {
+        return Err(action(
+            "tenant selection requires `nono platform login`; explicit tokens already have their own scope",
+        ));
+    }
+    // Pin one refreshed tenant and credential through launch, polling and attach.
+    let session = if !explicit_run || !explicit_connect {
+        crate::platform_oauth::session_access(tenant.as_deref())?
+    } else {
+        None
+    };
+    if tenant.is_some() && session.is_none() {
+        return Err(action(
+            "tenant selection requires a platform sign-in; run `nono platform login`",
+        ));
+    }
     let (run_token, session_platform) = match options.run_token_file.as_deref() {
-        Some(path) => (connect_client::load_token(Some(path))?, None),
+        Some(path) => (Arc::new(connect_client::load_token(Some(path))?), None),
         None => match std::env::var("NONO_RUN_TOKEN") {
             Ok(value) => {
                 let token = Zeroizing::new(value);
@@ -134,17 +117,20 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
                         "NONO_RUN_TOKEN must be a nonempty bearer token without whitespace",
                     ));
                 }
-                (ApiCredential::Bearer(token), None)
+                (Arc::new(ApiCredential::Bearer(token)), None)
             }
-            Err(_) => match crate::platform_oauth::session_access()? {
-                Some(access) => (access.credential, Some(access.platform_url)),
+            Err(std::env::VarError::NotPresent) => match session.as_ref() {
+                Some(access) => (
+                    Arc::clone(&access.credential),
+                    Some(access.platform_url.clone()),
+                ),
                 None => {
                     return Err(action(
-                        "sign in with `nono login`, or set NONO_RUN_TOKEN or --run-token-file to a \
-                         personal access token with runs:create and runs:read",
+                        "sign in with `nono platform login`, or set NONO_RUN_TOKEN or --run-token-file to a personal access token with runs:create and runs:read",
                     ));
                 }
             },
+            Err(_) => return Err(action("NONO_RUN_TOKEN is not valid UTF-8")),
         },
     };
     let platform = match (options.platform_url.as_deref(), &session_platform) {
@@ -163,7 +149,7 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         (None, Some(signed_in)) => connect_client::validate_console_url(signed_in)?,
         (None, None) => {
             let state = platform_client::load_state()?.ok_or_else(|| {
-                action("remote launch requires `nono login`, platform enrollment or --platform-url")
+                action("remote launch requires `nono platform login`, platform enrollment or --platform-url")
             })?;
             connect_client::validate_console_url(&state.platform_url)?
         }
@@ -172,12 +158,26 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         .console
         .clone()
         .or_else(|| std::env::var("NONO_CONSOLE_URL").ok());
-    let connect_token_file = options
-        .connect_token_file
-        .clone()
-        .or_else(|| std::env::var_os("NONO_CONNECT_TOKEN_FILE").map(std::path::PathBuf::from));
-    let console_access = connect_client::console_access(connect_token_file.as_deref())?;
+    let console_access = connect_client::console_access_from_session(
+        connect_token_file.as_deref(),
+        if explicit_connect { None } else { session },
+    )?;
     let console = connect_client::resolve_console(console_override.as_deref(), &console_access)?;
+    let tenant_flag = console_access
+        .session_tenant
+        .as_ref()
+        .map(|tenant| {
+            let selector = if tenant.kind == "personal" {
+                "personal"
+            } else {
+                &tenant.slug
+            };
+            format!(
+                " {}",
+                crate::command_display::format_command_line(&["--tenant", &safe_label(selector)])
+            )
+        })
+        .unwrap_or_default();
     let workspaces: WorkspaceList =
         get(&console, "/api/v1/workspaces", &console_access.credential)?;
     let workspace = select_workspace(&workspaces.workspaces, options.workspace.as_deref())?;
@@ -188,12 +188,12 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         "workspace_id": workspace.id,
     });
     let idempotency_key = uuid::Uuid::now_v7().to_string();
-    eprintln!(
-        "Workspace: {} ({})",
-        safe_label(&workspace.name),
-        workspace.id
+    eprint!(
+        "{}{}{}",
+        summary_heading("Launching remote session", SummaryKind::Info),
+        summary_row("Workspace", &safe_label(&workspace.name)),
+        summary_row("Submission key", &idempotency_key)
     );
-    eprintln!("Submission key: {idempotency_key}");
     let endpoint = platform_client::endpoint_url(platform.as_str(), "/api/v1/runs")?;
     let endpoint_url =
         Url::parse(&endpoint).map_err(|_| action("could not construct the Runs endpoint"))?;
@@ -212,10 +212,27 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         .send(payload.to_string().as_bytes())
         .map_err(|_| action("Run submission could not be confirmed; check platform Runs before submitting again"))?;
     let accepted: AcceptedRun = decode(&mut response)?;
-    println!("Run: {}", accepted.run_id);
+    let mut summary = summary_heading("Remote session queued", SummaryKind::Success);
+    if let Some(tenant) = &console_access.session_tenant {
+        summary.push_str(&summary_row(
+            "Tenant",
+            &platform_client::tenant_label(tenant),
+        ));
+    }
+    summary.push_str(&summary_row("Workspace", &safe_label(&workspace.name)));
+    summary.push_str(&summary_row("Run", &accepted.run_id.to_string()));
+    summary.push_str(&summary_row(
+        "Attachment",
+        if args.detached {
+            "Detached"
+        } else {
+            "Waiting for session"
+        },
+    ));
+    println!("{summary}");
     if args.detached {
         eprintln!(
-            "Launch queued. Use `nono ps --remote` to find the session, then `nono connect <session-id>`."
+            "Launch queued. Use `nono remote list{tenant_flag}` to find the session, then `nono remote connect{tenant_flag} <session-id>`."
         );
         return Ok(());
     }
@@ -238,18 +255,23 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         }
         if let Some(session) = run.session {
             validate_session_id(&session.session_id)?;
-            println!("Session: {}", safe_label(&session.session_id));
-            return connect_client::run_connect(ConnectArgs {
-                target: Some(session.session_id),
-                console: Some(console.to_string()),
-                token_file: connect_token_file,
-                read_only: false,
-            });
+
+            return connect_client::run_connect_with_access(
+                ConnectArgs {
+                    target: Some(session.session_id),
+                    console: Some(console.to_string()),
+                    token_file: connect_token_file,
+                    read_only: false,
+                    help: None,
+                    tenant: options.tenant.clone(),
+                },
+                console_access,
+            );
         }
         std::thread::sleep(Duration::from_secs(1));
     }
     Err(action(&format!(
-        "Run {} is still queued; it has not been cancelled. Use `nono ps --remote` and connect when ready",
+        "Run {} is still queued; it has not been cancelled. Use `nono remote list{tenant_flag}` and connect when ready",
         accepted.run_id
     )))
 }
@@ -404,30 +426,32 @@ mod tests {
     }
 
     #[test]
-    fn remote_launch_rejects_local_policy_options() -> Result<()> {
+    fn remote_launch_rejects_local_policy_options() {
         for option in ["--allow-net", "--no-audit", "--rollback"] {
-            let matches = Cli::command()
-                .try_get_matches_from(["nono", "run", "--remote", "--agent", "claude", option])
-                .map_err(|error| action(&error.to_string()))?;
-            assert!(validate_matches(&matches).is_err());
+            assert!(
+                Cli::command()
+                    .try_get_matches_from(["nono", "remote", "run", "--agent", "claude", option])
+                    .is_err()
+            );
         }
-        for suffix in [vec![], vec!["initial prompt"], vec!["--detach"]] {
+        for suffix in [
+            vec![],
+            vec!["initial prompt"],
+            vec!["--detached"],
+            vec!["--tenant", "personal"],
+        ] {
             let mut args = vec![
                 "nono",
+                "remote",
                 "run",
-                "--remote",
                 "--agent",
                 "claude",
                 "--workspace",
                 "project",
             ];
             args.extend(suffix);
-            let matches = Cli::command()
-                .try_get_matches_from(args)
-                .map_err(|error| action(&error.to_string()))?;
-            validate_matches(&matches)?;
+            assert!(Cli::command().try_get_matches_from(args).is_ok());
         }
-        Ok(())
     }
 
     #[test]

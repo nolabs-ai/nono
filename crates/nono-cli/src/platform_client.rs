@@ -3,6 +3,9 @@
 use crate::cli::{
     PlatformArgs, PlatformCommands, PlatformEnrollArgs, PlatformStatusArgs, PlatformUnenrollArgs,
 };
+use crate::output::{SummaryKind, summary_heading, summary_row};
+use crate::platform_oauth::{client::Organization, session::SessionRecord};
+use crate::terminal_approval::sanitize_for_terminal as safe_text;
 use crate::trust_keystore::{self, TrustKeyRef};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
@@ -64,6 +67,13 @@ pub(crate) struct EnrollmentExchangeResponse {
 
 pub(crate) fn run_platform(args: PlatformArgs) -> Result<()> {
     match args.command {
+        PlatformCommands::Login(args) => crate::login_cmd::run_login(args),
+        PlatformCommands::Logout(args) => crate::login_cmd::run_logout(args),
+        PlatformCommands::Tenant(args) => crate::login_cmd::run_tenant(args),
+        PlatformCommands::ReEnroll(mut args) => {
+            args.re_enroll = true;
+            crate::login_cmd::run_login(args)
+        }
         PlatformCommands::Enroll(args) => enroll(args),
         PlatformCommands::Status(args) => status(args),
         PlatformCommands::Unenroll(args) => unenroll(args),
@@ -74,10 +84,9 @@ fn enroll(args: PlatformEnrollArgs) -> Result<()> {
     let platform_url = validate_platform_url(&args.url)?;
     let state_path = state_path()?;
     if state_path.exists() {
-        return Err(NonoError::ConfigParse(format!(
-            "platform enrollment already exists at {}; re-enrollment and key rotation are not implemented",
-            state_path.display()
-        )));
+        return Err(NonoError::ActionRequired(
+            "a local enrollment already exists; inspect it with `nono platform status` or remove it with `nono platform unenroll` before manual enrollment".into(),
+        ));
     }
 
     let key_ref = TrustKeyRef::parse(&args.keyref)?;
@@ -113,46 +122,193 @@ fn enroll(args: PlatformEnrollArgs) -> Result<()> {
         key_ref: args.keyref,
         enrolled_at: response.enrolled_at,
     };
-    write_json_secure(&state_path, &state)?;
-    println!("Enrolled for audit-only delivery.");
-    println!("  Tenant:  {}", state.tenant_id);
-    println!("  Subject: {}", state.subject_id);
-    println!("  Platform: {}", state.platform_url);
+    let stored = StoredEnrollment {
+        state,
+        login_user_id: None,
+        display_name: request.display_name.clone(),
+        tenant: None,
+        revoked: false,
+    };
+    write_json_secure(&state_path, &stored)?;
+    print!(
+        "{}",
+        enrollment_text_with_heading(
+            &stored,
+            if stored.state.subject_kind == "workload" {
+                "Workload enrolled"
+            } else {
+                "Device enrolled"
+            },
+            SummaryKind::Success,
+            None,
+        )
+    );
     Ok(())
 }
 
 fn status(args: PlatformStatusArgs) -> Result<()> {
-    let Some(state) = load_state()? else {
-        if args.json {
-            println!(r#"{{"enrolled":false}}"#);
-        } else {
-            println!("Not enrolled with a platform.");
-        }
-        return Ok(());
+    let context = crate::platform_oauth::session::load_record()?;
+    let stored = match &context {
+        Some(context) => load_for_session(context)?,
+        None => read_state(&state_path()?)?,
     };
     if args.json {
-        let output = serde_json::json!({
-            "enrolled": true,
-            "platform_url": state.platform_url,
-            "tenant_id": state.tenant_id,
-            "subject_id": state.subject_id,
-            "subject_kind": state.subject_kind,
-            "management_mode": state.management_mode,
-            "enrolled_at": state.enrolled_at,
-        });
+        let mut output = match &stored {
+            Some(stored) => serde_json::json!({
+                "enrolled": !stored.revoked,
+                "platform_url": stored.state.platform_url,
+                "tenant_id": stored.state.tenant_id,
+                "subject_id": stored.state.subject_id,
+                "subject_kind": stored.state.subject_kind,
+                "management_mode": stored.state.management_mode,
+                "enrolled_at": stored.state.enrolled_at,
+            }),
+            None => serde_json::json!({"enrolled": false}),
+        };
+        if let Some(context) = &context {
+            output["context"] = serde_json::json!({
+                "platform_url": context.platform_url,
+                "user_subject": context.user_subject,
+                "user_display": context.user_display,
+                "tenant_id": context.tenant_id,
+                "tenant_selection_pending": context.tenant_selection_pending,
+                "tenant": context.active_organization(),
+                "sign_in": "stored_locally",
+            });
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&output)
                 .map_err(|error| NonoError::ConfigParse(error.to_string()))?
         );
+    } else if let Some(context) = &context {
+        print!("{}", context_text(context, stored.as_ref()));
+    } else if let Some(stored) = &stored {
+        print!("{}", enrollment_text(stored));
     } else {
-        println!("Platform enrollment");
-        println!("  Platform: {}", state.platform_url);
-        println!("  Tenant:   {}", state.tenant_id);
-        println!("  Subject:  {} ({})", state.subject_id, state.subject_kind);
-        println!("  Mode:     {}", state.management_mode);
+        println!("Not enrolled with a platform.");
     }
     Ok(())
+}
+
+fn context_text(
+    context: &crate::platform_oauth::session::SessionRecord,
+    stored: Option<&StoredEnrollment>,
+) -> String {
+    let mut text = summary_heading("Platform", SummaryKind::Info);
+    text.push_str(&summary_row("User", &safe_text(&context.user_display)));
+    text.push_str(&summary_row("URL", &safe_text(&context.platform_url)));
+    let tenant = if context.tenant_selection_pending {
+        "Not selected".into()
+    } else {
+        context
+            .active_organization()
+            .map(tenant_label)
+            .unwrap_or_else(|| "Not selected".into())
+    };
+    text.push_str(&summary_row("Current tenant", &tenant));
+    text.push_str(&summary_row("CLI sign-in", "Stored locally"));
+    if let Some(stored) = stored {
+        text.push_str(&summary_row(
+            "Enrollment",
+            if stored.revoked {
+                "Revoked"
+            } else {
+                "Registered locally"
+            },
+        ));
+        text.push_str(&summary_row(
+            "Audit delivery",
+            if stored.revoked {
+                "Unavailable: enrollment revoked"
+            } else {
+                "Automatic when sessions finish"
+            },
+        ));
+        text.push_str(&enrollment_details(stored));
+    } else {
+        text.push_str(&summary_row("Enrollment", "Not enrolled"));
+        text.push_str(&summary_row("Audit delivery", "Local only"));
+    }
+    text.push('\n');
+    text
+}
+
+pub(crate) fn tenant_label(tenant: &Organization) -> String {
+    let name = safe_text(&tenant.display_name);
+    if tenant.kind == "personal" {
+        format!("{name} (personal)")
+    } else if tenant.display_name == tenant.slug {
+        format!("{name} (organization)")
+    } else {
+        format!("{name} ({})", safe_text(&tenant.slug))
+    }
+}
+
+fn enrollment_text(stored: &StoredEnrollment) -> String {
+    enrollment_text_with_heading(stored, "Platform", SummaryKind::Info, Some("Not signed in"))
+}
+
+fn enrollment_text_with_heading(
+    stored: &StoredEnrollment,
+    title: &str,
+    kind: SummaryKind,
+    sign_in: Option<&str>,
+) -> String {
+    let state = &stored.state;
+    let tenant = stored
+        .tenant
+        .as_ref()
+        .filter(|tenant| tenant.tenant_id == state.tenant_id)
+        .map(tenant_label)
+        .unwrap_or_else(|| "Name not recorded (see --json)".into());
+    let enrollment = if stored.revoked {
+        "Revoked"
+    } else {
+        "Registered locally"
+    };
+    let delivery = if stored.revoked {
+        "Unavailable: enrollment revoked"
+    } else {
+        "Automatic when sessions finish"
+    };
+    let mut text = summary_heading(title, kind);
+    text.push_str(&summary_row("URL", &safe_text(&state.platform_url)));
+    text.push_str(&summary_row("Audit tenant", &tenant));
+    if let Some(sign_in) = sign_in {
+        text.push_str(&summary_row("CLI sign-in", sign_in));
+    }
+    text.push_str(&summary_row("Enrollment", enrollment));
+    text.push_str(&summary_row("Audit delivery", delivery));
+    text.push_str(&enrollment_details(stored));
+    text.push('\n');
+    text
+}
+
+fn enrollment_details(stored: &StoredEnrollment) -> String {
+    let name = stored
+        .display_name
+        .as_deref()
+        .map(safe_text)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "Name not recorded".into());
+    let kind = if stored.state.subject_kind == "workload" {
+        "Workload"
+    } else {
+        "Device"
+    };
+    let enrolled = chrono::DateTime::parse_from_rfc3339(&stored.state.enrolled_at)
+        .map(|date| {
+            date.with_timezone(&chrono::Utc)
+                .format("%d %b %Y, %H:%M UTC")
+                .to_string()
+        })
+        .unwrap_or_else(|_| "Not recorded".into());
+    format!(
+        "{}{}",
+        summary_row(kind, &name),
+        summary_row("Enrolled", &enrolled)
+    )
 }
 
 /// Remove the local enrollment. Local-only by design: the platform-side
@@ -197,22 +353,25 @@ fn unenroll(args: PlatformUnenrollArgs) -> Result<()> {
             source,
         })?;
     }
-    println!("Unenrolled from {}.", state.platform_url);
-    println!(
-        "  Subject {} stays registered with tenant {} until an operator revokes it.",
-        state.subject_id, state.tenant_id
-    );
-    if args.delete_key {
-        println!("  Local signing key deleted; the next enrollment mints a new one.");
-    } else {
-        println!("  Local signing key kept; pass --delete-key to remove it.");
-    }
+    let mut text = summary_heading("Device unenrolled locally", SummaryKind::Success);
+    text.push_str(&summary_row("Platform", &safe_text(&state.platform_url)));
+    text.push_str(&summary_row("Platform record", "Unchanged"));
+    text.push_str(&summary_row(
+        "Signing key",
+        if args.delete_key {
+            "Deleted locally"
+        } else {
+            "Retained locally"
+        },
+    ));
     if queued > 0 {
-        println!(
-            "  {queued} audit session(s) remain queued and will be delivered after the next \
-             enrollment; evidence remains bound to its original identity."
-        );
+        text.push_str(&summary_row("Pending uploads", &queued.to_string()));
+        text.push_str(&summary_row(
+            "Audit history",
+            "Evidence retains its original identity",
+        ));
     }
+    println!("{text}");
     Ok(())
 }
 
@@ -260,6 +419,12 @@ struct StoredEnrollment {
     state: PlatformState,
     #[serde(default)]
     login_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant: Option<Organization>,
+    #[serde(default)]
+    revoked: bool,
 }
 
 pub(crate) fn enrollment_scope_id(platform: &str, tenant: &str, user: &str) -> Result<String> {
@@ -302,11 +467,22 @@ fn read_state(path: &Path) -> Result<Option<StoredEnrollment>> {
     Ok(Some(stored))
 }
 
-pub(crate) fn save_login_enrollment(state: PlatformState, user: &str) -> Result<()> {
-    let path = scoped_state_path(&state.platform_url, &state.tenant_id, user)?;
+pub(crate) fn save_login_enrollment(
+    state: PlatformState,
+    session: &SessionRecord,
+    display_name: &str,
+) -> Result<()> {
+    let path = scoped_state_path(&state.platform_url, &state.tenant_id, &session.user_subject)?;
     let stored = StoredEnrollment {
+        tenant: session
+            .organizations
+            .iter()
+            .find(|tenant| tenant.tenant_id == state.tenant_id)
+            .cloned(),
         state,
-        login_user_id: Some(user.to_string()),
+        login_user_id: Some(session.user_subject.clone()),
+        display_name: Some(display_name.to_string()),
+        revoked: false,
     };
     write_json_secure(&path, &stored)?;
     write_json_secure(&state_path()?, &stored)
@@ -343,25 +519,74 @@ pub(crate) fn activate_login_enrollment(
 }
 
 pub(crate) fn load_state() -> Result<Option<PlatformState>> {
-    if let Some(session) = crate::platform_oauth::session::load_record()? {
-        if session.tenant_selection_pending {
-            return Ok(None);
-        }
-        if let Some(stored) = selected_enrollment(&session)? {
-            return Ok(Some(stored.state));
-        }
-        return Ok(read_state(&state_path()?)?
-            .filter(|stored| {
-                stored.state.platform_url == session.platform_url
-                    && stored.state.tenant_id == session.tenant_id
-                    && stored
-                        .login_user_id
-                        .as_deref()
-                        .is_none_or(|user| user == session.user_subject)
-            })
-            .map(|stored| stored.state));
+    Ok(load_enrollment()?.map(|stored| stored.state))
+}
+
+pub(crate) fn load_active_state() -> Result<Option<PlatformState>> {
+    Ok(load_enrollment()?
+        .filter(|stored| !stored.revoked)
+        .map(|stored| stored.state))
+}
+
+pub(crate) fn enrollment_revoked() -> Result<bool> {
+    Ok(load_enrollment()?.is_some_and(|stored| stored.revoked))
+}
+
+pub(crate) fn mark_revoked(state: &PlatformState) -> Result<()> {
+    let Some(mut stored) = load_enrollment()? else {
+        return Ok(());
+    };
+    if stored.state.subject_id != state.subject_id {
+        return Ok(());
     }
-    Ok(read_state(&state_path()?)?.map(|stored| stored.state))
+    stored.revoked = true;
+    if let Some(user) = &stored.login_user_id {
+        write_json_secure(
+            &scoped_state_path(&state.platform_url, &state.tenant_id, user)?,
+            &stored,
+        )?;
+    }
+    write_json_secure(&state_path()?, &stored)
+}
+
+fn with_tenant_label(mut stored: StoredEnrollment, session: &SessionRecord) -> StoredEnrollment {
+    stored.tenant = session
+        .organizations
+        .iter()
+        .find(|tenant| tenant.tenant_id == stored.state.tenant_id)
+        .cloned()
+        .or(stored.tenant);
+    stored
+}
+
+fn load_enrollment() -> Result<Option<StoredEnrollment>> {
+    if let Some(session) = crate::platform_oauth::session::load_record()? {
+        return load_for_session(&session);
+    }
+    read_state(&state_path()?)
+}
+
+pub(crate) fn enrollment_for_login(session: &SessionRecord) -> Result<Option<PlatformState>> {
+    Ok(load_for_session(session)?.map(|stored| stored.state))
+}
+
+fn load_for_session(session: &SessionRecord) -> Result<Option<StoredEnrollment>> {
+    if session.tenant_selection_pending {
+        return Ok(None);
+    }
+    if let Some(stored) = selected_enrollment(session)? {
+        return Ok(Some(with_tenant_label(stored, session)));
+    }
+    Ok(read_state(&state_path()?)?
+        .filter(|stored| {
+            stored.state.platform_url == session.platform_url
+                && stored.state.tenant_id == session.tenant_id
+                && stored
+                    .login_user_id
+                    .as_deref()
+                    .is_none_or(|user| user == session.user_subject)
+        })
+        .map(|stored| with_tenant_label(stored, session)))
 }
 
 pub(crate) fn load_signing_key(state: &PlatformState) -> Result<EcdsaKeyPair> {
@@ -683,7 +908,11 @@ mod tests {
             key_ref: "keystore://fixture".into(),
             enrolled_at: "2026-11-10T00:00:00Z".into(),
         };
-        save_login_enrollment(first.clone(), "u").unwrap();
+        save_login_enrollment(first.clone(), &login, "Laptop").unwrap();
+        mark_revoked(&first).unwrap();
+        assert!(enrollment_revoked().unwrap());
+        assert!(load_active_state().unwrap().is_none());
+        assert_eq!(load_state().unwrap().unwrap().subject_id, "device-one");
         login.tenant_id = "t-2".into();
         session::save_record(&lock, &login).unwrap();
         assert!(load_state().unwrap().is_none());
@@ -692,10 +921,12 @@ mod tests {
             subject_id: "device-two".into(),
             ..first.clone()
         };
-        save_login_enrollment(second, "u").unwrap();
+        save_login_enrollment(second, &login, "Laptop").unwrap();
+        assert!(!enrollment_revoked().unwrap());
         login.tenant_id = "t-1".into();
         session::save_record(&lock, &login).unwrap();
         assert_eq!(load_state().unwrap().unwrap().subject_id, "device-one");
+        assert!(enrollment_revoked().unwrap());
         login.user_subject = "another-user".into();
         session::save_record(&lock, &login).unwrap();
         assert!(load_state().unwrap().is_none());

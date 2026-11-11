@@ -141,6 +141,18 @@ mod tests {
     }
 
     #[test]
+    fn platform_and_remote_groups_are_completed() -> TestResult<()> {
+        let output = generate_to_string(CompletionShell::Bash)?;
+        for command in ["platform", "tenant", "re-enroll", "remote", "connect"] {
+            assert!(output.contains(command), "missing completion: {command}");
+        }
+        assert!(output.contains("nono__subcmd__platform__subcmd__tenant__subcmd__use"));
+        assert!(output.contains("nono__subcmd__remote__subcmd__run"));
+        assert!(!output.contains("nono__subcmd__login)"));
+        Ok(())
+    }
+
+    #[test]
     fn test_completion_write_errors_are_returned() {
         struct FailingWriter;
 

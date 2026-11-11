@@ -1,16 +1,16 @@
 # Remote Run launch prototype (v1)
 
-`nono run --remote --agent claude` selects a ready workspace and starts an
+`nono remote run --agent claude` selects a ready workspace and starts an
 interactive session. An optional quoted argument supplies the initial prompt.
 Both forms request persistent execution. Local sandbox flags are rejected;
 the server selects the agent command, policy, credentials, and network grants.
 
 ```sh
-nono run --remote --agent claude --workspace my-project
-nono run --remote --agent claude --workspace my-project "Investigate the failing tests"
-nono run --remote --agent claude --workspace my-project --detach
-nono ps --remote
-nono connect <session-id>
+nono remote run --agent claude --workspace my-project
+nono remote run --agent claude --workspace my-project "Investigate the failing tests"
+nono remote run --agent claude --workspace my-project --detach
+nono remote list
+nono remote connect <session-id>
 ```
 
 The prototype requires a Run API personal access token with `runs:create` and

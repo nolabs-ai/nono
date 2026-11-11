@@ -16,6 +16,23 @@ pub(crate) fn load_or_create(
     load_or_create_in(&dir)
 }
 
+pub(crate) fn replacement(
+    issuer: &str,
+    tenant: &str,
+    user: &str,
+    subject: &str,
+) -> Result<(String, EcdsaKeyPair)> {
+    let subject = uuid::Uuid::parse_str(subject)
+        .map_err(|_| NonoError::ConfigParse("invalid registration to replace".into()))?;
+    let scope = crate::platform_client::enrollment_scope_id(issuer, tenant, user)?;
+    let dir = crate::state_paths::user_state_dir()?
+        .join("platform-device-keys")
+        .join(scope)
+        .join("replacements")
+        .join(subject.to_string());
+    load_or_create_in(&dir)
+}
+
 fn load_or_create_in(dir: &Path) -> Result<(String, EcdsaKeyPair)> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()

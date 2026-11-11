@@ -1,10 +1,12 @@
 //! Durable final-session audit delivery for audit-only platform enrollment.
 
 use crate::cli::{AuditStatusArgs, AuditSyncArgs};
+use crate::output::{SummaryKind, summary_heading, summary_row};
 use crate::platform_client::{
     PlatformState, REQUEST_PROTOCOL_V1, endpoint_url, http_agent, load_state, sign_request_v1,
     write_json_secure,
 };
+use crate::theme::{self, fg};
 use nono::audit::{
     AUDIT_EVENTS_FILENAME, canonical_session_digest_payload, compute_session_digest,
     verify_audit_log,
@@ -156,7 +158,7 @@ struct SyncSummary {
 pub(crate) fn capture_enrollment(session_dir: &Path) -> Result<()> {
     write_json_secure(
         &session_dir.join("platform-audit-origin.json"),
-        &load_state()?,
+        &crate::platform_client::load_active_state()?,
     )
 }
 
@@ -210,11 +212,22 @@ pub(crate) fn run_sync(args: AuditSyncArgs) -> Result<()> {
             serde_json::to_string_pretty(&summary)
                 .map_err(|error| NonoError::ConfigParse(error.to_string()))?
         );
+    } else if summary.attempted == 0 && summary.failures.is_empty() {
+        println!("No pending audit uploads.");
     } else {
-        println!(
-            "Audit sync: {} delivered, {} remaining ({} attempted)",
-            summary.delivered, summary.remaining, summary.attempted
-        );
+        let kind = if summary.failures.is_empty() {
+            SummaryKind::Success
+        } else {
+            SummaryKind::Attention
+        };
+        let mut text = summary_heading("Audit sync", kind);
+        text.push_str(&summary_row("Delivered", &summary.delivered.to_string()));
+        text.push_str(&summary_row(
+            "Pending uploads",
+            &summary.remaining.to_string(),
+        ));
+        text.push_str(&summary_row("Attempted", &summary.attempted.to_string()));
+        println!("{text}");
         for failure in &summary.failures {
             eprintln!("  {failure}");
         }
@@ -253,7 +266,8 @@ fn queued_origin<'a>(
 }
 
 pub(crate) fn run_status(args: AuditStatusArgs) -> Result<()> {
-    let enrolled = load_state()?.is_some();
+    let revoked = crate::platform_client::enrollment_revoked()?;
+    let enrolled = load_state()?.is_some() && !revoked;
     let queued = queued_paths()?.len();
     if args.json {
         println!(
@@ -265,9 +279,41 @@ pub(crate) fn run_status(args: AuditStatusArgs) -> Result<()> {
             .map_err(|error| NonoError::ConfigParse(error.to_string()))?
         );
     } else {
-        println!("Audit delivery");
-        println!("  Enrolled: {}", if enrolled { "yes" } else { "no" });
-        println!("  Queued:   {queued}");
+        let t = theme::current();
+        print!("{}", summary_heading("Audit delivery", SummaryKind::Info));
+        print!(
+            "{}",
+            summary_row(
+                "Enrollment",
+                if revoked {
+                    "Revoked"
+                } else if enrolled {
+                    "Registered locally"
+                } else {
+                    "Not recorded"
+                }
+            )
+        );
+        if enrolled {
+            print!(
+                "{}",
+                summary_row("Delivery", "Automatic when sessions finish")
+            );
+        }
+        println!(
+            "{}",
+            summary_row(
+                "Pending uploads",
+                &format!(
+                    "{} {}",
+                    fg(
+                        &queued.to_string(),
+                        if queued > 0 { t.yellow } else { t.text }
+                    ),
+                    fg("(all local queues)", t.subtext)
+                )
+            )
+        );
     }
     Ok(())
 }

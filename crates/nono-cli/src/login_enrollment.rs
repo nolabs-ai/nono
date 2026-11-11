@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const ENROLLMENT_PATH: &str = "/api/v1/auth/oauth/enroll";
 pub(crate) const ENROLLMENT_SCOPE: &str = "nono:enroll";
+pub(crate) const REENROLLMENT_SCOPE: &str = "nono:reenroll";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +18,8 @@ pub(crate) struct EnrollmentIntent {
     pub display_name: String,
     pub timestamp_ms: i64,
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_subject_id: Option<String>,
 }
 
 impl EnrollmentIntent {
@@ -54,6 +57,15 @@ mod tests {
         assert_eq!(
             intent.signing_bytes().expect("canonical"),
             fixture["canonical"].as_str().expect("bytes").as_bytes()
+        );
+        let replacement: EnrollmentIntent =
+            serde_json::from_value(fixture["replacement_intent"].clone()).expect("replacement");
+        assert_eq!(
+            replacement.signing_bytes().expect("canonical"),
+            fixture["replacement_canonical"]
+                .as_str()
+                .expect("bytes")
+                .as_bytes()
         );
     }
 }

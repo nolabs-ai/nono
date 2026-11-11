@@ -323,6 +323,11 @@ pub(crate) enum TokenOutcome {
     Error(OAuthError),
 }
 
+pub(crate) enum EnrollmentOutcome {
+    Enrolled(crate::platform_client::EnrollmentExchangeResponse),
+    Error(OAuthError),
+}
+
 /// A pending RFC 8628 device authorization.
 pub(crate) struct DeviceAuthorization {
     pub(crate) device_code: Zeroizing<String>,
@@ -436,7 +441,7 @@ impl<'a> OAuthClient<'a> {
             .clone()
             .ok_or_else(|| {
                 NonoError::ActionRequired(
-                    "the platform does not support device-code sign-in; run `nono login --browser` \
+                    "the platform does not support device-code sign-in; run `nono platform login --browser` \
                      on a machine with a browser"
                         .to_string(),
                 )
@@ -499,7 +504,7 @@ impl<'a> OAuthClient<'a> {
     pub(crate) fn enroll(
         &mut self,
         request: &crate::login_enrollment::LoginEnrollmentRequest,
-    ) -> Result<crate::platform_client::EnrollmentExchangeResponse> {
+    ) -> Result<EnrollmentOutcome> {
         let endpoint = self.server.enrollment_endpoint.clone().ok_or_else(|| {
             NonoError::ActionRequired(
                 "this platform does not support enrollment during login".into(),
@@ -511,14 +516,16 @@ impl<'a> OAuthClient<'a> {
         );
         let response = self.post_body(&endpoint, "application/json", &body)?;
         if response.status != 200 {
-            let message = parse_oauth_error(&response.body)
-                .map(|error| error.to_string())
-                .unwrap_or_else(|_| format!("HTTP {}", response.status));
-            return Err(NonoError::ActionRequired(format!(
-                "device enrollment failed: {message}"
-            )));
+            return match parse_oauth_error(&response.body) {
+                Ok(error) => Ok(EnrollmentOutcome::Error(error)),
+                Err(_) => Err(NonoError::ActionRequired(format!(
+                    "device enrollment returned HTTP {}",
+                    response.status
+                ))),
+            };
         }
         serde_json::from_str(&response.body)
+            .map(EnrollmentOutcome::Enrolled)
             .map_err(|_| NonoError::ConfigParse("invalid enrollment response".into()))
     }
 

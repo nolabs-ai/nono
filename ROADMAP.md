@@ -38,8 +38,8 @@ _Approved; implementation may proceed._
 
 _Under active authoring; not yet ready for a decision._
 
-- **[NEP-0009: Account sign-in from the CLI (`nono login`)](neps/0009-cli-login.md)** — _Breaking_
-  Add `nono login`, which signs a person in to a nono platform from the terminal.
+- **[NEP-0009: Account sign-in from the CLI (`nono platform login`)](neps/0009-cli-login.md)** — _Breaking_
+  Add `nono platform login`, which signs a person in to a nono platform from the terminal.
 - **[NEP-0007: Supervisor decisions, audit and credentials outside a microVM guest](neps/0007-remote-supervisor-decisions-over-vsock.md)** — _Breaking: not yet assessed_
   Let nono split its supervisor across a virtual-machine boundary.
 - **[NEP-0008: Session flight recorder](neps/0008-session-flight-recorder.md)** — _Breaking: not yet assessed_

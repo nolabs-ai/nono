@@ -86,6 +86,7 @@ mod startup_runtime;
 mod state_paths;
 mod supervised_runtime;
 mod temp_keepalive;
+mod tenant_selector;
 mod terminal_approval;
 mod terminal_capture;
 mod terminal_prompt;
@@ -144,9 +145,6 @@ fn main() {
     let command_blocking_warnings = collect_cli_warnings(&cli);
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
-    #[cfg(unix)]
-    let cli_result = remote_run::validate_matches(&matches).and_then(|()| run_cli(cli));
-    #[cfg(not(unix))]
     let cli_result = run_cli(cli);
     tool_sandbox::log_main_total();
     #[cfg(unix)]

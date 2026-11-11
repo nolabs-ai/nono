@@ -3322,7 +3322,7 @@ mod tests {
             nonzero_screen_dimension(30),
             30,
         );
-        parser.process(b"$ nono connect\r\nconnected\r\ndetach keys\r\n");
+        parser.process(b"$ nono remote connect\r\nconnected\r\ndetach keys\r\n");
         // Reproduce a saved cursor above the connection banner. Restoring only
         // the alternate buffer would put the next prompt over that banner.
         parser.process(b"\x1b[H");
@@ -3334,7 +3334,7 @@ mod tests {
         parser.process(b"Detached\r\n$ ");
         assert_eq!(parser.screen().contents(), "Detached\n$ ");
         parser.screen_mut().set_scrollback(6);
-        assert!(parser.screen().contents().contains("$ nono connect"));
+        assert!(parser.screen().contents().contains("$ nono remote connect"));
         assert!(parser.screen().contents().contains("connected"));
         assert!(parser.screen().contents().contains("detach keys"));
     }

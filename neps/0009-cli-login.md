@@ -1,6 +1,6 @@
 ---
 nep: 0009
-title: Account sign-in from the CLI (`nono login`)
+title: Account sign-in from the CLI (`nono platform login`)
 authors:
   - lukehinds
 status: draft
@@ -9,20 +9,20 @@ breaking: true
 superseded-by:
 ---
 
-# NEP-0009: Account sign-in from the CLI (`nono login`)
+# NEP-0009: Account sign-in from the CLI (`nono platform login`)
 
 ## Summary
 
-Add `nono login`, which signs a person in to a nono platform from the
+Add `nono platform login`, which signs a person in to a nono platform from the
 terminal. The browser opens the platform's sign-in page, the person signs in
 with GitHub or Google, and a first sign-in creates their account through the
 platform's normal onboarding. The CLI then holds a revocable session that lets
 it use the platform on that person's behalf: launch remote runs
-(`nono run --remote`), list remote sessions (`nono ps --remote`) and attach to
-them (`nono connect`), in their personal account or in any organization they
+(`nono remote run`), list remote sessions (`nono remote list`) and attach to
+them (`nono remote connect`), in their personal account or in any organization they
 belong to.
 
-`nono login` signs in a person and automatically enrolls a separate device
+`nono platform login` signs in a person and automatically enrolls a separate device
 identity unless `--no-enroll` is supplied. The coordinated extension is described
 in [login-enrollment-v1](../docs/protocols/login-enrollment-v1.md). Manual enrollment
 remains available through `nono platform enroll`.
@@ -36,8 +36,8 @@ DPoP ([RFC 9449]).
 ## Implementation status
 
 Implemented in `nono-cli` by PR #2250, pending acceptance of this NEP:
-`nono login` (browser and device-code flows, `--tenant`), `nono logout`, session
-use by `nono run --remote`, `nono ps --remote` and `nono connect`, the
+`nono platform login` (browser and device-code flows, `--tenant`), `nono platform logout`, session
+use by `nono remote run`, `nono remote list` and `nono remote connect`, the
 `cli-login-v1` protocol document and conformance fixtures. Open questions
 below remain open.
 
@@ -47,26 +47,26 @@ Today a person who wants to use a hosted nono platform from the terminal must:
 
 1. sign in to the platform in a browser;
 2. mint a Run API personal access token and export it as `NONO_RUN_TOKEN` for
-   `nono run --remote`;
+   `nono remote run`;
 3. enroll the machine with a single-use enrollment token
-   (`nono platform enroll --url … --token …`), because `nono connect` and
-   `nono ps --remote` find the console through a request signed by an enrolled
+   (`nono platform enroll --url … --token …`), because `nono remote connect` and
+   `nono remote list` find the console through a request signed by an enrolled
    device;
 4. complete a second, bespoke browser approval (remote-attach-v1) the first
    time they connect.
 
 That is three credentials and two browser trips before anything works, and it
 ties remote use to device enrollment, which exists for audit delivery. People
-expect `nono login`, as with `gh auth login` or `gcloud auth login`: sign in
+expect `nono platform login`, as with `gh auth login` or `gcloud auth login`: sign in
 once, and the CLI can act as them.
 
 ### Goals
 
-- `nono login` takes a person with no account to "signed in, account created"
+- `nono platform login` takes a person with no account to "signed in, account created"
   in one browser sign-in, using the platform's existing GitHub and Google
   sign-in and onboarding.
-- After `nono login`, `nono run --remote`, `nono ps --remote` and
-  `nono connect` work with no other credential, token file or enrollment.
+- After `nono platform login`, `nono remote run`, `nono remote list` and
+  `nono remote connect` work with no other credential, token file or enrollment.
 - A signed-in person can work in their personal account or any organization
   they are a member of, including ones they join later by invitation, and
   switch between them from the CLI.
@@ -74,7 +74,7 @@ once, and the CLI can act as them.
   platform administrators.
 - No dependency on the operating-system keyring: sign-in works over SSH and in
   containers.
-- `nono logout` revokes the session.
+- `nono platform logout` revokes the session.
 
 ### Non-Goals
 
@@ -92,12 +92,17 @@ once, and the CLI can act as them.
 ### CLI surface (`nono-cli` only)
 
 ```text
-nono login   [--url <origin>] [--tenant <name>] [--no-enroll] [--browser | --device-code] [--no-open]
-nono logout
-```
+nono platform login   [--url <origin>] [--tenant <name>] [--no-enroll] [--browser | --device-code] [--no-open]
+nono platform logout
+nono platform tenant list [--json]
+nono platform tenant use <tenant> [--no-enroll]
+nono platform re-enroll [--tenant <tenant>]
+nono remote run --agent <agent> [--workspace <workspace>] [--tenant <tenant>] [--detached] [prompt]
+nono remote list [--tenant <tenant>] [--all] [--json]
+nono remote connect [session] [--tenant <tenant>]\```
 
-The CLI adds these two commands and nothing else. It is not a platform
-administration CLI: organizations, members, invitations and workspaces are
+The CLI groups sign-in, tenant selection and enrollment under `platform`, and
+remote session operations under `remote`. Tenant administration remains in the web console: organizations, members, invitations and workspaces are
 managed in the platform's web console.
 
 - `--url` is the platform origin, validated like `platform enroll --url`. It
@@ -108,18 +113,24 @@ managed in the platform's web console.
 - Over SSH (`SSH_CONNECTION`/`SSH_TTY`), with no display, or when the loopback
   listener cannot bind, the CLI uses the device-code flow.
 - After authentication, the CLI selects the only accessible tenant or displays
-  a terminal picker shared with `nono connect`. `--tenant personal` selects the
+  a terminal picker shared with `nono remote connect`. `--tenant personal` selects the
   personal tenant.
-  `nono login --tenant <name>` makes another one active; on a signed-in machine it
+  `nono platform tenant use <name>` makes another one active; on a signed-in machine it
   does so without a browser, after the platform confirms membership.
-- `nono login` on a signed-in machine reports who is signed in, lists the
-  person's tenants with the active one marked, and ensures device enrollment
-  unless `--no-enroll` is given. This is the
-  CLI's only organization listing.
-- The `NONO_TENANT` environment variable names an organization for one command
-  (`NONO_TENANT=acme nono ps --remote`) without changing the active one.
-  `nono run --remote`, `nono ps --remote` and `nono connect` take no
-  organization flag.
+- `nono platform login` on a signed-in machine confirms the saved context and ensures
+  device enrollment unless `--no-enroll` or `NONO_NO_ENROLL=true` is set.
+  The summary uses **User**, **Current tenant**, and **Enrollment** separately.
+- Remote commands (`nono remote run`, `nono remote list`, `nono remote connect`)
+  resolve `--tenant` before `NONO_TENANT`, then the saved tenant. Overrides last
+  one command, do not change local audit enrollment, and cannot change the scope
+  of explicitly supplied API tokens. An unfinished default selection uses the
+  shared tenant picker and persists the choice without creating an enrollment.
+- A remote launch pins one resolved tenant and access token through workspace
+  selection, submission, polling and attachment. The human CLI context owns
+  remote selection; enrolled-device discovery remains a legacy fallback only.
+
+See [platform identity and tenant context](../docs/platform-context.md) for
+terminology, workflows, opt-outs and status semantics.
 
 ### Sign-in
 
@@ -171,22 +182,22 @@ DPoP key recorded when the device authorization starts.
   invitation is usable immediately, and a removed membership stops working at
   the next refresh. The response carries a fresh `nono_session` member, which
   keeps the CLI's organization list current.
-- The access token is accepted by nono-console (`nono connect`,
-  `nono ps --remote`) and by the platform Runs API (`nono run --remote`).
+- The access token is accepted by nono-console (`nono remote connect`,
+  `nono remote list`) and by the platform Runs API (`nono remote run`).
   Requests present it as `Authorization: DPoP <token>` with a proof.
   Permissions are the person's role permissions in that organization, as for
   their browser session.
 - Access tokens live five minutes and are never stored. Refresh tokens rotate
   on every use; reuse of a rotated one revokes the session.
-- `nono logout` revokes the refresh token ([RFC 7009]) and deletes the local
+- `nono platform logout` revokes the refresh token ([RFC 7009]) and deletes the local
   session even if revocation fails.
 
 ### Relationship to existing credentials
 
 - Explicit credentials keep precedence: `NONO_RUN_TOKEN`, `--run-token-file`,
   `NONO_CONNECT_TOKEN` and `--token-file` behave as today.
-- A device-enrolled machine without a `nono login` session keeps using
-  remote-attach-v1 for `nono connect`. Deprecating that flow is a follow-up.
+- A device-enrolled machine without a `nono platform login` session keeps using
+  remote-attach-v1 for `nono remote connect`. Deprecating that flow is a follow-up.
 - Manual token enrollment is retained. Login enrollment and fixed audit provenance
   are specified in `login-enrollment-v1`.
 
@@ -220,7 +231,7 @@ issuing and holding human credentials.
   `gh` or `gcloud` file storage; DPoP still prevents replay of a token
   captured in transit, in logs, or by a server. Secrets are held in
   `Zeroizing` types and never logged.
-- **Sandboxed agents.** `nono login` (including `--tenant`) and `nono logout`
+- **Sandboxed agents.** `nono platform login` (including `--tenant`) and `nono platform logout`
   refuse to run inside a nono sandbox. Remote commands launched by an agent
   inside a sandbox cannot use the session, because they cannot read it.
 - **Organization scoping.** The organization comes from the person's
@@ -250,16 +261,16 @@ issuing and holding human credentials.
   where the CLI is often used. A keyring backend can be added later as an
   option.
 - **Fix the organization at login.** Simpler, but members of several
-  organizations would sign in repeatedly. `nono login --tenant` keeps the
+  organizations would sign in repeatedly. `nono platform tenant use` keeps the
   organization a sign-in setting while switching through a token refresh
   instead of a new sign-in.
 - **A `nono org list` / `nono org switch` command group.** Rejected to keep
-  the CLI from growing platform-administration commands; `nono login` already
-  lists organizations and `--tenant` switches.
+  the CLI from growing platform-administration commands; `nono platform login` reports
+  the current context and `--tenant` switches.
 - **Organization-free tokens.** A token covering every organization, with
   the platform inferring the organization from each request, would remove the
   concept from the CLI entirely. Rejected: the console and its row-level
-  security are scoped to one organization, `ps --remote` would need a listing
+  security are scoped to one organization, `remote list` would need a listing
   that spans organizations, a workspace name can exist in several
   organizations, and membership would be checked per request instead of per
   token.

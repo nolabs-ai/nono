@@ -1,4 +1,4 @@
-//! Local storage for a `nono login` session.
+//! Local storage for a `nono platform login` session.
 //!
 //! Three owner-only files in nono's state directory (`$XDG_STATE_HOME/nono`):
 //!
@@ -71,7 +71,7 @@ impl SessionRecord {
                 .iter()
                 .find(|tenant| tenant.kind == "personal")
                 .ok_or_else(|| {
-                    NonoError::ActionRequired("this account has no personal tenant".into())
+                    NonoError::ActionRequired("this user has no personal tenant".into())
                 });
         }
         if let Some(org) = self
@@ -88,11 +88,11 @@ impl SessionRecord {
         match (matches.next(), matches.next()) {
             (Some(org), None) => Ok(org),
             (Some(_), Some(_)) => Err(NonoError::ActionRequired(format!(
-                "more than one organization is named '{name}'; use its slug: {}",
+                "more than one tenant is named '{name}'; use its slug: {}",
                 self.organization_slugs()
             ))),
             _ => Err(NonoError::ActionRequired(format!(
-                "you are not a member of an organization called '{name}'; your organizations: {}",
+                "you are not a member of a tenant called '{name}'; your tenants: {}",
                 self.organization_slugs()
             ))),
         }
@@ -156,7 +156,8 @@ pub(crate) fn load_record() -> Result<Option<SessionRecord>> {
         .map_err(|error| NonoError::ConfigParse(format!("invalid {}: {error}", path.display())))?;
     if record.protocol_version != SESSION_PROTOCOL_V1 {
         return Err(NonoError::ConfigParse(
-            "unsupported local sign-in record; run `nono logout` and sign in again".to_string(),
+            "unsupported local sign-in record; run `nono platform logout` and sign in again"
+                .to_string(),
         ));
     }
     Ok(Some(record))
@@ -356,7 +357,7 @@ fn read_secret(path: &Path) -> Result<Option<Zeroizing<String>>> {
     #[cfg(unix)]
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(NonoError::ActionRequired(format!(
-            "{} is accessible to other users; run `nono logout` and sign in again",
+            "{} is accessible to other users; run `nono platform logout` and sign in again",
             path.display()
         )));
     }

@@ -13,10 +13,14 @@ keywords = ["sandbox", "security", "capability", "landlock", "seatbelt"]
 categories = ["os", "api-bindings"]
 
 [features]
-default = ["system-keyring"]
+default = ["system-keyring", "sigstore"]
 # Enables OS system keyring access (macOS Keychain / Linux Secret Service).
 # Headless/container consumers opt out with default-features = false.
 system-keyring = ["dep:keyring"]
+# Sigstore bundle verification and keyed audit attestation.
+# Default on. Sandbox-only consumers use default-features = false and
+# leave this off, which drops sigstore-verify.
+sigstore = ["dep:sigstore-verify", "dep:x509-cert", "dep:der"]
 
 [dependencies]
 thiserror.workspace = true
@@ -40,11 +44,11 @@ libc = "0.2"
 # backend on Linux, with no libdbus runtime dependency.
 keyring = { version = "4", features = ["v1"], optional = true, default-features = false }
 
-# Sigstore bundle verification. The release line is coordinated with
-# sigstore-sign at the workspace level.
-sigstore-verify.workspace = true
-x509-cert = { version = "0.3", default-features = false }
-der = { version = "0.8", default-features = false }
+# Sigstore bundle verification. Behind the `sigstore` feature.
+# The release line is coordinated with sigstore-sign at the workspace level.
+sigstore-verify = { workspace = true, optional = true }
+x509-cert = { version = "0.3", default-features = false, optional = true }
+der = { version = "0.8", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true

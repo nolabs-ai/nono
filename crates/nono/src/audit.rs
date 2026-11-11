@@ -6,6 +6,7 @@
 //! and Merkle root.
 
 use crate::supervisor::{AuditEntry, UrlOpenRequest};
+#[cfg(feature = "sigstore")]
 use crate::trust;
 use crate::undo::{
     AuditAttestationSummary, AuditIntegritySummary, COMMAND_POLICY_SUMMARY_MAX_COMMANDS,
@@ -15,6 +16,7 @@ use crate::undo::{
 use crate::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "sigstore")]
 use sigstore_verify::types::bundle::SignatureContent;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -362,6 +364,7 @@ pub struct AuditAttestationVerificationResult {
     pub verification_error: Option<String>,
 }
 
+#[cfg(feature = "sigstore")]
 #[derive(Serialize)]
 struct AuditAttestationPredicate<'a> {
     version: u32,
@@ -375,6 +378,7 @@ struct AuditAttestationPredicate<'a> {
     signer: AuditSignerPredicate<'a>,
 }
 
+#[cfg(feature = "sigstore")]
 #[derive(Serialize)]
 struct AuditLogPredicate<'a> {
     hash_algorithm: &'a str,
@@ -383,6 +387,7 @@ struct AuditLogPredicate<'a> {
     merkle_root: &'a ContentHash,
 }
 
+#[cfg(feature = "sigstore")]
 #[derive(Serialize)]
 struct AuditSignerPredicate<'a> {
     kind: &'static str,
@@ -1184,6 +1189,7 @@ pub fn verify_session_in_ledger_reader<R: BufRead>(
     })
 }
 
+#[cfg(feature = "sigstore")]
 /// Build and sign an alpha audit attestation bundle for a completed session.
 ///
 /// The caller owns key loading and bundle storage. This primitive commits to
@@ -1247,6 +1253,7 @@ pub fn sign_audit_attestation_bundle(
     ))
 }
 
+#[cfg(feature = "sigstore")]
 /// Verify an alpha audit attestation bundle against session metadata.
 ///
 /// The caller is responsible for loading the bundle and any externally pinned
@@ -1501,6 +1508,7 @@ pub fn verify_audit_attestation_bundle(
     })
 }
 
+#[cfg(feature = "sigstore")]
 fn attestation_failure(
     summary: &AuditAttestationSummary,
     expected_public_key_matches: Option<bool>,
@@ -1519,6 +1527,7 @@ fn attestation_failure(
     }
 }
 
+#[cfg(feature = "sigstore")]
 fn extract_audit_attestation_statement(bundle: &trust::Bundle) -> Result<trust::InTotoStatement> {
     let envelope = match &bundle.content {
         SignatureContent::DsseEnvelope(envelope) => envelope,
@@ -2581,6 +2590,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sigstore")]
     fn audit_attestation_bundle_round_trips_in_core() {
         let key_pair = crate::trust::generate_signing_key().unwrap();
         let key_id = crate::trust::key_id_hex(&key_pair).unwrap();

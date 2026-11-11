@@ -711,7 +711,20 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let namespaces = if flags.isolate.is_empty() {
         None
     } else {
-        Some(crate::isolation::prepare_namespaces(flags.isolate, &caps)?)
+        Some(crate::isolation::prepare_namespaces(&flags.isolate, &caps)?)
+    };
+    // The mount mask is built from the final capability set, so every grant
+    // (including the sandbox state file) is re-bound through the masks.
+    #[cfg(target_os = "linux")]
+    let mount_mask = if namespaces
+        .as_ref()
+        .is_some_and(nono::NamespaceSpec::has_mounts)
+    {
+        let plan = crate::isolation::prepare_mount_mask(&flags.isolate, &caps, &requested_workdir)?;
+        crate::output::print_mount_mask(&plan, flags.silent);
+        Some(plan)
+    } else {
+        None
     };
 
     // With `linux.isolate.loopback` the validated network namespace confines
@@ -792,6 +805,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         sandbox_policy: flags.sandbox_policy,
         #[cfg(target_os = "linux")]
         namespaces,
+        #[cfg(target_os = "linux")]
+        mount_mask: mount_mask.as_ref(),
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         case_insensitive_env_vars: flags.case_insensitive_env_vars,
@@ -921,6 +936,18 @@ fn write_capability_state_file(
     let linux_af_unix_mediation = false;
     state.pathname_socket_enforcement =
         sandbox_state::pathname_socket_enforcement(linux_af_unix_mediation);
+    #[cfg(target_os = "linux")]
+    if !flags.isolate.is_empty() {
+        state.isolation = Some(sandbox_state::IsolationState {
+            namespaces: flags
+                .isolate
+                .labels()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            masked_paths: crate::isolation::masked_host_paths(&flags.isolate, &flags.workdir),
+        });
+    }
 
     for _ in 0..8 {
         let cap_file = next_capability_state_file_path();

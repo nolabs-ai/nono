@@ -30,7 +30,9 @@ fn python3_bin() -> Option<String> {
 
 /// True (and logs) when nono refused because the host lacks namespace support.
 fn host_unsupported(completed: &Completed) -> bool {
-    let unsupported = completed.stderr().contains("namespace isolation (net");
+    let stderr = completed.stderr();
+    let unsupported =
+        stderr.contains("namespace isolation (") && stderr.contains("not available on this host");
     if unsupported {
         eprintln!("skipping: host cannot create unprivileged namespaces");
     }
@@ -314,4 +316,214 @@ fn loopback_without_network_isolation_is_rejected() {
         .exec(Argv::new("/bin/true"))
         .assert_failure("loopback without a network namespace is a configuration error")
         .assert_stderr_contains("requires linux.isolate.network");
+}
+
+// ---- Phase 2: mount masks (linux.isolate.mounts) ----
+
+/// Connects to each path argument and prints `<label> CONNECTED` or
+/// `<label> <errno name>`; labels are the paths' file names.
+const CONNECT_PROBE: &str = r#"
+import errno, os, socket, sys
+for path in sys.argv[1:]:
+    s = socket.socket(socket.AF_UNIX); s.settimeout(5)
+    label = os.path.basename(path)
+    try:
+        s.connect(path); print(label, "CONNECTED")
+    except OSError as e:
+        print(label, errno.errorcode.get(e.errno, str(e.errno)))
+"#;
+
+fn mounts_profile(extra: &str) -> String {
+    format!(r#"{{"meta":{{"name":"iso-mounts"}}{extra},"linux":{{"isolate":{{"mounts":true}}}}}}"#)
+}
+
+#[test]
+fn mounts_hide_masked_sockets_and_rebind_granted_ones() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+    let t = nono_test!("iso-mounts-sockets");
+    // Socket paths must fit sun_path, so use a short directory. Outside /tmp
+    // (when /dev/shm exists) the extra mask itself is what hides it.
+    let short_base = if std::path::Path::new("/dev/shm").is_dir() {
+        "/dev/shm"
+    } else {
+        "/tmp"
+    };
+    let scratch = tempfile::Builder::new()
+        .prefix("nono-iso-")
+        .tempdir_in(short_base)
+        .expect("short tempdir");
+    let runtime = std::fs::canonicalize(scratch.path())
+        .expect("canonical scratch")
+        .join("runtime");
+    std::fs::create_dir_all(runtime.join("app")).expect("mkdir runtime");
+    let hidden = runtime.join("hidden.sock");
+    let granted = runtime.join("app").join("granted.sock");
+    let _hidden = UnixListener::bind(&hidden).expect("bind hidden");
+    let _granted = UnixListener::bind(&granted).expect("bind granted");
+    let json = format!(
+        r#"{{"meta":{{"name":"iso-mounts"}},"filesystem":{{"unix_socket":["{}"]}},"linux":{{"isolate":{{"mounts":true,"extra_masks":["{}"]}}}}}}"#,
+        granted.display(),
+        runtime.display()
+    );
+    let profile = t.write_profile("iso-mounts", &json);
+    let completed = t.run().profile(&profile).exec(
+        Argv::new(&py)
+            .arg("-c")
+            .arg(CONNECT_PROBE)
+            .arg(&hidden)
+            .arg(&granted),
+    );
+    if host_unsupported(&completed) {
+        return;
+    }
+    let completed = completed.assert_success("masked run succeeds");
+    let stdout = completed.stdout();
+    assert!(
+        stdout.contains("hidden.sock ENOENT"),
+        "a socket under a mask is unreachable: {stdout}"
+    );
+    assert!(
+        stdout.contains("granted.sock CONNECTED"),
+        "an explicit unix_socket grant is re-bound through the mask: {stdout}"
+    );
+}
+
+#[test]
+fn mounts_hide_the_users_runtime_directory() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { nix::libc::getuid() };
+    let runtime = std::path::PathBuf::from(format!("/run/user/{uid}"));
+    let bus = runtime.join("bus");
+    if !bus.exists() {
+        eprintln!("skipping: no session bus at {}", bus.display());
+        return;
+    }
+    let t = nono_test!("iso-mounts-runtime");
+    let profile = t.write_profile("iso-mounts", &mounts_profile(""));
+    let completed = t
+        .run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(CONNECT_PROBE).arg(&bus));
+    if host_unsupported(&completed) {
+        return;
+    }
+    completed
+        .assert_success("masked run succeeds")
+        .assert_stdout_contains("bus ENOENT");
+}
+
+#[test]
+fn mounts_give_the_session_a_private_tmp() {
+    let marker = format!("nono-iso-private-tmp-{}", std::process::id());
+    let t = nono_test!("iso-mounts-tmp");
+    let profile = t.write_profile(
+        "iso-mounts",
+        &mounts_profile(r#","filesystem":{"allow":["/tmp"]}"#),
+    );
+    let script = format!("echo inside > /tmp/{marker} && cat /tmp/{marker}");
+    let completed = t
+        .run()
+        .profile(&profile)
+        .exec(Argv::new("/bin/sh").arg("-c").arg(&script));
+    if host_unsupported(&completed) {
+        return;
+    }
+    completed
+        .assert_success("a /tmp grant applies to the private /tmp")
+        .assert_stdout_contains("inside");
+    let host = std::path::Path::new("/tmp").join(&marker);
+    let leaked = host.exists();
+    let _ = std::fs::remove_file(&host);
+    assert!(
+        !leaked,
+        "writes to the private /tmp must not reach the host"
+    );
+}
+
+#[test]
+fn mounts_cannot_be_removed_from_inside() {
+    let t = nono_test!("iso-mounts-umount");
+    let profile = t.write_profile("iso-mounts", &mounts_profile(""));
+    // Direct umount, and umount from a nested user+mount namespace, where the
+    // workload holds capabilities but the inherited masks are locked.
+    let script = "/usr/bin/umount /tmp && echo UNMOUNTED; \
+                  /usr/bin/unshare -Um --propagation unchanged /usr/bin/umount /tmp \
+                  && echo NESTED-UNMOUNTED; echo done";
+    let completed = t
+        .run()
+        .profile(&profile)
+        .exec(Argv::new("/bin/sh").arg("-c").arg(script));
+    if host_unsupported(&completed) {
+        return;
+    }
+    completed
+        .assert_success("probe script runs")
+        .assert_stdout_contains("done")
+        .assert_stdout_lacks("UNMOUNTED");
+}
+
+#[test]
+fn mounts_keep_nested_namespaces_working() {
+    let t = nono_test!("iso-mounts-nested");
+    let profile = t.write_profile("iso-mounts", &mounts_profile(""));
+    let completed = t.run().profile(&profile).exec(
+        Argv::new("/usr/bin/unshare")
+            .arg("-Um")
+            .arg("--propagation")
+            .arg("unchanged")
+            .arg("/bin/echo")
+            .arg("nested-ok"),
+    );
+    if host_unsupported(&completed) {
+        return;
+    }
+    completed
+        .assert_success("nested user+mount namespaces work under the mask (#1980)")
+        .assert_stdout_contains("nested-ok");
+}
+
+#[test]
+fn extra_masks_without_mounts_are_rejected() {
+    let t = nono_test!("iso-masks-alone");
+    let profile = t.write_profile(
+        "iso-masks-alone",
+        r#"{"meta":{"name":"iso-masks-alone"},"linux":{"isolate":{"ipc":true,"extra_masks":["/opt/agent.sock"]}}}"#,
+    );
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new("/bin/true"))
+        .assert_failure("extra_masks without mounts is a configuration error")
+        .assert_stderr_contains("requires linux.isolate.mounts");
+}
+
+#[test]
+fn mounts_reject_capability_elevation() {
+    let t = nono_test!("iso-mounts-elevation");
+    let profile = t.write_profile(
+        "iso-mounts",
+        &mounts_profile(r#","security":{"capability_elevation":true}"#),
+    );
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new("/bin/true"))
+        .assert_failure("supervisor-opened paths would bypass the masks")
+        .assert_stderr_contains("cannot be combined with capability elevation");
+}
+
+#[test]
+fn wrap_rejects_mounts() {
+    let t = nono_test!("iso-mounts-wrap");
+    let profile = t.write_profile("iso-mounts", &mounts_profile(""));
+    t.wrap()
+        .profile(&profile)
+        .exec(Argv::new("/bin/true"))
+        .assert_failure("nono wrap cannot provide a mount namespace")
+        .assert_stderr_contains("nono wrap does not support linux.isolate");
 }

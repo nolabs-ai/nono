@@ -1435,9 +1435,12 @@ pub struct SandboxArgs {
 
     /// Run the command in new Linux namespaces (opt-in, NEP-0004).
     ///
-    /// Comma-separated list of: net, loopback, ipc, uts. Always adds a user
-    /// namespace. `loopback` (requires `net`) allows TCP bind/connect on any
-    /// port of the namespace's own loopback, for local dev servers and tests.
+    /// Comma-separated list of: net, loopback, ipc, uts, mounts. Always adds a
+    /// user namespace. `loopback` (requires `net`) allows TCP bind/connect on
+    /// any port of the namespace's own loopback, for local dev servers and
+    /// tests. `mounts` masks host IPC endpoints ($XDG_RUNTIME_DIR, the D-Bus
+    /// system bus, container runtime sockets) and gives the session a private
+    /// /tmp; granted paths stay reachable through the masks.
     /// `net` leaves only loopback; egress is possible only through the session
     /// proxy, so it requires --block-net or a proxied network policy and cannot
     /// be combined with direct-access grants (--open-port, --listen-port,
@@ -1956,6 +1959,8 @@ pub enum IsolateNamespace {
     Ipc,
     /// UTS namespace.
     Uts,
+    /// Mount namespace masking host IPC endpoints, with a private /tmp.
+    Mounts,
 }
 
 #[cfg(target_os = "linux")]
@@ -1968,6 +1973,8 @@ impl SandboxArgs {
             loopback: has(IsolateNamespace::Loopback),
             ipc: has(IsolateNamespace::Ipc),
             uts: has(IsolateNamespace::Uts),
+            mounts: has(IsolateNamespace::Mounts),
+            extra_masks: Vec::new(),
         }
     }
 }

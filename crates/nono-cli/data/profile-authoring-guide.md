@@ -1184,6 +1184,8 @@ preferably, use `unix_socket_dir_bind` with a dedicated directory.
 
 Add `"loopback": true` (requires `network`) to let the command use TCP on the namespace's own loopback, for local dev servers and tests. Egress stays proxy-only and the host's localhost stays unreachable.
 
+Add `"mounts": true` to mask host IPC endpoints (`$XDG_RUNTIME_DIR`, the D-Bus system bus, container runtime sockets) and give the session a private `/tmp`. Paths the profile grants beneath a mask, including `unix_socket` grants, stay reachable. `"extra_masks": ["$HOME/.corp/agent.sock"]` adds masks (requires `mounts`); lists merge by deduplicated append, so no layer can remove a mask. `mounts` cannot be combined with `security.capability_elevation`.
+
 Network isolation does not block pathname Unix sockets (such as `/run/docker.sock`); use `linux.af_unix_mediation` for those.
 
 #### Linux

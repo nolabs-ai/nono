@@ -1,15 +1,41 @@
 //! Opt-in Linux namespace isolation policy (NEP-0004).
 //!
 //! The mechanism (namespace spec, raw child entry, id maps, bridge validation,
-//! probe) lives in `nono::sandbox`. This module owns every policy decision:
-//! which network modes and grants isolation can be combined with, how the
-//! proxy bridge is wired, and how a host refusal is explained to the user.
+//! mount masks, probe) lives in `nono::sandbox`. This module owns every policy
+//! decision: which network modes and grants isolation can be combined with,
+//! how the proxy bridge is wired, which host paths are masked, and how a host
+//! refusal is explained to the user.
 
 use crate::cli::SandboxArgs;
 use crate::profile::LinuxIsolateConfig;
 use crate::sandbox_prepare::{PreparedSandbox, has_proxy_intent};
+use nono::sandbox::{MountSkipReason, PreparedMountMask};
 use nono::{CapabilitySet, NamespaceProbe, NamespaceProbeStage, NamespaceSpec, NetworkMode};
-use nono::{NonoError, Result, Sandbox};
+use nono::{MountMask, NonoError, Result, Sandbox};
+use std::path::{Path, PathBuf};
+
+/// System IPC endpoints masked by `linux.isolate.mounts`, besides the user's
+/// runtime directory and `/tmp`. Pathname `connect(2)` is not governed by
+/// Landlock below ABI 9, so these sockets are hidden rather than mediated.
+/// Any change to this list is a security change.
+const DEFAULT_SYSTEM_MASKS: &[&str] = &[
+    // D-Bus system bus.
+    "/run/dbus",
+    // Container runtimes: each socket grants root-equivalent control.
+    "/run/docker.sock",
+    "/var/run/docker.sock",
+    "/run/containerd/containerd.sock",
+    "/run/podman/podman.sock",
+    // snapd and the systemd system manager's private socket.
+    "/run/snapd.socket",
+    "/run/systemd/private",
+];
+/// Mode of the tmpfs over the user's runtime directory, matching systemd.
+const RUNTIME_DIR_MODE: u32 = 0o700;
+/// Mode of the per-session `/tmp`.
+const PRIVATE_TMP_MODE: u32 = 0o1777;
+/// Mode of the tmpfs over other masked directories.
+const SYSTEM_DIR_MODE: u32 = 0o755;
 
 /// Reject configurations that namespace isolation cannot satisfy, before
 /// anything is started.
@@ -18,8 +44,18 @@ use nono::{NonoError, Result, Sandbox};
 /// proxy. Allow-all networking and every grant of direct reachability would
 /// silently stop working, so each is a configuration error instead.
 pub(crate) fn validate_config(args: &SandboxArgs, prepared: &PreparedSandbox) -> Result<()> {
-    let isolate = prepared.isolate;
+    let isolate = &prepared.isolate;
     reject_loopback_without_network(isolate).map_err(NonoError::ConfigParse)?;
+    reject_masks_without_mounts(isolate).map_err(NonoError::ConfigParse)?;
+    if isolate.mounts && prepared.capability_elevation {
+        return Err(NonoError::ConfigParse(
+            "linux.isolate.mounts (--isolate mounts) cannot be combined with capability \
+             elevation: approved paths are opened by the supervisor outside the sandbox's \
+             mount namespace, so they would bypass the masks and the private /tmp. Grant the \
+             paths up front instead."
+                .to_string(),
+        ));
+    }
     if !isolate.network {
         return Ok(());
     }
@@ -46,7 +82,9 @@ pub(crate) fn validate_config(args: &SandboxArgs, prepared: &PreparedSandbox) ->
 /// `loopback` lifts TCP enforcement on the grounds that the network namespace
 /// confines TCP to its own loopback. Without that namespace it would grant
 /// host-loopback reachability, so it is always an error on its own.
-fn reject_loopback_without_network(isolate: LinuxIsolateConfig) -> std::result::Result<(), String> {
+fn reject_loopback_without_network(
+    isolate: &LinuxIsolateConfig,
+) -> std::result::Result<(), String> {
     if isolate.loopback && !isolate.network {
         return Err(
             "linux.isolate.loopback (--isolate loopback) requires linux.isolate.network \
@@ -56,6 +94,131 @@ fn reject_loopback_without_network(isolate: LinuxIsolateConfig) -> std::result::
         );
     }
     Ok(())
+}
+
+/// `extra_masks` only has meaning inside a mount namespace. Without one it
+/// would be a mask the profile believes is applied but is not.
+fn reject_masks_without_mounts(isolate: &LinuxIsolateConfig) -> std::result::Result<(), String> {
+    if !isolate.extra_masks.is_empty() && !isolate.mounts {
+        return Err(
+            "linux.isolate.extra_masks requires linux.isolate.mounts (--isolate mounts): \
+             masks are applied only inside the isolated mount namespace."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Build the mount mask plan for the final capability set.
+///
+/// Masks nono's default host IPC endpoints, the profile's `extra_masks`, and
+/// `/tmp` (made private to the session). Every path the capability set grants,
+/// including `unix_socket` grants, is re-bound through the masks so explicit
+/// grants keep working. A grant of a whole masked directory does not re-bind
+/// it; the directory stays masked.
+///
+/// # Errors
+///
+/// Returns an error if an extra mask does not expand to an absolute path, or
+/// if any path cannot be prepared. Never drops a requested mask silently:
+/// only masks whose path does not exist on this host are skipped.
+pub(crate) fn prepare_mount_mask(
+    isolate: &LinuxIsolateConfig,
+    caps: &CapabilitySet,
+    workdir: &Path,
+) -> Result<PreparedMountMask> {
+    let masks = mask_list(isolate, workdir)?;
+    let rebinds: Vec<PathBuf> = caps
+        .fs_capabilities()
+        .iter()
+        .map(|cap| cap.resolved.clone())
+        .chain(
+            caps.unix_socket_capabilities()
+                .iter()
+                .map(|cap| cap.resolved.clone()),
+        )
+        .collect();
+    let plan = PreparedMountMask::prepare(&masks, &rebinds)?;
+    for skipped in plan.skipped() {
+        let under_mask = masks
+            .iter()
+            .any(|mask| skipped.path.starts_with(mask.path()));
+        match skipped.reason {
+            MountSkipReason::Missing | MountSkipReason::Inaccessible if skipped.is_mask => {
+                tracing::debug!(
+                    "mount mask {} not applied: path does not exist or is not reachable by this \
+                     user",
+                    skipped.path.display()
+                );
+            }
+            MountSkipReason::Missing if under_mask => tracing::warn!(
+                "granted path {} does not exist, so it cannot be re-bound through the mount mask",
+                skipped.path.display()
+            ),
+            MountSkipReason::ReplacesDirectoryMask => tracing::info!(
+                "grant of masked directory {} applies to the session's private copy; host \
+                 contents stay masked",
+                skipped.path.display()
+            ),
+            _ => {}
+        }
+    }
+    Ok(plan)
+}
+
+/// Host paths `isolate` masks on this host, for diagnostics and `nono why`.
+/// Paths that do not exist (and so are not masked) are left out. Empty when
+/// `mounts` is off or the list cannot be built.
+pub(crate) fn masked_host_paths(isolate: &LinuxIsolateConfig, workdir: &Path) -> Vec<PathBuf> {
+    if !isolate.mounts {
+        return Vec::new();
+    }
+    mask_list(isolate, workdir)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mask| mask.path().to_path_buf())
+        .filter(|path| std::fs::symlink_metadata(path).is_ok())
+        .collect()
+}
+
+/// The full mask list: user runtime directory, private `/tmp`, system IPC
+/// endpoints, then the profile's extra masks. Paths are canonicalized so a
+/// symlinked location (`/var/run` -> `/run`) masks the real target.
+fn mask_list(isolate: &LinuxIsolateConfig, workdir: &Path) -> Result<Vec<MountMask>> {
+    let mut masks: Vec<MountMask> = Vec::new();
+    let mut push = |path: PathBuf, mode: u32| {
+        let path = nono::try_canonicalize(&path);
+        if !masks.iter().any(|mask| mask.path() == path) {
+            masks.push(MountMask::new(path).tmpfs_mode(mode));
+        }
+    };
+    // The environment is untrusted: mask the standard per-user runtime
+    // directory whether or not $XDG_RUNTIME_DIR points at it.
+    push(
+        PathBuf::from(format!("/run/user/{}", nix::unistd::getuid())),
+        RUNTIME_DIR_MODE,
+    );
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+        && runtime.is_absolute()
+    {
+        push(runtime, RUNTIME_DIR_MODE);
+    }
+    push(PathBuf::from("/tmp"), PRIVATE_TMP_MODE);
+    for path in DEFAULT_SYSTEM_MASKS {
+        push(PathBuf::from(path), SYSTEM_DIR_MODE);
+    }
+    for raw in &isolate.extra_masks {
+        let expanded = crate::profile::expand_vars(raw, workdir)?;
+        if !expanded.is_absolute() {
+            return Err(NonoError::ConfigParse(format!(
+                "linux.isolate.extra_masks entry {raw:?} does not expand to an absolute path \
+                 ({}); is a variable it uses unset?",
+                expanded.display()
+            )));
+        }
+        push(expanded, SYSTEM_DIR_MODE);
+    }
+    Ok(masks)
 }
 
 fn direct_grants(caps: &CapabilitySet) -> Vec<&'static str> {
@@ -93,15 +256,17 @@ fn reject_direct_grants(conflicts: &[&str]) -> Result<()> {
 /// Returns an error if the final network mode conflicts with isolation, or if
 /// the host refuses any requested namespace. Never downgrades.
 pub(crate) fn prepare_namespaces(
-    isolate: LinuxIsolateConfig,
+    isolate: &LinuxIsolateConfig,
     caps: &CapabilitySet,
 ) -> Result<NamespaceSpec> {
     reject_loopback_without_network(isolate).map_err(NonoError::SandboxInit)?;
+    reject_masks_without_mounts(isolate).map_err(NonoError::SandboxInit)?;
     let mut spec = NamespaceSpec::new()
         .network(isolate.network)
         .loopback_tcp(isolate.loopback)
         .ipc(isolate.ipc)
-        .uts(isolate.uts);
+        .uts(isolate.uts)
+        .mounts(isolate.mounts);
     if isolate.network {
         match caps.network_mode() {
             NetworkMode::AllowAll => {
@@ -137,13 +302,14 @@ pub(crate) fn prepare_namespaces(
 ///
 /// The probe decides availability by attempting the operation; sysctls and
 /// process status are read here only to explain an observed failure.
-fn explain_refusal(isolate: LinuxIsolateConfig, stage: NamespaceProbeStage, errno: i32) -> String {
+fn explain_refusal(isolate: &LinuxIsolateConfig, stage: NamespaceProbeStage, errno: i32) -> String {
     let requested = isolate.labels().join(",");
     let step = match stage {
         NamespaceProbeStage::Unshare => "creating the namespaces",
         NamespaceProbeStage::IdMap => "writing the user namespace id maps",
         NamespaceProbeStage::LoopbackUp => "using capabilities inside the new namespace",
         NamespaceProbeStage::BridgeListener => "creating a loopback listener in the new namespace",
+        NamespaceProbeStage::Mount => "mounting a tmpfs in the new mount namespace",
         NamespaceProbeStage::Child | _ => "running the namespace probe",
     };
     let error = if errno == 0 {
@@ -195,6 +361,13 @@ fn likely_cause(stage: NamespaceProbeStage, errno: i32) -> String {
                 .find_map(|line| line.strip_prefix("Seccomp:").map(|v| v.trim() == "2"))
         })
         .unwrap_or(false);
+    if stage == NamespaceProbeStage::Mount {
+        return "the namespaces were created but mounting inside them was refused. A security \
+                module (AppArmor or SELinux mount rules) or a seccomp filter on nono that blocks \
+                the mount API (fsopen, fsmount, move_mount) can cause this. Run without \
+                linux.isolate.mounts, or allow mounts in unprivileged user namespaces."
+            .to_string();
+    }
     if seccomp_filtered && stage == NamespaceProbeStage::Unshare {
         return "a seccomp filter on nono itself blocks unshare(2). Container runtimes \
                 (Docker, Kubernetes) install one by default. Run namespace isolation outside \
@@ -236,7 +409,7 @@ mod tests {
     fn allow_all_is_rejected_at_launch() {
         let caps = CapabilitySet::new();
         assert_eq!(caps.network_mode(), &NetworkMode::AllowAll);
-        let error = prepare_namespaces(isolate_network(), &caps).expect_err("allow-all");
+        let error = prepare_namespaces(&isolate_network(), &caps).expect_err("allow-all");
         assert!(error.to_string().contains("allows all traffic"));
     }
 
@@ -248,7 +421,7 @@ mod tests {
             ipc: true,
             ..Default::default()
         };
-        let error = prepare_namespaces(isolate, &caps).expect_err("loopback without net");
+        let error = prepare_namespaces(&isolate, &caps).expect_err("loopback without net");
         assert!(error.to_string().contains("requires linux.isolate.network"));
     }
 
@@ -260,7 +433,7 @@ mod tests {
             loopback: true,
             ..Default::default()
         };
-        match prepare_namespaces(isolate, &caps) {
+        match prepare_namespaces(&isolate, &caps) {
             Ok(spec) => {
                 assert!(spec.has_network());
                 assert!(spec.loopback_tcp_enabled());
@@ -278,7 +451,7 @@ mod tests {
             loopback: true,
             ..Default::default()
         };
-        let error = prepare_namespaces(isolate, &caps).expect_err("direct grants");
+        let error = prepare_namespaces(&isolate, &caps).expect_err("direct grants");
         assert!(error.to_string().contains("open_port"));
     }
 
@@ -288,7 +461,7 @@ mod tests {
             port: 3128,
             bind_ports: vec![8080],
         });
-        let error = prepare_namespaces(isolate_network(), &caps).expect_err("bind ports");
+        let error = prepare_namespaces(&isolate_network(), &caps).expect_err("bind ports");
         assert!(error.to_string().contains("inbound listen ports"));
     }
 
@@ -297,7 +470,7 @@ mod tests {
         let mut caps = CapabilitySet::new().set_network_mode(NetworkMode::Blocked);
         caps.add_localhost_port(5432);
         caps.add_tcp_connect_port(22);
-        let error = prepare_namespaces(isolate_network(), &caps).expect_err("direct grants");
+        let error = prepare_namespaces(&isolate_network(), &caps).expect_err("direct grants");
         let message = error.to_string();
         assert!(message.contains("open_port"), "{message}");
         assert!(message.contains("connect_port"), "{message}");
@@ -312,7 +485,7 @@ mod tests {
             ipc: true,
             ..Default::default()
         };
-        if let Err(error) = prepare_namespaces(isolate, &caps) {
+        if let Err(error) = prepare_namespaces(&isolate, &caps) {
             assert!(error.to_string().contains("not available on this host"));
         }
     }
@@ -323,7 +496,7 @@ mod tests {
             port: 3128,
             bind_ports: vec![],
         });
-        match prepare_namespaces(isolate_network(), &caps) {
+        match prepare_namespaces(&isolate_network(), &caps) {
             Ok(spec) => assert_eq!(spec.bridge_port(), Some(3128)),
             Err(error) => assert!(error.to_string().contains("not available on this host")),
         }
@@ -332,7 +505,7 @@ mod tests {
     #[test]
     fn refusal_names_the_failed_step_and_never_downgrades() {
         let message = explain_refusal(
-            isolate_network(),
+            &isolate_network(),
             NamespaceProbeStage::Unshare,
             nix::libc::EPERM,
         );
@@ -343,13 +516,98 @@ mod tests {
     #[test]
     fn enospc_refusal_names_the_namespace_limit_not_disk_space() {
         let message = explain_refusal(
-            isolate_network(),
+            &isolate_network(),
             NamespaceProbeStage::Unshare,
             nix::libc::ENOSPC,
         );
         assert!(message.contains("namespace limit reached"), "{message}");
         assert!(!message.contains("No space left on device"), "{message}");
         assert!(message.contains("max_user_namespaces"), "{message}");
+    }
+
+    #[test]
+    fn extra_masks_require_mounts() {
+        let caps = CapabilitySet::new();
+        let isolate = LinuxIsolateConfig {
+            ipc: true,
+            extra_masks: vec!["/opt/agent.sock".to_string()],
+            ..Default::default()
+        };
+        let error = prepare_namespaces(&isolate, &caps).expect_err("masks without mounts");
+        assert!(error.to_string().contains("requires linux.isolate.mounts"));
+    }
+
+    #[test]
+    fn mounts_are_carried_on_the_spec() {
+        let caps = CapabilitySet::new();
+        let isolate = LinuxIsolateConfig {
+            mounts: true,
+            ..Default::default()
+        };
+        match prepare_namespaces(&isolate, &caps) {
+            Ok(spec) => assert!(spec.has_mounts()),
+            Err(error) => assert!(error.to_string().contains("not available on this host")),
+        }
+    }
+
+    #[test]
+    fn default_masks_cover_runtime_dir_tmp_and_system_sockets() {
+        let isolate = LinuxIsolateConfig {
+            mounts: true,
+            extra_masks: vec!["$WORKDIR/agent.sock".to_string()],
+            ..Default::default()
+        };
+        let workdir = std::env::temp_dir();
+        let masks = mask_list(&isolate, &workdir).expect("mask list");
+        let paths: Vec<_> = masks.iter().map(|mask| mask.path().to_path_buf()).collect();
+        let uid = nix::unistd::getuid();
+        assert!(paths.contains(&nono::try_canonicalize(Path::new(&format!(
+            "/run/user/{uid}"
+        )))));
+        assert!(paths.contains(&nono::try_canonicalize(Path::new("/tmp"))));
+        assert!(paths.contains(&nono::try_canonicalize(Path::new("/run/dbus"))));
+        assert!(paths.contains(&nono::try_canonicalize(Path::new("/var/run/docker.sock"))));
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("agent.sock") && path.is_absolute()),
+            "extra masks are expanded: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn unexpandable_extra_mask_is_an_error() {
+        let isolate = LinuxIsolateConfig {
+            mounts: true,
+            extra_masks: vec!["relative/agent.sock".to_string()],
+            ..Default::default()
+        };
+        let error = mask_list(&isolate, Path::new("/")).expect_err("relative mask");
+        assert!(error.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn mount_mask_rebinds_grants_beneath_masks_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonical");
+        let masked = root.join("runtime");
+        let granted = masked.join("agent");
+        std::fs::create_dir_all(&granted).expect("mkdir");
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(nono::FsCapability::new_dir(&granted, nono::AccessMode::Read).expect("grant"));
+        let isolate = LinuxIsolateConfig {
+            mounts: true,
+            extra_masks: vec![masked.display().to_string()],
+            ..Default::default()
+        };
+        let plan = prepare_mount_mask(&isolate, &caps, &root).expect("plan");
+        // The extra mask, or a default mask above it (the tempdir may sit
+        // under the masked /tmp), hides the granted path.
+        assert!(plan.masked_paths().any(|path| masked.starts_with(path)));
+        assert_eq!(
+            plan.rebound_paths().collect::<Vec<_>>(),
+            vec![granted.as_path()]
+        );
     }
 
     #[test]

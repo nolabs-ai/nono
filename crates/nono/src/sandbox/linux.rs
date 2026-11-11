@@ -11,7 +11,7 @@ use landlock::{
 };
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
@@ -826,16 +826,23 @@ fn normalize_path_access(
 ///
 /// Returning the same descriptor used for metadata validation prevents a path
 /// replacement between type/device classification and rule installation.
-fn open_path_rule(cap: &crate::capability::FsCapability, abi: ABI) -> Result<OpenedPathRule> {
+fn open_path_rule(
+    cap: &crate::capability::FsCapability,
+    abi: ABI,
+    root: Option<BorrowedFd<'_>>,
+) -> Result<OpenedPathRule> {
     // Do not use std::fs::OpenOptions::custom_flags here. On musl, O_ACCMODE
     // includes O_PATH, so Rust's standard-library access-mode mask strips the
     // flag and turns this into an ordinary permission-checked read open.
-    let path_fd = open(
-        &cap.resolved,
-        OFlag::O_PATH | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| {
+    let opened = match root {
+        None => open(
+            &cap.resolved,
+            OFlag::O_PATH | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ),
+        Some(root) => open_in_root(root, &cap.resolved),
+    };
+    let path_fd = opened.map_err(|e| {
         NonoError::SandboxInit(format!(
             "Cannot open Landlock rule path {}: {}",
             cap.resolved.display(),
@@ -856,6 +863,51 @@ fn open_path_rule(cap: &crate::capability::FsCapability, abi: ABI) -> Result<Ope
         path_fd: file.into(),
         access,
     })
+}
+
+/// Open `path` as an `O_PATH` descriptor, resolving it inside `root` as if
+/// `root` were `/`. `RESOLVE_IN_ROOT` keeps `..` and absolute symlinks inside
+/// `root`, so a root taken from another mount namespace resolves exactly as a
+/// process in that namespace would see the path.
+fn open_in_root(root: BorrowedFd<'_>, path: &Path) -> nix::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    const RESOLVE_IN_ROOT: u64 = 0x10;
+    let relative = path.strip_prefix("/").unwrap_or(path);
+    let relative = if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    };
+    let relative = std::ffi::CString::new(relative.as_os_str().as_bytes())
+        .map_err(|_| nix::errno::Errno::EINVAL)?;
+    /// `struct open_how`; libc's is non-exhaustive.
+    #[repr(C)]
+    struct RawOpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let how = RawOpenHow {
+        flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_IN_ROOT,
+    };
+    // SAFETY: `relative` is NUL-terminated and `how` is a live stack value of
+    // the size passed; `root` is a valid borrowed descriptor.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            relative.as_ptr(),
+            &how as *const RawOpenHow,
+            std::mem::size_of::<RawOpenHow>(),
+        )
+    };
+    if fd < 0 {
+        return Err(nix::errno::Errno::last());
+    }
+    // SAFETY: openat2 returned a fresh descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
 /// Legacy check: whether the simple block-all seccomp filter can be used.
@@ -986,7 +1038,22 @@ pub fn prepare_landlock_with_abi(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
 ) -> Result<PreparedLandlockSandbox> {
-    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly)
+    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly, None)
+}
+
+/// Like [`prepare_landlock_with_abi`], but resolve every filesystem rule path
+/// inside `root` instead of the caller's root directory.
+///
+/// Pass a descriptor for `/proc/<pid>/root` of a child in another mount
+/// namespace, so each rule attaches to the inode that child sees at the path
+/// (for example a tmpfs mounted over a granted directory).
+#[must_use = "preparation failure must prevent sandbox launch"]
+pub fn prepare_landlock_with_abi_in_root(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+    root: BorrowedFd<'_>,
+) -> Result<PreparedLandlockSandbox> {
+    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly, Some(root))
 }
 
 /// Apply Landlock filesystem/process sandboxing and use seccomp for TCP
@@ -1020,13 +1087,25 @@ pub fn prepare_seccomp_with_abi(
     abi: &DetectedAbi,
     opts: SeccompOpts,
 ) -> Result<PreparedLandlockSandbox> {
-    prepare_with_abi_inner(caps, abi, opts.tcp_network.into())
+    prepare_with_abi_inner(caps, abi, opts.tcp_network.into(), None)
+}
+
+/// Like [`prepare_seccomp_with_abi`], but resolve every filesystem rule path
+/// inside `root`; see [`prepare_landlock_with_abi_in_root`].
+pub fn prepare_seccomp_with_abi_in_root(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+    opts: SeccompOpts,
+    root: BorrowedFd<'_>,
+) -> Result<PreparedLandlockSandbox> {
+    prepare_with_abi_inner(caps, abi, opts.tcp_network.into(), Some(root))
 }
 
 fn prepare_with_abi_inner(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
     tcp_network: TcpNetworkEnforcement,
+    root: Option<BorrowedFd<'_>>,
 ) -> Result<PreparedLandlockSandbox> {
     let target_abi = abi.enforced_abi();
     let scopes = requested_scopes(caps, abi)?;
@@ -1124,7 +1203,7 @@ fn prepare_with_abi_inner(
 
     let mut path_rules = Vec::with_capacity(caps.fs_capabilities().len());
     for cap in caps.fs_capabilities() {
-        let opened = open_path_rule(cap, target_abi)?;
+        let opened = open_path_rule(cap, target_abi, root)?;
         let path_fd = move_fd_above_stdio(opened.path_fd).map_err(|e| {
             NonoError::SandboxInit(format!(
                 "Cannot reserve Landlock rule descriptor for {}: {}",
@@ -1442,7 +1521,7 @@ fn apply_with_abi_inner(
         std::collections::HashSet::new();
 
     for cap in caps.fs_capabilities() {
-        let opened = open_path_rule(cap, target_abi)?;
+        let opened = open_path_rule(cap, target_abi, None)?;
         let access = opened.access.effective;
 
         if !opened.access.dropped.is_empty() {
@@ -4163,14 +4242,14 @@ mod tests {
         let device_cap =
             crate::capability::FsCapability::new_file("/dev/null", AccessMode::ReadWrite)
                 .expect("device capability");
-        let device_rule = open_path_rule(&device_cap, ABI::V5).expect("open device rule");
+        let device_rule = open_path_rule(&device_cap, ABI::V5, None).expect("open device rule");
         assert!(device_rule.access.effective.contains(AccessFs::IoctlDev));
 
         let regular = tempfile::NamedTempFile::new().expect("regular file");
         let regular_cap =
             crate::capability::FsCapability::new_file(regular.path(), AccessMode::ReadWrite)
                 .expect("regular file capability");
-        let regular_rule = open_path_rule(&regular_cap, ABI::V5).expect("open regular rule");
+        let regular_rule = open_path_rule(&regular_cap, ABI::V5, None).expect("open regular rule");
         assert!(!regular_rule.access.effective.contains(AccessFs::IoctlDev));
 
         let ordinary_dir = tempfile::tempdir().expect("ordinary directory");
@@ -4178,7 +4257,7 @@ mod tests {
             crate::capability::FsCapability::new_dir(ordinary_dir.path(), AccessMode::ReadWrite)
                 .expect("ordinary directory capability");
         let ordinary_dir_rule =
-            open_path_rule(&ordinary_dir_cap, ABI::V5).expect("open ordinary directory rule");
+            open_path_rule(&ordinary_dir_cap, ABI::V5, None).expect("open ordinary directory rule");
         assert!(
             !ordinary_dir_rule
                 .access
@@ -4191,7 +4270,7 @@ mod tests {
                 crate::capability::FsCapability::new_dir("/dev/pts", AccessMode::ReadWrite)
                     .expect("device directory capability");
             let device_dir_rule =
-                open_path_rule(&device_dir_cap, ABI::V5).expect("open device directory rule");
+                open_path_rule(&device_dir_cap, ABI::V5, None).expect("open device directory rule");
             assert!(
                 device_dir_rule
                     .access
@@ -4205,7 +4284,7 @@ mod tests {
     fn test_open_path_rule_retains_o_path_flag() {
         let cap = crate::capability::FsCapability::new_file("/dev/null", AccessMode::Read)
             .expect("device capability");
-        let rule = open_path_rule(&cap, ABI::V1).expect("open path rule");
+        let rule = open_path_rule(&cap, ABI::V1, None).expect("open path rule");
         let flags = nix::fcntl::fcntl(&rule.path_fd, nix::fcntl::FcntlArg::F_GETFL)
             .expect("inspect path fd flags");
 
@@ -4235,7 +4314,7 @@ mod tests {
         let cap = crate::capability::FsCapability::new_file(&gitconfig_link, AccessMode::Read)
             .expect("gitconfig capability");
 
-        let rule = open_path_rule(&cap, ABI::V5).expect("open multi-hop symlink rule");
+        let rule = open_path_rule(&cap, ABI::V5, None).expect("open multi-hop symlink rule");
         assert!(rule.access.effective.contains(AccessFs::ReadFile));
     }
 
@@ -4248,7 +4327,7 @@ mod tests {
             .expect("file capability");
         std::fs::remove_file(&path).expect("remove file");
 
-        let Err(error) = open_path_rule(&cap, ABI::V5) else {
+        let Err(error) = open_path_rule(&cap, ABI::V5, None) else {
             panic!("removed path must fail closed");
         };
         assert!(matches!(error, NonoError::SandboxInit(_)));
@@ -5729,7 +5808,7 @@ mod tests {
             .expect("file capability");
         std::fs::remove_file(&file_path).expect("remove file");
         std::fs::create_dir(&file_path).expect("replace file with directory");
-        let Err(error) = open_path_rule(&file_cap, ABI::V2) else {
+        let Err(error) = open_path_rule(&file_cap, ABI::V2, None) else {
             panic!("shared path rule builder must reject a replacement directory");
         };
         assert!(matches!(error, NonoError::ExpectedFile(_)));
@@ -5751,7 +5830,7 @@ mod tests {
             .expect("directory capability");
         std::fs::remove_dir(&dir_path).expect("remove directory");
         std::fs::write(&dir_path, b"data").expect("replace directory with file");
-        let Err(error) = open_path_rule(&dir_cap, ABI::V2) else {
+        let Err(error) = open_path_rule(&dir_cap, ABI::V2, None) else {
             panic!("shared path rule builder must reject a replacement file");
         };
         assert!(matches!(error, NonoError::ExpectedDirectory(_)));

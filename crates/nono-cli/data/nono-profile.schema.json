@@ -677,7 +677,7 @@
     },
     "LinuxIsolateConfig": {
       "type": "object",
-      "description": "Opt-in namespace isolation (NEP-0004). Every field defaults to false. Fields merge by logical OR across profile layers and the CLI: any layer can enable a namespace and none can disable it. Requested isolation that the host cannot provide is a startup error, never a silent downgrade. Inert on macOS. Not supported by `nono wrap`.",
+      "description": "Opt-in namespace isolation (NEP-0004). Every field defaults to false (extra_masks to empty). Boolean fields merge by logical OR across profile layers, packs and the CLI: any layer can enable a namespace and none can disable it. extra_masks merges by deduplicated append, so no layer can remove a mask. Requested isolation that the host cannot provide is a startup error, never a silent downgrade. Inert on macOS. Not supported by `nono wrap`.",
       "additionalProperties": false,
       "properties": {
         "network": {
@@ -699,6 +699,17 @@
           "type": "boolean",
           "default": false,
           "description": "Run in a new user + UTS namespace (hostname changes do not affect the host)."
+        },
+        "mounts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run in a new user + mount namespace that masks host IPC endpoints: an empty tmpfs over $XDG_RUNTIME_DIR (and /run/user/<uid>), masks over /run/dbus, the Docker, containerd, Podman and snapd sockets and /run/systemd/private, and a private per-session /tmp. Paths the profile grants, including unix_socket grants, are re-bound through the masks; a grant of a whole masked directory applies to the session's private copy. Cannot be combined with security.capability_elevation."
+        },
+        "extra_masks": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Additional host paths to mask (a directory gets an empty tmpfs; a socket or file becomes unreachable). Additive only: no layer can remove a default or inherited mask. Requires mounts. Supports variable expansion ($HOME, $XDG_RUNTIME_DIR, $WORKDIR, ...); a path that does not exist on the host is skipped."
         }
       }
     },

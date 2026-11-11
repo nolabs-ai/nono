@@ -236,6 +236,39 @@ pub fn query_path(
 /// `denied_by_filesystem_policy` matters on macOS because nono translates a
 /// filesystem deny for a socket path into a Seatbelt `network-outbound` deny.
 /// Linux Landlock filesystem denies do not mediate AF_UNIX operations.
+/// Answer a pathname socket query for a path hidden by the Linux mount mask
+/// (`linux.isolate.mounts`). Returns `None` when no mask covers the path, or
+/// when an explicit grant re-binds it through the mask; the regular socket
+/// query then decides.
+#[must_use]
+pub fn query_masked_unix_socket(
+    path: &Path,
+    op: nono::UnixSocketOp,
+    caps: &CapabilitySet,
+    masked_paths: &[std::path::PathBuf],
+) -> Option<QueryResult> {
+    let resolved = try_canonicalize(path);
+    let mask = masked_paths
+        .iter()
+        .find(|mask| resolved.starts_with(mask))?;
+    if caps.matching_unix_socket(&resolved, op).is_some() {
+        return None;
+    }
+    Some(QueryResult::Denied {
+        reason: "isolation_mount_masked".to_string(),
+        details: Some(format!(
+            "{} is hidden by the linux.isolate.mounts mask over {}; only explicitly granted \
+             paths are re-bound through the mask",
+            resolved.display(),
+            mask.display()
+        )),
+        policy_source: Some("linux.isolate.mounts".to_string()),
+        matching_capability: None,
+        suggested_flag: Some(format!("--allow-unix-socket {}", resolved.display())),
+        endpoint_rules: None,
+    })
+}
+
 pub fn query_unix_socket(
     path: &Path,
     op: nono::UnixSocketOp,
@@ -1056,6 +1089,46 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_query_masked_unix_socket_denies_unless_granted() {
+        let dir = tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical");
+        let socket = root.join("agent.sock");
+        let _listener = UnixListener::bind(&socket).expect("bind");
+        let masked = vec![root.clone()];
+
+        let denied = query_masked_unix_socket(
+            &socket,
+            UnixSocketOp::Connect,
+            &CapabilitySet::new(),
+            &masked,
+        )
+        .expect("masked path is answered");
+        assert!(
+            matches!(&denied, QueryResult::Denied { reason, .. } if reason == "isolation_mount_masked"),
+            "{denied:?}"
+        );
+
+        let mut caps = CapabilitySet::new();
+        caps.add_unix_socket(
+            UnixSocketCapability::new_file(&socket, UnixSocketMode::Connect).expect("grant"),
+        );
+        assert!(
+            query_masked_unix_socket(&socket, UnixSocketOp::Connect, &caps, &masked).is_none(),
+            "a granted socket is re-bound through the mask"
+        );
+        assert!(
+            query_masked_unix_socket(
+                Path::new("/elsewhere.sock"),
+                UnixSocketOp::Connect,
+                &CapabilitySet::new(),
+                &masked
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn test_query_unix_socket_linux_unmediated_is_not_reported_allowed() {

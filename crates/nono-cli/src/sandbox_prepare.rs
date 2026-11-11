@@ -798,7 +798,7 @@ fn finalize_prepared_sandbox(
     #[cfg(target_os = "linux")]
     output::print_landlock_scope_policy(&prepared.caps, args.verbose, silent);
     #[cfg(target_os = "linux")]
-    output::print_isolation(prepared.isolate, silent);
+    output::print_isolation(&prepared.isolate, silent);
 
     if !Sandbox::is_supported() {
         return Err(NonoError::SandboxInit(Sandbox::support_info().details));

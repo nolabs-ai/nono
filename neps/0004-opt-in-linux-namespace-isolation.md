@@ -23,15 +23,18 @@ user manager) instead of mediating them syscall-by-syscall.
 
 ## Implementation status
 
-Partially implemented as of 2026-11-02:
+Partially implemented as of 2026-11-11:
 
 - Phase 1 and private TCP loopback shipped in v0.81.0
   ([#2145](https://github.com/nolabs-ai/nono/pull/2145)): user/network/IPC/UTS
   namespaces, the passed-listener proxy bridge and startup validation.
 - Landlock ABI detection and reporting through V9 shipped separately in
   [#2217](https://github.com/nolabs-ai/nono/pull/2217); enforcement stays at V6.
-- Pending: Phase 2 mount masks and private `/tmp`, SOCKS5, packaged AppArmor
-  support, external-namespace detection and isolation audit metadata.
+- Phase 2 mount masks and private `/tmp` (`linux.isolate.mounts`,
+  `extra_masks`), with the effective isolation set recorded in sandbox state
+  and reported by `nono why`.
+- Pending: SOCKS5, packaged AppArmor support and external-namespace
+  detection.
   Reverse forwarding remains deferred; WSL2 support remains unverified.
 
 ## Motivation
@@ -409,8 +412,8 @@ existing `linux.af_unix_mediation` precedent):
 }
 ```
 
-Current CLI: `--isolate net,loopback,ipc,uts` (comma list).
-`mounts` and `extra_masks` are planned Phase 2 fields and are not accepted yet.
+Current CLI: `--isolate net,loopback,ipc,uts,mounts` (comma list).
+`extra_masks` is profile-only.
 
 **Merge semantics.** The boolean `isolate` fields merge like `network.block`:
 logical OR across every profile layer, packs and the CLI. Any layer can turn

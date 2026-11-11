@@ -317,6 +317,11 @@ pub struct ExecConfig<'a> {
     /// Landlock and seccomp apply. Partial application is fatal.
     #[cfg(target_os = "linux")]
     pub namespaces: Option<nono::NamespaceSpec>,
+    /// Mount masks applied in the child's new mount namespace, after the id
+    /// maps are written and before Landlock. Present exactly when
+    /// `namespaces` requests a mount namespace.
+    #[cfg(target_os = "linux")]
+    pub mount_mask: Option<&'a nono::PreparedMountMask>,
     /// Allow-list of environment variable names. When set, only variables
     /// matching a glob pattern (e.g. `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.

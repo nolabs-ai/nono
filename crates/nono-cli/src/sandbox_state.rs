@@ -63,6 +63,21 @@ pub struct SandboxState {
     /// nono builds; `#[serde(default)]` keeps those loadable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimits>,
+    /// Effective Linux namespace isolation (NEP-0004). Absent when no
+    /// isolation was requested, and in states written by older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<IsolationState>,
+}
+
+/// Linux namespace isolation in effect for a sandbox (NEP-0004).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolationState {
+    /// Requested namespaces, as `--isolate` names them (`net`, `mounts`, ...).
+    pub namespaces: Vec<String>,
+    /// Host paths hidden by the mount mask. Granted paths beneath them are
+    /// re-bound and stay reachable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub masked_paths: Vec<PathBuf>,
 }
 
 /// Enforcement applied to pathname AF_UNIX operations for a running sandbox.
@@ -275,6 +290,7 @@ impl SandboxState {
             denied_domains: denied_domains.to_vec(),
             domain_endpoints: domain_endpoints.to_vec(),
             resource_limits: caps.resource_limits().copied(),
+            isolation: None,
         }
     }
 
@@ -1118,6 +1134,7 @@ mod tests {
             }],
             unix_sockets: vec![],
             pathname_socket_enforcement: None,
+            isolation: None,
             net_blocked: false,
             allowed_commands: vec![],
             blocked_commands: vec![],

@@ -876,6 +876,8 @@ pub(crate) enum CredentialResolution<'a> {
     Rejected(u16),
     /// Host credential capture failed; return a safe diagnostic, not backend output.
     CaptureFailed,
+    /// The route requires a managed credential, but none is available.
+    Unavailable,
     /// Forward the request, optionally injecting `credential`.
     Forward {
         credential: Option<ResolvedCredential<'a>>,
@@ -944,7 +946,7 @@ pub(crate) async fn resolve_managed_credential<'a>(
             port,
             &reason,
         );
-        return CredentialResolution::Rejected(503);
+        return CredentialResolution::Unavailable;
     }
 
     // AWS SigV4 signing is not yet implemented. Return 501 so the caller knows
@@ -1231,6 +1233,10 @@ where
         }
         CredentialResolution::CaptureFailed => {
             reverse::send_credential_capture_error(tls_stream, req.method == "HEAD").await?;
+            return Ok(());
+        }
+        CredentialResolution::Unavailable => {
+            reverse::send_credential_unavailable_error(tls_stream, req.method == "HEAD").await?;
             return Ok(());
         }
         CredentialResolution::Forward { credential } => credential,
@@ -2425,6 +2431,7 @@ fn parse_request_line(line: &str) -> Result<(String, String, String)> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::capture::tests::FailureKind;
 
     #[test]
     fn handshake_validity_errors_suggest_clocks_and_expiry() {
@@ -4650,20 +4657,30 @@ mod tests {
 
     #[tokio::test]
     async fn http1_intercept_reports_credential_capture_failure() {
-        assert_http1_credential_capture_failure("POST").await;
+        assert_http1_credential_failure("POST", FailureKind::Capture).await;
     }
 
     #[tokio::test]
     async fn http1_head_reports_credential_capture_failure_without_body() {
-        assert_http1_credential_capture_failure("HEAD").await;
+        assert_http1_credential_failure("HEAD", FailureKind::Capture).await;
     }
 
-    async fn assert_http1_credential_capture_failure(method: &str) {
+    #[tokio::test]
+    async fn http1_intercept_reports_credential_unavailable() {
+        assert_http1_credential_failure("POST", FailureKind::Unavailable).await;
+    }
+
+    #[tokio::test]
+    async fn http1_intercept_head_reports_credential_unavailable_without_body() {
+        assert_http1_credential_failure("HEAD", FailureKind::Unavailable).await;
+    }
+
+    async fn assert_http1_credential_failure(method: &str, failure: FailureKind) {
         use crate::capture::tests::{FailingCaptureBackend, FailureFixture, assert_http1_failure};
         use tokio::io::AsyncReadExt;
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let fixture = FailureFixture::new().await;
+            let fixture = FailureFixture::new(failure).await;
             let session_token = Zeroizing::new("session-token".to_string());
             let filter = ProxyFilter::allow_all();
             let mut ctx = test_intercept_ctx(&session_token, &fixture.connector, &filter);
@@ -4683,7 +4700,7 @@ mod tests {
             drop(server);
             let mut response = String::new();
             client.read_to_string(&mut response).await.unwrap();
-            assert_http1_failure(&response, method == "HEAD");
+            assert_http1_failure(&response, method == "HEAD", failure);
             fixture.assert_no_upstream_connection();
         }).await.unwrap();
     }

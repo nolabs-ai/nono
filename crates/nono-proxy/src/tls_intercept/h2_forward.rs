@@ -328,7 +328,19 @@ async fn handle_h2_stream(
             return Ok(());
         }
         handle::CredentialResolution::CaptureFailed => {
-            send_h2_credential_capture_error(&mut respond, method == http::Method::HEAD)?;
+            send_h2_credential_error(
+                &mut respond,
+                crate::capture::CAPTURE_FAILED_BODY,
+                method == http::Method::HEAD,
+            )?;
+            return Ok(());
+        }
+        handle::CredentialResolution::Unavailable => {
+            send_h2_credential_error(
+                &mut respond,
+                crate::credential::CREDENTIAL_UNAVAILABLE_BODY,
+                method == http::Method::HEAD,
+            )?;
             return Ok(());
         }
         handle::CredentialResolution::Forward { credential } => credential,
@@ -683,12 +695,13 @@ async fn stream_body_to_client(mut recv: RecvStream, send: &mut SendStream<Bytes
     Ok(())
 }
 
-/// Send the same safe credential-capture diagnostic as the HTTP/1.1 paths.
-fn send_h2_credential_capture_error(
+/// Send the same safe credential diagnostic as the HTTP/1.1 paths.
+fn send_h2_credential_error(
     respond: &mut h2::server::SendResponse<Bytes>,
+    body: &'static str,
     is_head: bool,
 ) -> Result<()> {
-    let body = Bytes::from_static(crate::capture::CAPTURE_FAILED_BODY.as_bytes());
+    let body = Bytes::from_static(body.as_bytes());
     let response = Response::builder()
         .status(http::StatusCode::SERVICE_UNAVAILABLE)
         .header(http::header::CONTENT_TYPE, "application/json")
@@ -724,6 +737,7 @@ fn send_h2_error(respond: &mut h2::server::SendResponse<Bytes>, status_code: u16
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::capture::tests::FailureKind;
     use crate::config::{EndpointRule, InjectMode, RouteConfig};
     use crate::credential::{CredentialStore, LoadedCredential};
     use crate::filter::ProxyFilter;
@@ -1487,16 +1501,26 @@ mod tests {
 
     #[tokio::test]
     async fn h2_intercept_reports_credential_capture_failure() {
-        assert_h2_credential_capture_failure("POST").await;
+        assert_h2_credential_failure("POST", FailureKind::Capture).await;
     }
 
     #[tokio::test]
     async fn h2_head_reports_credential_capture_failure_without_body() {
-        assert_h2_credential_capture_failure("HEAD").await;
+        assert_h2_credential_failure("HEAD", FailureKind::Capture).await;
     }
 
-    async fn assert_h2_credential_capture_failure(method: &str) {
-        use crate::capture::tests::{FailingCaptureBackend, assert_failure_body};
+    #[tokio::test]
+    async fn h2_intercept_reports_credential_unavailable() {
+        assert_h2_credential_failure("POST", FailureKind::Unavailable).await;
+    }
+
+    #[tokio::test]
+    async fn h2_head_reports_credential_unavailable_without_body() {
+        assert_h2_credential_failure("HEAD", FailureKind::Unavailable).await;
+    }
+
+    async fn assert_h2_credential_failure(method: &str, failure: FailureKind) {
+        use crate::capture::tests::FailingCaptureBackend;
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let ca = Arc::new(EphemeralCa::generate().unwrap());
@@ -1504,6 +1528,10 @@ mod tests {
             let connector = h2_tls_connector_trusting(ca.cert_pem());
             let (route_store, credential_store) =
                 make_cmd_route_stores("localhost", port, &connector).await;
+            let credential_store = match failure {
+                FailureKind::Capture => credential_store,
+                FailureKind::Unavailable => CredentialStore::empty(),
+            };
             let session_token = Zeroizing::new("session-token".to_string());
             let filter = ProxyFilter::allow_all();
             let ctx = InterceptCtx {
@@ -1554,12 +1582,12 @@ mod tests {
                     while let Some(chunk) = body.data().await {
                         bytes.extend_from_slice(&chunk.unwrap());
                     }
-                    assert_eq!(content_length, crate::capture::CAPTURE_FAILED_BODY.len());
+                    assert_eq!(content_length, failure.expected_body().len());
                     if method == "HEAD" {
                         assert!(bytes.is_empty());
                     } else {
                         assert_eq!(content_length, bytes.len());
-                        assert_failure_body(&bytes);
+                        failure.assert_body(&bytes);
                     }
                     drop(client);
                     driver.abort();

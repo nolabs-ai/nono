@@ -125,6 +125,31 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    pub(crate) enum FailureKind {
+        Capture,
+        Unavailable,
+    }
+
+    impl FailureKind {
+        pub fn expected_body(self) -> &'static str {
+            match self {
+                Self::Capture => {
+                    r#"{"error":"credential_capture_failed","message":"nono could not obtain host credentials. Check the host credential helper and proxy logs."}"#
+                }
+                Self::Unavailable => {
+                    r#"{"error":"credential_unavailable","message":"nono could not load the managed credential. Check the host credential configuration and proxy logs."}"#
+                }
+            }
+        }
+
+        pub fn assert_body(self, body: &[u8]) {
+            let value: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let expected: serde_json::Value = serde_json::from_str(self.expected_body()).unwrap();
+            assert_eq!(value, expected);
+        }
+    }
+
     pub(crate) struct FailureFixture {
         pub route_store: Arc<RouteStore>,
         pub credential_store: Arc<CredentialStore>,
@@ -134,7 +159,7 @@ pub(crate) mod tests {
     }
 
     impl FailureFixture {
-        pub async fn new() -> Self {
+        pub async fn new(failure: FailureKind) -> Self {
             let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             upstream.set_nonblocking(true).unwrap();
             let config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -160,12 +185,15 @@ pub(crate) mod tests {
             .unwrap();
             let routes = [route];
             let route_store = Arc::new(RouteStore::load(&routes).await.unwrap());
-            let credential_store = Arc::new(
-                CredentialStore::load_with_diagnostics(&routes, &connector, None)
-                    .await
-                    .unwrap()
-                    .store,
-            );
+            let credential_store = Arc::new(match failure {
+                FailureKind::Capture => {
+                    CredentialStore::load_with_diagnostics(&routes, &connector, None)
+                        .await
+                        .unwrap()
+                        .store
+                }
+                FailureKind::Unavailable => CredentialStore::empty(),
+            });
             Self {
                 route_store,
                 credential_store,
@@ -185,27 +213,19 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn assert_failure_body(body: &[u8]) {
-        let value: serde_json::Value = serde_json::from_slice(body).unwrap();
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "error": "credential_capture_failed",
-                "message": "nono could not obtain host credentials. Check the host credential helper and proxy logs."
-            })
-        );
-    }
-
-    pub(crate) fn assert_http1_failure(response: &str, is_head: bool) {
+    pub(crate) fn assert_http1_failure(response: &str, is_head: bool, failure: FailureKind) {
         let (headers, body) = response.split_once("\r\n\r\n").unwrap();
         assert!(headers.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(headers.contains("Content-Type: application/json\r\n"));
-        assert!(headers.ends_with(&format!("Content-Length: {}", CAPTURE_FAILED_BODY.len())));
+        assert!(headers.ends_with(&format!(
+            "Content-Length: {}",
+            failure.expected_body().len()
+        )));
         assert!(!headers.to_ascii_lowercase().contains("www-authenticate"));
         if is_head {
             assert!(body.is_empty());
         } else {
-            assert_failure_body(body.as_bytes());
+            failure.assert_body(body.as_bytes());
         }
     }
 }

@@ -250,7 +250,7 @@ pub async fn handle_reverse_proxy(
             0,
             &reason,
         );
-        send_error(stream, 503, "Service Unavailable").await?;
+        send_credential_unavailable_error(stream, method == "HEAD").await?;
         return Ok(());
     }
 
@@ -1811,6 +1811,24 @@ where
     .await
 }
 
+/// Reject a missing managed credential without exposing credential diagnostics.
+pub(crate) async fn send_credential_unavailable_error<S>(
+    stream: &mut S,
+    is_head: bool,
+) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    send_json_error(
+        stream,
+        503,
+        "Service Unavailable",
+        crate::credential::CREDENTIAL_UNAVAILABLE_BODY,
+        is_head,
+    )
+    .await
+}
+
 async fn send_json_error<S>(
     stream: &mut S,
     status: u16,
@@ -2888,22 +2906,33 @@ pub(crate) fn injected_credential_header_names(cred: Option<&LoadedCredential>) 
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::capture::tests::FailureKind;
 
     #[tokio::test]
     async fn reverse_proxy_reports_credential_capture_failure() {
-        assert_reverse_credential_capture_failure("POST").await;
+        assert_reverse_credential_failure("POST", FailureKind::Capture).await;
     }
 
     #[tokio::test]
     async fn reverse_proxy_head_reports_credential_capture_failure_without_body() {
-        assert_reverse_credential_capture_failure("HEAD").await;
+        assert_reverse_credential_failure("HEAD", FailureKind::Capture).await;
     }
 
-    async fn assert_reverse_credential_capture_failure(method: &str) {
+    #[tokio::test]
+    async fn reverse_proxy_reports_credential_unavailable() {
+        assert_reverse_credential_failure("POST", FailureKind::Unavailable).await;
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_head_reports_credential_unavailable_without_body() {
+        assert_reverse_credential_failure("HEAD", FailureKind::Unavailable).await;
+    }
+
+    async fn assert_reverse_credential_failure(method: &str, failure: FailureKind) {
         use crate::capture::tests::{FailingCaptureBackend, FailureFixture, assert_http1_failure};
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let fixture = FailureFixture::new().await;
+            let fixture = FailureFixture::new(failure).await;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let (client, server) = tokio::join!(
                 TcpStream::connect(listener.local_addr().unwrap()),
@@ -2939,7 +2968,7 @@ mod tests {
             drop(server);
             let mut response = String::new();
             client.read_to_string(&mut response).await.unwrap();
-            assert_http1_failure(&response, method == "HEAD");
+            assert_http1_failure(&response, method == "HEAD", failure);
             fixture.assert_no_upstream_connection();
         }).await.unwrap();
     }

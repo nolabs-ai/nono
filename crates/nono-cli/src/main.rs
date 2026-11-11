@@ -24,6 +24,7 @@ mod config;
 mod connect_client;
 mod credential_runtime;
 mod deprecation_warnings;
+mod device_key;
 mod diagnostic;
 mod exec_strategy;
 mod execution_runtime;
@@ -37,6 +38,7 @@ mod launch_runtime;
 #[cfg(target_os = "linux")]
 mod lineage_cgroup;
 mod login_cmd;
+mod login_enrollment;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
@@ -84,9 +86,11 @@ mod startup_runtime;
 mod state_paths;
 mod supervised_runtime;
 mod temp_keepalive;
+mod tenant_selector;
 mod terminal_approval;
 mod terminal_capture;
 mod terminal_prompt;
+mod terminal_selector;
 mod theme;
 mod timeouts;
 #[path = "tool-sandbox/mod.rs"]
@@ -141,9 +145,6 @@ fn main() {
     let command_blocking_warnings = collect_cli_warnings(&cli);
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
-    #[cfg(unix)]
-    let cli_result = remote_run::validate_matches(&matches).and_then(|()| run_cli(cli));
-    #[cfg(not(unix))]
     let cli_result = run_cli(cli);
     tool_sandbox::log_main_total();
     #[cfg(unix)]

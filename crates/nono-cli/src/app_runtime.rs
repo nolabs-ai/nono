@@ -1,5 +1,5 @@
 use crate::audit_commands;
-use crate::cli::{Cli, Commands, RunArgs, SetupArgs};
+use crate::cli::{Cli, Commands, RemoteArgs, RemoteCommands, RunArgs, SetupArgs};
 use crate::command_runtime::{run_sandbox, run_shell, run_wrap};
 use crate::completions::run_completions;
 use crate::open_url_runtime::run_open_url_helper;
@@ -67,40 +67,12 @@ fn dispatch_command(
         Commands::Platform(args) => run_command_with_update(update_handle, silent, || {
             platform_client::run_platform(args)
         }),
-        Commands::Login(args) => {
-            run_command_with_update(update_handle, silent, || crate::login_cmd::run_login(args))
+        Commands::Remote(args) => {
+            run_command_with_update(update_handle, silent, || run_remote(args))
         }
-        Commands::Logout(args) => {
-            run_command_with_update(update_handle, silent, || crate::login_cmd::run_logout(args))
+        Commands::Ps(args) => {
+            run_command_with_update(update_handle, silent, || session_commands::run_ps(&args))
         }
-        Commands::Connect(args) => run_command_with_update(update_handle, silent, || {
-            #[cfg(unix)]
-            {
-                crate::connect_client::run_connect(args)
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = args;
-                Err(nono::NonoError::UnsupportedPlatform(
-                    "remote terminal attach currently requires a Unix terminal".to_string(),
-                ))
-            }
-        }),
-        Commands::Ps(args) => run_command_with_update(update_handle, silent, || {
-            if args.remote {
-                #[cfg(unix)]
-                {
-                    return crate::connect_client::run_remote_ps(&args);
-                }
-                #[cfg(not(unix))]
-                {
-                    return Err(nono::NonoError::UnsupportedPlatform(
-                        "remote session listing is not implemented on this platform".to_string(),
-                    ));
-                }
-            }
-            session_commands::run_ps(&args)
-        }),
         Commands::Stop(args) => {
             run_command_with_update(update_handle, silent, || session_commands::run_stop(&args))
         }
@@ -160,6 +132,24 @@ fn dispatch_command(
     }
 }
 
+fn run_remote(args: RemoteArgs) -> Result<()> {
+    #[cfg(unix)]
+    {
+        match args.command {
+            RemoteCommands::Run(args) => crate::remote_run::run(args),
+            RemoteCommands::List(args) => crate::connect_client::run_remote_ps(&args),
+            RemoteCommands::Connect(args) => crate::connect_client::run_connect(args),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        Err(nono::NonoError::UnsupportedPlatform(
+            "remote commands currently require Unix".into(),
+        ))
+    }
+}
+
 fn run_command_with_update<T>(
     update_handle: &mut Option<update_check::UpdateCheckHandle>,
     silent: bool,
@@ -179,14 +169,6 @@ fn run_command_with_banner_and_update<T>(
 }
 
 fn run_or_detach(args: RunArgs, silent: bool) -> Result<()> {
-    if args.remote_options.remote {
-        #[cfg(unix)]
-        return crate::remote_run::run(args);
-        #[cfg(not(unix))]
-        return Err(nono::NonoError::UnsupportedPlatform(
-            "remote launch currently requires Unix".to_string(),
-        ));
-    }
     if args.detached && std::env::var_os(DETACHED_LAUNCH_ENV).is_none() {
         run_detached_launch(args, silent)
     } else {

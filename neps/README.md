@@ -107,6 +107,6 @@ CI fails PRs that leave them stale.
 | 0005 | Windows enforcement backend | draft | Non-breaking |
 | 0007 | Supervisor decisions, audit and credentials outside a microVM guest | draft | Breaking: not yet assessed |
 | 0008 | Session flight recorder | draft | Breaking: not yet assessed |
-| 0009 | Account sign-in from the CLI (`nono login`) | draft | Non-breaking |
+| 0009 | Account sign-in from the CLI (`nono platform login`) | draft | Breaking |
 | 0010 | Session terminal capture | accepted | Non-breaking |
 <!-- nep-index:end -->

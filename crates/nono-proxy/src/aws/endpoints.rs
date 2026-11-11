@@ -30,13 +30,13 @@ fn derived_region_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"^[a-z]{2}-(?:central|north|south|east|west|northeast|northwest|southeast|southwest)-[1-9][0-9]?$",
+            r"^(?:[a-z]{2}-(?:central|north|south|east|west|northeast|northwest|southeast|southwest)|us-gov-(?:east|west))-[1-9][0-9]?$",
         )
         .expect("static regex is valid")
     })
 }
 
-/// Commercial-partition region grammar for derived regions; `cn-` is excluded.
+/// Commercial and GovCloud (`us-gov-`) region grammar for derived regions; `cn-` is excluded.
 fn is_derived_region(region: &str) -> bool {
     !region.starts_with("cn-") && derived_region_re().is_match(region)
 }
@@ -179,6 +179,15 @@ pub fn validate_aws_upstream(
         || !matches!(url.path(), "" | "/")
     {
         return reject("userinfo, path, query, and fragment are not allowed");
+    }
+    // Bucket-subdomain (virtual-hosted S3) hosts keep a literal region, so the
+    // wildcard only spans the bucket label and the route signs with its own
+    // `aws_auth.region`.
+    if matches!(
+        host.split('.').collect::<Vec<_>>().as_slice(),
+        ["*", "s3", region, "amazonaws", "com"] if region_re().is_match(region)
+    ) {
+        return Ok(None);
     }
     let service_label = match host.split('.').collect::<Vec<_>>().as_slice() {
         [service_label, "*", "amazonaws", "com"] => *service_label,
@@ -550,6 +559,7 @@ mod tests {
             "https://*.amazonaws.com",
             "https://*.*.amazonaws.com",
             "https://*.s3.*.amazonaws.com",
+            "https://*.s3.us-east-1.amazonaws.com.cn",
             "https://*.eks.us-east-1.amazonaws.com",
             "https://eks.*.amazonaws.com.cn",
             "https://eks.*.api.aws",
@@ -596,6 +606,8 @@ mod tests {
         let c = cfg(Some("us-east-1"), Some("bedrock"));
         for upstream in [
             "https://s3.us-gov-east-1.amazonaws.com",
+            "https://*.s3.us-east-1.amazonaws.com",
+            "https://*.s3.us-gov-west-1.amazonaws.com",
             "https://*.example.com",
         ] {
             assert_eq!(validate_aws_upstream(upstream, &c).unwrap(), None);
@@ -622,11 +634,14 @@ mod tests {
             "il-central-1",
             "mx-central-1",
             "ca-west-1",
+            "us-gov-west-1",
+            "us-gov-east-1",
         ] {
             assert!(is_derived_region(ok), "{ok}");
         }
         for bad in [
-            "us-gov-west-1",
+            "us-gov-north-1",
+            "us-gov-west-0",
             "us-iso-east-1",
             "us-isob-east-1",
             "cn-north-1",
@@ -646,6 +661,10 @@ mod tests {
             derive_region("eks.eu-west-1.amazonaws.com", 443, "eks").as_deref(),
             Some("eu-west-1")
         );
+        assert_eq!(
+            derive_region("eks.us-gov-west-1.amazonaws.com", 443, "eks").as_deref(),
+            Some("us-gov-west-1")
+        );
     }
 
     #[test]
@@ -661,7 +680,6 @@ mod tests {
             ("eks.amazonaws.com", 443),
             ("a.eks.us-west-2.amazonaws.com", 443),
             ("eks..amazonaws.com", 443),
-            ("eks.us-gov-west-1.amazonaws.com", 443),
             ("127.0.0.1", 443),
             ("[::1]", 443),
             ("", 443),

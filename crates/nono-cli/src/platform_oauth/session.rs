@@ -1,4 +1,4 @@
-//! Local storage for a `nono login` session.
+//! Local storage for a `nono platform login` session.
 //!
 //! Three owner-only files in nono's state directory (`$XDG_STATE_HOME/nono`):
 //!
@@ -44,11 +44,15 @@ pub(crate) struct SessionRecord {
     pub(crate) key_thumbprint: String,
     pub(crate) user_subject: String,
     pub(crate) user_display: String,
-    /// The organization remote commands use unless `NONO_ORG` says otherwise.
+    /// The organization remote commands use unless `NONO_TENANT` says otherwise.
     pub(crate) tenant_id: String,
     pub(crate) organizations: Vec<Organization>,
     pub(crate) console_url: Option<String>,
     pub(crate) signed_in_at: String,
+    #[serde(default)]
+    pub(crate) tenant_selection_pending: bool,
+    #[serde(default)]
+    pub(crate) enrollment_authorized: bool,
 }
 
 impl SessionRecord {
@@ -61,6 +65,15 @@ impl SessionRecord {
     /// Resolve an organization by ID, slug, or (unambiguous, case-insensitive)
     /// display name.
     pub(crate) fn find_organization(&self, name: &str) -> Result<&Organization> {
+        if name == "personal" {
+            return self
+                .organizations
+                .iter()
+                .find(|tenant| tenant.kind == "personal")
+                .ok_or_else(|| {
+                    NonoError::ActionRequired("this user has no personal tenant".into())
+                });
+        }
         if let Some(org) = self
             .organizations
             .iter()
@@ -75,11 +88,11 @@ impl SessionRecord {
         match (matches.next(), matches.next()) {
             (Some(org), None) => Ok(org),
             (Some(_), Some(_)) => Err(NonoError::ActionRequired(format!(
-                "more than one organization is named '{name}'; use its slug: {}",
+                "more than one tenant is named '{name}'; use its slug: {}",
                 self.organization_slugs()
             ))),
             _ => Err(NonoError::ActionRequired(format!(
-                "you are not a member of an organization called '{name}'; your organizations: {}",
+                "you are not a member of a tenant called '{name}'; your tenants: {}",
                 self.organization_slugs()
             ))),
         }
@@ -143,7 +156,8 @@ pub(crate) fn load_record() -> Result<Option<SessionRecord>> {
         .map_err(|error| NonoError::ConfigParse(format!("invalid {}: {error}", path.display())))?;
     if record.protocol_version != SESSION_PROTOCOL_V1 {
         return Err(NonoError::ConfigParse(
-            "unsupported local sign-in record; run `nono logout` and sign in again".to_string(),
+            "unsupported local sign-in record; run `nono platform logout` and sign in again"
+                .to_string(),
         ));
     }
     Ok(Some(record))
@@ -160,6 +174,7 @@ pub(crate) fn new_record(
     key: &DpopKey,
     identity: &super::client::Identity,
     session: &super::client::SessionInfo,
+    enrollment_authorized: bool,
 ) -> SessionRecord {
     SessionRecord {
         protocol_version: SESSION_PROTOCOL_V1.to_string(),
@@ -171,6 +186,8 @@ pub(crate) fn new_record(
         tenant_id: session.tenant_id.clone(),
         organizations: session.organizations.clone(),
         console_url: session.console_url.as_ref().map(|url| url.to_string()),
+        tenant_selection_pending: true,
+        enrollment_authorized,
         signed_in_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     }
 }
@@ -340,7 +357,7 @@ fn read_secret(path: &Path) -> Result<Option<Zeroizing<String>>> {
     #[cfg(unix)]
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(NonoError::ActionRequired(format!(
-            "{} is accessible to other users; run `nono logout` and sign in again",
+            "{} is accessible to other users; run `nono platform logout` and sign in again",
             path.display()
         )));
     }
@@ -385,6 +402,8 @@ pub(crate) mod tests {
             ],
             console_url: None,
             signed_in_at: "2026-11-02T00:00:00Z".to_string(),
+            tenant_selection_pending: false,
+            enrollment_authorized: true,
         }
     }
 

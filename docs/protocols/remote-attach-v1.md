@@ -1,6 +1,6 @@
 # Remote terminal attach protocol v1
 
-This document specifies the open WebSocket contract used by `nono connect` to
+This document specifies the open WebSocket contract used by `nono remote connect` to
 discover nono-console and attach a local terminal to a hosted session. It does
 not define session launch, fleet policy, or local sandbox enforcement.
 
@@ -59,11 +59,11 @@ explicit development and support override.
 
 ## Human device authorization
 
-A person signed in with `nono login` uses OAuth instead of this flow: the CLI
+A person signed in with `nono platform login` uses OAuth instead of this flow: the CLI
 presents a DPoP-bound access token (`Authorization: DPoP <token>` plus a
 `DPoP` proof) obtained as specified in [cli-login-v1](cli-login-v1.md), and
 needs no device enrollment. The flow below remains for enrolled devices without
-a `nono login` session.
+a `nono platform login` session.
 
 When no explicit human token is configured, an enrolled device obtains a
 revocable CLI authorization without copying the browser session cookie. All
@@ -128,7 +128,7 @@ not enter this flow.
 
 After a newly approved credential has been cached and successfully exchanged,
 the CLI reports `Terminal authorized.` A cached authorization is normally
-silent. `nono ps --remote` performs the same authorization and discovery flow,
+silent. `nono remote list` performs the same authorization and discovery flow,
 lists the sessions visible to that human, and exits successfully without
 attaching a terminal.
 
@@ -163,9 +163,9 @@ agent, and repository metadata. The fields consumed by protocol v1 are:
 }
 ```
 
-Additive fields are allowed. By default `nono ps --remote` and the interactive
-`nono connect` picker show only entries whose backend is `ready` and whose
-runtime record is `running`. `nono ps --remote --all` retains inactive entries;
+Additive fields are allowed. By default `nono remote list` and the interactive
+`nono remote connect` picker show only entries whose backend is `ready` and whose
+runtime record is `running`. `nono remote list --all` retains inactive entries;
 `--json` emits the client-consumed protocol fields for automation. Listing and
 attaching accept the same `--console` / `NONO_CONSOLE_URL` discovery override
 and `--token-file` / `NONO_CONNECT_TOKEN_FILE` credential override.

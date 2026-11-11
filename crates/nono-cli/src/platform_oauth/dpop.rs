@@ -1,6 +1,6 @@
 //! DPoP proofs ([RFC 9449]) signed by the platform device key.
 //!
-//! Every OAuth token issued to `nono login` is bound to the CLI's P-256 device
+//! Every OAuth token issued to `nono platform login` is bound to the CLI's P-256 device
 //! key. The key's JWK thumbprint ([RFC 7638]) is sent as `dpop_jkt` at
 //! authorization time, and every token-endpoint and resource request carries a
 //! fresh proof JWT. A copied token is useless without the private key.

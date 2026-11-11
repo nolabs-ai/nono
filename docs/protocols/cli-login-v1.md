@@ -1,14 +1,15 @@
 # CLI login protocol v1
 
-This document specifies the OAuth 2.0 contract between `nono login` and a nono
+This document specifies the OAuth 2.0 contract between `nono platform login` and a nono
 platform acting as the authorization server ([NEP-0009]). It is normative for
 both the CLI and the platform. It does not define how the platform signs people
 in (GitHub, Google, or other providers), how it onboards new accounts, or any
 sandbox behaviour.
 
-`nono login` signs in a person. It does not enroll a device; device enrollment
-and audit delivery are specified separately in
-[audit-delivery-v1](audit-delivery-v1.md).
+`nono platform login` signs in a person and, by default, registers a separate device
+identity through the optional [login enrollment extension](login-enrollment-v1.md).
+`--no-enroll` or `NONO_NO_ENROLL=true` requests sign-in only. Manual token enrollment and audit delivery
+remain specified in [audit-delivery-v1](audit-delivery-v1.md).
 
 The CLI is an OAuth 2.0 public native client:
 
@@ -31,7 +32,9 @@ unrelated to any device enrollment key.
 | `nono:connect` | Access tokens accepted by nono-console: list sessions and attach to them. |
 | `nono:runs` | Access tokens accepted by the platform Runs API: launch and read runs; and by nono-console to list the workspaces a run can target. |
 
-The CLI requests all three. The platform rejects any other scope value.
+The CLI requests all three. With automatic enrollment enabled and the extension
+advertised, it also requests `nono:enroll`. That scope authorizes the dedicated
+enrollment endpoint; it does not expand console or Runs API access.
 
 A console accepts these tokens only for `GET /api/v1/sessions`,
 `GET /api/v1/sessions/{id}/terminal` and `GET /api/v1/workspaces`, and still
@@ -65,7 +68,7 @@ otherwise fails without writing any state:
 
 `authorization_endpoint` is required for the loopback flow,
 `device_authorization_endpoint` for the device flow, and `revocation_endpoint`
-for `nono logout`. Deployments that front the platform with a reverse proxy
+for `nono platform logout`. Deployments that front the platform with a reverse proxy
 must route the metadata path to the platform.
 
 ## DPoP
@@ -130,8 +133,9 @@ Resource servers must reject a DPoP-bound access token presented as `Bearer`.
 2. The platform signs the person in. Someone without an account signs in with
    one of the platform's providers, and the platform creates the account and
    runs its onboarding before returning to this request. The consent screen
-   shows the client, the scopes, the key fingerprint, and the organization that
-   will be active, which a member of several organizations can change.
+   shows the client, the scopes and the key fingerprint. After sign-in the CLI
+   selects the sole accessible tenant, or presents a terminal picker. `--tenant`
+   explicitly selects a tenant by slug, ID, display name, or `personal`.
 
 3. The platform redirects to the redirect URI with `code`, `state` and `iss`
    (RFC 9207), or with `error`, `state` and `iss`.
@@ -298,7 +302,7 @@ accepts error codes of at most 64 characters from `a-z 0-9 _`. It treats
 
 ## Revocation
 
-`nono logout` sends:
+`nono platform logout` sends:
 
 ```http
 POST {revocation_endpoint}
@@ -336,15 +340,20 @@ All of it lives in nono's state directory (`$XDG_STATE_HOME/nono`, created
 
 | File | Contents |
 |---|---|
-| `platform-login.json` | Platform URL, issuer, signed-in person, active organization, organization list, console URL, session key thumbprint. No secrets. |
+| `platform-login.json` | Platform URL, issuer, signed-in user, current tenant, tenant memberships, console URL, session key thumbprint. No secrets. |
 | `platform-login-key` | The session's P-256 private key (PKCS#8, base64), mode 0600. |
 | `platform-login-refresh-token` | The current refresh token, mode 0600. |
 | `platform-login.lock` | Empty; serializes session access between nono processes (`flock`), mode 0600. |
 
-The CLI never stores access tokens. `nono connect`, `nono ps --remote` and
-`nono run --remote` use the refresh grant to get one on demand. Explicit
+The CLI never stores access tokens. `nono remote connect`, `nono remote list` and
+`nono remote run` use the refresh grant to get one on demand. Explicit
 credentials (`NONO_RUN_TOKEN`, `--run-token-file`, `NONO_CONNECT_TOKEN`,
-`--token-file`) take precedence over the session.
+`--token-file`) take precedence over the session and cannot be combined with a
+tenant override. Remote commands resolve `--tenant` before `NONO_TENANT`, then
+the saved tenant, and verify the issued token matches that tenant. Command
+overrides do not change the saved default or audit enrollment. See
+[platform identity and tenant context](../platform-context.md) for user-facing
+terminology and workflows.
 
 [NEP-0009]: ../../neps/0009-cli-login.md
 [RFC 7009]: https://www.rfc-editor.org/rfc/rfc7009

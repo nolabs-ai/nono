@@ -1,11 +1,11 @@
 //! OAuth 2.0 sign-in for the nono platform (NEP-0009, `cli-login-v1`).
 //!
-//! `nono login` signs a person in; the CLI is a public native client
+//! `nono platform login` signs a person in; the CLI is a public native client
 //! (`client_id=nono-cli`). The session is a refresh token bound with DPoP to
 //! a key the CLI generates for it, both kept in nono's protected state
 //! directory. Remote commands turn the session into short-lived access tokens
-//! for the active organization, or the one `NONO_ORG` names. Nothing here
-//! enrolls a device. `login_cmd` drives `nono login` and `nono logout`.
+//! for the current tenant, or the one `NONO_TENANT` names. Nothing here
+//! enrolls a device directly; `login_cmd` coordinates separate device enrollment.
 
 pub(crate) mod client;
 pub(crate) mod dpop;
@@ -15,6 +15,7 @@ pub(crate) mod session;
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nono::{NonoError, Result};
+use std::sync::Arc;
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -25,7 +26,7 @@ pub(crate) const SCOPE_OPENID: &str = "openid";
 pub(crate) const SCOPE_CONNECT: &str = "nono:connect";
 pub(crate) const SCOPE_RUNS: &str = "nono:runs";
 
-/// The scope `nono login` always requests.
+/// The scope `nono platform login` always requests.
 pub(crate) fn login_scope() -> String {
     format!("{SCOPE_OPENID} {SCOPE_CONNECT} {SCOPE_RUNS}")
 }
@@ -43,7 +44,7 @@ pub(crate) fn random_token() -> Result<Zeroizing<String>> {
 ///
 /// `Bearer` covers explicit token files, environment tokens and the
 /// remote-attach-v1 device flow. `Dpop` is an access token from a
-/// `nono login` session, presented with a fresh proof on every request.
+/// `nono platform login` session, presented with a fresh proof on every request.
 pub(crate) enum ApiCredential {
     Bearer(Zeroizing<String>),
     Dpop {
@@ -95,38 +96,50 @@ impl ApiCredential {
 /// What a remote command needs from the signed-in session.
 #[derive(Debug)]
 pub(crate) struct SessionAccess {
-    pub(crate) credential: ApiCredential,
+    pub(crate) credential: Arc<ApiCredential>,
     pub(crate) platform_url: String,
     pub(crate) console_url: Option<Url>,
     pub(crate) organization: client::Organization,
 }
 
-/// Environment variable naming the organization (name, slug or ID) for one
-/// remote command, instead of the active one.
-pub(crate) const ORG_ENV: &str = "NONO_ORG";
+/// Environment variable naming the tenant (name, slug, ID or personal) for one
+/// remote command, instead of the saved one.
+pub(crate) const TENANT_ENV: &str = "NONO_TENANT";
 
-/// The organization `NONO_ORG` names, if set. Empty means unset.
-pub(crate) fn org_override() -> Result<Option<String>> {
-    match std::env::var(ORG_ENV) {
+/// Resolve the command flag before the environment override. Empty environment means unset.
+pub(crate) fn tenant_override(explicit: Option<&str>) -> Result<Option<String>> {
+    if std::env::var_os("NONO_ORG").is_some() {
+        return Err(NonoError::ActionRequired(
+            "NONO_ORG has been replaced by NONO_TENANT; update your environment".into(),
+        ));
+    }
+    if let Some(value) = explicit {
+        if value.trim().is_empty() {
+            return Err(NonoError::ActionRequired(
+                "--tenant must not be empty".into(),
+            ));
+        }
+        return Ok(Some(value.trim().to_string()));
+    }
+    match std::env::var(TENANT_ENV) {
         Ok(value) if value.trim().is_empty() => Ok(None),
         Ok(value) => Ok(Some(value.trim().to_string())),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(NonoError::ConfigParse(format!(
-            "{ORG_ENV} is not valid UTF-8"
+            "{TENANT_ENV} is not valid UTF-8"
         ))),
     }
 }
 
-/// Exchange the stored session for an access token for the organization
-/// `NONO_ORG` names, else the active organization.
+/// Exchange the stored session for an access token in the resolved tenant.
 ///
 /// Returns `Ok(None)` when nobody is signed in, so callers can fall back to
 /// other credentials. A session the platform no longer accepts is removed
 /// and reported, so the person knows to sign in again.
-pub(crate) fn session_access() -> Result<Option<SessionAccess>> {
-    let org = org_override()?;
+pub(crate) fn session_access(tenant: Option<&str>) -> Result<Option<SessionAccess>> {
+    let tenant = tenant_override(tenant)?;
     let lock = session::lock()?;
-    session_access_locked(&lock, org.as_deref())
+    session_access_locked(&lock, tenant.as_deref())
 }
 
 /// [`session_access`] for a caller that already holds the session lock.
@@ -137,19 +150,14 @@ pub(crate) fn session_access_locked(
     let Some(mut record) = session::load_record()? else {
         return Ok(None);
     };
+    let persist_selection = record.tenant_selection_pending && org.is_none();
     let tenant_id = match org {
         Some(name) => record.find_organization(name)?.tenant_id.clone(),
+        None if persist_selection => crate::tenant_selector::select(&record)?
+            .ok_or_else(|| NonoError::ActionRequired("no tenant selected".into()))?,
         None => record.tenant_id.clone(),
     };
-    let (key, refresh_token) = match (session::load_key()?, session::load_refresh_token()?) {
-        (Some(key), Some(token)) if key.thumbprint() == record.key_thumbprint => (key, token),
-        _ => {
-            session::clear(lock)?;
-            return Err(NonoError::ActionRequired(
-                "the local sign-in is incomplete; run `nono login`".to_string(),
-            ));
-        }
-    };
+    let (key, refresh_token) = load_session_credentials(lock, &record)?;
     let response = refresh(
         lock,
         &record,
@@ -163,26 +171,66 @@ pub(crate) fn session_access_locked(
         .iter()
         .find(|org| org.tenant_id == response.session.tenant_id)
         .cloned()
-        .ok_or_else(|| {
-            NonoError::ConfigParse("platform returned an unknown organization".to_string())
-        })?;
-    // Keep the organization list and console current; the active organization
-    // changes only with `nono login --org`.
-    record.organizations = response.session.organizations.clone();
-    record.console_url = response.session.console_url.as_ref().map(Url::to_string);
-    if record.active_organization().is_none() {
-        record.tenant_id = response.session.tenant_id.clone();
+        .ok_or_else(|| NonoError::ConfigParse("platform returned an unknown tenant".to_string()))?;
+    update_record(lock, &mut record, &response.session, persist_selection)?;
+    if persist_selection {
+        crate::platform_client::activate_login_enrollment(&record)?;
     }
-    session::save_record(lock, &record)?;
     Ok(Some(SessionAccess {
-        credential: ApiCredential::Dpop {
+        credential: Arc::new(ApiCredential::Dpop {
             access_token: response.access_token,
             key,
-        },
+        }),
         platform_url: record.platform_url,
         console_url: response.session.console_url,
         organization,
     }))
+}
+
+pub(crate) fn refresh_memberships() -> Result<session::SessionRecord> {
+    let lock = session::lock()?;
+    let mut record = session::load_record()?.ok_or_else(|| {
+        NonoError::ActionRequired("not signed in; run `nono platform login`".into())
+    })?;
+    let (key, token) = load_session_credentials(&lock, &record)?;
+    let response = refresh(&lock, &record, &key, token.as_str(), None)?;
+    update_record(&lock, &mut record, &response.session, false)?;
+    Ok(record)
+}
+
+fn load_session_credentials(
+    lock: &session::SessionLock,
+    record: &session::SessionRecord,
+) -> Result<(DpopKey, Zeroizing<String>)> {
+    match (session::load_key()?, session::load_refresh_token()?) {
+        (Some(key), Some(token)) if key.thumbprint() == record.key_thumbprint => Ok((key, token)),
+        _ => {
+            session::clear(lock)?;
+            Err(NonoError::ActionRequired(
+                "the local sign-in is incomplete; run `nono platform login`".to_string(),
+            ))
+        }
+    }
+}
+
+fn update_record(
+    lock: &session::SessionLock,
+    record: &mut session::SessionRecord,
+    info: &client::SessionInfo,
+    persist_selection: bool,
+) -> Result<()> {
+    // Refresh memberships without persisting a command-specific override.
+    record.organizations = info.organizations.clone();
+    if persist_selection {
+        record.tenant_id = info.tenant_id.clone();
+        record.tenant_selection_pending = false;
+    } else if record.active_organization().is_none() {
+        record.tenant_selection_pending = true;
+    }
+    if info.tenant_id == record.tenant_id {
+        record.console_url = info.console_url.as_ref().map(Url::to_string);
+    }
+    session::save_record(lock, record)
 }
 
 /// Run the refresh grant, storing the rotated refresh token before anything
@@ -201,7 +249,8 @@ pub(crate) fn refresh(
     let server = client::discover(&record.platform_url)?;
     if server.issuer != record.issuer {
         return Err(NonoError::ConfigParse(
-            "the platform's OAuth issuer changed since sign-in; run `nono login` again".to_string(),
+            "the platform's OAuth issuer changed since sign-in; run `nono platform login` again"
+                .to_string(),
         ));
     }
     match OAuthClient::new(&server, key).token(&Grant::RefreshToken {
@@ -217,7 +266,7 @@ pub(crate) fn refresh(
                 && response.session.tenant_id != requested
             {
                 return Err(NonoError::ConfigParse(
-                    "the platform issued access for a different organization than requested; \
+                    "the platform issued access for a different tenant than requested; \
                      refusing to use it"
                         .to_string(),
                 ));
@@ -227,13 +276,12 @@ pub(crate) fn refresh(
         TokenOutcome::Error(error) if error.code == "invalid_grant" => {
             session::clear(lock)?;
             Err(NonoError::ActionRequired(
-                "your platform sign-in expired or was revoked; run `nono login`".to_string(),
+                "your platform sign-in expired or was revoked; run `nono platform login`".to_string(),
             ))
         }
         TokenOutcome::Error(error) if error.code == "invalid_target" => {
             Err(NonoError::ActionRequired(
-                "you are no longer a member of that organization; run `nono login` to see the \
-                 organizations you belong to"
+                "you cannot access that tenant; choose one with `nono platform tenant use <tenant>`"
                     .to_string(),
             ))
         }

@@ -1298,7 +1298,7 @@ impl CompiledEndpointRules {
     pub fn compile(rules: &[EndpointRule]) -> Result<Self, String> {
         let mut compiled = Vec::with_capacity(rules.len());
         for rule in rules {
-            let glob = GlobBuilder::new(&rule.path)
+            let glob = GlobBuilder::new(normalize_rule_path(&rule.path))
                 .literal_separator(true)
                 .build()
                 .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
@@ -1489,7 +1489,7 @@ impl CompiledEndpointPolicy {
 fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPolicyRule>, String> {
     let mut compiled = Vec::with_capacity(rules.len());
     for rule in rules {
-        let glob = GlobBuilder::new(&rule.path)
+        let glob = GlobBuilder::new(normalize_rule_path(&rule.path))
             .literal_separator(true)
             .build()
             .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
@@ -1689,13 +1689,32 @@ fn endpoint_allowed(rules: &[EndpointRule], method: &str, path: &str) -> bool {
     let normalized = normalize_path(path);
     rules.iter().any(|r| {
         (r.method == "*" || r.method.eq_ignore_ascii_case(method))
-            && GlobBuilder::new(&r.path)
+            && GlobBuilder::new(normalize_rule_path(&r.path))
                 .literal_separator(true)
                 .build()
                 .ok()
                 .map(|g| g.compile_matcher())
                 .is_some_and(|m| m.is_match(&normalized))
     })
+}
+
+/// Normalize an endpoint rule path pattern so it lines up with request
+/// paths after [`normalize_path`], which strips the trailing slash.
+///
+/// Without this, a rule such as `/3322/` could never match a request for
+/// `/3322/` (normalized to `/3322`), so allow rules silently failed and deny
+/// or approve rules never fired. Only trailing slashes are removed (root `/`
+/// is preserved); the rule matches exactly what the slash-less form matches,
+/// so this never broadens a grant. The pattern is otherwise left untouched
+/// because it is a glob, not a request path.
+#[must_use]
+pub fn normalize_rule_path(pattern: &str) -> &str {
+    let trimmed = pattern.trim_end_matches('/');
+    if trimmed.is_empty() && !pattern.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
 }
 
 /// Normalize a URL path for matching: percent-decode, strip query string,
@@ -3227,6 +3246,63 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn normalize_rule_path_strips_trailing_slash() {
+        assert_eq!(normalize_rule_path("/3322/"), "/3322");
+        assert_eq!(normalize_rule_path("/3322"), "/3322");
+        assert_eq!(normalize_rule_path("/api/**/"), "/api/**");
+        assert_eq!(normalize_rule_path("/a//"), "/a");
+        assert_eq!(normalize_rule_path("/"), "/");
+        assert_eq!(normalize_rule_path("//"), "/");
+    }
+
+    #[test]
+    fn endpoint_rules_with_trailing_slash_match_request() {
+        let compiled = CompiledEndpointRules::compile(&[EndpointRule {
+            method: "GET".to_string(),
+            path: "/3322/".to_string(),
+        }])
+        .unwrap();
+        assert!(compiled.is_allowed("GET", "/3322/"));
+        assert!(compiled.is_allowed("GET", "/3322"));
+        assert!(!compiled.is_allowed("GET", "/3322/extra"));
+        assert!(!compiled.is_allowed("GET", "/3323/"));
+    }
+
+    #[test]
+    fn endpoint_policy_deny_with_trailing_slash_fires() {
+        let policy = EndpointPolicyConfig {
+            default: EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            },
+            deny: vec![EndpointPolicyRule {
+                method: "*".to_string(),
+                path: "/admin/".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+                operations: None,
+            }],
+            approve: Vec::new(),
+            allow: Vec::new(),
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        assert!(matches!(
+            compiled.evaluate("GET", "/admin/"),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("GET", "/admin"),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("GET", "/other"),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
     }
 
     #[test]

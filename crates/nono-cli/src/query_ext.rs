@@ -651,7 +651,8 @@ fn path_matches_endpoint_rules(
     }
     let normalized = normalize_path(path);
     rules.iter().any(|r| {
-        let Ok(glob) = globset::GlobBuilder::new(&r.path)
+        let pattern = nono_proxy::config::normalize_rule_path(&r.path);
+        let Ok(glob) = globset::GlobBuilder::new(pattern)
             .literal_separator(true)
             .build()
         else {
@@ -1849,6 +1850,19 @@ mod tests {
         assert!(path_matches_endpoint_rules("/repos/one", &rules));
         assert!(!path_matches_endpoint_rules("/repos/one/two", &rules));
         assert!(!path_matches_endpoint_rules("/repos/a/b/c/d", &rules));
+    }
+
+    // Regression test for https://github.com/nolabs-ai/nono/issues/2292:
+    // a rule with a trailing `/` must match the request it names.
+    #[test]
+    fn test_path_matches_endpoint_rules_trailing_slash() {
+        let rules = vec![crate::sandbox_state::EndpointRuleState {
+            method: "*".to_string(),
+            path: "/3322/".to_string(),
+        }];
+        assert!(path_matches_endpoint_rules("/3322/", &rules));
+        assert!(path_matches_endpoint_rules("/3322", &rules));
+        assert!(!path_matches_endpoint_rules("/3322/extra", &rules));
     }
 
     // suggested_flag_parts: non-existent file directly under $HOME must not widen to ~/

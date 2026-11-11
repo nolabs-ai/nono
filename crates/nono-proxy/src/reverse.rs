@@ -485,7 +485,7 @@ pub async fn handle_reverse_proxy(
                     0,
                     &err.to_string(),
                 );
-                send_credential_capture_error(stream).await?;
+                send_credential_capture_error(stream, method == "HEAD").await?;
                 return Ok(());
             }
         }
@@ -1792,12 +1792,12 @@ where
     S: tokio::io::AsyncWrite + Unpin,
 {
     let body = format!("{{\"error\":\"{}\"}}", reason);
-    send_json_error(stream, status, reason, &body).await
+    send_json_error(stream, status, reason, &body, false).await
 }
 
 /// Reject a host credential-capture failure without exposing helper diagnostics.
 /// Keep 503: this is not a challenge for the client's upstream credentials.
-pub(crate) async fn send_credential_capture_error<S>(stream: &mut S) -> Result<()>
+pub(crate) async fn send_credential_capture_error<S>(stream: &mut S, is_head: bool) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
@@ -1806,11 +1806,18 @@ where
         503,
         "Service Unavailable",
         crate::capture::CAPTURE_FAILED_BODY,
+        is_head,
     )
     .await
 }
 
-async fn send_json_error<S>(stream: &mut S, status: u16, reason: &str, body: &str) -> Result<()>
+async fn send_json_error<S>(
+    stream: &mut S,
+    status: u16,
+    reason: &str,
+    body: &str,
+    is_head: bool,
+) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
@@ -1819,7 +1826,7 @@ where
         status,
         reason,
         body.len(),
-        body
+        if is_head { "" } else { body }
     );
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
@@ -2884,6 +2891,15 @@ mod tests {
 
     #[tokio::test]
     async fn reverse_proxy_reports_credential_capture_failure() {
+        assert_reverse_credential_capture_failure("POST").await;
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_head_reports_credential_capture_failure_without_body() {
+        assert_reverse_credential_capture_failure("HEAD").await;
+    }
+
+    async fn assert_reverse_credential_capture_failure(method: &str) {
         use crate::capture::tests::{FailingCaptureBackend, FailureFixture, assert_http1_failure};
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -2914,7 +2930,7 @@ mod tests {
                 credential_capture_backend: Some(Arc::new(FailingCaptureBackend)),
             };
             handle_reverse_proxy(
-                "POST /capture/mcp HTTP/1.1",
+                &format!("{method} /capture/mcp HTTP/1.1"),
                 &mut server,
                 b"Host: localhost\r\nAuthorization: Bearer session-token\r\nContent-Length: 0\r\n\r\n",
                 &ctx,
@@ -2923,7 +2939,7 @@ mod tests {
             drop(server);
             let mut response = String::new();
             client.read_to_string(&mut response).await.unwrap();
-            assert_http1_failure(&response);
+            assert_http1_failure(&response, method == "HEAD");
             fixture.assert_no_upstream_connection();
         }).await.unwrap();
     }

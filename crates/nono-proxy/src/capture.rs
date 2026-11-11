@@ -152,7 +152,10 @@ pub(crate) mod tests {
                 "credential_key": "cmd://private-credential-reference",
                 "inject_header": "Authorization",
                 "credential_format": "Bearer {}",
-                "endpoint_rules": [{"method": "POST", "path": "/mcp"}]
+                "endpoint_rules": [
+                    {"method": "POST", "path": "/mcp"},
+                    {"method": "HEAD", "path": "/mcp"}
+                ]
             }))
             .unwrap();
             let routes = [route];
@@ -193,12 +196,16 @@ pub(crate) mod tests {
         );
     }
 
-    pub(crate) fn assert_http1_failure(response: &str) {
+    pub(crate) fn assert_http1_failure(response: &str, is_head: bool) {
         let (headers, body) = response.split_once("\r\n\r\n").unwrap();
         assert!(headers.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(headers.contains("Content-Type: application/json\r\n"));
-        assert!(headers.ends_with(&format!("Content-Length: {}", body.len())));
+        assert!(headers.ends_with(&format!("Content-Length: {}", CAPTURE_FAILED_BODY.len())));
         assert!(!headers.to_ascii_lowercase().contains("www-authenticate"));
-        assert_failure_body(body.as_bytes());
+        if is_head {
+            assert!(body.is_empty());
+        } else {
+            assert_failure_body(body.as_bytes());
+        }
     }
 }

@@ -1230,7 +1230,7 @@ where
             return Ok(());
         }
         CredentialResolution::CaptureFailed => {
-            reverse::send_credential_capture_error(tls_stream).await?;
+            reverse::send_credential_capture_error(tls_stream, req.method == "HEAD").await?;
             return Ok(());
         }
         CredentialResolution::Forward { credential } => credential,
@@ -4650,6 +4650,15 @@ mod tests {
 
     #[tokio::test]
     async fn http1_intercept_reports_credential_capture_failure() {
+        assert_http1_credential_capture_failure("POST").await;
+    }
+
+    #[tokio::test]
+    async fn http1_head_reports_credential_capture_failure_without_body() {
+        assert_http1_credential_capture_failure("HEAD").await;
+    }
+
+    async fn assert_http1_credential_capture_failure(method: &str) {
         use crate::capture::tests::{FailingCaptureBackend, FailureFixture, assert_http1_failure};
         use tokio::io::AsyncReadExt;
 
@@ -4667,14 +4676,14 @@ mod tests {
 
             let (mut client, mut server) = tokio::io::duplex(4096);
             client.write_all(format!(
-                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer session-token\r\nContent-Length: 0\r\n\r\n",
+                "{method} /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer session-token\r\nContent-Length: 0\r\n\r\n",
                 fixture.port(),
             ).as_bytes()).await.unwrap();
             handle_inner_request(&mut server, &ctx).await.unwrap();
             drop(server);
             let mut response = String::new();
             client.read_to_string(&mut response).await.unwrap();
-            assert_http1_failure(&response);
+            assert_http1_failure(&response, method == "HEAD");
             fixture.assert_no_upstream_connection();
         }).await.unwrap();
     }

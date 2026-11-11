@@ -345,7 +345,7 @@ where
 fn aws_region_denial_reason(route: &str, host: &str) -> String {
     format!(
         "AWS route '{route}': host '{host}' is not a canonical \
-         {{service}}.{{region}}.amazonaws.com commercial-region host on port 443"
+         {{service}}.{{region}} AWS endpoint host on port 443 in the route partition"
     )
 }
 
@@ -592,34 +592,36 @@ pub(crate) async fn select_intercept_route<'a>(
                 // refusal rejects the request below.
                 // AWS wildcard-region routes show the derived region; a host
                 // that yields none is denied before prompting.
-                let aws_region = match &route.aws_wildcard_service_label {
-                    Some(label) => match crate::aws::endpoints::derive_region(host, port, label) {
-                        Some(region) => Some(region),
-                        None => {
-                            let concrete_upstream = format!(
-                                "https://{}",
-                                reverse::format_host_header(UpstreamScheme::Https, host, port)
-                            );
-                            let deny_reason = aws_region_denial_reason(prefix, host);
-                            warn!("tls_intercept: {}", deny_reason);
-                            audit::log_denied(
-                                audit_log,
-                                audit::ProxyMode::ConnectIntercept,
-                                &audit::EventContext {
-                                    denial_category: Some(
-                                        nono::undo::NetworkAuditDenialCategory::HostDenied,
-                                    ),
-                                    route_id: Some(prefix),
-                                    upstream: Some(&concrete_upstream),
-                                    ..audit::EventContext::default()
-                                },
-                                host,
-                                port,
-                                &deny_reason,
-                            );
-                            return RouteSelection::Rejected(403);
+                let aws_region = match &route.aws_wildcard {
+                    Some(pattern) => {
+                        match crate::aws::endpoints::derive_region(host, port, pattern) {
+                            Some(region) => Some(region),
+                            None => {
+                                let concrete_upstream = format!(
+                                    "https://{}",
+                                    reverse::format_host_header(UpstreamScheme::Https, host, port)
+                                );
+                                let deny_reason = aws_region_denial_reason(prefix, host);
+                                warn!("tls_intercept: {}", deny_reason);
+                                audit::log_denied(
+                                    audit_log,
+                                    audit::ProxyMode::ConnectIntercept,
+                                    &audit::EventContext {
+                                        denial_category: Some(
+                                            nono::undo::NetworkAuditDenialCategory::HostDenied,
+                                        ),
+                                        route_id: Some(prefix),
+                                        upstream: Some(&concrete_upstream),
+                                        ..audit::EventContext::default()
+                                    },
+                                    host,
+                                    port,
+                                    &deny_reason,
+                                );
+                                return RouteSelection::Rejected(403);
+                            }
                         }
-                    },
+                    }
                     None => None,
                 };
                 let approval = crate::endpoint_approval::PendingApproval {
@@ -1842,10 +1844,10 @@ where
         "https://{}",
         reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port)
     );
-    let (region, region_source) = match (&aws.region, aws.service_label.as_deref()) {
+    let (region, region_source) = match (&aws.region, aws.wildcard.as_ref()) {
         (SigningRegion::Fixed(r), _) => (r.clone(), "route"),
-        (SigningRegion::FromRequestHost, Some(label)) => {
-            match crate::aws::endpoints::derive_region(ctx.host, ctx.port, label) {
+        (SigningRegion::FromRequestHost, Some(pattern)) => {
+            match crate::aws::endpoints::derive_region(ctx.host, ctx.port, pattern) {
                 Some(r) => (r, "request_host"),
                 None => {
                     let reason = aws_region_denial_reason(service.unwrap_or("unknown"), ctx.host);
@@ -5776,7 +5778,7 @@ mod tests {
 
         // `zz-fake-9` matches the route pattern but is not a valid region label.
         for host in [
-            "eks.us-gov-west-1.amazonaws.com",
+            "eks.us-iso-east-1.amazonaws.com",
             "eks.zz-fake-9.amazonaws.com",
         ] {
             let selection = select_intercept_route(

@@ -5,13 +5,16 @@
 //! - Global:     `{service}.amazonaws.com`
 //! - FIPS:       `{service}-fips.{region}.amazonaws.com` (`-fips` is stripped)
 //!
-//! `api.aws` dual-stack endpoints are not supported; supply explicit
+//! Concrete `api.aws` dual-stack endpoints are not parsed; supply explicit
 //! `aws_auth.region` and `aws_auth.service` config values for those.
 //!
-//! A route upstream may also be `https://{service}.*.amazonaws.com`, where `*`
-//! is the whole region label. The SigV4 region is then derived per request
-//! from the intercepted host by [`derive_region`], limited to commercial-partition
-//! region codes. Every other wildcard shape on an `amazonaws` host is rejected.
+//! A route upstream may also be `https://{service}.*.{domain}` or
+//! `https://*.s3.*.{domain}` (virtual-hosted S3), where the second `*` is the
+//! whole region label and `{domain}` is an AWS partition domain (see
+//! [`AwsPartition`]). The SigV4 region is then derived per request from the
+//! intercepted host by [`derive_region`], limited to that partition's region
+//! codes. `https://*.s3.{region}.{domain}` is accepted with an explicit
+//! `aws_auth.region`. Every other wildcard shape on an AWS host is rejected.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -36,9 +39,73 @@ fn derived_region_re() -> &'static Regex {
     })
 }
 
-/// Commercial and GovCloud (`us-gov-`) region grammar for derived regions; `cn-` is excluded.
-fn is_derived_region(region: &str) -> bool {
-    !region.starts_with("cn-") && derived_region_re().is_match(region)
+/// `true` for a 1-2 digit region ordinal without a leading zero.
+fn is_region_ordinal(n: &str) -> bool {
+    matches!(n.as_bytes(), [b'1'..=b'9'] | [b'1'..=b'9', b'0'..=b'9'])
+}
+
+/// `true` when `region` is `{prefix}{direction}-{ordinal}` for one of `directions`.
+fn is_region_of(region: &str, prefix: &str, directions: &[&str]) -> bool {
+    region
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.rsplit_once('-'))
+        .is_some_and(|(dir, n)| directions.contains(&dir) && is_region_ordinal(n))
+}
+
+/// AWS partition, identified by its endpoint domain. A wildcard route is bound
+/// to one partition, so a host from another partition never yields a region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AwsPartition {
+    /// `amazonaws.com`: commercial and GovCloud (`us-gov-`) regions.
+    Aws,
+    /// `amazonaws.com.cn`: China regions.
+    AwsCn,
+    /// `api.aws`: dual-stack endpoints, same regions as `amazonaws.com`.
+    ApiAws,
+}
+
+impl AwsPartition {
+    const ALL: [Self; 3] = [Self::Aws, Self::AwsCn, Self::ApiAws];
+
+    /// Endpoint domain labels, most significant last.
+    fn domain(self) -> &'static [&'static str] {
+        match self {
+            Self::Aws => &["amazonaws", "com"],
+            Self::AwsCn => &["amazonaws", "com", "cn"],
+            Self::ApiAws => &["api", "aws"],
+        }
+    }
+
+    /// Strict region grammar used when a region is derived from a request host.
+    fn is_derived_region(self, region: &str) -> bool {
+        match self {
+            Self::Aws | Self::ApiAws => {
+                !region.starts_with("cn-") && derived_region_re().is_match(region)
+            }
+            Self::AwsCn => is_region_of(region, "cn-", &["north", "northwest"]),
+        }
+    }
+
+    /// Region grammar for the literal region of `*.s3.{region}.{domain}`.
+    fn is_literal_region(self, region: &str) -> bool {
+        region_re().is_match(region)
+            && match self {
+                // Lenient for new commercial regions, but never another partition's.
+                Self::Aws | Self::ApiAws => !region.starts_with("cn-") && !region.contains("-iso"),
+                _ => self.is_derived_region(region),
+            }
+    }
+}
+
+/// Split `labels` into the leading labels and the AWS partition whose domain
+/// ends them, compared label by label.
+fn split_partition<'a>(labels: &'a [&'a str]) -> Option<(&'a [&'a str], AwsPartition)> {
+    AwsPartition::ALL.into_iter().find_map(|partition| {
+        let domain = partition.domain();
+        let split = labels.len().checked_sub(domain.len())?;
+        let (rest, tail) = labels.split_at(split);
+        (tail == domain).then_some((rest, partition))
+    })
 }
 
 fn service_label_re() -> &'static Regex {
@@ -62,6 +129,7 @@ fn service_map() -> &'static HashMap<&'static str, &'static str> {
             // Core services
             ("dynamodb", "dynamodb"),
             ("s3", "s3"),
+            ("api.ecr", "ecr"),
             ("lambda", "lambda"),
             ("sqs", "sqs"),
             ("sns", "sns"),
@@ -127,19 +195,40 @@ pub enum SigningRegion {
     FromRequestHost,
 }
 
-/// A validated `https://{service}.*.amazonaws.com` upstream.
+/// Which labels of a wildcard-region upstream are fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WildcardShape {
+    /// `{service}.*.{domain}`.
+    Service(String),
+    /// `*.s3.*.{domain}`: any bucket label, any region.
+    Bucket,
+}
+
+/// A validated wildcard-region upstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwsUpstreamPattern {
-    /// The literal service label that precedes the wildcard region label.
-    pub service_label: String,
+    pub partition: AwsPartition,
+    pub shape: WildcardShape,
+}
+
+impl AwsUpstreamPattern {
+    /// The service label that precedes the wildcard region label.
+    #[must_use]
+    pub fn service_label(&self) -> &str {
+        match &self.shape {
+            WildcardShape::Service(label) => label,
+            WildcardShape::Bucket => "s3",
+        }
+    }
 }
 
 /// Validate the wildcard shape of an `aws_auth` route upstream.
 ///
 /// Returns `Ok(None)` when the legacy resolution path applies (no `*` in the
-/// host, or a wildcard on a non-AWS host), `Ok(Some(_))` for the accepted
-/// `{service}.*.amazonaws.com` shape on port 443, and `Err` for any other
-/// wildcard on an AWS host or an explicit `region` combined with the wildcard.
+/// host, a wildcard on a non-AWS host, or `*.s3.{region}.{domain}`),
+/// `Ok(Some(_))` for the accepted `{service}.*.{domain}` and `*.s3.*.{domain}`
+/// shapes on port 443, and `Err` for any other wildcard on an AWS host or an
+/// explicit `region` combined with a wildcard region.
 ///
 /// # Errors
 ///
@@ -157,13 +246,17 @@ pub fn validate_aws_upstream(
     if !host.contains('*') {
         return Ok(None);
     }
-    let is_aws_host = host.contains("amazonaws") || host.ends_with(".api.aws");
+    let labels: Vec<&str> = host.split('.').collect();
+    let partition_split = split_partition(&labels);
+    let is_aws_host =
+        host.contains("amazonaws") || host.ends_with(".api.aws") || partition_split.is_some();
     if !is_aws_host {
         return Ok(None);
     }
 
-    const SHAPE: &str =
-        "the only accepted wildcard upstream is `https://{service}.*.amazonaws.com`";
+    const SHAPE: &str = "the accepted wildcard upstreams are `https://{service}.*.{aws domain}`, \
+                         `https://*.s3.*.{aws domain}`, and `https://*.s3.{region}.{aws domain}` \
+                         with an explicit aws_auth.region";
     let reject = |why: &str| Err(format!("upstream '{upstream}': {why}; {SHAPE}"));
 
     if url.scheme() != "https" {
@@ -180,23 +273,26 @@ pub fn validate_aws_upstream(
     {
         return reject("userinfo, path, query, and fragment are not allowed");
     }
-    // Bucket-subdomain (virtual-hosted S3) hosts keep a literal region, so the
-    // wildcard only spans the bucket label and the route signs with its own
-    // `aws_auth.region`.
-    if matches!(
-        host.split('.').collect::<Vec<_>>().as_slice(),
-        ["*", "s3", region, "amazonaws", "com"] if region_re().is_match(region)
-    ) {
-        return Ok(None);
-    }
-    let service_label = match host.split('.').collect::<Vec<_>>().as_slice() {
-        [service_label, "*", "amazonaws", "com"] => *service_label,
+    let Some((rest, partition)) = partition_split else {
+        return reject("host does not match the accepted shape");
+    };
+    let shape = match rest {
+        // Bucket-subdomain (virtual-hosted S3) hosts with a literal region: the
+        // wildcard only spans the bucket label and the route signs with its own
+        // `aws_auth.region`.
+        ["*", "s3", region] if partition.is_literal_region(region) => return Ok(None),
+        ["*", "s3", "*"] => WildcardShape::Bucket,
+        // One or two literal service labels, e.g. `eks` or `api.ecr`.
+        [service_labels @ .., "*"] if matches!(service_labels.len(), 1 | 2) => {
+            WildcardShape::Service(service_labels.join("."))
+        }
         _ => return reject("host does not match the accepted shape"),
     };
-    if !service_label_re().is_match(service_label)
-        || service_label.starts_with("ec2-")
-        || matches!(service_label, "compute" | "elb")
-    {
+    let pattern = AwsUpstreamPattern { partition, shape };
+    let service_label = pattern.service_label();
+    if service_label.split('.').any(|l| {
+        !service_label_re().is_match(l) || l.starts_with("ec2-") || matches!(l, "compute" | "elb")
+    }) {
         return reject(&format!("service label '{service_label}' is not allowed"));
     }
     if aws_auth.region.is_some() {
@@ -214,19 +310,18 @@ pub fn validate_aws_upstream(
             ));
         }
     }
-    Ok(Some(AwsUpstreamPattern {
-        service_label: service_label.to_owned(),
-    }))
+    Ok(Some(pattern))
 }
 
 /// Derive the SigV4 region from the raw request host of a wildcard-region route.
 ///
 /// `host` must be canonical (lowercase ASCII, no trailing dot, no punycode) so
 /// the derived region, the signed host, and the connected host are the same
-/// string. The host must be exactly `{service_label}.{region}.amazonaws.com` on
-/// port 443, with `region` in the commercial-partition grammar.
+/// string. On port 443 the host must be exactly `{service}.{region}.{domain}`
+/// or `{bucket}.s3.{region}.{domain}`, as `pattern` requires, with `domain` the
+/// pattern's partition and `region` in that partition's grammar.
 #[must_use]
-pub fn derive_region(host: &str, port: u16, service_label: &str) -> Option<String> {
+pub fn derive_region(host: &str, port: u16, pattern: &AwsUpstreamPattern) -> Option<String> {
     if port != 443
         || host.is_empty()
         || !host.is_ascii()
@@ -235,20 +330,20 @@ pub fn derive_region(host: &str, port: u16, service_label: &str) -> Option<Strin
     {
         return None;
     }
-    match host.split('.').collect::<Vec<_>>().as_slice() {
-        [svc, region, "amazonaws", "com"] if *svc == service_label && is_derived_region(region) => {
-            Some((*region).to_owned())
-        }
-        _ => None,
+    let labels: Vec<&str> = host.split('.').collect();
+    let (rest, partition) = split_partition(&labels)?;
+    if partition != pattern.partition {
+        return None;
     }
+    let region = match (&pattern.shape, rest) {
+        (WildcardShape::Service(label), [svc @ .., region]) if svc.join(".") == *label => region,
+        (WildcardShape::Bucket, [bucket, "s3", region]) if !bucket.is_empty() => region,
+        _ => return None,
+    };
+    partition
+        .is_derived_region(region)
+        .then(|| (*region).to_owned())
 }
-
-/// AWS endpoint domains: commercial, China, and dual-stack.
-const AWS_DOMAIN_SUFFIXES: [&[&str]; 3] = [
-    &["amazonaws", "com"],
-    &["amazonaws", "com", "cn"],
-    &["api", "aws"],
-];
 
 /// `true` when `host` (a hostname or `*.`-style pattern) is under an AWS
 /// endpoint domain, compared label by label so `evilamazonaws.com` is not.
@@ -257,9 +352,9 @@ const AWS_DOMAIN_SUFFIXES: [&[&str]; 3] = [
 pub fn is_aws_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let labels: Vec<&str> = host.split('.').collect();
-    AWS_DOMAIN_SUFFIXES.iter().any(|suffix| {
+    AwsPartition::ALL.iter().map(|p| p.domain()).any(|suffix| {
         labels.len() > suffix.len()
-            && labels[labels.len() - suffix.len()..] == **suffix
+            && labels[labels.len() - suffix.len()..] == *suffix
             && labels.iter().all(|l| !l.is_empty())
     })
 }
@@ -282,7 +377,7 @@ pub fn validate_operations_upstream(upstream: &str, has_aws_auth: bool) -> Resul
         return Ok(());
     }
     Err(format!(
-        "endpoint_policy `operations` requires `aws_auth` or an AWS upstream (amazonaws.com, amazonaws.com.cn or api.aws), got '{host}'"
+        "endpoint_policy `operations` requires `aws_auth` or an AWS upstream (an AWS partition domain or api.aws), got '{host}'"
     ))
 }
 
@@ -303,10 +398,8 @@ pub fn resolve_signing_params(
         let service = match aws_auth.service.as_deref() {
             Some(s) => s.to_owned(),
             None => {
-                let base = pattern
-                    .service_label
-                    .strip_suffix("-fips")
-                    .unwrap_or(&pattern.service_label);
+                let label = pattern.service_label();
+                let base = label.strip_suffix("-fips").unwrap_or(label);
                 service_map().get(base).map(|s| (*s).to_owned())?
             }
         };
@@ -431,12 +524,6 @@ mod tests {
                 "s3",
                 Some("us-gov-east-1"),
             ),
-            // Regional — ISO partition
-            (
-                "s3.us-iso-east-1.amazonaws.com",
-                "s3",
-                Some("us-iso-east-1"),
-            ),
             // Regional — FIPS suffix stripped
             (
                 "bedrock-runtime-fips.us-east-1.amazonaws.com",
@@ -547,6 +634,13 @@ mod tests {
             ("https://eks.*.amazonaws.com", Some("eks")),
             ("https://eks.*.amazonaws.com:443", Some("eks")),
             ("https://eks.*.amazonaws.com/", Some("eks")),
+            ("https://eks.*.amazonaws.com.cn", Some("eks")),
+            ("https://eks.*.api.aws", Some("eks")),
+            ("https://*.s3.*.api.aws", None),
+            ("https://api.ecr.*.amazonaws.com", None),
+            ("https://api.ecr.*.amazonaws.com", Some("ecr")),
+            ("https://*.s3.*.amazonaws.com", None),
+            ("https://*.s3.*.amazonaws.com.cn", None),
         ] {
             let got = validate_aws_upstream(upstream, &cfg(None, service)).unwrap();
             assert!(got.is_some(), "{upstream}");
@@ -558,11 +652,17 @@ mod tests {
         for upstream in [
             "https://*.amazonaws.com",
             "https://*.*.amazonaws.com",
-            "https://*.s3.*.amazonaws.com",
             "https://*.s3.us-east-1.amazonaws.com.cn",
+            "https://*.s3.cn-north-1.amazonaws.com",
+            "https://*.s3.us-iso-east-1.amazonaws.com",
+            "https://*.s3.*.amazonaws.eu",
+            "https://*.s3.*.amazonaws.com:8443",
+            "https://*.*.s3.*.amazonaws.com",
+            "https://*.ec2.*.amazonaws.com",
             "https://*.eks.us-east-1.amazonaws.com",
-            "https://eks.*.amazonaws.com.cn",
-            "https://eks.*.api.aws",
+            "https://a.b.c.*.amazonaws.com",
+            "https://*.ecr.*.amazonaws.com",
+            "https://api.ec2-1.*.amazonaws.com",
             "https://eks.*.amazonaws.eu",
             "https://e*s.*.amazonaws.com",
             "https://eks.us-*.amazonaws.com",
@@ -608,10 +708,32 @@ mod tests {
             "https://s3.us-gov-east-1.amazonaws.com",
             "https://*.s3.us-east-1.amazonaws.com",
             "https://*.s3.us-gov-west-1.amazonaws.com",
+            "https://*.s3.cn-north-1.amazonaws.com.cn",
             "https://*.example.com",
         ] {
             assert_eq!(validate_aws_upstream(upstream, &c).unwrap(), None);
         }
+    }
+
+    #[test]
+    fn validate_bucket_wildcard_requires_service_and_no_region() {
+        let up = "https://*.s3.*.amazonaws.com";
+        let got = validate_aws_upstream(up, &cfg(None, None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.shape, WildcardShape::Bucket);
+        assert_eq!(got.partition, AwsPartition::Aws);
+        assert_eq!(got.service_label(), "s3");
+        assert!(validate_aws_upstream(up, &cfg(Some("us-east-1"), None)).is_err());
+    }
+
+    #[test]
+    fn resolve_bucket_wildcard_signs_as_s3() {
+        let (region, service) =
+            resolve_signing_params("p", &cfg(None, None), "https://*.s3.*.amazonaws.com.cn")
+                .unwrap();
+        assert_eq!(region, SigningRegion::FromRequestHost);
+        assert_eq!(service, "s3");
     }
 
     #[test]
@@ -637,7 +759,7 @@ mod tests {
             "us-gov-west-1",
             "us-gov-east-1",
         ] {
-            assert!(is_derived_region(ok), "{ok}");
+            assert!(AwsPartition::Aws.is_derived_region(ok), "{ok}");
         }
         for bad in [
             "us-gov-north-1",
@@ -651,19 +773,176 @@ mod tests {
             "compute-1",
             "US-EAST-1",
         ] {
-            assert!(!is_derived_region(bad), "{bad}");
+            assert!(!AwsPartition::Aws.is_derived_region(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn partition_region_grammars() {
+        for (partition, ok, bad) in [(
+            AwsPartition::AwsCn,
+            &["cn-north-1", "cn-northwest-1"][..],
+            &["cn-east-1", "cn-north-0", "us-east-1", "cn-north-100"][..],
+        )] {
+            for r in ok {
+                assert!(partition.is_derived_region(r), "{partition:?} {r}");
+            }
+            for r in bad {
+                assert!(!partition.is_derived_region(r), "{partition:?} {r}");
+            }
+        }
+        // Commercial grammar never admits another partition's regions.
+        for r in ["us-iso-east-1", "cn-north-1"] {
+            assert!(!AwsPartition::Aws.is_derived_region(r), "{r}");
+        }
+    }
+
+    fn service_pattern(partition: AwsPartition, label: &str) -> AwsUpstreamPattern {
+        AwsUpstreamPattern {
+            partition,
+            shape: WildcardShape::Service(label.to_owned()),
+        }
+    }
+
+    fn bucket_pattern(partition: AwsPartition) -> AwsUpstreamPattern {
+        AwsUpstreamPattern {
+            partition,
+            shape: WildcardShape::Bucket,
         }
     }
 
     #[test]
     fn derive_region_accepts_canonical_host() {
+        for (host, partition, region) in [
+            (
+                "eks.eu-west-1.amazonaws.com",
+                AwsPartition::Aws,
+                "eu-west-1",
+            ),
+            (
+                "eks.us-gov-west-1.amazonaws.com",
+                AwsPartition::Aws,
+                "us-gov-west-1",
+            ),
+            (
+                "eks.cn-north-1.amazonaws.com.cn",
+                AwsPartition::AwsCn,
+                "cn-north-1",
+            ),
+        ] {
+            assert_eq!(
+                derive_region(host, 443, &service_pattern(partition, "eks")).as_deref(),
+                Some(region),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_region_api_aws_and_two_label_service() {
+        let api = service_pattern(AwsPartition::ApiAws, "eks");
         assert_eq!(
-            derive_region("eks.eu-west-1.amazonaws.com", 443, "eks").as_deref(),
+            derive_region("eks.eu-west-1.api.aws", 443, &api).as_deref(),
             Some("eu-west-1")
         );
+        assert_eq!(derive_region("eks.cn-north-1.api.aws", 443, &api), None);
         assert_eq!(
-            derive_region("eks.us-gov-west-1.amazonaws.com", 443, "eks").as_deref(),
-            Some("us-gov-west-1")
+            derive_region("eks.eu-west-1.amazonaws.com", 443, &api),
+            None
+        );
+
+        let ecr = service_pattern(AwsPartition::Aws, "api.ecr");
+        assert_eq!(
+            derive_region("api.ecr.us-east-1.amazonaws.com", 443, &ecr).as_deref(),
+            Some("us-east-1")
+        );
+        for host in [
+            "ecr.us-east-1.amazonaws.com",
+            "x.api.ecr.us-east-1.amazonaws.com",
+            "api.ecr-public.us-east-1.amazonaws.com",
+        ] {
+            assert_eq!(derive_region(host, 443, &ecr), None, "{host}");
+        }
+    }
+
+    #[test]
+    fn validate_two_label_service_resolves_signing_name() {
+        let got = validate_aws_upstream("https://api.ecr.*.amazonaws.com", &cfg(None, None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.service_label(), "api.ecr");
+        let (_, service) =
+            resolve_signing_params("p", &cfg(None, None), "https://api.ecr.*.amazonaws.com")
+                .unwrap();
+        assert_eq!(service, "ecr");
+    }
+
+    #[test]
+    fn derive_region_bucket_wildcard() {
+        for (host, partition, region) in [
+            (
+                "my-bucket.s3.us-east-1.amazonaws.com",
+                AwsPartition::Aws,
+                "us-east-1",
+            ),
+            (
+                "b.s3.cn-northwest-1.amazonaws.com.cn",
+                AwsPartition::AwsCn,
+                "cn-northwest-1",
+            ),
+        ] {
+            assert_eq!(
+                derive_region(host, 443, &bucket_pattern(partition)).as_deref(),
+                Some(region),
+                "{host}"
+            );
+        }
+        for host in [
+            // Dotted bucket (two labels), no bucket label, wrong service.
+            "a.b.s3.us-east-1.amazonaws.com",
+            "s3.us-east-1.amazonaws.com",
+            "b.sqs.us-east-1.amazonaws.com",
+            "b.s3.us-east-1.amazonaws.com.",
+            "B.s3.us-east-1.amazonaws.com",
+            "xn--b.s3.us-east-1.amazonaws.com",
+            // Region from another partition.
+            "b.s3.cn-north-1.amazonaws.com",
+            "b.s3.us-iso-east-1.amazonaws.com",
+            // Pattern is bound to the commercial partition.
+            "b.s3.cn-north-1.amazonaws.com.cn",
+        ] {
+            assert_eq!(
+                derive_region(host, 443, &bucket_pattern(AwsPartition::Aws)),
+                None,
+                "{host}"
+            );
+        }
+        assert_eq!(
+            derive_region(
+                "b.s3.us-east-1.amazonaws.com",
+                8443,
+                &bucket_pattern(AwsPartition::Aws)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn derive_region_is_bound_to_pattern_partition() {
+        let aws = service_pattern(AwsPartition::Aws, "eks");
+        let cn = service_pattern(AwsPartition::AwsCn, "eks");
+        assert_eq!(
+            derive_region("eks.cn-north-1.amazonaws.com.cn", 443, &aws),
+            None
+        );
+        assert_eq!(derive_region("eks.us-east-1.amazonaws.com", 443, &cn), None);
+        assert_eq!(
+            derive_region("eks.cn-north-1.amazonaws.com", 443, &aws),
+            None
+        );
+        assert_eq!(
+            derive_region("eks.us-iso-east-1.amazonaws.com", 443, &aws),
+            None
         );
     }
 
@@ -690,7 +969,11 @@ mod tests {
             ("id.execute-api.us-east-1.amazonaws.com", 443),
             ("bucket.s3.us-east-1.amazonaws.com", 443),
         ] {
-            assert_eq!(derive_region(host, port, "eks"), None, "{host}:{port}");
+            assert_eq!(
+                derive_region(host, port, &service_pattern(AwsPartition::Aws, "eks")),
+                None,
+                "{host}:{port}"
+            );
         }
     }
 

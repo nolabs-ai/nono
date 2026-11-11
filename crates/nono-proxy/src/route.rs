@@ -87,9 +87,9 @@ pub struct LoadedRoute {
     /// these routes may use `operations` in their endpoint policy.
     pub aws_auth: bool,
 
-    /// Service label of a `{service}.*.amazonaws.com` `aws_auth` upstream.
+    /// Wildcard-region shape of an `aws_auth` upstream.
     /// `Some` means the SigV4 region is derived from each request's host.
-    pub aws_wildcard_service_label: Option<String>,
+    pub aws_wildcard: Option<crate::aws::endpoints::AwsUpstreamPattern>,
 
     /// Audit auth mechanism implied by the managed credential configuration.
     /// Kept even if credential material failed to load so fail-closed denial
@@ -445,13 +445,12 @@ impl RouteStore {
                 || !route.redeem_phantoms.is_empty()
                 || !endpoint_policy.allows_all_without_l7()
                 || !upgrade_rules.is_empty();
-            let aws_wildcard_service_label = match &route.aws_auth {
+            let aws_wildcard = match &route.aws_auth {
                 Some(aws_auth) => {
                     crate::aws::endpoints::validate_aws_upstream(&route.upstream, aws_auth)
                         .map_err(|e| {
                             ProxyError::Config(format!("route '{}': {e}", normalized_prefix))
                         })?
-                        .map(|p| p.service_label)
                 }
                 None => None,
             };
@@ -484,7 +483,7 @@ impl RouteStore {
                     requires_managed_credential,
                     requires_http1,
                     aws_auth: route.aws_auth.is_some(),
-                    aws_wildcard_service_label,
+                    aws_wildcard,
                     managed_auth_mechanism,
                     managed_injection_mode,
                     managed_auth,
@@ -1718,7 +1717,7 @@ mod tests {
             requires_managed_credential: false,
             requires_http1: false,
             aws_auth: false,
-            aws_wildcard_service_label: None,
+            aws_wildcard: None,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
@@ -2064,7 +2063,7 @@ mod tests {
             requires_managed_credential: true,
             requires_http1: false,
             aws_auth: false,
-            aws_wildcard_service_label: None,
+            aws_wildcard: None,
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
             managed_auth: None,
@@ -2091,7 +2090,7 @@ mod tests {
             requires_managed_credential: false,
             requires_http1: false,
             aws_auth: false,
-            aws_wildcard_service_label: None,
+            aws_wildcard: None,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
@@ -2762,15 +2761,19 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             .next()
             .unwrap()
             .1;
-        assert_eq!(route.aws_wildcard_service_label.as_deref(), Some("eks"));
+        assert_eq!(
+            route.aws_wildcard.as_ref().map(|p| p.service_label()),
+            Some("eks")
+        );
     }
 
     #[tokio::test]
     async fn load_rejects_malformed_wildcard_aws_routes() {
         for (upstream, region) in [
             ("https://eks.*.amazonaws.com", Some("us-east-1")),
-            ("https://*.s3.*.amazonaws.com", None),
-            ("https://eks.*.amazonaws.com.cn", None),
+            ("https://*.s3.*.amazonaws.com", Some("us-east-1")),
+            ("https://*.s3.*.amazonaws.com.cn", Some("cn-north-1")),
+            ("https://eks.*.amazonaws.eu", None),
             ("https://*.amazonaws.com", None),
         ] {
             let err = RouteStore::load(&[wildcard_aws_route(upstream, region)])

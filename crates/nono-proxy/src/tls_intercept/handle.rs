@@ -484,8 +484,10 @@ pub(crate) struct InterceptRouteRequest<'a> {
 ///
 /// `endpoint_policy` subsumes the legacy `endpoint_rules` (they are merged at
 /// compile time in `route::LoadedRoute::load`), so it is the authoritative
-/// source for allow / deny / approve decisions. The loop runs the approval
-/// workflow when required and emits L7 audit records. Bucketing mirrors
+/// source for allow / deny / approve decisions. The loop evaluates every
+/// route and emits L7 audit records; `approve` outcomes are asked once, after
+/// every `deny`, gate, and ambiguity check has passed (see
+/// [`crate::endpoint_approval::authorize`]). Bucketing mirrors
 /// `route::select_route` so a credential catch-all is not shadowed by a
 /// passthrough endpoint route.
 pub(crate) async fn select_intercept_route<'a>(
@@ -514,6 +516,8 @@ pub(crate) async fn select_intercept_route<'a>(
     let mut catchall_passthrough: Vec<(&str, &crate::route::LoadedRoute)> = Vec::new();
     let mut has_endpoint_only_route = false;
     let mut endpoint_authorized = false;
+    let mut endpoint_approvals: Vec<crate::endpoint_approval::PendingApproval<'_>> = Vec::new();
+    let mut credential_approvals: Vec<crate::endpoint_approval::PendingApproval<'_>> = Vec::new();
     for (prefix, route) in &candidates {
         if request
             .websocket_path
@@ -529,16 +533,17 @@ pub(crate) async fn select_intercept_route<'a>(
             }
             continue;
         }
-        // Only `aws_auth` routes may carry `operations` rules; other routes
-        // are evaluated without an operation.
-        let operation_name: Option<&str> = route.aws_auth.then(|| {
+        // Only routes that resolve AWS operations may carry `operations`
+        // rules; other routes are evaluated without an operation.
+        let resolves_operation = route.resolves_aws_operation();
+        let operation_name: Option<&str> = resolves_operation.then(|| {
             request
                 .operation
                 .map_or(crate::config::UNKNOWN_OPERATION, |op| op.name.as_str())
         });
         let operation_protocol: Option<&str> = request
             .operation
-            .filter(|_| route.aws_auth)
+            .filter(|_| resolves_operation)
             .map(|op| op.protocol.as_str());
         match route
             .endpoint_policy
@@ -582,94 +587,19 @@ pub(crate) async fn select_intercept_route<'a>(
                 timeout_secs,
                 rule_label,
             } => {
-                let Some(approval_backends) = approval_backends else {
-                    let deny_reason = format!(
-                        "endpoint approval required by {} but no approval backend is configured",
-                        rule_label
-                    );
-                    warn!("tls_intercept: {}", deny_reason);
-                    audit::log_denied(
-                        audit_log,
-                        audit::ProxyMode::ConnectIntercept,
-                        &audit::EventContext {
-                            denial_category: Some(
-                                nono::undo::NetworkAuditDenialCategory::EndpointPolicy,
-                            ),
-                            route_id: Some(prefix),
-                            endpoint_operation: operation_name,
-                            endpoint_protocol: operation_protocol,
-                            endpoint_policy_action: Some("approve"),
-                            endpoint_policy_rule: Some(&rule_label),
-                            upstream: Some(&route.upstream),
-                            ..audit::EventContext::default()
-                        },
-                        host,
-                        port,
-                        &deny_reason,
-                    );
-                    return RouteSelection::Rejected(403);
-                };
-                let (backend_name, backend) = match approval_backends.resolve(backend) {
-                    Ok(resolved) => resolved,
-                    Err(err) => {
-                        let deny_reason =
-                            format!("endpoint approval backend resolution failed: {err}");
-                        warn!("tls_intercept: {}", deny_reason);
-                        audit::log_l7_policy_decision(
-                            audit_log,
-                            audit::ProxyMode::ConnectIntercept,
-                            &audit::EventContext {
-                                denial_category: Some(
-                                    nono::undo::NetworkAuditDenialCategory::EndpointPolicy,
-                                ),
-                                route_id: Some(prefix),
-                                endpoint_operation: operation_name,
-                                endpoint_protocol: operation_protocol,
-                                endpoint_policy_action: Some("approve"),
-                                endpoint_policy_rule: Some(&rule_label),
-                                upstream: Some(&route.upstream),
-                                ..audit::EventContext::default()
-                            },
-                            host,
-                            Some(port),
-                            method,
-                            path,
-                            nono::undo::NetworkAuditDecision::ApproveError,
-                            "approve",
-                            &rule_label,
-                            Some(&deny_reason),
-                        );
-                        return RouteSelection::Rejected(403);
-                    }
-                };
-                let mut request_reason = reason.map(str::to_string).unwrap_or_else(|| {
-                    format!(
-                        "endpoint approval required by {} for {} {}{}",
-                        rule_label,
-                        method,
-                        path,
-                        operation_name
-                            .map(|op| format!(" (operation {op})"))
-                            .unwrap_or_default()
-                    )
-                });
-                // Wildcard upstreams: show the concrete host, and for AWS
-                // wildcard-region routes the derived region. A host that yields
-                // no region is denied before prompting.
-                let concrete_upstream = if route.upstream.contains('*') {
-                    format!(
-                        "https://{}",
-                        reverse::format_host_header(UpstreamScheme::Https, host, port)
-                    )
-                } else {
-                    route.upstream.clone()
-                };
-                if let Some(label) = &route.aws_wildcard_service_label {
-                    match crate::aws::endpoints::derive_region(host, port, label) {
-                        Some(region) => {
-                            request_reason.push_str(&format!(" (AWS region: {region})"));
-                        }
+                // Asked after every route is evaluated, so a `deny` on any
+                // route refuses without prompting. Bucketed as if granted; a
+                // refusal rejects the request below.
+                // AWS wildcard-region routes show the derived region; a host
+                // that yields none is denied before prompting.
+                let aws_region = match &route.aws_wildcard_service_label {
+                    Some(label) => match crate::aws::endpoints::derive_region(host, port, label) {
+                        Some(region) => Some(region),
                         None => {
+                            let concrete_upstream = format!(
+                                "https://{}",
+                                reverse::format_host_header(UpstreamScheme::Https, host, port)
+                            );
                             let deny_reason = aws_region_denial_reason(prefix, host);
                             warn!("tls_intercept: {}", deny_reason);
                             audit::log_denied(
@@ -689,219 +619,29 @@ pub(crate) async fn select_intercept_route<'a>(
                             );
                             return RouteSelection::Rejected(403);
                         }
-                    }
-                }
-                let approval_ctx = audit::EventContext {
-                    route_id: Some(prefix),
-                    endpoint_operation: operation_name,
-                    endpoint_protocol: operation_protocol,
-                    endpoint_policy_action: Some("approve"),
-                    endpoint_policy_rule: Some(&rule_label),
-                    approval_backend: Some(&backend_name),
-                    upstream: Some(&concrete_upstream),
-                    ..audit::EventContext::default()
+                    },
+                    None => None,
                 };
-                audit::log_l7_policy_decision(
-                    audit_log,
-                    audit::ProxyMode::ConnectIntercept,
-                    &approval_ctx,
-                    host,
-                    Some(port),
-                    method,
-                    path,
-                    nono::undo::NetworkAuditDecision::ApproveRequested,
-                    "approve",
-                    &rule_label,
-                    Some(&request_reason),
-                );
-                let request = nono::supervisor::ApprovalRequest::Endpoint {
-                    request_id: reverse::endpoint_approval_request_id(&format!("{host}-{port}")),
-                    route_id: (*prefix).to_string(),
-                    upstream: concrete_upstream.clone(),
-                    method: method.to_string(),
-                    path: path.to_string(),
-                    rule_label: rule_label.clone(),
-                    operation: operation_name.map(str::to_string),
-                    reason: Some(request_reason),
-                    child_pid: 0,
-                    session_id: approval_backends.session_id().to_string(),
+                let approval = crate::endpoint_approval::PendingApproval {
+                    route_id: prefix,
+                    upstream: &route.upstream,
+                    backend,
+                    reason,
+                    timeout_secs,
+                    rule_label,
+                    // Credential-route approvals stay one-shot.
+                    session_scope: !route.requires_managed_credential,
+                    aws_region,
+                    operation: operation_name,
+                    operation_protocol,
                 };
-                let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(60));
-                let deadline = std::time::Instant::now()
-                    .checked_add(timeout)
-                    .unwrap_or_else(std::time::Instant::now);
-                let decision = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    tokio::task::spawn_blocking(move || {
-                        backend.request_approval_with_deadline(&request, deadline)
-                    }),
-                )
-                .await;
-                // L7 endpoint approval has no per-connection session cache, so
-                // collapse the session-scoped decision variants to their
-                // one-shot equivalents and keep the match below total. A future
-                // cache must key on (route, upstream, method, path, operation).
-                let decision = decision.map(|joined| {
-                    joined.map(|approved| {
-                        approved.map(nono::supervisor::ApprovalDecision::without_session_scope)
-                    })
-                });
-                match decision {
-                    Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Granted))) => {
-                        audit::log_l7_policy_decision(
-                            audit_log,
-                            audit::ProxyMode::ConnectIntercept,
-                            &approval_ctx,
-                            host,
-                            Some(port),
-                            method,
-                            path,
-                            nono::undo::NetworkAuditDecision::ApproveGranted,
-                            "approve",
-                            &rule_label,
-                            None,
-                        );
-                        if route.requires_managed_credential {
-                            matched_cred.push((prefix, route));
-                        } else {
-                            matched_passthrough.push((prefix, route));
-                            endpoint_authorized = true;
-                        }
-                    }
-                    Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Denied { reason }))) => {
-                        // A refusal is authoritative for this request. Dropping
-                        // the route and forwarding without its credential would
-                        // silently downgrade enforcement.
-                        let deny_reason = if reason.is_empty() {
-                            "endpoint approval denied".to_string()
-                        } else {
-                            format!("endpoint approval denied: {reason}")
-                        };
-                        audit::log_l7_policy_decision(
-                            audit_log,
-                            audit::ProxyMode::ConnectIntercept,
-                            &approval_ctx,
-                            host,
-                            Some(port),
-                            method,
-                            path,
-                            nono::undo::NetworkAuditDecision::ApproveDenied,
-                            "approve",
-                            &rule_label,
-                            Some(&deny_reason),
-                        );
-                        warn!(
-                            "tls_intercept: {}",
-                            crate::approval::sanitize_reason_for_log(&deny_reason)
-                        );
-                        return RouteSelection::Rejected(403);
-                    }
-                    Ok(Ok(Ok(
-                        nono::supervisor::ApprovalDecision::GrantedForSession
-                        | nono::supervisor::ApprovalDecision::DeniedForSession,
-                    ))) => {
-                        // Unreachable: without_session_scope() above collapses
-                        // these to Granted/Denied before this match. Kept for
-                        // exhaustiveness and fail-secure if that normalization is
-                        // ever removed.
-                        let deny_reason = format!(
-                            "endpoint approval returned an unexpected session-scoped decision for {} {} on route '{}'",
-                            method, path, prefix
-                        );
-                        audit::log_l7_policy_decision(
-                            audit_log,
-                            audit::ProxyMode::ConnectIntercept,
-                            &approval_ctx,
-                            host,
-                            Some(port),
-                            method,
-                            path,
-                            nono::undo::NetworkAuditDecision::ApproveDenied,
-                            "approve",
-                            &rule_label,
-                            Some(&deny_reason),
-                        );
-                        warn!("tls_intercept: {}", deny_reason);
-                        return RouteSelection::Rejected(403);
-                    }
-                    Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Timeout))) => {
-                        let deny_reason = format!(
-                            "endpoint approval backend reported timeout for {} {} on route '{}'",
-                            method, path, prefix
-                        );
-                        audit::log_l7_policy_decision(
-                            audit_log,
-                            audit::ProxyMode::ConnectIntercept,
-                            &approval_ctx,
-                            host,
-                            Some(port),
-                            method,
-                            path,
-                            nono::undo::NetworkAuditDecision::ApproveTimeout,
-                            "approve",
-                            &rule_label,
-                            Some(&deny_reason),
-                        );
-                        warn!("tls_intercept: {}", deny_reason);
-                        return RouteSelection::Rejected(403);
-                    }
-                    Ok(Ok(Err(err))) => {
-                        let deny_reason = format!("endpoint approval backend error: {err}");
-                        audit::log_l7_policy_decision(
-                            audit_log,
-                            audit::ProxyMode::ConnectIntercept,
-                            &approval_ctx,
-                            host,
-                            Some(port),
-                            method,
-                            path,
-                            nono::undo::NetworkAuditDecision::ApproveError,
-                            "approve",
-                            &rule_label,
-                            Some(&deny_reason),
-                        );
-                        warn!("{}", deny_reason);
-                        return RouteSelection::Rejected(403);
-                    }
-                    Ok(Err(err)) => {
-                        let deny_reason = format!("endpoint approval task failed: {err}");
-                        audit::log_l7_policy_decision(
-                            audit_log,
-                            audit::ProxyMode::ConnectIntercept,
-                            &approval_ctx,
-                            host,
-                            Some(port),
-                            method,
-                            path,
-                            nono::undo::NetworkAuditDecision::ApproveError,
-                            "approve",
-                            &rule_label,
-                            Some(&deny_reason),
-                        );
-                        warn!("{}", deny_reason);
-                        return RouteSelection::Rejected(403);
-                    }
-                    Err(_) => {
-                        let deny_reason = format!(
-                            "endpoint approval timed out by {}: {} {} on route '{}'",
-                            rule_label, method, path, prefix
-                        );
-                        audit::log_l7_policy_decision(
-                            audit_log,
-                            audit::ProxyMode::ConnectIntercept,
-                            &approval_ctx,
-                            host,
-                            Some(port),
-                            method,
-                            path,
-                            nono::undo::NetworkAuditDecision::ApproveTimeout,
-                            "approve",
-                            &rule_label,
-                            Some(&deny_reason),
-                        );
-                        warn!("{}", deny_reason);
-                        return RouteSelection::Rejected(403);
-                    }
+                if route.requires_managed_credential {
+                    credential_approvals.push(approval);
+                    matched_cred.push((prefix, route));
+                } else {
+                    endpoint_approvals.push(approval);
+                    matched_passthrough.push((prefix, route));
+                    endpoint_authorized = true;
                 }
             }
             EndpointPolicyOutcome::Deny { reason, rule_label } => {
@@ -1025,6 +765,41 @@ pub(crate) async fn select_intercept_route<'a>(
         );
         return RouteSelection::Rejected(403);
     }
+    // One prompt for the request even when both the endpoint-authorization
+    // (`_ep_`) route and the credential route ask. `_ep_` approvals go first so
+    // the prompt names the route that gates the request; `credential_route`
+    // tells the operator whether a credential will be injected.
+    if !endpoint_approvals.is_empty() || !credential_approvals.is_empty() {
+        endpoint_approvals.append(&mut credential_approvals);
+        let credential_route = selected
+            .filter(|(_, route)| route.requires_managed_credential)
+            .map(|(prefix, _)| prefix);
+        let request_id_scope = format!("{host}-{port}");
+        let upstream = if port == 443 {
+            format!("https://{}", host.to_lowercase())
+        } else {
+            format!("https://{}:{}", host.to_lowercase(), port)
+        };
+        let audit_ctx = audit::EventContext::default();
+        let target = crate::endpoint_approval::ApprovalTarget {
+            method,
+            path,
+            upstream: &upstream,
+            credential_route,
+            audit_log,
+            mode: audit::ProxyMode::ConnectIntercept,
+            audit_ctx: &audit_ctx,
+            audit_target: host,
+            audit_port: Some(port),
+            request_id_scope: &request_id_scope,
+        };
+        if !crate::endpoint_approval::authorize(approval_backends, &endpoint_approvals, &target)
+            .await
+        {
+            return RouteSelection::Rejected(403);
+        }
+    }
+
     match selected.map(|(s, _)| s) {
         Some(svc) => debug!(
             "tls_intercept: selected route '{}' for {} {}",
@@ -1099,6 +874,10 @@ pub(crate) enum CredentialResolution<'a> {
     /// The request must be rejected with this HTTP status; the denial has
     /// already been audited.
     Rejected(u16),
+    /// Host credential capture failed; return a safe diagnostic, not backend output.
+    CaptureFailed,
+    /// The route requires a managed credential, but none is available.
+    Unavailable,
     /// Forward the request, optionally injecting `credential`.
     Forward {
         credential: Option<ResolvedCredential<'a>>,
@@ -1167,7 +946,7 @@ pub(crate) async fn resolve_managed_credential<'a>(
             port,
             &reason,
         );
-        return CredentialResolution::Rejected(503);
+        return CredentialResolution::Unavailable;
     }
 
     // AWS SigV4 signing is not yet implemented. Return 501 so the caller knows
@@ -1222,7 +1001,7 @@ pub(crate) async fn resolve_managed_credential<'a>(
                     port,
                     &reason,
                 );
-                return CredentialResolution::Rejected(503);
+                return CredentialResolution::CaptureFailed;
             }
         }
     }
@@ -1244,16 +1023,39 @@ where
     };
     debug!("tls_intercept: inner request {} {}", req.method, req.path);
 
-    // For upstreams with an `aws_auth` route, buffer the body before policy
-    // evaluation so the AWS operation can be resolved. The same body, header
-    // list and path are then signed and forwarded, so what policy inspected is
-    // exactly what is sent.
+    // Endpoint policy matches origin-form paths. An absolute-form target
+    // (`GET https://host/a/b`) would normalize to `/https:/host/a/b` and miss
+    // fixed-depth rules while the upstream still serves `/a/b`, so refuse
+    // anything but origin-form and `OPTIONS *`.
+    if !is_origin_form_target(&req.method, &req.path) {
+        let reason = "request target is not in origin form";
+        warn!("tls_intercept: {}: {} {}", reason, req.method, req.path);
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
+                ..audit::EventContext::default()
+            },
+            ctx.host,
+            ctx.port,
+            reason,
+        );
+        reverse::send_error_generic(tls_stream, 400, "Bad Request").await?;
+        return Ok(());
+    }
+
+    // For upstreams with a route that resolves AWS operations, buffer the
+    // body before policy evaluation so the operation can be resolved. The
+    // same body, header list and path are then signed (or, on a
+    // credential-free route, forwarded under the agent's own signature), so
+    // what policy inspected is exactly what is sent.
     let host_port_key = format!("{}:{}", ctx.host.to_lowercase(), ctx.port);
     let has_aws_route = ctx
         .route_store
         .lookup_all_by_upstream(&host_port_key)
         .iter()
-        .any(|(_, route)| route.aws_auth);
+        .any(|(_, route)| route.resolves_aws_operation());
     let mut aws_headers: Option<Vec<(String, String)>> = None;
     let mut resolved_operation: Option<crate::aws::operation::ResolvedOperation> = None;
     if has_aws_route {
@@ -1427,6 +1229,14 @@ where
                 _ => "Service Unavailable",
             };
             reverse::send_error_generic(tls_stream, status, msg).await?;
+            return Ok(());
+        }
+        CredentialResolution::CaptureFailed => {
+            reverse::send_credential_capture_error(tls_stream, req.method == "HEAD").await?;
+            return Ok(());
+        }
+        CredentialResolution::Unavailable => {
+            reverse::send_credential_unavailable_error(tls_stream, req.method == "HEAD").await?;
             return Ok(());
         }
         CredentialResolution::Forward { credential } => credential,
@@ -2596,6 +2406,12 @@ fn build_websocket_upstream_request(
 }
 
 /// Parse a request line into (method, path, version).
+/// `true` for an origin-form request target (`/path?query`) or the
+/// asterisk form of `OPTIONS`.
+fn is_origin_form_target(method: &str, target: &str) -> bool {
+    target.starts_with('/') || (target == "*" && method.eq_ignore_ascii_case("OPTIONS"))
+}
+
 fn parse_request_line(line: &str) -> Result<(String, String, String)> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 3 {
@@ -2615,6 +2431,7 @@ fn parse_request_line(line: &str) -> Result<(String, String, String)> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::capture::tests::FailureKind;
 
     #[test]
     fn handshake_validity_errors_suggest_clocks_and_expiry() {
@@ -3634,6 +3451,94 @@ mod tests {
         assert_eq!(*backend.operations.lock().unwrap(), vec![None]);
     }
 
+    /// Credential-free `_ep_` route from an `allow_domain` entry: the agent
+    /// signs its own requests and the proxy only filters by operation.
+    fn ep_aws_ops_route(approve: &[&str], allow: &[&str]) -> crate::config::RouteConfig {
+        let mut route = aws_ops_route(&[], approve, allow);
+        route.prefix = format!(
+            "{}ssm.us-east-1.amazonaws.com",
+            crate::config::ENDPOINT_ROUTE_PREFIX
+        );
+        route.aws_auth = None;
+        route
+    }
+
+    #[tokio::test]
+    async fn ep_aws_route_filters_by_operation_without_signing() {
+        let store = RouteStore::load(&[ep_aws_ops_route(&[], &["Describe*"])])
+            .await
+            .unwrap();
+        let (_, route) = store
+            .lookup_by_upstream("ssm.us-east-1.amazonaws.com:443")
+            .unwrap();
+        assert!(!route.requires_managed_credential);
+        assert!(route.resolves_aws_operation());
+        assert_eq!(
+            select_aws(&store, Some(&resolved("DescribeParameters")), None, None).await,
+            200
+        );
+        assert_eq!(
+            select_aws(&store, Some(&resolved("DeleteParameter")), None, None).await,
+            403
+        );
+        assert_eq!(select_aws(&store, None, None, None).await, 403);
+    }
+
+    /// Grants every endpoint request for the session and records its operation.
+    struct SessionGrantingBackend {
+        operations: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl nono::ApprovalBackend for SessionGrantingBackend {
+        fn request_approval(
+            &self,
+            request: &nono::ApprovalRequest,
+        ) -> nono::Result<nono::ApprovalDecision> {
+            if let nono::ApprovalRequest::Endpoint { operation, .. } = request {
+                self.operations
+                    .lock()
+                    .map_err(|_| nono::NonoError::SandboxInit("poisoned".to_string()))?
+                    .push(operation.clone());
+            }
+            Ok(nono::ApprovalDecision::GrantedForSession)
+        }
+
+        fn backend_name(&self) -> &str {
+            "session-granting"
+        }
+    }
+
+    #[tokio::test]
+    async fn ep_aws_session_grant_covers_only_its_operation() {
+        let store = RouteStore::load(&[ep_aws_ops_route(&["Terminate*"], &[])])
+            .await
+            .unwrap();
+        let backend = std::sync::Arc::new(SessionGrantingBackend {
+            operations: std::sync::Mutex::new(Vec::new()),
+        });
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+        for op in [
+            "TerminateInstances",
+            "TerminateInstances",
+            "TerminateDBInstance",
+        ] {
+            assert_eq!(
+                select_aws(&store, Some(&resolved(op)), None, Some(&registry)).await,
+                200,
+                "{op}"
+            );
+        }
+        // The repeat is answered from the session cache; the other operation
+        // under the same rule asks again.
+        assert_eq!(
+            *backend.operations.lock().unwrap(),
+            vec![
+                Some("TerminateInstances".to_string()),
+                Some("TerminateDBInstance".to_string())
+            ]
+        );
+    }
+
     fn parsed(header_bytes: &[u8], buffered: &[u8], body: Option<&[u8]>) -> ParsedRequest {
         ParsedRequest {
             method: "POST".to_string(),
@@ -3847,6 +3752,475 @@ mod tests {
                 panic!("granted approval must be allowed, got rejection with status {status}")
             }
         }
+    }
+
+    fn policy_rule(
+        method: &str,
+        path: &str,
+        reason: Option<&str>,
+    ) -> crate::config::EndpointPolicyRule {
+        crate::config::EndpointPolicyRule {
+            method: method.to_string(),
+            path: path.to_string(),
+            backend: None,
+            reason: reason.map(str::to_string),
+            timeout_secs: Some(5),
+            operations: None,
+        }
+    }
+
+    /// `_ep_` route built from an `allow_domain` entry with `endpoint_policy`:
+    /// `/login` is allowed, pushes are denied, and any repository asks.
+    /// `approve` is checked before `allow`, so the two must not overlap.
+    fn ep_policy_route() -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            prefix: "_ep_example.com".to_string(),
+            credential_key: None,
+            credential_format: None,
+            endpoint_policy: Some(crate::config::EndpointPolicyConfig {
+                default: crate::config::EndpointPolicyDefault::default(),
+                deny: vec![policy_rule("*", "/*/*/git-receive-pack", None)],
+                approve: vec![policy_rule(
+                    "*",
+                    "/*/*/**",
+                    Some("repository outside the allowed orgs"),
+                )],
+                allow: vec![policy_rule("*", "/login", None)],
+            }),
+            ..approval_gated_route("_ep_example.com")
+        }
+    }
+
+    /// Credential route on the same upstream with the given endpoint policy.
+    fn credential_route_with(
+        policy: crate::config::EndpointPolicyConfig,
+    ) -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            endpoint_policy: Some(policy),
+            ..approval_gated_route("example_https")
+        }
+    }
+
+    /// Records each endpoint approval request and answers with `decision`
+    /// after `delay`.
+    struct RecordingBackend {
+        requests: std::sync::Mutex<Vec<nono::ApprovalRequest>>,
+        decision: nono::ApprovalDecision,
+        delay: std::time::Duration,
+    }
+
+    impl RecordingBackend {
+        fn new(decision: nono::ApprovalDecision) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+                decision,
+                delay: std::time::Duration::ZERO,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+
+        fn last(&self) -> nono::ApprovalRequest {
+            self.requests.lock().unwrap().last().cloned().unwrap()
+        }
+    }
+
+    impl nono::ApprovalBackend for RecordingBackend {
+        fn request_approval(
+            &self,
+            request: &nono::ApprovalRequest,
+        ) -> nono::Result<nono::ApprovalDecision> {
+            std::thread::sleep(self.delay);
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(self.decision.clone())
+        }
+
+        fn backend_name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    async fn select(
+        store: &RouteStore,
+        registry: &crate::approval::ApprovalBackendRegistry,
+        method: &str,
+        path: &str,
+    ) -> std::result::Result<Option<String>, u16> {
+        match select_intercept_route(
+            store,
+            "example.com",
+            443,
+            InterceptRouteRequest {
+                method,
+                path,
+                websocket_path: None,
+                operation: None,
+            },
+            None,
+            Some(registry),
+        )
+        .await
+        {
+            RouteSelection::Selected(selected) => Ok(selected.map(|s| s.id.to_string())),
+            RouteSelection::Rejected(status) => Err(status),
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_domain_endpoint_policy_approve_asks_with_ep_route() {
+        let store = RouteStore::load(&[ep_policy_route()]).await.unwrap();
+        let backend = RecordingBackend::new(nono::ApprovalDecision::Granted);
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+
+        let selected = select(&store, &registry, "GET", "/torvalds/linux/info/refs").await;
+
+        assert_eq!(selected, Ok(Some("_ep_example.com".to_string())));
+        assert_eq!(backend.calls(), 1);
+        match backend.last() {
+            nono::ApprovalRequest::Endpoint {
+                route_id,
+                credential_route,
+                upstream,
+                rule_label,
+                reason,
+                method,
+                path,
+                ..
+            } => {
+                assert_eq!(route_id, "_ep_example.com");
+                assert_eq!(credential_route, None);
+                assert_eq!(upstream, "https://example.com");
+                assert_eq!(
+                    rule_label,
+                    "endpoint_policy.approve[GET /torvalds/linux/**]"
+                );
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("repository outside the allowed orgs")
+                );
+                assert_eq!(method, "GET");
+                assert_eq!(path, "/torvalds/linux/info/refs");
+            }
+            other => panic!("expected an endpoint request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_domain_endpoint_policy_allow_and_deny_never_ask() {
+        let store = RouteStore::load(&[ep_policy_route()]).await.unwrap();
+        let backend = RecordingBackend::new(nono::ApprovalDecision::Granted);
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+
+        assert_eq!(
+            select(&store, &registry, "GET", "/login").await,
+            Ok(Some("_ep_example.com".to_string()))
+        );
+        assert_eq!(
+            select(
+                &store,
+                &registry,
+                "POST",
+                "/torvalds/linux/git-receive-pack"
+            )
+            .await,
+            Err(403)
+        );
+        assert_eq!(
+            select(&store, &registry, "GET", "/robots.txt").await,
+            Err(403)
+        );
+        assert_eq!(
+            backend.calls(),
+            0,
+            "allow, deny, and default deny must not ask"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_session_grant_covers_the_scope_only() {
+        let store = RouteStore::load(&[ep_policy_route()]).await.unwrap();
+        let backend = RecordingBackend::new(nono::ApprovalDecision::GrantedForSession);
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+
+        assert!(
+            select(&store, &registry, "GET", "/torvalds/linux/info/refs")
+                .await
+                .is_ok()
+        );
+        assert!(
+            select(&store, &registry, "GET", "/torvalds/linux/HEAD")
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            backend.calls(),
+            1,
+            "same scope must reuse the session grant"
+        );
+
+        assert!(
+            select(&store, &registry, "POST", "/torvalds/linux/git-upload-pack")
+                .await
+                .is_ok()
+        );
+        assert_eq!(backend.calls(), 2, "another method must ask again");
+
+        assert!(
+            select(&store, &registry, "GET", "/torvalds/other/info/refs")
+                .await
+                .is_ok()
+        );
+        assert_eq!(backend.calls(), 3, "a different repository must ask again");
+
+        assert_eq!(
+            select(
+                &store,
+                &registry,
+                "POST",
+                "/torvalds/linux/git-receive-pack"
+            )
+            .await,
+            Err(403),
+            "a session grant must not override a deny rule"
+        );
+        assert_eq!(backend.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn endpoint_session_denial_is_cached_and_one_shot_answers_are_not() {
+        let store = RouteStore::load(&[ep_policy_route()]).await.unwrap();
+        let denying = RecordingBackend::new(nono::ApprovalDecision::DeniedForSession);
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(denying.clone());
+        for _ in 0..2 {
+            assert_eq!(
+                select(&store, &registry, "GET", "/torvalds/linux/info/refs").await,
+                Err(403)
+            );
+        }
+        assert_eq!(denying.calls(), 1);
+
+        let granting = RecordingBackend::new(nono::ApprovalDecision::Granted);
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(granting.clone());
+        for _ in 0..2 {
+            assert!(
+                select(&store, &registry, "GET", "/torvalds/linux/info/refs")
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(granting.calls(), 2, "a one-shot grant must not be cached");
+    }
+
+    #[tokio::test]
+    async fn endpoint_session_cache_is_per_registry() {
+        let store = RouteStore::load(&[ep_policy_route()]).await.unwrap();
+        let backend = RecordingBackend::new(nono::ApprovalDecision::GrantedForSession);
+        let first = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+        let second = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+
+        assert!(
+            select(&store, &first, "GET", "/torvalds/linux/info/refs")
+                .await
+                .is_ok()
+        );
+        assert!(
+            select(&store, &first.clone(), "GET", "/torvalds/linux/info/refs")
+                .await
+                .is_ok()
+        );
+        assert_eq!(backend.calls(), 1, "clones share one proxy session");
+        assert!(
+            select(&store, &second, "GET", "/torvalds/linux/info/refs")
+                .await
+                .is_ok()
+        );
+        assert_eq!(backend.calls(), 2, "another proxy session must ask again");
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_endpoint_approvals_share_one_prompt() {
+        let store = RouteStore::load(&[ep_policy_route()]).await.unwrap();
+        let backend = std::sync::Arc::new(RecordingBackend {
+            requests: std::sync::Mutex::new(Vec::new()),
+            decision: nono::ApprovalDecision::GrantedForSession,
+            delay: std::time::Duration::from_millis(200),
+        });
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+
+        let (first, second, third) = tokio::join!(
+            select(&store, &registry, "GET", "/torvalds/linux/info/refs"),
+            select(&store, &registry, "GET", "/torvalds/linux/objects/pack"),
+            select(&store, &registry, "GET", "/torvalds/linux/HEAD"),
+        );
+
+        assert!(first.is_ok() && second.is_ok() && third.is_ok());
+        assert_eq!(backend.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn approved_request_on_both_layers_asks_once_and_injects_credential() {
+        let store = RouteStore::load(&[
+            ep_policy_route(),
+            credential_route_with(crate::config::EndpointPolicyConfig {
+                approve: vec![policy_rule("*", "/**", None)],
+                ..crate::config::EndpointPolicyConfig::default()
+            }),
+        ])
+        .await
+        .unwrap();
+        let backend = RecordingBackend::new(nono::ApprovalDecision::Granted);
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+
+        let selected = select(&store, &registry, "GET", "/torvalds/linux/info/refs").await;
+
+        assert_eq!(selected, Ok(Some("example_https".to_string())));
+        assert_eq!(backend.calls(), 1, "both layers asking must prompt once");
+        match backend.last() {
+            nono::ApprovalRequest::Endpoint {
+                route_id,
+                credential_route,
+                ..
+            } => {
+                assert_eq!(route_id, "_ep_example.com");
+                assert_eq!(credential_route.as_deref(), Some("example_https"));
+            }
+            other => panic!("expected an endpoint request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_answer_for_both_layers_caches_only_the_shown_scope() {
+        let store = RouteStore::load(&[
+            ep_policy_route(),
+            credential_route_with(crate::config::EndpointPolicyConfig {
+                approve: vec![policy_rule("*", "/**", None)],
+                ..crate::config::EndpointPolicyConfig::default()
+            }),
+        ])
+        .await
+        .unwrap();
+        let backend = RecordingBackend::new(nono::ApprovalDecision::GrantedForSession);
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+
+        assert!(
+            select(&store, &registry, "GET", "/torvalds/linux/info/refs")
+                .await
+                .is_ok()
+        );
+        assert_eq!(backend.calls(), 1);
+        // The prompt showed only the `_ep_` scope, so only it is cached. The
+        // credential route's approval stays one-shot: it asks again, naming
+        // itself.
+        assert!(
+            select(&store, &registry, "GET", "/torvalds/linux/HEAD")
+                .await
+                .is_ok()
+        );
+        assert_eq!(backend.calls(), 2);
+        match backend.last() {
+            nono::ApprovalRequest::Endpoint { route_id, .. } => {
+                assert_eq!(route_id, "example_https");
+            }
+            other => panic!("expected an endpoint request, got {other:?}"),
+        }
+        // A path only the credential route asks for is never covered by the
+        // earlier session answer.
+        for _ in 0..2 {
+            assert!(select(&store, &registry, "GET", "/login").await.is_ok());
+        }
+        assert_eq!(backend.calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn credential_route_asking_alone_names_itself() {
+        let store = RouteStore::load(&[
+            ep_policy_route(),
+            credential_route_with(crate::config::EndpointPolicyConfig {
+                approve: vec![policy_rule("POST", "/**", None)],
+                default: crate::config::EndpointPolicyDefault {
+                    decision: crate::config::EndpointPolicyDecision::Allow,
+                    backend: None,
+                    timeout_secs: None,
+                },
+                ..crate::config::EndpointPolicyConfig::default()
+            }),
+        ])
+        .await
+        .unwrap();
+        let backend = RecordingBackend::new(nono::ApprovalDecision::Granted);
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+
+        assert_eq!(
+            select(&store, &registry, "POST", "/login").await,
+            Ok(Some("example_https".to_string()))
+        );
+        match backend.last() {
+            nono::ApprovalRequest::Endpoint {
+                route_id,
+                credential_route,
+                ..
+            } => {
+                assert_eq!(route_id, "example_https");
+                assert_eq!(credential_route.as_deref(), Some("example_https"));
+            }
+            other => panic!("expected an endpoint request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deny_on_either_layer_refuses_without_asking() {
+        let allow_all = crate::config::EndpointPolicyDefault {
+            decision: crate::config::EndpointPolicyDecision::Allow,
+            backend: None,
+            timeout_secs: None,
+        };
+        // The credential route allows everything: it must not authorize what
+        // the `_ep_` layer denies.
+        let store = RouteStore::load(&[
+            ep_policy_route(),
+            credential_route_with(crate::config::EndpointPolicyConfig {
+                allow: vec![policy_rule("*", "/**", None)],
+                default: allow_all.clone(),
+                ..crate::config::EndpointPolicyConfig::default()
+            }),
+        ])
+        .await
+        .unwrap();
+        let backend = RecordingBackend::new(nono::ApprovalDecision::Granted);
+        let registry = crate::approval::ApprovalBackendRegistry::singleton(backend.clone());
+        assert_eq!(
+            select(
+                &store,
+                &registry,
+                "POST",
+                "/torvalds/linux/git-receive-pack"
+            )
+            .await,
+            Err(403)
+        );
+        assert_eq!(
+            select(&store, &registry, "GET", "/robots.txt").await,
+            Err(403)
+        );
+
+        // The `_ep_` layer would ask, but the credential route denies.
+        let store = RouteStore::load(&[
+            ep_policy_route(),
+            credential_route_with(crate::config::EndpointPolicyConfig {
+                deny: vec![policy_rule("*", "/torvalds/**", None)],
+                default: allow_all,
+                ..crate::config::EndpointPolicyConfig::default()
+            }),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            select(&store, &registry, "GET", "/torvalds/linux/info/refs").await,
+            Err(403)
+        );
+        assert_eq!(backend.calls(), 0);
     }
 
     fn test_default_h2_connector() -> tokio_rustls::TlsConnector {
@@ -4281,6 +4655,56 @@ mod tests {
         assert!(matches!(selection, RouteSelection::Rejected(403)));
     }
 
+    #[tokio::test]
+    async fn http1_intercept_reports_credential_capture_failure() {
+        assert_http1_credential_failure("POST", FailureKind::Capture).await;
+    }
+
+    #[tokio::test]
+    async fn http1_head_reports_credential_capture_failure_without_body() {
+        assert_http1_credential_failure("HEAD", FailureKind::Capture).await;
+    }
+
+    #[tokio::test]
+    async fn http1_intercept_reports_credential_unavailable() {
+        assert_http1_credential_failure("POST", FailureKind::Unavailable).await;
+    }
+
+    #[tokio::test]
+    async fn http1_intercept_head_reports_credential_unavailable_without_body() {
+        assert_http1_credential_failure("HEAD", FailureKind::Unavailable).await;
+    }
+
+    async fn assert_http1_credential_failure(method: &str, failure: FailureKind) {
+        use crate::capture::tests::{FailingCaptureBackend, FailureFixture, assert_http1_failure};
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let fixture = FailureFixture::new(failure).await;
+            let session_token = Zeroizing::new("session-token".to_string());
+            let filter = ProxyFilter::allow_all();
+            let mut ctx = test_intercept_ctx(&session_token, &fixture.connector, &filter);
+            ctx.host = "127.0.0.1";
+            ctx.port = fixture.port();
+            ctx.route_id = Some("capture");
+            ctx.route_store = Arc::clone(&fixture.route_store);
+            ctx.credential_store = Arc::clone(&fixture.credential_store);
+            ctx.credential_capture_backend = Some(Arc::new(FailingCaptureBackend));
+
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            client.write_all(format!(
+                "{method} /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer session-token\r\nContent-Length: 0\r\n\r\n",
+                fixture.port(),
+            ).as_bytes()).await.unwrap();
+            handle_inner_request(&mut server, &ctx).await.unwrap();
+            drop(server);
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert_http1_failure(&response, method == "HEAD", failure);
+            fixture.assert_no_upstream_connection();
+        }).await.unwrap();
+    }
+
     fn test_intercept_ctx<'a>(
         session_token: &'a Zeroizing<String>,
         connector: &'a tokio_rustls::TlsConnector,
@@ -4684,6 +5108,33 @@ mod tests {
             response.extend_from_slice(&buf[..n]);
         }
         String::from_utf8_lossy(&response).to_string()
+    }
+
+    #[tokio::test]
+    async fn absolute_form_request_target_is_refused() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let store = Arc::new(OAuthCaptureStore::load(&[]).unwrap());
+        let ctx = oauth_intercept_ctx(ca, &connector, &filter, &session_token, store, 443);
+
+        let response = drive_token_endpoint_request(
+            &ctx,
+            "POST https://localhost/acme/repo/git-receive-pack HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "got {response:?}");
+    }
+
+    #[test]
+    fn origin_form_targets_are_recognized() {
+        assert!(is_origin_form_target("GET", "/a/b?c=d"));
+        assert!(is_origin_form_target("options", "*"));
+        assert!(!is_origin_form_target("GET", "*"));
+        assert!(!is_origin_form_target("GET", "https://host/a"));
+        assert!(!is_origin_form_target("CONNECT", "host:443"));
     }
 
     #[tokio::test]

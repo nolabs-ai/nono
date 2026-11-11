@@ -117,6 +117,15 @@ pub struct LoadedRoute {
 }
 
 impl LoadedRoute {
+    /// `true` if requests on this route must have their AWS operation
+    /// resolved before policy evaluation: `aws_auth` routes, and routes whose
+    /// policy has `operations` rules (load validation allows those only on
+    /// `aws_auth` routes and AWS upstreams).
+    #[must_use]
+    pub fn resolves_aws_operation(&self) -> bool {
+        self.aws_auth || self.endpoint_policy.has_operation_rules()
+    }
+
     /// The phantom value a client must present on this route: the session token
     /// wrapped in the route's template, or the bare token when none is set.
     #[must_use]
@@ -248,8 +257,27 @@ impl RouteStore {
 
         let base_root_store = build_base_root_store();
 
+        // Two different routes under one prefix would leave only the last one
+        // loaded, silently dropping the other's endpoint policy. Identical
+        // repeats are harmless and skipped.
+        let mut seen: HashMap<String, serde_json::Value> = HashMap::new();
+
         for route in routes {
             let normalized_prefix = route.prefix.trim_matches('/').to_string();
+            let fingerprint = serde_json::to_value(route)
+                .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
+            match seen.get(&normalized_prefix) {
+                Some(existing) if *existing == fingerprint => continue,
+                Some(_) => {
+                    return Err(ProxyError::Config(format!(
+                        "route '{}' is configured more than once with different settings",
+                        normalized_prefix
+                    )));
+                }
+                None => {
+                    seen.insert(normalized_prefix.clone(), fingerprint);
+                }
+            }
 
             debug!(
                 "Loading route '{}' -> {}",
@@ -263,19 +291,12 @@ impl RouteStore {
                 &route.endpoint_rules,
             )
             .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
-            if route.aws_auth.is_none()
-                && route.endpoint_policy.as_ref().is_some_and(|p| {
-                    p.deny
-                        .iter()
-                        .chain(&p.approve)
-                        .chain(&p.allow)
-                        .any(|r| r.operations.is_some())
-                })
-            {
-                return Err(ProxyError::Config(format!(
-                    "route '{}': endpoint_policy `operations` requires `aws_auth`",
-                    normalized_prefix
-                )));
+            if endpoint_policy.has_operation_rules() {
+                crate::aws::endpoints::validate_operations_upstream(
+                    &route.upstream,
+                    route.aws_auth.is_some(),
+                )
+                .map_err(|e| ProxyError::Config(format!("route '{}': {e}", normalized_prefix)))?;
             }
             let upgrade_rules = CompiledUpgradeRules::compile(&route.upgrades)
                 .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
@@ -434,6 +455,8 @@ impl RouteStore {
                 }
                 None => None,
             };
+            // Operations are resolved only on the HTTP/1.1 path.
+            let requires_http1 = route.aws_auth.is_some() || endpoint_policy.has_operation_rules();
             let managed_auth_mechanism = auth_mechanism_for_route(route);
             let managed_injection_mode = injection_mode_for_route(route);
 
@@ -459,7 +482,7 @@ impl RouteStore {
                     tls_config_key,
                     requires_intercept,
                     requires_managed_credential,
-                    requires_http1: route.aws_auth.is_some(),
+                    requires_http1,
                     aws_auth: route.aws_auth.is_some(),
                     aws_wildcard_service_label,
                     managed_auth_mechanism,
@@ -1983,11 +2006,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_operations_rejected_without_aws_auth() {
-        let err = RouteStore::load(&[operations_route(false)])
+    async fn test_operations_load_on_credential_free_aws_route() {
+        let store = RouteStore::load(&[operations_route(false)]).await.unwrap();
+        let (_, route) = store
+            .lookup_by_upstream("ssm.us-east-1.amazonaws.com:443")
+            .unwrap();
+        assert!(!route.aws_auth);
+        assert!(!route.requires_managed_credential);
+        assert!(route.resolves_aws_operation());
+        assert!(store.requires_http1("ssm.us-east-1.amazonaws.com:443"));
+    }
+
+    #[tokio::test]
+    async fn test_operations_rejected_on_non_aws_upstream() {
+        let mut route = operations_route(false);
+        route.upstream = "https://evilamazonaws.com".to_string();
+        let err = RouteStore::load(&[route])
             .await
-            .expect_err("operations without aws_auth must be rejected");
-        assert!(err.to_string().contains("operations"));
+            .expect_err("operations on a non-AWS upstream must be rejected");
+        assert!(err.to_string().contains("AWS upstream"));
+    }
+
+    #[tokio::test]
+    async fn test_route_without_operations_does_not_resolve_them() {
+        let mut route = operations_route(false);
+        route.endpoint_policy = None;
+        let store = RouteStore::load(&[route]).await.unwrap();
+        let (_, route) = store
+            .lookup_by_upstream("ssm.us-east-1.amazonaws.com:443")
+            .unwrap();
+        assert!(!route.resolves_aws_operation());
     }
 
     #[tokio::test]
@@ -2085,6 +2133,28 @@ mod tests {
         assert!(hit.1.requires_intercept);
         assert!(hit.1.requires_managed_credential);
         assert!(store.lookup_by_upstream("api.example.com:443").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_load_rejects_conflicting_duplicate_prefixes() {
+        let route = |path: &str| RouteConfig {
+            prefix: "_ep_github.com".to_string(),
+            upstream: "https://github.com".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "*".to_string(),
+                path: path.to_string(),
+            }],
+            ..RouteConfig::default()
+        };
+        assert!(
+            RouteStore::load(&[route("/a/**"), route("/a/**")])
+                .await
+                .is_ok()
+        );
+        let err = RouteStore::load(&[route("/a/**"), route("/b/**")])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("more than once"), "{err}");
     }
 
     #[tokio::test]

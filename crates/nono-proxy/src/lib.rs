@@ -26,6 +26,7 @@ pub mod config;
 pub mod connect;
 pub mod credential;
 pub mod diagnostic;
+pub(crate) mod endpoint_approval;
 pub mod error;
 pub mod external;
 pub mod filter;

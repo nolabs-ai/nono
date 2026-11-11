@@ -154,7 +154,7 @@ Both variants `POST` the same JSON body:
 | --- | --- |
 | `capability` | `path`, `access` (`Read`, `Write`, `ReadWrite`) |
 | `network` | `host`, `port`, `protocol`, `resolved_ips` |
-| `endpoint` | `route_id`, `upstream`, `method`, `path`, `rule_label`, `operation` (nullable) |
+| `endpoint` | `route_id`, `credential_route`, `upstream`, `method`, `path`, `rule_label`, `operation` (nullable) |
 | `command` | `command`, `args`, `caller`, `intercept_rule` |
 | `unix_socket` | `path`, `op` (`connect`, `bind`) |
 
@@ -176,6 +176,20 @@ Every variant also carries `request_id`, `session_id`, `reason` (nullable), and
 embedding that starts the proxy without session context reports `"proxy"`.
 Network and endpoint requests report `child_pid` 0 because the proxy cannot
 attribute a connection to a process.
+
+For endpoint requests, `route_id` names the route whose rule asked: a
+credential route, or `_ep_<domain>` for an `allow_domain` entry with an
+`endpoint_policy`. `credential_route` names the credential route that will
+inject a credential into the approved request, or is `null` when the request
+goes out without one; it equals `route_id` when a credential route's own policy
+asks. When both routes would ask, one request is sent, naming the `_ep_` route;
+its `reason` joins both routes' reasons. `upstream` is the host the request
+goes to, never a wildcard pattern. `rule_label` shows the request method and
+the matched rule with its `*` path segments filled in from the request
+(`endpoint_policy.approve[GET /torvalds/linux/**]` for the rule `* /*/*/**`).
+When the policy `default` asks, it shows the exact path
+(`endpoint_policy.default[GET /v1/items]`). This is the scope a session
+answer covers.
 
 Endpoint requests are answered by the `command_policies` approval backends
 when the profile declares them, otherwise by the `network` approval backends,
@@ -252,8 +266,23 @@ addresses against the SSRF guard. Session denials (`deny_session` /
 In an `all` backend chain, every backend must grant for the session before the
 combined result can be `GrantedForSession`. Any ordinary `Granted` limits the
 combined result to single-use, regardless of backend order. An `any` chain
-uses the scope of its first granting backend. Callers without session caching,
-such as L7 endpoint approvals, treat a session grant as an ordinary grant.
+uses the scope of its first granting backend. Callers without session caching
+treat a session grant as an ordinary grant.
+
+### Endpoint grant scope and local caching
+
+Endpoint approvals for an `allow_domain` route (`_ep_<domain>`) cache
+`allow_session` and `deny_session` for the rest of the proxy session, keyed by
+`route_id`, `upstream`, `credential_route`, `rule_label`, and `operation`. The `**` part of
+a rule is what one answer covers; the method and `*` segments are part of the
+key. Only the approval the request shows is cached. Approvals asked by a
+credential route's own policy treat a session answer as an ordinary one.
+Concurrent requests with the same key share one request; as for CONNECT, only
+a session answer authorizes the waiting requests, and any other outcome makes
+each waiting request ask on its own, within its own timeout. Ordinary grants
+and denials are not cached, and a proxy session caches at most 1024 answers.
+`deny` rules, `allow` rules, and the policy `default` are evaluated before the
+cache, so a cached grant never overrides a deny.
 These session response spellings apply to the unsigned response contract;
 the signed `state: "granted"` contract below grants only the current attempt.
 

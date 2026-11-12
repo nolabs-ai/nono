@@ -7637,7 +7637,10 @@ mod tests {
         })?;
         fs::write(
             &assigned,
-            format!("#!/bin/sh\nexec FOO=bar /bin/true {} \"$@\"\n", data.display()),
+            format!(
+                "#!/bin/sh\nexec FOO=bar /bin/true {} \"$@\"\n",
+                data.display()
+            ),
         )
         .map_err(|source| NonoError::ConfigWrite {
             path: assigned.clone(),

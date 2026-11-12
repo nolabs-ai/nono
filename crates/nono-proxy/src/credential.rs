@@ -626,9 +626,9 @@ impl CredentialStore {
                 ) else {
                     continue;
                 };
-                let service_label =
+                let wildcard =
                     match crate::aws::endpoints::validate_aws_upstream(&route.upstream, aws_auth) {
-                        Ok(pattern) => pattern.map(|p| p.service_label),
+                        Ok(pattern) => pattern,
                         Err(_) => continue,
                     };
                 debug!(
@@ -652,7 +652,7 @@ impl CredentialStore {
                                 profiles,
                                 route.upstream.clone(),
                                 region,
-                                service_label,
+                                wildcard,
                                 service,
                             )
                             .await
@@ -664,7 +664,7 @@ impl CredentialStore {
                                 profile_opt,
                                 route.upstream.clone(),
                                 region,
-                                service_label,
+                                wildcard,
                                 service,
                             )
                             .await

@@ -350,7 +350,14 @@ fn build_queued_audit(
             session_id: metadata.session_id.clone(),
             shipper_id: state.subject_id.clone(),
             principal_id: None,
-            profile_ref: None,
+            profile_ref: crate::audit_event_reader::session_policy_json(session_dir)?.and_then(
+                |policy| {
+                    policy["profile_id"]
+                        .as_str()
+                        .or_else(|| policy["profile"].as_str())
+                        .map(str::to_owned)
+                },
+            ),
             merkle_root: integrity.merkle_root.to_string(),
             hash_chain_head: Some(integrity.chain_head.to_string()),
             started_at: metadata.started.clone(),

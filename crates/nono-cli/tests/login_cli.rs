@@ -142,6 +142,39 @@ fn reenrollment_without_local_registration_directs_to_normal_login() {
 }
 
 #[test]
+fn group_selection_rejects_opt_out_and_empty_names_before_sign_in() {
+    let home = tempfile::tempdir().expect("home");
+    for (args, env) in [
+        (
+            vec!["platform", "login", "--group", "Engineering", "--no-enroll"],
+            vec![],
+        ),
+        (
+            vec!["platform", "login", "--group", "Engineering"],
+            vec![("NONO_NO_ENROLL", "true")],
+        ),
+        (vec!["platform", "login", "--group", " "], vec![]),
+        (
+            vec![
+                "platform",
+                "tenant",
+                "use",
+                "work",
+                "--group",
+                "Engineering",
+                "--no-enroll",
+            ],
+            vec![],
+        ),
+    ] {
+        let output = nono(home.path(), &args, &env);
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("--group"), "{}", stderr(&output));
+        assert_not_enrolled(home.path());
+    }
+}
+
+#[test]
 fn reenrollment_cannot_be_combined_with_enrollment_opt_out() {
     let home = tempfile::tempdir().expect("home");
     let output = nono(home.path(), &["platform", "re-enroll", "--no-enroll"], &[]);
@@ -451,7 +484,8 @@ fn enrollment_status_uses_labels_and_keeps_ids_in_json_only() {
         "subject_kind": "device", "management_mode": "audit_only",
         "key_algorithm": "ecdsa_p256_sha256_fixed", "key_ref": "file:///private/key/location",
         "enrolled_at": "2026-11-11T11:28:00Z", "display_name": "Alice laptop",
-        "tenant": {"tenant_id":"tenant-private-uuid", "slug":"acme", "display_name":"Acme", "kind":"organization"}
+        "tenant": {"tenant_id":"tenant-private-uuid", "slug":"acme", "display_name":"Acme", "kind":"organization"},
+        "groups": [{"group_id":"0198f357-7c22-75e6-a64d-7dcb16ad5c95", "name":"Developers", "unit_id":"0198f357-7c22-75e6-a64d-7dcb16ad5c96", "unit_name":"Engineering", "is_default":false}]
     });
     std::fs::write(&path, record.to_string()).expect("state");
     let output = nono(home.path(), &["platform", "status"], &[]);
@@ -460,6 +494,7 @@ fn enrollment_status_uses_labels_and_keeps_ids_in_json_only() {
     for label in [
         "Acme (acme)",
         "Alice laptop",
+        "Developers (Engineering)",
         "Audit tenant     Acme (acme)",
         "Registered locally",
         "Automatic when sessions finish",
@@ -473,6 +508,7 @@ fn enrollment_status_uses_labels_and_keeps_ids_in_json_only() {
         "private/key/location",
         "audit_only",
         "ecdsa_p256",
+        "0198f357-7c22-75e6-a64d-7dcb16ad5c95",
     ] {
         assert!(!text.contains(internal), "{text}");
     }
@@ -480,10 +516,12 @@ fn enrollment_status_uses_labels_and_keeps_ids_in_json_only() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
     assert_eq!(json["tenant_id"], "tenant-private-uuid");
     assert_eq!(json["subject_id"], "device-private-uuid");
-    assert_eq!(json.as_object().expect("object").len(), 7);
+    assert_eq!(json.as_object().expect("object").len(), 8);
+    assert_eq!(json["groups"][0]["name"], "Developers");
     assert!(json.get("key_ref").is_none());
     assert!(json.get("key_algorithm").is_none());
     record.as_object_mut().expect("object").remove("tenant");
+    record.as_object_mut().expect("object").remove("groups");
     record
         .as_object_mut()
         .expect("object")
@@ -640,5 +678,45 @@ fn tenant_switch_and_listing_require_an_existing_human_sign_in() {
         );
         assert!(!stderr(&output).contains("Session key fingerprint"));
         assert_not_enrolled(home.path());
+    }
+}
+
+#[test]
+fn group_commands_require_sign_in_and_reject_sandboxed_mutations() {
+    let home = tempfile::tempdir().expect("home");
+    for args in [
+        vec!["platform", "group", "list", "--json"],
+        vec!["platform", "group", "memberships"],
+        vec!["platform", "group", "add", "Engineering"],
+        vec!["platform", "group", "remove", "Engineering"],
+        vec![
+            "platform",
+            "group",
+            "move",
+            "--from",
+            "Engineering",
+            "--to",
+            "Production",
+        ],
+    ] {
+        for sandbox in [false, true] {
+            let env = if sandbox {
+                vec![("NONO_CAP_FILE", "/nonexistent")]
+            } else {
+                vec![]
+            };
+            let output = nono(home.path(), &args, &env);
+            assert!(!output.status.success());
+            assert!(
+                stderr(&output).contains(if sandbox {
+                    "cannot be used inside a sandbox"
+                } else {
+                    "nono platform login"
+                }),
+                "{}",
+                stderr(&output)
+            );
+            assert_not_enrolled(home.path());
+        }
     }
 }

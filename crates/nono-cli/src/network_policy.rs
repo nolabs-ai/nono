@@ -114,6 +114,13 @@ pub fn load_network_policy(json: &str) -> Result<NetworkPolicy> {
         .map_err(|e| NonoError::ConfigParse(format!("Failed to parse network-policy.json: {}", e)))
 }
 
+pub(crate) fn load_embedded_network_policy() -> Result<NetworkPolicy> {
+    match crate::profile_bundle::current_network() {
+        Some(policy) => Ok(policy),
+        None => load_network_policy(crate::config::embedded::embedded_network_policy_json()),
+    }
+}
+
 /// Resolve a network profile name into flat host lists and routes.
 ///
 /// Merges all groups referenced by the profile into a single set of

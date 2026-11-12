@@ -9,6 +9,7 @@ It changes neither sandbox permissions nor audit opt-outs.
 ```console
 nono platform login
 nono platform login --url https://nono.acme.example --tenant engineering
+nono platform login --tenant engineering --group Developers
 nono platform tenant use personal
 nono platform login --no-enroll
 nono platform re-enroll --tenant engineering
@@ -24,6 +25,15 @@ and `q`, Escape or Ctrl-C cancels. An explicit `--tenant` takes precedence. In a
 noninteractive terminal with several tenants, login retains the credentials but
 requires an explicit selection before default remote access or enrollment.
 Subsequent logins reuse a completed selection unless another tenant is requested.
+
+For a new registration, the CLI selects the only permitted enrollment group or
+uses the same picker for several groups. `--group <name|id>` selects explicitly;
+duplicate names require IDs. Noninteractive enrollment with multiple choices
+requires `--group`. Existing registrations retain their groups and skip the
+picker. A different explicit group leaves the enrollment unchanged and directs
+the user to `nono platform group move`.
+Login and status show group labels; JSON status includes their IDs and units.
+Opting out skips group discovery, and conflicts with `--group`.
 
 Enrollment failure does not invalidate a successful human login. The CLI reports
 the failure and how to retry. `--no-enroll` leaves existing registrations intact;
@@ -61,6 +71,30 @@ consent again when login later requests enrollment. After storing the new sessio
 the CLI revokes the previous session; revocation failure is reported without
 discarding the new login.
 
+## Group discovery
+
+Supporting servers additionally advertise `nono_enrollment_options_endpoint`,
+normally `/api/v1/auth/oauth/enrollment-options`, with the same origin and URL
+restrictions as the enrollment endpoint. The CLI posts `refresh_token`,
+`tenant_id`, `user_id`, and the device's `public_key`, with a fresh login-key
+DPoP proof and no `ath`. This does not rotate the refresh token or enroll.
+
+The response includes `protocol_version`, `tenant_id`, permitted `groups`, and
+optional `existing` registration metadata (`subject_id` and current `groups`).
+Each group has `group_id`, `name`, `unit_id`, `unit_name`, and `is_default`;
+`is_default` identifies the tenant root's default landing group. Existing
+placement is visible only for a device owned by this user in this tenant.
+
+Discovery and submission both validate the current CLI session, enrollment scope,
+membership, and `enrollment:self`. Self-enrollment permits the root default.
+Other placements require `enrollment_token:create` and `devices:assign` in the
+group's unit, inherited through the existing unit hierarchy. Permission changes
+or deletion after discovery fail submission without falling back to a default.
+Responses must not be cached. No browser cookie or console access token is used.
+
+An older server without group discovery keeps its default-placement behavior;
+an explicit `--group` fails with an unsupported-feature message.
+
 ## Enrollment request
 
 The client posts JSON to the advertised endpoint with a fresh DPoP proof from
@@ -81,6 +115,7 @@ contains `refresh_token`, `intent`, and `signature`. Never log this body.
 | `timestamp_ms` | Unix milliseconds, within five minutes |
 | `request_id` | Fresh random UUID |
 | `replaces_subject_id` | Optional revoked subject UUID; omitted for ordinary enrollment |
+| `group_id` | Optional selected group UUID; omitted for legacy default placement or unchanged registration |
 
 The independent device key signs the UTF-8 compact JSON serialization of:
 
@@ -100,7 +135,7 @@ Fresh MFA is required for a new registration when the selected tenant requires
 it, using server-captured assurance from the browser approval. Device enrollment
 does not raise human assurance or fleet policy assurance.
 
-The platform derives ownership and default group placement itself. It atomically
+The platform derives ownership and authorizes group placement itself. It atomically
 creates the subject and group membership, with the acting human recorded. The
 same public key, user and tenant return the same subject, including concurrent
 retries and retries after a lost response. A revoked registration is refused,
@@ -121,6 +156,11 @@ and `management_mode=audit_only`. OAuth-style errors include `access_denied`,
 and `mfa_required`. Neither success nor error responses may be cached.
 Recovery errors include `enrollment_revoked`, `enrollment_active`,
 `enrollment_replaced`, and `reenrollment_authorization_required`.
+`enrollment_group_mismatch` refuses changing an existing registration's groups
+through login. Successful enrollment returns its actual `groups`, including
+when reusing a registration; the client checks any explicitly selected group.
+Group selection does not download a profile during login. Subsequent implicit
+`nono run` sessions use [signed local policy delivery](local-policy-v1.md).
 
 ## Local identity and audit provenance
 
@@ -174,3 +214,24 @@ Delivery is attempted automatically when an audited session finishes. An empty
 manual sync reports `No pending audit uploads.`; it is not a delivery history.
 Switching tenant leaves existing sessions and queued audits bound to their
 original enrollment, and does not revoke other registrations.
+
+## Group membership management
+
+Metadata advertises `nono_groups_endpoint` at
+`POST /api/v1/auth/oauth/enrollment-groups`. Requests carry `refresh_token`,
+`tenant_id`, `user_id`, optional `subject_id`, and an `action` tagged by `type`:
+`list`, `memberships`, `add`/`remove` with `group_id`, or `move` with `from`/`to`.
+The human session's DPoP proof targets this endpoint; device keys are not used
+as human credentials. Responses are `no-store` and include `protocol_version`,
+`tenant_id`, `subject_id`, permitted `groups`, current explicit `memberships`, and
+`changed`. The shared fixture covers the wire format.
+
+Listing requires an active tenant membership; it works without an enrollment
+or enrollment scope. Subject reads require an owned device in that tenant.
+Mutations additionally require `nono:enroll`, active device registration, and
+existing unit placement permissions. Move is atomic, preserves other groups,
+and retries already completed changes report `changed: false`. Mutations use
+the same domain operation as platform group administration, including its
+governance audit records. Successful CLI requests update cached labels without
+replacing the enrollment key or ID. Revocation blocks mutations but does not
+remove the person's ability to list permitted groups.

@@ -123,6 +123,9 @@ Are you an agent developer and want to publish your own agent package? We would 
 
 Head over to the [docs](https://nono.sh/docs) and discover nono's rich composable policy system, credentials injection, L7 filtering, supply chain security, rollback, multiplexing, audit and more.
 
+The [platform workflow](docs/platform-context.md) covers CLI sign-in, tenants,
+device groups, assigned policies, audit delivery and remote sessions.
+
 ## Library support
 
 nono provides FFI bindings for Rust and Python.

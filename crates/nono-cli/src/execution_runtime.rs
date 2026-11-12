@@ -290,8 +290,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .collect();
     let domain_filter = proxy.and_then(|p| p.domain_filter.as_ref());
     let allowed_domain_strs: Vec<String> = if domain_filter.is_some() {
-        let policy_json = config::embedded::embedded_network_policy_json();
-        match network_policy::load_network_policy(policy_json) {
+        match network_policy::load_embedded_network_policy() {
             Ok(net_policy) => {
                 let mut domains =
                     network_policy::expand_proxy_allow(&net_policy, &plain_domain_strs);
@@ -327,16 +326,15 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     // Expand `deny_domain` the same way for `nono why --self`.
     let denied_domain_strs: Vec<String> = domain_filter
         .map(|d| d.deny_domain.as_slice())
-        .map(|deny_domain| {
-            let policy_json = config::embedded::embedded_network_policy_json();
-            match network_policy::load_network_policy(policy_json) {
+        .map(
+            |deny_domain| match network_policy::load_embedded_network_policy() {
                 Ok(net_policy) => network_policy::expand_proxy_deny(&net_policy, deny_domain),
                 Err(e) => {
                     warn!("failed to load network policy for sandbox state: {e}");
                     deny_domain.to_vec()
                 }
-            }
-        })
+            },
+        )
         .unwrap_or_default();
     let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = all_domain_entries
         .iter()

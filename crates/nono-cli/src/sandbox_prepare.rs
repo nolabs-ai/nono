@@ -774,6 +774,7 @@ fn finalize_prepared_sandbox(
     let proxy_intent = has_proxy_intent(args, &prepared);
     let block_wins = args.block_net || (prepared.profile_network_block && !args.allow_net);
     let proxy_pending = !block_wins && !args.allow_net && proxy_intent;
+    crate::platform_policy::display_selection(args, silent);
     output::print_capabilities(
         &prepared.caps,
         blocked_grants,
@@ -1550,9 +1551,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         // Map inline manifest credential routes into custom_credentials so
         // `profile show --format manifest` → `run --config` round-trips.
         // Built-in network-policy names stay name-only (no route override).
-        let net_policy = network_policy::load_network_policy(
-            crate::config::embedded::embedded_network_policy_json(),
-        )?;
+        let net_policy = network_policy::load_embedded_network_policy()?;
         let builtin_credential_names: std::collections::HashSet<String> =
             net_policy.credentials.keys().cloned().collect();
         let (credentials, custom_credentials) =
@@ -1681,8 +1680,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     // profiles — same trust boundary as `resolve_profile_binary`. Strip them
     // (top-level and nested in command/from/intercept sandboxes) for
     // pack/registry/built-in profiles before they can reach emission.
-    if let (Some(profile_name), Some(profile)) = (args.profile.as_deref(), loaded_profile.as_mut())
-    {
+    if let (Some(profile_name), Some(profile)) = (
+        crate::platform_policy::origin(args),
+        loaded_profile.as_mut(),
+    ) {
         crate::command_runtime::strip_untrusted_unsafe_seatbelt_rules(
             profile_name,
             profile,
@@ -1694,9 +1695,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     // sandbox, so it follows the same trust boundary. Recording itself stays
     // on; only the extra destination is dropped.
     let mut profile_session_recording = profile_session_recording;
-    if let (Some(profile_name), Some(recording)) =
-        (args.profile.as_deref(), profile_session_recording.as_mut())
-    {
+    if let (Some(profile_name), Some(recording)) = (
+        crate::platform_policy::origin(args),
+        profile_session_recording.as_mut(),
+    ) {
         crate::terminal_capture::settings::drop_untrusted_file(profile_name, recording, silent);
     }
 

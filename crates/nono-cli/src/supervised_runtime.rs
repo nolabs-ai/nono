@@ -281,6 +281,12 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     } else {
         None
     };
+    if let (Some(state), Some(selection)) = (&audit_state, &rollback.policy_selection) {
+        crate::platform_client::write_json_secure(
+            &state.session_dir.join("platform-audit-origin.json"),
+            &selection.enrollment,
+        )?;
+    }
     let audit_recorder = if audit_state.is_some() {
         audit_state
             .as_ref()
@@ -300,6 +306,10 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             .lock()
             .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
         recorder.record_session_started(started.clone(), command.to_vec())?;
+        if let Some(selection) = &rollback.policy_selection {
+            recorder.record_extension_event("session_policy", &selection.provenance)?;
+        }
+
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(tool_sandbox_runtime) = config.tool_sandbox_runtime {
             #[cfg(target_os = "linux")]

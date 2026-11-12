@@ -153,6 +153,7 @@ fn resolve_program_from_profile_or_cli(
 }
 
 pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
+    let _policy_scope = crate::platform_policy::select_for_run(&mut run_args.sandbox)?;
     let command = run_args.command.clone();
 
     // Load profile once and reuse for binary resolution and command_args.
@@ -164,10 +165,19 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
         None => None,
     };
 
+    if let Some((_, loaded)) = &loaded_profile {
+        crate::platform_policy::record_resolved(&mut run_args.sandbox, loaded)?;
+    }
+
     // Resolve the program: profile `binary` takes precedence over CLI trailing command.
     let (program, mut cmd_args) = resolve_program_from_profile_or_cli(
         &command,
-        loaded_profile.as_ref().map(|(n, p)| (n.as_str(), p)),
+        loaded_profile.as_ref().map(|(n, p)| {
+            (
+                crate::platform_policy::origin(&run_args.sandbox).unwrap_or(n.as_str()),
+                p,
+            )
+        }),
         silent,
     )?;
 

@@ -3866,7 +3866,7 @@ fn prepend_cli_extends(profile: &mut Profile, cli_extends: &[String]) {
 // ============================================================================
 
 /// Maximum depth for profile inheritance chains.
-const MAX_INHERITANCE_DEPTH: usize = 10;
+pub(crate) const MAX_INHERITANCE_DEPTH: usize = 10;
 
 /// Resolve the `extends` chain for a profile.
 ///
@@ -3962,69 +3962,97 @@ enum ResolvedBase {
 /// package; bare names then resolve from user profiles and built-ins. Package
 /// profiles therefore keep local sibling inheritance without exposing their
 /// internal profiles as global short names.
+pub(crate) enum BaseProfileSource {
+    File {
+        path: PathBuf,
+        package: Option<String>,
+    },
+    Embedded(String),
+}
+
+pub(crate) fn base_profile_source(
+    name: &str,
+    context_dir: Option<&Path>,
+    source_file: Option<&Path>,
+) -> Result<BaseProfileSource> {
+    if !is_valid_profile_name(name) && !is_registry_ref(name) {
+        return Err(NonoError::ProfileInheritance(format!(
+            "invalid base profile name '{name}'"
+        )));
+    }
+    if let Some(path) = crate::profile_bundle::bundled_base(name, context_dir) {
+        return Ok(BaseProfileSource::File {
+            path: path?,
+            package: None,
+        });
+    }
+    if let Some(dir) = context_dir {
+        let path = dir.join(format!("{name}.json"));
+        if path.is_file() {
+            let canonical = path
+                .canonicalize()
+                .map_err(|source| NonoError::ProfileRead {
+                    path: path.clone(),
+                    source,
+                })?;
+            if !source_file.is_some_and(|source| source == canonical) {
+                return Ok(BaseProfileSource::File {
+                    path: canonical,
+                    package: None,
+                });
+            }
+        }
+    }
+    if is_registry_ref(name) {
+        let path = ensure_pack_profile_available(name)?;
+        return Ok(BaseProfileSource::File {
+            path,
+            package: Some(crate::package::parse_package_ref(name)?.key()),
+        });
+    }
+    let path = resolve_user_profile_path(name)?;
+    if path.exists() {
+        return Ok(BaseProfileSource::File {
+            path,
+            package: None,
+        });
+    }
+    let embedded: serde_json::Value =
+        serde_json::from_str(crate::config::embedded::embedded_policy_json())
+            .map_err(|e| NonoError::ProfileParse(e.to_string()))?;
+    if embedded["profiles"].get(name).is_some() {
+        return Ok(BaseProfileSource::Embedded(name.into()));
+    }
+    Err(NonoError::ProfileInheritance(format!(
+        "base profile '{name}' not found"
+    )))
+}
+
 fn load_base_profile_raw(
     name: &str,
     context_dir: Option<&Path>,
     source_file: Option<&Path>,
 ) -> Result<ResolvedBase> {
-    if !is_valid_profile_name(name) && !is_registry_ref(name) {
-        return Err(NonoError::ProfileInheritance(format!(
-            "invalid base profile name '{}'",
-            name
-        )));
-    }
-
-    // 0. Sibling in the same directory as the child profile.
-    //    Skip if the sibling path is the source file itself to avoid
-    //    self-references (e.g. `.nono/codex.json` extending "codex").
-    if let Some(dir) = context_dir {
-        let sibling_path = dir.join(format!("{name}.json"));
-        if sibling_path.is_file() {
-            let (profile, source_path) = parse_file_backed_profile(&sibling_path)?;
-            let is_self = source_file.is_some_and(|src| source_path == src);
-            if !is_self {
-                tracing::debug!(
-                    "Resolved '{}' from sibling: {}",
-                    name,
-                    source_path.display()
-                );
-                return Ok(ResolvedBase::Sibling(profile, source_path));
+    match base_profile_source(name, context_dir, source_file)? {
+        BaseProfileSource::File { path, package } => {
+            let (mut profile, source_path) = parse_file_backed_profile(&path)?;
+            if let Some(pack_key) = package {
+                resolve_store_pack_session_hooks(&mut profile, &pack_key)?;
+                if !profile.packs.contains(&pack_key) {
+                    profile.packs.push(pack_key);
+                }
             }
+            Ok(ResolvedBase::Sibling(profile, source_path))
+        }
+        BaseProfileSource::Embedded(name) => {
+            let policy = crate::policy::load_embedded_policy()?;
+            let def = policy
+                .profiles
+                .get(&name)
+                .ok_or_else(|| NonoError::ProfileNotFound(name.clone()))?;
+            Ok(ResolvedBase::Global(def.to_raw_profile()))
         }
     }
-
-    // A cross-package base must be fully qualified. Return it with its source
-    // path so that package-local transitive bases continue resolving as
-    // siblings of that package profile.
-    if is_registry_ref(name) {
-        let profile_path = ensure_pack_profile_available(name)?;
-        let (mut profile, source_path) = parse_file_backed_profile(&profile_path)?;
-        let package_ref = crate::package::parse_package_ref(name)?;
-        let pack_key = package_ref.key();
-        resolve_store_pack_session_hooks(&mut profile, &pack_key)?;
-        if !profile.packs.contains(&pack_key) {
-            profile.packs.push(pack_key);
-        }
-        return Ok(ResolvedBase::Sibling(profile, source_path));
-    }
-
-    // 1. User profiles take precedence.
-    let profile_path = resolve_user_profile_path(name)?;
-    if profile_path.exists() {
-        let (profile, source_path) = parse_file_backed_profile(&profile_path)?;
-        return Ok(ResolvedBase::Sibling(profile, source_path));
-    }
-
-    // 2. Built-in profile from embedded policy.
-    let policy = crate::policy::load_embedded_policy()?;
-    if let Some(def) = policy.profiles.get(name) {
-        return Ok(ResolvedBase::Global(def.to_raw_profile()));
-    }
-
-    Err(NonoError::ProfileInheritance(format!(
-        "base profile '{}' not found",
-        name
-    )))
 }
 
 /// `session_recording.file` makes the unsandboxed supervisor create a file

@@ -62,6 +62,7 @@ struct Authorized {
 
 pub(crate) fn run_login(mut args: LoginArgs) -> Result<()> {
     reject_if_sandboxed("platform login")?;
+    validate_group_args(args.group.as_deref(), args.no_enroll)?;
     if args.re_enroll && args.no_enroll {
         return Err(NonoError::ActionRequired(
             "re-enroll cannot be used with --no-enroll or NONO_NO_ENROLL=true; disable the opt-out before recovery".into(),
@@ -224,7 +225,22 @@ pub(crate) fn run_login(mut args: LoginArgs) -> Result<()> {
     finish_login(&args, true)
 }
 
+fn validate_group_args(group: Option<&str>, no_enroll: bool) -> Result<()> {
+    if group.is_some_and(|group| group.trim().is_empty()) {
+        return Err(NonoError::ActionRequired(
+            "--group must name an enrollment group or ID".into(),
+        ));
+    }
+    if group.is_some() && no_enroll {
+        return Err(NonoError::ActionRequired(
+            "--group cannot be used with --no-enroll or NONO_NO_ENROLL=true".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn finish_login(args: &LoginArgs, select: bool) -> Result<()> {
+    validate_group_args(args.group.as_deref(), args.no_enroll)?;
     let lock = session::lock()?;
     let previous = session::load_record()?.ok_or_else(not_signed_in)?;
     let tenant = match &args.tenant {
@@ -240,11 +256,16 @@ fn finish_login(args: &LoginArgs, select: bool) -> Result<()> {
     let enrollment = if args.no_enroll {
         Ok(EnrollmentResult::Skipped)
     } else {
-        enroll_device(&record, args.re_enroll)
+        enroll_device(&record, args.re_enroll, args.group.as_deref())
     };
     print!(
         "{}",
-        login_summary(&record, (!select).then_some(&previous), &enrollment)
+        login_summary(
+            &record,
+            (!select).then_some(&previous),
+            &enrollment,
+            &platform_client::login_enrollment_groups(&record)?
+        )
     );
     if let Err(error) = enrollment {
         let retry = if args.re_enroll {
@@ -263,13 +284,18 @@ enum EnrollmentResult {
     Enrolled,
     Reenrolled,
     Reused,
+    GroupUnchanged,
     Skipped,
     Revoked,
     NotEnrolled,
     Active,
 }
 
-fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<EnrollmentResult> {
+fn enroll_device(
+    record: &session::SessionRecord,
+    re_enroll: bool,
+    group: Option<&str>,
+) -> Result<EnrollmentResult> {
     use crate::login_enrollment::{EnrollmentIntent, LoginEnrollmentRequest};
     let server = client::discover(&record.platform_url)?;
     if server.enrollment_endpoint.is_none() {
@@ -301,6 +327,37 @@ fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<Enr
             &record.user_subject,
         )?,
     };
+    let mut client = OAuthClient::new(&server, &login_key);
+    let mut group_change_requested = false;
+    let group_id = if server.enrollment_options_endpoint.is_some() {
+        let options =
+            client.enrollment_options(&crate::login_enrollment::EnrollmentOptionsRequest {
+                refresh_token: refresh.to_string(),
+                tenant_id: record.tenant_id.clone(),
+                user_id: record.user_subject.clone(),
+                public_key: URL_SAFE_NO_PAD.encode(key.public_key().as_ref()),
+            })?;
+        if let (Some(existing), Some(requested)) = (&options.existing, group) {
+            group_change_requested =
+                crate::enrollment_group::resolve(&existing.groups, requested)?.is_none();
+        }
+        if group_change_requested {
+            None
+        } else {
+            crate::enrollment_group::select(
+                &options,
+                &record.tenant_id,
+                group,
+                &selected_tenant_label(record),
+            )?
+        }
+    } else if group.is_some() {
+        return Err(NonoError::ActionRequired(
+            "this platform does not support enrollment group selection".into(),
+        ));
+    } else {
+        None
+    };
     let display_name = device_name(None).unwrap_or_else(|| "nono device".into());
     let intent = EnrollmentIntent {
         protocol_version: "1".into(),
@@ -312,6 +369,7 @@ fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<Enr
         display_name: display_name.clone(),
         timestamp_ms: chrono::Utc::now().timestamp_millis(),
         request_id: uuid::Uuid::new_v4().to_string(),
+        group_id,
         replaces_subject_id: if re_enroll {
             previous.as_ref().map(|state| state.subject_id.clone())
         } else {
@@ -353,7 +411,7 @@ fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<Enr
             )
         );
     }
-    let response = match OAuthClient::new(&server, &login_key).enroll(&request)? {
+    let response = match client.enroll(&request)? {
         EnrollmentOutcome::Enrolled(response) => response,
         EnrollmentOutcome::Error(error) if error.code == "enrollment_revoked" => {
             if let Some(previous) = &previous {
@@ -394,8 +452,21 @@ fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<Enr
     let reused = previous.as_ref().is_some_and(|previous| {
         previous.subject_id == state.subject_id && previous.key_ref == state.key_ref
     });
-    platform_client::save_login_enrollment(state, record, &display_name)?;
-    Ok(if re_enroll {
+    crate::enrollment_group::validate(&response.groups)?;
+    if request.intent.group_id.as_ref().is_some_and(|group| {
+        !response
+            .groups
+            .iter()
+            .any(|actual| &actual.group_id == group)
+    }) {
+        return Err(NonoError::ConfigParse(
+            "platform returned a mismatched enrollment group".into(),
+        ));
+    }
+    platform_client::save_login_enrollment(state, record, &display_name, response.groups)?;
+    Ok(if group_change_requested {
+        EnrollmentResult::GroupUnchanged
+    } else if re_enroll {
         EnrollmentResult::Reenrolled
     } else if reused {
         EnrollmentResult::Reused
@@ -408,11 +479,13 @@ pub(crate) fn run_tenant(args: TenantArgs) -> Result<()> {
     reject_if_sandboxed("platform tenant")?;
     match args.command {
         TenantCommands::Use(args) => {
+            validate_group_args(args.group.as_deref(), args.no_enroll)?;
             let record = platform_oauth::refresh_memberships()?;
             record.find_organization(&args.tenant)?;
             let login = LoginArgs {
                 url: None,
                 tenant: Some(args.tenant),
+                group: args.group,
                 no_enroll: args.no_enroll,
                 re_enroll: false,
                 help: None,
@@ -611,6 +684,7 @@ fn login_summary(
     record: &session::SessionRecord,
     previous: Option<&session::SessionRecord>,
     enrollment: &Result<EnrollmentResult>,
+    groups: &[crate::enrollment_group::EnrollmentGroup],
 ) -> String {
     let clean = crate::terminal_approval::sanitize_for_terminal;
     let t = theme::current();
@@ -640,7 +714,9 @@ fn login_summary(
     let (label, color) = match enrollment {
         Ok(EnrollmentResult::Enrolled) => ("Device enrolled", t.green),
         Ok(EnrollmentResult::Reenrolled) => ("Device re-enrolled with a new key", t.green),
-        Ok(EnrollmentResult::Reused) => ("Using existing device enrollment", t.text),
+        Ok(EnrollmentResult::Reused | EnrollmentResult::GroupUnchanged) => {
+            ("Using existing device enrollment", t.text)
+        }
         Ok(EnrollmentResult::Skipped) => ("Skipped (no-enroll enabled)", t.subtext),
         Ok(EnrollmentResult::Revoked) => ("Revoked", t.yellow),
         Ok(EnrollmentResult::NotEnrolled) => ("Not recorded", t.yellow),
@@ -648,9 +724,20 @@ fn login_summary(
         Err(_) => ("Not confirmed", t.yellow),
     };
     text.push_str(&summary_row("Enrollment", &fg(label, color).to_string()));
+    text.push_str(&platform_client::enrollment_group_row(groups));
+    if matches!(enrollment, Ok(EnrollmentResult::GroupUnchanged)) {
+        text.push_str(&summary_row("Group change", "Not applied"));
+        text.push_str(&summary_row(
+            "Next step",
+            "nono platform group move --from <group> --to <group>",
+        ));
+    }
     if matches!(
         enrollment,
-        Ok(EnrollmentResult::Enrolled | EnrollmentResult::Reenrolled | EnrollmentResult::Reused)
+        Ok(EnrollmentResult::Enrolled
+            | EnrollmentResult::Reenrolled
+            | EnrollmentResult::Reused
+            | EnrollmentResult::GroupUnchanged)
     ) && (switched
         || previous.is_none()
         || matches!(
@@ -999,7 +1086,7 @@ fn default_device_name() -> Option<String> {
     }
 }
 
-fn reject_if_sandboxed(command: &str) -> Result<()> {
+pub(crate) fn reject_if_sandboxed(command: &str) -> Result<()> {
     // Defence in depth: the session lives in nono's protected state
     // directory, which no sandbox grant reaches, but refuse early and clearly.
     if std::env::var_os("NONO_CAP_FILE").is_some() {
@@ -1019,6 +1106,8 @@ mod tests {
         let endpoint = |path: &str| Url::parse(&format!("https://nono.example.com{path}")).unwrap();
         AuthorizationServer {
             enrollment_endpoint: None,
+            enrollment_options_endpoint: None,
+            groups_endpoint: None,
             issuer: "https://nono.example.com".to_string(),
             authorization_endpoint: browser.then(|| endpoint("/oauth/authorize")),
             token_endpoint: endpoint("/oauth/token"),
@@ -1032,6 +1121,7 @@ mod tests {
             help: None,
             url: None,
             tenant: None,
+            group: None,
             no_enroll: false,
             re_enroll: false,
             browser,
@@ -1198,18 +1288,18 @@ mod fixture_tests {
         let personal = record.clone();
         record.tenant_id = record.organizations[1].tenant_id.clone();
         let enrollment = Ok(EnrollmentResult::Reused);
-        let summary = login_summary(&record, Some(&personal), &enrollment);
+        let summary = login_summary(&record, Some(&personal), &enrollment, &[]);
         assert!(summary.contains("Tenant switched"));
         assert!(summary.contains("Previous tenant"));
         assert!(summary.contains("Alice (personal)"));
         assert!(summary.contains("Current tenant"));
         assert!(summary.contains("Acme (acme)"));
         assert!(summary.contains("Using existing device enrollment"));
-        let summary = login_summary(&record, Some(&record), &enrollment);
+        let summary = login_summary(&record, Some(&record), &enrollment, &[]);
         assert!(summary.contains("Already signed in"));
         assert!(!summary.contains("Previous tenant"));
         assert!(!summary.contains("New sessions →"));
-        let summary = login_summary(&personal, None, &Ok(EnrollmentResult::Enrolled));
+        let summary = login_summary(&personal, None, &Ok(EnrollmentResult::Enrolled), &[]);
         assert!(summary.contains("Signed in"));
         assert!(summary.contains("User"));
         assert!(summary.contains("Alice"));
@@ -1218,13 +1308,14 @@ mod fixture_tests {
         assert!(summary.contains("Device enrolled"));
         assert!(summary.contains("New sessions → Alice (personal)"));
         assert!(!summary.contains(&personal.tenant_id));
-        let skipped = login_summary(&personal, None, &Ok(EnrollmentResult::Skipped));
+        let skipped = login_summary(&personal, None, &Ok(EnrollmentResult::Skipped), &[]);
         assert!(skipped.contains("Skipped (no-enroll enabled)"));
         assert!(!skipped.contains("New sessions →"));
         let failed = login_summary(
             &personal,
             None,
             &Err(NonoError::ActionRequired("unavailable".into())),
+            &[],
         );
         assert!(failed.contains("Not confirmed"));
         assert!(!failed.contains("Device enrolled"));

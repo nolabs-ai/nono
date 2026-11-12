@@ -52,6 +52,7 @@ pub(crate) struct SessionLaunchOptions {
 
 #[derive(Clone, Default)]
 pub(crate) struct RollbackLaunchOptions {
+    pub(crate) policy_selection: Option<crate::platform_policy::PolicySelection>,
     pub(crate) requested: bool,
     pub(crate) disabled: bool,
     pub(crate) prompt_disabled: bool,
@@ -494,6 +495,7 @@ pub(crate) fn prepare_run_launch_plan(
             detach_sequence,
         },
         rollback: RollbackLaunchOptions {
+            policy_selection: args.policy_selection.clone(),
             requested: rollback,
             disabled: run_args.no_rollback,
             prompt_disabled: no_rollback_prompt,

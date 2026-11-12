@@ -23,5 +23,37 @@
     "request_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c93",
     "replaces_subject_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c94"
   },
-  "replacement_canonical": "[\"nono-login-enrollment-v1\",\"POST\",\"/api/v1/auth/oauth/enroll\",{\"protocol_version\":\"1\",\"issuer\":\"https://nono.example.com\",\"tenant_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c91\",\"user_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c92\",\"login_key_thumbprint\":\"0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I\",\"public_key\":\"BJfLRa4cft-LVd4USAkQ2PcwpA5aQYReNlEFH1lQFgRb9VE4jf_Ok_o64zbTTlcuNJajHmt6v9TDVrU0CdvGRDA\",\"display_name\":\"Linux laptop\",\"timestamp_ms\":1794312000000,\"request_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c93\",\"replaces_subject_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c94\"}]"
+  "replacement_canonical": "[\"nono-login-enrollment-v1\",\"POST\",\"/api/v1/auth/oauth/enroll\",{\"protocol_version\":\"1\",\"issuer\":\"https://nono.example.com\",\"tenant_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c91\",\"user_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c92\",\"login_key_thumbprint\":\"0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I\",\"public_key\":\"BJfLRa4cft-LVd4USAkQ2PcwpA5aQYReNlEFH1lQFgRb9VE4jf_Ok_o64zbTTlcuNJajHmt6v9TDVrU0CdvGRDA\",\"display_name\":\"Linux laptop\",\"timestamp_ms\":1794312000000,\"request_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c93\",\"replaces_subject_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c94\"}]",
+  "group_intent": {
+    "protocol_version": "1",
+    "issuer": "https://nono.example.com",
+    "tenant_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c91",
+    "user_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c92",
+    "login_key_thumbprint": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I",
+    "public_key": "BJfLRa4cft-LVd4USAkQ2PcwpA5aQYReNlEFH1lQFgRb9VE4jf_Ok_o64zbTTlcuNJajHmt6v9TDVrU0CdvGRDA",
+    "display_name": "Linux laptop",
+    "timestamp_ms": 1794312000000,
+    "request_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c93",
+    "group_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c95"
+  },
+  "group_canonical": "[\"nono-login-enrollment-v1\",\"POST\",\"/api/v1/auth/oauth/enroll\",{\"protocol_version\":\"1\",\"issuer\":\"https://nono.example.com\",\"tenant_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c91\",\"user_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c92\",\"login_key_thumbprint\":\"0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I\",\"public_key\":\"BJfLRa4cft-LVd4USAkQ2PcwpA5aQYReNlEFH1lQFgRb9VE4jf_Ok_o64zbTTlcuNJajHmt6v9TDVrU0CdvGRDA\",\"display_name\":\"Linux laptop\",\"timestamp_ms\":1794312000000,\"request_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c93\",\"group_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c95\"}]",
+  "group_request": {
+    "refresh_token": "fixture-refresh-token",
+    "tenant_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c91",
+    "user_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c92",
+    "subject_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c90",
+    "action": {
+      "type": "move",
+      "from": "0198f357-7c22-75e6-a64d-7dcb16ad5c91",
+      "to": "0198f357-7c22-75e6-a64d-7dcb16ad5c92"
+    }
+  },
+  "group_response": {
+    "protocol_version": "1",
+    "tenant_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c91",
+    "subject_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c90",
+    "groups": [],
+    "memberships": [],
+    "changed": true
+  }
 }

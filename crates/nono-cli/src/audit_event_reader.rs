@@ -162,6 +162,31 @@ pub(crate) fn load_capability_decisions(session_dir: &Path) -> Result<Vec<AuditE
     Ok(events)
 }
 
+pub(crate) fn session_policy_json(session_dir: &Path) -> Result<Option<serde_json::Value>> {
+    let path = session_dir.join(AUDIT_EVENTS_FILENAME);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut policies = Vec::new();
+    for_each_event_record(&path, false, |record| {
+        if let Some(json) = record.event_json
+            && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json)
+            && value["type"] == "session_policy"
+        {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("type");
+            }
+            policies.push(value);
+        }
+    })?;
+    if policies.len() > 1 {
+        return Err(NonoError::Snapshot(
+            "multiple session policy records".into(),
+        ));
+    }
+    Ok(policies.pop())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -170,6 +195,28 @@ mod tests {
     use nono::undo::CommandPolicyOutcome;
     use std::fs::OpenOptions;
     use std::io::Write;
+
+    #[test]
+    fn session_policy_reader_preserves_provenance_and_rejects_multiple_selections() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(session_policy_json(dir.path()).unwrap().is_none());
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-11-12T00:00:00Z".into(), vec!["echo".into()])
+            .unwrap();
+        let policy = serde_json::json!({"source":"platform","profile_id":"development","revision":2,"content_digest":"sha256:fixture"});
+        recorder
+            .record_extension_event("session_policy", &policy)
+            .unwrap();
+        assert_eq!(
+            session_policy_json(dir.path()).unwrap(),
+            Some(policy.clone())
+        );
+        recorder
+            .record_extension_event("session_policy", &policy)
+            .unwrap();
+        assert!(session_policy_json(dir.path()).is_err());
+    }
 
     fn command_policy_event(
         command: &str,

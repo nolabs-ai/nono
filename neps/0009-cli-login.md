@@ -27,6 +27,13 @@ identity unless `--no-enroll` is supplied. The coordinated extension is describe
 in [login-enrollment-v1](../docs/protocols/login-enrollment-v1.md). Manual enrollment
 remains available through `nono platform enroll`.
 
+New device registrations select an authorized enrollment group with the shared
+terminal picker or `--group <name|id>`. Existing registrations retain their
+groups; enrollment opt-outs skip group selection. `nono platform group` lists
+and changes explicit memberships without rotating the device identity. Group
+placement feeds [signed local policy delivery](../docs/protocols/local-policy-v1.md)
+for subsequent runs; explicit local profiles still take precedence.
+
 The CLI is a standard OAuth 2.0 public native client: authorization code with
 PKCE on a loopback redirect ([RFC 8252], [RFC 7636]), with the device
 authorization grant ([RFC 8628]) as the fallback when no local browser is

@@ -3262,7 +3262,25 @@ fn wrapper_exec_target(path: &Path) -> Result<Option<PathBuf>> {
         if command != Some("exec") {
             continue;
         }
-        for token in tokens {
+        // Only the program word of the `exec` line (the first
+        // non-assignment token after `exec`) can be the wrapper target.
+        // Absolute paths in the arguments must not be treated as the
+        // target (#2303): `exec echo /abs/data.txt` must not select the
+        // data file, or the script is distrusted because the file is
+        // not executable.
+        let mut program = tokens.next();
+        while let Some(token) = program {
+            let is_assignment = token.split_once('=').is_some_and(|(name, _)| {
+                let mut chars = name.chars();
+                matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+                    && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+            });
+            if !is_assignment {
+                break;
+            }
+            program = tokens.next();
+        }
+        if let Some(token) = program {
             let token = token.trim_matches(|c: char| matches!(c, '\'' | '"' | ';' | '(' | ')'));
             if token.starts_with('/') {
                 return Ok(Some(PathBuf::from(token)));
@@ -7764,6 +7782,126 @@ mod tests {
         assert!(
             paths.contains(&shell),
             "outer gate must permit the script's interpreter: {paths:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wrapper_exec_target_ignores_absolute_exec_arguments() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let data = tmp.path().join("relay.mjs");
+        fs::write(&data, b"data\n").map_err(|source| NonoError::ConfigWrite {
+            path: data.clone(),
+            source,
+        })?;
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o400)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: data.clone(),
+                source,
+            }
+        })?;
+        let script = tmp.path().join("arg-wrapper");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nexec echo {}\n", data.display()),
+        )
+        .map_err(|source| NonoError::ConfigWrite {
+            path: script.clone(),
+            source,
+        })?;
+
+        assert_eq!(wrapper_exec_target(&script)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn wrapper_exec_target_selects_program_word_over_absolute_arguments() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let data = tmp.path().join("relay.mjs");
+        let plain = tmp.path().join("plain-wrapper");
+        let assigned = tmp.path().join("assigned-wrapper");
+        fs::write(
+            &plain,
+            format!("#!/bin/sh\nexec /bin/true {} \"$@\"\n", data.display()),
+        )
+        .map_err(|source| NonoError::ConfigWrite {
+            path: plain.clone(),
+            source,
+        })?;
+        fs::write(
+            &assigned,
+            format!(
+                "#!/bin/sh\nexec FOO=bar /bin/true {} \"$@\"\n",
+                data.display()
+            ),
+        )
+        .map_err(|source| NonoError::ConfigWrite {
+            path: assigned.clone(),
+            source,
+        })?;
+
+        assert_eq!(
+            wrapper_exec_target(&plain)?,
+            Some(PathBuf::from("/bin/true"))
+        );
+        assert_eq!(
+            wrapper_exec_target(&assigned)?,
+            Some(PathBuf::from("/bin/true"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outer_exec_gate_trusts_script_with_absolute_exec_argument() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let data = tmp.path().join("relay.mjs");
+        fs::write(&data, b"data\n").map_err(|source| NonoError::ConfigWrite {
+            path: data.clone(),
+            source,
+        })?;
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o400)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: data.clone(),
+                source,
+            }
+        })?;
+        let script = tmp.path().join("arg-wrapper");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nexec echo {}\n", data.display()),
+        )
+        .map_err(|source| NonoError::ConfigWrite {
+            path: script.clone(),
+            source,
+        })?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o500)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: script.clone(),
+                source,
+            }
+        })?;
+
+        reset_elf_resolution_cache();
+        let mut seen = HashSet::new();
+        let mut script_seen = HashSet::new();
+        let mut paths = Vec::new();
+        add_outer_exec_file_with_deps(
+            &script,
+            &CapabilitySet::new(),
+            &mut seen,
+            &mut script_seen,
+            &mut paths,
+        )?;
+
+        let script = script
+            .canonicalize()
+            .map_err(|source| NonoError::PathCanonicalization {
+                path: script,
+                source,
+            })?;
+        assert!(
+            paths.contains(&script),
+            "outer gate must still trust a script with an absolute exec argument: {paths:?}"
         );
         Ok(())
     }

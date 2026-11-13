@@ -865,14 +865,15 @@ fn choose_flow(args: &LoginArgs, server: &AuthorizationServer, headless: bool) -
 /// No local browser is likely: an SSH session, or (on Linux) no display.
 fn is_headless() -> bool {
     let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
-    if set("SSH_CONNECTION") || set("SSH_TTY") {
-        return true;
-    }
+    let ssh = set("SSH_CONNECTION") || set("SSH_TTY");
     #[cfg(target_os = "linux")]
-    if !set("DISPLAY") && !set("WAYLAND_DISPLAY") {
-        return true;
+    {
+        ssh || (!set("DISPLAY") && !set("WAYLAND_DISPLAY"))
     }
-    false
+    #[cfg(not(target_os = "linux"))]
+    {
+        ssh
+    }
 }
 
 fn browser_flow(

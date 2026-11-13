@@ -39,6 +39,8 @@
 
 ### Dependencies
 
+- *(deps)* Update quinn-proto to 0.11.19, quinn-udp to 0.5.16 and rustix to 1.1.6 for security fixes; replace yanked async-executor 1.14.0 with 1.14.1
+
 - *(deps)* Bump ureq from 3.5.0 to 3.5.1 in the routine-rust group (#2289) ([#2289](https://github.com/nolabs-ai/nono/pull/2289))
 
 - *(deps)* Bump the routine-actions group with 5 updates (#2288) ([#2288](https://github.com/nolabs-ai/nono/pull/2288))

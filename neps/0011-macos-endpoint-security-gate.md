@@ -19,8 +19,18 @@ entitled helper, `nono-es-gate`, owns an ES client scoped to the sandboxed
 process tree and forwards authorization events to the nono supervisor.
 Seatbelt stays the static, irreversible boundary. ES adds kernel-enforced
 decisions inside that boundary: tree-wide exec policy, Mach/XPC allow-lists,
-Unix-socket mediation, and runtime approvals for file access. The main
-`nono` binary needs no entitlement. Unsigned and source builds, including the
+Unix-socket mediation, and runtime approvals for file access.
+
+Two further changes follow from this layer:
+- **Tool sandboxing moves from userspace to the kernel.** Command mediation
+  stops depending on PATH shims, the PATH-scan exec allow-list, the ancestry
+  walk and `setsid` markers. The kernel sees every exec in the tree and its
+  lineage.
+- **Grant expansion on macOS.** NEP-0002's `approval_fs` ceilings and the
+  session's approvable envelope are approved at the moment of access.
+  Today a request must be declared up front and the child relaunched.
+
+The main `nono` binary needs no entitlement. Unsigned and source builds, including the
 Homebrew core formula, keep today's Seatbelt-only behaviour, and that
 difference is reported, never silent.
 
@@ -48,6 +58,30 @@ compared with Linux:
   (`macos.rs:535-619`).
 - **Escalation and persistence classes aren't observed.** Examples are
   setuid execs, LaunchAgent installation, and TCC changes.
+- **Tool sandboxing (command mediation) on macOS is enforced in userspace,
+  with known gaps** (`docs/cli/features/tool-sandbox.mdx`):
+  - **Reaching tools.** Agents reach mediated tools through PATH shims. Direct
+    execution of a tool is blocked by `(deny process-exec* (literal …))` rules
+    for canonical paths (`deny_direct_exec_bypass`). A copied or renamed
+    binary is a different path.
+  - **Session exec allow-list.** It is built by scanning PATH directories at
+    startup. Binaries outside PATH (the `jspawnhelper` class) are denied
+    unless listed by hand, and binaries that appear later aren't covered.
+  - **Pinned executables.** These are verified, then exec'd by path, because
+    macOS has no `fexecve`. The docs warn that a sandbox-writable executable
+    "remains replaceable before launch".
+  - **Caller attribution.** It walks process ancestry. To survive
+    reparenting, every mediated command is put in its own POSIX session
+    (`setsid`), which costs it its controlling terminal: `/dev/tty` fails
+    with `ENXIO`, `ssh` passphrase prompts fail, and nono has to relay job
+    control. Double-forking daemons need declared `daemon_pid_source`
+    helpers that run **unsandboxed** in the supervisor.
+- **Grant expansion for tool sandboxes is declare-then-relaunch.** NEP-0002
+  `approval_fs` has a child propose an exact path through
+  `NONO_TOOL_SANDBOX_FS_REQUEST`. The supervisor approves it and the grant
+  applies only to a *fresh* child sandbox. Tools that find paths while
+  running (git, package managers, build systems) must either know their
+  paths in advance or be wrapped so they can make that request.
 
 macOS 27 adds `es_new_descendants_client`. It creates an ES client scoped to
 the caller's process subtree, including existing descendants, recursively.
@@ -71,6 +105,18 @@ The full API audit, with confidence labels, is in
   kernel on the resolved socket file.
 - Runtime file approvals on macOS through the existing approval backends
   (terminal, webhook), inside a declared, bounded envelope.
+- **Move tool-sandbox enforcement to the kernel on macOS:**
+  - every exec in the tree is decided by kernel-resolved identity (cdhash,
+    signing ID, vnode), not by PATH position or shim reachability;
+  - caller attribution comes from kernel-sourced lineage;
+  - pinned executables are checked at exec time, not before it.
+  - Shims remain the way a request *reaches* the broker, but stop being the
+    boundary.
+- **Grant expansion for tool sandboxes on macOS.** NEP-0002 `approval_fs`
+  ceilings become the command sandbox's envelope, and approvals happen when
+  the tool touches the path, with no request channel and no relaunch.
+- Remove the `setsid` requirement for mediated commands when the gate is
+  active, so tools keep their controlling terminal.
 - **One `nono` binary that installs from any channel**, including the
   Homebrew core formula, cargo and source builds. ES support is an add-on
   component, not a requirement.
@@ -132,9 +178,24 @@ nono (supervisor, unentitled, any build)
      │   1. read GateSpec from supervisor over inherited socketpair
      │   2. es_new_descendants_client, set FAIL_CLOSED, deadlines, mutes
      │   3. es_subscribe, es_sync_client, send "armed" to supervisor
-     └─ fork + exec: nono __child-bootstrap (existing child path)
-          └─ sandbox_init (Seatbelt) -> exec agent
+     ├─ fork + exec: nono __child-bootstrap        (session sandbox, domain 0)
+     │    └─ sandbox_init (Seatbelt) -> exec agent
+     ├─ fork + exec: nono tool-sandbox launcher    (command sandbox, domain 1: git)
+     │    └─ sandbox_init (Seatbelt) -> exec git
+     └─ fork + exec: nono tool-sandbox launcher    (command sandbox, domain 2: npm)
+          └─ ...
 ```
+
+**The helper is the single launcher for every sandboxed process in the
+session.** Today the supervisor spawns the tool-sandbox launcher directly
+(`tool-sandbox/launch.rs`), which would put command sandboxes outside the
+ES subtree. Under the gate, the supervisor asks the helper to fork the same
+launcher argv on its behalf. Each launch creates a **policy domain**, a
+domain ID the supervisor assigns and that the helper binds to the forked
+child's audit token. Every descendant inherits its root's domain through
+`NOTIFY_FORK`/`NOTIFY_EXEC` lineage, which the helper tracks. Each AUTH
+event carries its domain to the supervisor, so one ES client enforces
+different rules for the session sandbox and for each command sandbox.
 
 - **Supervisor (`nono`)** owns all policy:
   - builds a `GateSpec` (subscriptions, inverted target-path mutes, static
@@ -193,7 +254,8 @@ Profile (everything defaults to off):
     "endpoint_security": {
       "mode": "harden",            // off | harden | approve
       "required": false,           // true: startup error if the gate is unavailable
-      "exec":  { "enforce": "observe" },   // observe | enforce
+      "exec":  { "enforce": "observe",     // observe | enforce
+                 "default": "allow" },     // allow | prompt | deny (unlisted executables)
       "mach":  { "enforce": "observe", "allow": ["com.apple.coreservices.launchservicesd"] },
       "uipc":  { "enforce": "enforce" },
       "approvable": ["$WORKDIR/..", "$HOME/Library/Caches"]  // approve mode only
@@ -320,6 +382,154 @@ mismatch. `brew install nono` users see a one-line hint naming the cask.
   once, session, or deny. Session approvals live in the supervisor and are
   pushed into the helper's tables.
 
+### Kernel-enforced command policy
+
+Command policy was deprecated in v0.33.0 because it wasn't a boundary:
+`commands.{allow,deny}` checked only the startup command, and "child
+processes can bypass it". NEP-0001 retires those fields for 1.0, and
+deny-only `command_policies` entries are the successor
+(`docs/cli/features/dangerous-command-blocking.mdx`). Those entries are
+still enforced by shims plus Seatbelt path literals, so a copied, renamed
+or interpreter-launched binary gets past them.
+
+With the gate, `AUTH_EXEC` covers **every exec in every domain of the
+tree**, so command policy becomes kernel-enforced on macOS. This NEP
+**doesn't bring back `commands.{allow,deny}`**. It enforces the existing
+`command_policies` model in the kernel and adds identity matching:
+
+- **What is enforced.** These are evaluated at `AUTH_EXEC` for the domain
+  the exec happens in:
+  - deny-only entries (`from.session: "deny"`, `from.<caller>: "deny"`);
+  - inherited `dangerous_commands` groups;
+  - `can_use` edges.
+
+  A denied exec fails with `EPERM` in the kernel, wherever in the tree it
+  happens and whatever path or name it uses.
+- **What it matches on.** The kernel supplies the exec target's identity.
+  A command entry gains an optional `match` block, in addition to today's
+  name and `executable` resolution:
+
+  ```jsonc
+  "command_policies": {
+    "commands": {
+      "sudo":   { "from": { "session": "deny" } },          // resolved by name as today, then pinned by cdhash
+      "docker": {
+        "match": { "team_id": "<DOCKER_TEAM_ID>", "signing_id": "com.docker.docker" },
+        "from":  { "session": "deny" }
+      },
+      "unsigned-helpers": {
+        "match": { "cs_validation_category": ["none", "local_signing"],
+                   "under": ["$WORKDIR", "$TMPDIR"] },
+        "from":  { "session": "deny" }                     // no exec of agent-built, unsigned binaries
+      }
+    }
+  }
+  ```
+
+  - **Identity fields:** `cdhash`, `signing_id`, `team_id`,
+    `is_platform_binary` and `cs_validation_category` from `es_process_t`.
+  - **Entitlements:** `es_exec_entitlements`, macOS 27. For example, deny
+    images that carry `com.apple.security.get-task-allow` or the ES client
+    entitlement.
+  - **Location:** `under`, compared by path component against the
+    kernel-resolved image path.
+  - **Name resolution:** name-resolved entries are resolved at startup as
+    today and then pinned by **cdhash**. A copy or rename of `/usr/bin/sudo`
+    still matches, and on Apple Silicon every Mach-O has a cdhash.
+  - **Interpreted scripts:** the decision covers both the interpreter image
+    and `es_event_exec_t.script`, so `python evil.py` and `./evil.py` are
+    judged on the script's identity as well as the interpreter's.
+- **Default for unlisted executables.** This replaces the old
+  `commands.allow` allow-list intent.
+  `macos.endpoint_security.exec.default` is one of:
+  - `allow`: current behaviour; Seatbelt exec rules still apply.
+  - `prompt`: through the approval backend, with a long deadline.
+  - `deny`: only listed or `commands."*"`-mediated executables run.
+- **Modes.** Command policy enforcement is part of `harden`, so it **needs
+  no Seatbelt widening** and is safe even if the gate is lost: the
+  shim-and-literal enforcement still runs underneath. Each family starts in
+  `observe`, which audits would-be denials with full identity, so profiles
+  can be tuned before enforcing.
+- **Precedence.** Seatbelt exec rules are still evaluated. The gate can
+  only deny an exec that Seatbelt allows, never the other way round. A
+  command-policy deny is final. An allow from the gate means "not denied
+  by command policy", not "granted".
+
+The deprecated `commands.{allow,deny}`, `--block-command` and
+`process.blocked_commands` surfaces stay on NEP-0001's removal path. When
+the gate is active, migration guidance points users to deny-only
+`command_policies` entries, which now get the kernel guarantee the old
+fields never had.
+
+### Tool sandboxing in the kernel
+
+When the gate is active, command mediation on macOS keeps its policy model
+(`command_policies`, `can_use`/`from` edges, command sandbox policies,
+approval backends) but changes where enforcement happens.
+
+| Concern | Today (userspace) | With the gate (kernel) |
+| --- | --- | --- |
+| Reaching a tool | PATH shim → control socket → supervisor launches a fresh command sandbox | Unchanged. Shims stay the request path, because ES can deny an exec but can't redirect it into a fresh sandbox. |
+| Stopping bypass of the shim | `(deny process-exec* (literal <canonical path>))` per mediated tool. A copy or rename escapes it. | `AUTH_EXEC` of any image whose **cdhash** (or vnode, for unsigned scripts) matches a mediated tool is allowed only when the instigator is a launcher the helper itself forked for that tool. On Apple Silicon every Mach-O carries a code signature, at least ad hoc, so a copied or renamed binary keeps its cdhash and is still caught. |
+| Session exec allow-list | Seatbelt literals from a PATH scan at startup. Binaries outside PATH need `executable_dirs` or `exec_paths`. | `AUTH_EXEC` decides by identity: allow-list by path, cdhash, signing ID, team ID or `is_platform_binary`. An unknown executable goes to `commands."*"` (NEP-0002) or a prompt instead of a silent deny. The Seatbelt exec ceiling widens to the trusted-dir set, and the gate narrows it. |
+| Pinned `executable` | Verified (path, inode, digest), then `execve` by path, so it is replaceable before launch | Verified **at exec time**: the `AUTH_EXEC` target's cdhash and vnode must match the pin, or the exec is denied. Closes the pre-launch replacement gap. For scripts, `es_event_exec_t.script` identifies the script file. |
+| Caller attribution | Ancestry walk, `setsid` lineage marker, `daemon_pid_source` helpers run unsandboxed | Domain lineage from kernel fork/exec events, keyed by audit token (pid + pidversion). Daemons that double-fork to launchd stay in their domain *if* descendant tracking follows fork lineage rather than current ppid (Open Question 9). |
+| Controlling terminal | Lost (`setsid` on every mediated launch) | Kept. No `setsid` is needed when lineage is kernel-sourced, so `/dev/tty`, `ssh` passphrase prompts and job control work normally. |
+| Deny-only commands (`dangerous_commands`) | Shim plus Seatbelt literal | `AUTH_EXEC` by identity across the whole tree (see Kernel-enforced command policy). |
+| `allow_direct_exec_bypass` | Compatibility escape that runs with session capabilities | Still supported. The exec is allowed by identity and stays in the caller's domain, so it keeps session rules. |
+
+What doesn't change: command sandboxes are still separate Seatbelt
+sandboxes built from their own policy, which is the static ceiling for each
+domain. Credentials, environment filtering, stdio mediation and audit
+records keep their current paths. Linux keeps cgroup lineage and its
+existing mechanisms. This NEP doesn't change Linux tool sandboxing.
+
+When the gate is unavailable (Seatbelt-only builds), tool sandboxing runs
+exactly as today, including `setsid` and the PATH-scan allow-list. Any
+behaviour that depends on the gate, such as keeping the controlling
+terminal, is enabled only after the helper reports "armed". It is never
+assumed.
+
+### Grant expansion
+
+ES can only narrow access, so every form of expansion on macOS uses the same
+pattern: **the Seatbelt profile for a domain includes a declared ceiling,
+and the gate default-denies inside it, approving at the moment of access.**
+There are two kinds of ceiling, using the same machinery:
+
+1. **Session envelope**, the `approvable` list (`approve` mode, described
+   above).
+2. **Command sandbox ceilings**, NEP-0002 `approval_fs.read_roots` and
+   `write_roots`. NEP-0002 already defines these as "ceilings, not grants",
+   with deny paths applied, an approval backend and a timeout. On macOS with
+   the gate active:
+   - The command sandbox's Seatbelt profile includes the roots (minus deny
+     paths, which Seatbelt hard-denies).
+   - `AUTH_OPEN`/`CREATE`/`RENAME`/`UNLINK`/`LINK`/`TRUNCATE` inside the roots,
+     from that domain, are forwarded to the supervisor. The supervisor checks
+     NEP-0002's rules (exact path, read vs write root, deny paths), asks the
+     configured backend, and answers. A read-only approval answers `AUTH_OPEN`
+     with `FREAD` and strips `FWRITE`.
+   - **No request channel and no relaunch.** The tool doesn't need to know it
+     must ask. `NONO_TOOL_SANDBOX_FS_REQUEST` remains the Linux mechanism and
+     the macOS fallback without the gate.
+   - **Identity is checked at decision time.** NEP-0002 records device and
+     inode and checks them again before installing a grant. Here the
+     `es_file_t` in the AUTH message is the object the kernel resolved, so
+     the decision and the object it applies to are the same, subject to
+     Open Question 4.
+   - **Invocation scope.** An approval is keyed to `(domain, path, access)`
+     and discarded when the domain's root exits. A later invocation of the
+     same tool starts with nothing approved, as NEP-0002 requires.
+   - Audit records each decision in the existing command-policy audit event,
+     tagged with the domain.
+
+Relation to NEP-0002: NEP-0002 owns the `approval_fs` schema and decision
+rules. This NEP supplies a macOS enforcement mechanism for them. If NEP-0002
+changes its rules, this mechanism follows. The two can ship independently:
+without NEP-0002, only the session envelope exists, and without the gate,
+NEP-0002 uses its request channel on macOS.
+
 ### Platform behavior
 
 - macOS 27+ only. On macOS < 27 the gate is `unavailable`, and `required`
@@ -342,12 +552,26 @@ as today. `breaking: false` is proposed.
 1. **Helper, distribution, `harden` mode.**
    - Ship `nono-es-gate`, signing, notarization, the release tarball and
      the cask.
-   - Exec policy, the Mach/XPC allow-list, uipc, and process rules, each
-     starting in `observe`.
-   - The setuid block. The tier in diagnostics and audit.
-2. **`approve` mode.** Envelope, file prompts through approval backends, the
-   kill-on-gate-loss machinery, and security-model doc updates.
-3. **Audit and rollback integration.**
+   - **Kernel-enforced command policy:** deny-only entries,
+     `dangerous_commands`, `can_use` edges, `match` identity blocks and
+     `exec.default`.
+   - The Mach/XPC allow-list, uipc, and process rules.
+   - Every family starts in `observe`. The setuid block. The tier in
+     diagnostics and audit.
+2. **Tool sandboxing in the kernel.**
+   - The helper becomes the launcher for command sandboxes (policy
+     domains).
+   - Shim-bypass detection by cdhash, and exec-time verification of
+     pinned executables.
+   - Kernel lineage attribution, and dropping `setsid` when the gate is
+     armed.
+   - `daemon_pid_source` becomes unnecessary under the gate, subject to
+     Open Question 9.
+3. **Grant expansion.**
+   - `approve` mode (session envelope) and NEP-0002 `approval_fs` ceilings
+     for command sandboxes, both approved when the path is accessed.
+   - The kill-on-gate-loss machinery and security-model doc updates.
+4. **Audit and rollback integration.**
    - `NOTIFY_WRITE`/`CLOSE`/`RENAME`/`UNLINK` change sets for rollback.
    - Kernel-sourced lineage in the audit ledger.
    - Persistence and escalation tripwires (`BTM_LAUNCH_ITEM_ADD`, `SUDO`,
@@ -423,6 +647,42 @@ as today. `breaking: false` is proposed.
   refuses this). Mach/XPC rules are therefore static tables only, with no
   prompts.
 
+### Command policy and tool sandboxing
+
+- **Identity matching limits.**
+  - cdhash pins break on legitimate updates (a Homebrew upgrade, an Xcode
+    CLT update). Name-resolved entries are re-resolved at session start, and
+    a cdhash that changes mid-session is denied, which is fail-secure.
+  - `team_id` and `signing_id` matching trusts Apple's code-signing chain.
+    Ad-hoc signatures have no team ID, so `team_id` matches never apply to
+    them.
+  - Apple notes `CS_VALID` covers only pages validated so far. A tampered
+    page is caught on page-in, and the process is killed only if `CS_KILL`
+    is set. Matching is an identity check, not a malware verdict.
+- **Interpreters stay hard.** `AUTH_EXEC` sees `python -c '…'` and
+  `bash -c '…'` as the interpreter only. Inline code and `source`d files
+  aren't execs. Command policy on interpreters is as strong as on any other
+  binary, but it can't see what the interpreter runs. This is the same limit
+  as today; the docs must not claim more.
+- **The shim is still the launch path.** ES can deny an exec but can't
+  redirect it into a fresh command sandbox. A tool exec'd without its shim
+  is **denied**, not re-sandboxed. The shim remains needed for things to
+  work; the kernel only guarantees nothing gets around it.
+- **Domain integrity.**
+  - A process's domain is assigned only by the helper at fork of a launcher
+    it was asked to create, and is inherited only through kernel fork/exec
+    lineage. A process can't move itself into another domain.
+  - Audit tokens include pidversion, so pid reuse can't inherit a domain.
+- **Fewer unsandboxed helpers.** Removing the need for `daemon_pid_source`
+  helpers under the gate removes code that runs unsandboxed in the
+  supervisor today. If Open Question 9 shows that descendant tracking does
+  not survive reparenting, `daemon_pid_source` stays, and only `setsid`
+  removal is reconsidered.
+- **Expansion ceilings.** NEP-0002 roots become Seatbelt-reachable for the
+  command sandbox when the gate is armed, so the ceiling, not the approved
+  path, is the boundary under gate loss. The kill-on-gate-loss rule covers
+  every domain, not only the session.
+
 ### Path handling
 
 - ES supplies kernel-resolved paths in `es_file_t`. The CLI compares them
@@ -479,6 +739,14 @@ paths under credential deny groups.
 - **Gate only in `harden` mode, never `approve`.** Viable as a smaller
   first step and kept as a fallback if the spike finds that client death or
   atomicity can't be made safe. It forgoes macOS runtime approvals.
+- **Revive `commands.{allow,deny}` as a kernel-enforced field.** Rejected:
+  NEP-0001 removes those fields for 1.0, and deny-only `command_policies`
+  entries already express the same intent with caller edges. Enforcing that
+  existing model in the kernel avoids two command-policy schemas.
+- **Redirect exec into the broker in the kernel**, so a direct exec of a
+  mediated tool is transparently re-sandboxed. Not possible: ES can only
+  allow, deny or strip flags. Shims stay the launch path, and a direct exec
+  is denied.
 - **Do nothing.** macOS stays static-only, and over-granting continues.
 
 ## Assumptions
@@ -518,15 +786,27 @@ grant is assumed.
 8. **Nesting.** nono inside nono, and nono supervising an agent that is
    itself an ES descendants client.
 
+9. **Reparenting.** Does a descendants client keep covering a process that
+   double-forks and is reparented to launchd? Apple's text ("forked or
+   exec'd afterward, recursively") suggests lineage is fixed at fork, but
+   this decides whether `setsid` and `daemon_pid_source` can go.
+10. **Exec redirect cost.** Measure the latency of forwarding every
+    `AUTH_EXEC` in a large build (`make -j`, `cargo build`), and how much
+    the helper's static identity tables can answer without asking the
+    supervisor.
+11. **Script identity.** Is `es_event_exec_t.script` populated for every
+    shebang path, including `env`-indirected ones (`#!/usr/bin/env
+    python3`)?
+
 Non-blocking:
 
-9. Should `security.capability_elevation: true` imply `approve` on macOS
+12. Should `security.capability_elevation: true` imply `approve` on macOS
    once Phase 2 ships, or stay separate?
-10. Default envelope for `approve`: empty (explicit only), the workdir
+13. Default envelope for `approve`: empty (explicit only), the workdir
     parent, or a built-in group such as `approvable_macos_default`?
-11. Baseline Mach/XPC allow-list: maintain one per macOS release, or build
+14. Baseline Mach/XPC allow-list: maintain one per macOS release, or build
     it from `observe`-mode telemetry per profile?
-12. Should the `.pkg` become the recommended macOS install path, with the
+15. Should the `.pkg` become the recommended macOS install path, with the
     homebrew-core formula documented as Seatbelt-only?
-13. Cask naming and whether homebrew-cask accepts a helper-only cask, or
+16. Cask naming and whether homebrew-cask accepts a helper-only cask, or
     whether a nolabs tap is needed.

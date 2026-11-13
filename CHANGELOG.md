@@ -1,5 +1,110 @@
 # Changelog
 
+## [0.82.0] - 2026-11-13
+
+### Bug Fixes
+
+- *(cli)* Allow mise to read ~/.tool-versions (#2307) ([#2307](https://github.com/nolabs-ai/nono/pull/2307))
+
+- *(proxy)* Explain unavailable managed credentials to clients
+
+- *(proxy)* Omit credential failure bodies for HTTP/1.1 HEAD
+
+- *(proxy)* Distinguish credential capture failures in HTTP responses
+
+- *(proxy)* Normalize trailing slash in endpoint rule paths
+
+- *(deps)* Upgrade aws-config and remove crypto-bigint audit exception
+
+- Apply rustfmt to ENDPOINT_ROUTE_PREFIX use sites
+
+- *(proxy)* Skip synthetic _EP_ env vars for endpoint-filtered routes (#2286)
+
+- *(sandbox)* Scope macOS process-exec to the read set (#2282) ([#2282](https://github.com/nolabs-ai/nono/pull/2282))
+
+- *(docker)* Create home directory for nono user (#2278) ([#2278](https://github.com/nolabs-ai/nono/pull/2278))
+
+- *(proxy)* Enforce endpoint rules on plain-HTTP forward requests (#2184) ([#2184](https://github.com/nolabs-ai/nono/pull/2184))
+
+- *(proxy)* Strip hop headers when the colon is spaced (#2254) ([#2254](https://github.com/nolabs-ai/nono/pull/2254))
+
+- *(policy)* Keep exact-file directory bypasses literal (#2142) ([#2142](https://github.com/nolabs-ai/nono/pull/2142))
+
+- *(proxy)* Fail upstream connections that go silent (#2237) ([#2237](https://github.com/nolabs-ai/nono/pull/2237))
+
+- *(cli)* Support kitty release and repeat events in detach matcher (#2239) ([#2239](https://github.com/nolabs-ai/nono/pull/2239))
+
+- *(cli)* Pause the PTY relay for network approval prompts (#2234) ([#2234](https://github.com/nolabs-ai/nono/pull/2234))
+
+
+### Dependencies
+
+- *(deps)* Update quinn-proto to 0.11.19, quinn-udp to 0.5.16 and rustix to 1.1.6 for security fixes; replace yanked async-executor 1.14.0 with 1.14.1
+
+- *(deps)* Bump ureq from 3.5.0 to 3.5.1 in the routine-rust group (#2289) ([#2289](https://github.com/nolabs-ai/nono/pull/2289))
+
+- *(deps)* Bump the routine-actions group with 5 updates (#2288) ([#2288](https://github.com/nolabs-ai/nono/pull/2288))
+
+- *(deps)* Bump the routine-rust group with 6 updates (#2251) ([#2251](https://github.com/nolabs-ai/nono/pull/2251))
+
+
+### Documentation
+
+- *(proxy)* Describe credential capture error responses
+
+- *(proxy)* Document path normalization explicitly
+
+- *(undo)* Fix snapshot comments that describe a fast check and zeroed hash (#2264) ([#2264](https://github.com/nolabs-ai/nono/pull/2264))
+
+- *(schema)* Add command sandbox exec_paths and open_port fields (#2276) ([#2276](https://github.com/nolabs-ai/nono/pull/2276))
+
+- *(neps)* Add nep 0010 for session terminal capture (#2259) ([#2259](https://github.com/nolabs-ai/nono/pull/2259))
+
+- *(neps)* Update implementation status and pre-1.0 compatibility guidance (#2249) ([#2249](https://github.com/nolabs-ai/nono/pull/2249))
+
+- *(nep)* Propose nep-0009 for cli oauth login and device enrollment (#2245) ([#2245](https://github.com/nolabs-ai/nono/pull/2245))
+
+
+### Features
+
+- *(proxy)* Accept AWS GovCloud regions and s3 bucket-subdomain wildcards (#2302) ([#2302](https://github.com/nolabs-ai/nono/pull/2302))
+
+- *(cli)* Unify platform commands and automatic enrollment (#2297) ([#2297](https://github.com/nolabs-ai/nono/pull/2297))
+
+- *(proxy)* Approvals for allow_domain endpoints (#2266) ([#2266](https://github.com/nolabs-ai/nono/pull/2266))
+
+- *(cli)* Add session terminal recording (NEP-0010) (#2293) ([#2293](https://github.com/nolabs-ai/nono/pull/2293))
+
+- *(proxy)* Add phantom_format to custom credentials (#2281) ([#2281](https://github.com/nolabs-ai/nono/pull/2281))
+
+- *(proxy)* Match AWS operations in endpoint_policy on aws_auth routes (#2279) ([#2279](https://github.com/nolabs-ai/nono/pull/2279))
+
+- *(proxy)* Derive aws_auth signing region from request host for wildcard upstreams (#2280) ([#2280](https://github.com/nolabs-ai/nono/pull/2280))
+
+- *(proxy)* Select aws_auth signing profile by placeholder access key ID (#2277) ([#2277](https://github.com/nolabs-ai/nono/pull/2277))
+
+- *(proxy)* Network approval for plain-HTTP forward requests (#2265) ([#2265](https://github.com/nolabs-ai/nono/pull/2265))
+
+- *(cli)* Add nono login and logout commands (#2250) ([#2250](https://github.com/nolabs-ai/nono/pull/2250))
+
+- *(approval)* Unix-socket webhook transport and network approvals in `nono proxy` (#2240) ([#2240](https://github.com/nolabs-ai/nono/pull/2240))
+
+- *(cli)* Support approval elevation for AF_UNIX pathname sockets (#2238) ([#2238](https://github.com/nolabs-ai/nono/pull/2238))
+
+- *(cli)* Record proxy audit events live to audit log (#2235) ([#2235](https://github.com/nolabs-ai/nono/pull/2235))
+
+
+### Miscellaneous
+
+- *(nix)* Update prebuilt hashes for v0.81.0 (#2230) ([#2230](https://github.com/nolabs-ai/nono/pull/2230))
+
+
+### Refactoring
+
+- *(proxy)* Share ENDPOINT_ROUTE_PREFIX const for synthetic _ep_ routes (#2286)
+
+- *(cli)* Simplify remote session display and selector layout (#2260) ([#2260](https://github.com/nolabs-ai/nono/pull/2260))
+
 ## [0.81.0] - 2026-10-29
 
 ### Security Advisories

@@ -113,7 +113,10 @@ fn install_profile_hooks(_profile_name: Option<&str>, profile: &profile::Profile
 /// 1. Check the pack directory exists
 /// 2. Verify artifact SHA-256 digests against the lockfile
 /// 3. Re-verify Sigstore bundles from the stored `.nono-trust.bundle` file
-fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::Result<()> {
+pub(crate) fn verify_profile_packs(
+    packs: &[String],
+    profile: &profile::Profile,
+) -> crate::Result<()> {
     if let Some(hook) = [&profile.session_hooks.before, &profile.session_hooks.after]
         .into_iter()
         .flatten()

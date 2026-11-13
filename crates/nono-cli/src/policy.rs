@@ -2413,6 +2413,9 @@ pub fn list_policy_profiles() -> Result<Vec<String>> {
 /// so we parse it once and cache the result. This avoids re-parsing ~23 KB of
 /// JSON on every call (up to ~18 call sites per CLI invocation).
 pub fn load_embedded_policy() -> Result<Policy> {
+    if let Some(policy) = crate::profile_bundle::current_policy() {
+        return Ok(policy);
+    }
     static CACHED: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
 
     // The embedded JSON is baked in at build time — parse failure here means

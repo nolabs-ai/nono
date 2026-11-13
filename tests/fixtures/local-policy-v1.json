@@ -1,0 +1,49 @@
+{
+  "claims": {
+    "protocol_version": "1",
+    "tenant_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c91",
+    "subject_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c92",
+    "request_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c93",
+    "issued_at": "2026-11-12T00:00:00Z",
+    "source": "group",
+    "source_name": "Engineering",
+    "policy": {
+      "profile_id": "development",
+      "revision": 1,
+      "content_digest": "sha256:4cc1dda3e6ead8ead52e88bb0a0a73ccc0da71d0be3dee9d1a4f16bfd9f38972",
+      "profile_json": "{\"entry\":\"p0\",\"format_version\":\"1\",\"network\":{\"credentials\":{},\"groups\":{},\"meta\":{\"schema_version\":\"1\",\"version\":1},\"profiles\":{}},\"policy\":{\"groups\":{},\"meta\":{\"schema_version\":\"2.0\",\"version\":2},\"profiles\":{\"default\":{}}},\"profiles\":{\"p0\":{\"extends\":[\"p1\"],\"network\":{\"block\":true}},\"p1\":{}}}"
+    }
+  },
+  "canonical": "{\"protocol_version\":\"1\",\"tenant_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c91\",\"subject_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c92\",\"request_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c93\",\"issued_at\":\"2026-11-12T00:00:00Z\",\"source\":\"group\",\"source_name\":\"Engineering\",\"policy\":{\"profile_id\":\"development\",\"revision\":1,\"content_digest\":\"sha256:4cc1dda3e6ead8ead52e88bb0a0a73ccc0da71d0be3dee9d1a4f16bfd9f38972\",\"profile_json\":\"{\\\"entry\\\":\\\"p0\\\",\\\"format_version\\\":\\\"1\\\",\\\"network\\\":{\\\"credentials\\\":{},\\\"groups\\\":{},\\\"meta\\\":{\\\"schema_version\\\":\\\"1\\\",\\\"version\\\":1},\\\"profiles\\\":{}},\\\"policy\\\":{\\\"groups\\\":{},\\\"meta\\\":{\\\"schema_version\\\":\\\"2.0\\\",\\\"version\\\":2},\\\"profiles\\\":{\\\"default\\\":{}}},\\\"profiles\\\":{\\\"p0\\\":{\\\"extends\\\":[\\\"p1\\\"],\\\"network\\\":{\\\"block\\\":true}},\\\"p1\\\":{}}}\"}}",
+  "signed": {
+    "algorithm": "ecdsa_p256_sha256_fixed",
+    "key_id": "sha256:8cb3a66d47a25f13857366742d1718f7c0f578f1f933b0b7639c567a2cc43847",
+    "public_key": "BC0nZSp5Bv56Csdi6TWs2YXDRuxYKhmGNDRmW7nmQiCohQL96GJ348hLTMS1PfWU1hcQ9z61ud_llB9t8zqcASY",
+    "payload": "eyJwcm90b2NvbF92ZXJzaW9uIjoiMSIsInRlbmFudF9pZCI6IjAxOThmMzU3LTdjMjItNzVlNi1hNjRkLTdkY2IxNmFkNWM5MSIsInN1YmplY3RfaWQiOiIwMTk4ZjM1Ny03YzIyLTc1ZTYtYTY0ZC03ZGNiMTZhZDVjOTIiLCJyZXF1ZXN0X2lkIjoiMDE5OGYzNTctN2MyMi03NWU2LWE2NGQtN2RjYjE2YWQ1YzkzIiwiaXNzdWVkX2F0IjoiMjAyNi0xMS0xMlQwMDowMDowMFoiLCJzb3VyY2UiOiJncm91cCIsInNvdXJjZV9uYW1lIjoiRW5naW5lZXJpbmciLCJwb2xpY3kiOnsicHJvZmlsZV9pZCI6ImRldmVsb3BtZW50IiwicmV2aXNpb24iOjEsImNvbnRlbnRfZGlnZXN0Ijoic2hhMjU2OjRjYzFkZGEzZTZlYWQ4ZWFkNTJlODhiYjBhMGE3M2NjYzBkYTcxZDBiZTNkZWU5ZDFhNGYxNmJmZDlmMzg5NzIiLCJwcm9maWxlX2pzb24iOiJ7XCJlbnRyeVwiOlwicDBcIixcImZvcm1hdF92ZXJzaW9uXCI6XCIxXCIsXCJuZXR3b3JrXCI6e1wiY3JlZGVudGlhbHNcIjp7fSxcImdyb3Vwc1wiOnt9LFwibWV0YVwiOntcInNjaGVtYV92ZXJzaW9uXCI6XCIxXCIsXCJ2ZXJzaW9uXCI6MX0sXCJwcm9maWxlc1wiOnt9fSxcInBvbGljeVwiOntcImdyb3Vwc1wiOnt9LFwibWV0YVwiOntcInNjaGVtYV92ZXJzaW9uXCI6XCIyLjBcIixcInZlcnNpb25cIjoyfSxcInByb2ZpbGVzXCI6e1wiZGVmYXVsdFwiOnt9fX0sXCJwcm9maWxlc1wiOntcInAwXCI6e1wiZXh0ZW5kc1wiOltcInAxXCJdLFwibmV0d29ya1wiOntcImJsb2NrXCI6dHJ1ZX19LFwicDFcIjp7fX19In19",
+    "signature": "W1v_nFrdj2aLmCzkSaSXq7CHy6REVqnGuyvic4-JAUagZ3mOJhnL-akXc5lRvGUX91MwTehfJUig_JikjmXCjw"
+  },
+  "not_modified": {
+    "claims": {
+      "protocol_version": "1",
+      "tenant_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c91",
+      "subject_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c92",
+      "request_id": "0198f357-7c22-75e6-a64d-7dcb16ad5c94",
+      "issued_at": "2026-11-12T00:00:00Z",
+      "source": "group",
+      "source_name": "Engineering",
+      "policy": {
+        "profile_id": "development",
+        "revision": 1,
+        "content_digest": "sha256:4cc1dda3e6ead8ead52e88bb0a0a73ccc0da71d0be3dee9d1a4f16bfd9f38972"
+      }
+    },
+    "canonical": "{\"protocol_version\":\"1\",\"tenant_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c91\",\"subject_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c92\",\"request_id\":\"0198f357-7c22-75e6-a64d-7dcb16ad5c94\",\"issued_at\":\"2026-11-12T00:00:00Z\",\"source\":\"group\",\"source_name\":\"Engineering\",\"policy\":{\"profile_id\":\"development\",\"revision\":1,\"content_digest\":\"sha256:4cc1dda3e6ead8ead52e88bb0a0a73ccc0da71d0be3dee9d1a4f16bfd9f38972\"}}",
+    "signed": {
+      "algorithm": "ecdsa_p256_sha256_fixed",
+      "key_id": "sha256:8cb3a66d47a25f13857366742d1718f7c0f578f1f933b0b7639c567a2cc43847",
+      "public_key": "BC0nZSp5Bv56Csdi6TWs2YXDRuxYKhmGNDRmW7nmQiCohQL96GJ348hLTMS1PfWU1hcQ9z61ud_llB9t8zqcASY",
+      "payload": "eyJwcm90b2NvbF92ZXJzaW9uIjoiMSIsInRlbmFudF9pZCI6IjAxOThmMzU3LTdjMjItNzVlNi1hNjRkLTdkY2IxNmFkNWM5MSIsInN1YmplY3RfaWQiOiIwMTk4ZjM1Ny03YzIyLTc1ZTYtYTY0ZC03ZGNiMTZhZDVjOTIiLCJyZXF1ZXN0X2lkIjoiMDE5OGYzNTctN2MyMi03NWU2LWE2NGQtN2RjYjE2YWQ1Yzk0IiwiaXNzdWVkX2F0IjoiMjAyNi0xMS0xMlQwMDowMDowMFoiLCJzb3VyY2UiOiJncm91cCIsInNvdXJjZV9uYW1lIjoiRW5naW5lZXJpbmciLCJwb2xpY3kiOnsicHJvZmlsZV9pZCI6ImRldmVsb3BtZW50IiwicmV2aXNpb24iOjEsImNvbnRlbnRfZGlnZXN0Ijoic2hhMjU2OjRjYzFkZGEzZTZlYWQ4ZWFkNTJlODhiYjBhMGE3M2NjYzBkYTcxZDBiZTNkZWU5ZDFhNGYxNmJmZDlmMzg5NzIifX0",
+      "signature": "q5_qrEid76x5wlzr8yx5a22QhE_sxUKO-RpzhLOIhqcgkgCZO9SFrUAvxxReZ81jvVHDlXRAKr-_ihHuR0Hz9A"
+    }
+  }
+}

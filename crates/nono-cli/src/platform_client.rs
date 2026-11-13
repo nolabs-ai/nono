@@ -63,13 +63,17 @@ pub(crate) struct EnrollmentExchangeResponse {
     pub subject_kind: String,
     pub management_mode: String,
     pub enrolled_at: String,
+    #[serde(default)]
+    pub groups: Vec<crate::enrollment_group::EnrollmentGroup>,
 }
 
-pub(crate) fn run_platform(args: PlatformArgs) -> Result<()> {
+pub(crate) fn run_platform(args: PlatformArgs, silent: bool) -> Result<()> {
     match args.command {
         PlatformCommands::Login(args) => crate::login_cmd::run_login(args),
         PlatformCommands::Logout(args) => crate::login_cmd::run_logout(args),
         PlatformCommands::Tenant(args) => crate::login_cmd::run_tenant(args),
+        PlatformCommands::Policy(args) => crate::platform_policy::run(args, silent),
+        PlatformCommands::Group(args) => crate::group_cmd::run(args, silent),
         PlatformCommands::ReEnroll(mut args) => {
             args.re_enroll = true;
             crate::login_cmd::run_login(args)
@@ -111,6 +115,7 @@ fn enroll(args: PlatformEnrollArgs) -> Result<()> {
     validate_wire_identifier("tenant id", &response.tenant_id)?;
     validate_wire_identifier("subject id", &response.subject_id)?;
 
+    crate::enrollment_group::validate(&response.groups)?;
     let state = PlatformState {
         protocol_version: response.protocol_version,
         platform_url,
@@ -125,6 +130,7 @@ fn enroll(args: PlatformEnrollArgs) -> Result<()> {
     let stored = StoredEnrollment {
         state,
         login_user_id: None,
+        groups: response.groups,
         display_name: request.display_name.clone(),
         tenant: None,
         revoked: false,
@@ -165,6 +171,10 @@ fn status(args: PlatformStatusArgs) -> Result<()> {
             }),
             None => serde_json::json!({"enrolled": false}),
         };
+        if let Some(stored) = &stored {
+            output["groups"] = serde_json::to_value(&stored.groups)
+                .map_err(|error| NonoError::ConfigParse(error.to_string()))?;
+        }
         if let Some(context) = &context {
             output["context"] = serde_json::json!({
                 "platform_url": context.platform_url,
@@ -305,10 +315,29 @@ fn enrollment_details(stored: &StoredEnrollment) -> String {
         })
         .unwrap_or_else(|_| "Not recorded".into());
     format!(
-        "{}{}",
+        "{}{}{}",
         summary_row(kind, &name),
+        enrollment_group_row(&stored.groups),
         summary_row("Enrolled", &enrolled)
     )
+}
+
+pub(crate) fn enrollment_group_row(groups: &[crate::enrollment_group::EnrollmentGroup]) -> String {
+    if groups.is_empty() {
+        return String::new();
+    }
+    summary_row(
+        if groups.len() == 1 { "Group" } else { "Groups" },
+        &crate::enrollment_group::labels(groups),
+    )
+}
+
+pub(crate) fn login_enrollment_groups(
+    session: &SessionRecord,
+) -> Result<Vec<crate::enrollment_group::EnrollmentGroup>> {
+    Ok(selected_enrollment(session)?
+        .map(|stored| stored.groups)
+        .unwrap_or_default())
 }
 
 /// Remove the local enrollment. Local-only by design: the platform-side
@@ -425,6 +454,8 @@ struct StoredEnrollment {
     tenant: Option<Organization>,
     #[serde(default)]
     revoked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<crate::enrollment_group::EnrollmentGroup>,
 }
 
 pub(crate) fn enrollment_scope_id(platform: &str, tenant: &str, user: &str) -> Result<String> {
@@ -452,6 +483,7 @@ fn read_state(path: &Path) -> Result<Option<StoredEnrollment>> {
     })?;
     let stored: StoredEnrollment = serde_json::from_str(&contents)
         .map_err(|_| NonoError::ConfigParse("invalid platform enrollment state".into()))?;
+    crate::enrollment_group::validate(&stored.groups)?;
     let state = &stored.state;
     if state.protocol_version != ENROLLMENT_PROTOCOL_V1
         || state.key_algorithm != KEY_ALGORITHM
@@ -471,9 +503,11 @@ pub(crate) fn save_login_enrollment(
     state: PlatformState,
     session: &SessionRecord,
     display_name: &str,
+    groups: Vec<crate::enrollment_group::EnrollmentGroup>,
 ) -> Result<()> {
     let path = scoped_state_path(&state.platform_url, &state.tenant_id, &session.user_subject)?;
     let stored = StoredEnrollment {
+        groups,
         tenant: session
             .organizations
             .iter()
@@ -484,8 +518,35 @@ pub(crate) fn save_login_enrollment(
         display_name: Some(display_name.to_string()),
         revoked: false,
     };
-    write_json_secure(&path, &stored)?;
-    write_json_secure(&state_path()?, &stored)
+    write_login_enrollment(&path, &stored)
+}
+
+fn write_login_enrollment(path: &Path, stored: &StoredEnrollment) -> Result<()> {
+    crate::enrollment_group::validate(&stored.groups)?;
+    write_json_secure(path, stored)?;
+    write_json_secure(&state_path()?, stored)
+}
+
+pub(crate) fn update_login_groups(
+    session: &SessionRecord,
+    subject: &str,
+    groups: Vec<crate::enrollment_group::EnrollmentGroup>,
+) -> Result<()> {
+    let mut stored = selected_enrollment(session)?.ok_or_else(|| {
+        NonoError::ActionRequired("no local device enrollment; run `nono platform login`".into())
+    })?;
+    if stored.state.subject_id != subject {
+        return Err(NonoError::ConfigParse(
+            "enrollment changed while updating group metadata".into(),
+        ));
+    }
+    stored.groups = groups;
+    let path = scoped_state_path(
+        &session.platform_url,
+        &session.tenant_id,
+        &session.user_subject,
+    )?;
+    write_login_enrollment(&path, &stored)
 }
 
 fn selected_enrollment(
@@ -908,7 +969,22 @@ mod tests {
             key_ref: "keystore://fixture".into(),
             enrolled_at: "2026-11-10T00:00:00Z".into(),
         };
-        save_login_enrollment(first.clone(), &login, "Laptop").unwrap();
+        save_login_enrollment(first.clone(), &login, "Laptop", vec![]).unwrap();
+        let group = crate::enrollment_group::EnrollmentGroup {
+            group_id: uuid::Uuid::now_v7().to_string(),
+            name: "Default".into(),
+            unit_id: uuid::Uuid::now_v7().to_string(),
+            unit_name: "root".into(),
+            is_default: true,
+        };
+        assert!(update_login_groups(&login, "different-device", vec![group.clone()]).is_err());
+        assert!(login_enrollment_groups(&login).unwrap().is_empty());
+        update_login_groups(&login, &first.subject_id, vec![group.clone()]).unwrap();
+        assert_eq!(login_enrollment_groups(&login).unwrap(), vec![group]);
+        let cached = load_active_state().unwrap().unwrap();
+        assert_eq!(cached.subject_id, first.subject_id);
+        assert_eq!(cached.key_ref, first.key_ref);
+        assert_eq!(cached.enrolled_at, first.enrolled_at);
         mark_revoked(&first).unwrap();
         assert!(enrollment_revoked().unwrap());
         assert!(load_active_state().unwrap().is_none());
@@ -921,7 +997,7 @@ mod tests {
             subject_id: "device-two".into(),
             ..first.clone()
         };
-        save_login_enrollment(second, &login, "Laptop").unwrap();
+        save_login_enrollment(second, &login, "Laptop", vec![]).unwrap();
         assert!(!enrollment_revoked().unwrap());
         login.tenant_id = "t-1".into();
         session::save_record(&lock, &login).unwrap();

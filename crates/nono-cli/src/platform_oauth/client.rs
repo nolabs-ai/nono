@@ -44,6 +44,8 @@ const MAX_IDENTIFIER_LEN: usize = 200;
 pub(crate) struct AuthorizationServer {
     pub(crate) issuer: String,
     pub(crate) enrollment_endpoint: Option<Url>,
+    pub(crate) enrollment_options_endpoint: Option<Url>,
+    pub(crate) groups_endpoint: Option<Url>,
     pub(crate) authorization_endpoint: Option<Url>,
     pub(crate) token_endpoint: Url,
     pub(crate) device_authorization_endpoint: Option<Url>,
@@ -53,6 +55,8 @@ pub(crate) struct AuthorizationServer {
 #[derive(Debug, Deserialize)]
 struct RawMetadata {
     nono_enrollment_endpoint: Option<String>,
+    nono_enrollment_options_endpoint: Option<String>,
+    nono_groups_endpoint: Option<String>,
     issuer: String,
     authorization_endpoint: Option<String>,
     token_endpoint: Option<String>,
@@ -170,6 +174,8 @@ fn validate_metadata(platform_url: &str, raw: RawMetadata) -> Result<Authorizati
         .ok_or_else(|| NonoError::ConfigParse("metadata omits token_endpoint".to_string()))?;
     Ok(AuthorizationServer {
         enrollment_endpoint: endpoint(raw.nono_enrollment_endpoint)?,
+        enrollment_options_endpoint: endpoint(raw.nono_enrollment_options_endpoint)?,
+        groups_endpoint: endpoint(raw.nono_groups_endpoint)?,
         issuer: raw.issuer,
         authorization_endpoint: endpoint(raw.authorization_endpoint)?,
         token_endpoint,
@@ -510,22 +516,63 @@ impl<'a> OAuthClient<'a> {
                 "this platform does not support enrollment during login".into(),
             )
         })?;
+        self.post_enrollment_json(&endpoint, request)
+            .map(|result| match result {
+                Ok(response) => EnrollmentOutcome::Enrolled(response),
+                Err(error) => EnrollmentOutcome::Error(error),
+            })
+    }
+
+    pub(crate) fn enrollment_options(
+        &mut self,
+        request: &crate::login_enrollment::EnrollmentOptionsRequest,
+    ) -> Result<crate::login_enrollment::EnrollmentOptions> {
+        let endpoint = self
+            .server
+            .enrollment_options_endpoint
+            .clone()
+            .ok_or_else(|| {
+                NonoError::ActionRequired(
+                    "this platform does not support enrollment group selection".into(),
+                )
+            })?;
+        self.post_enrollment_json(&endpoint, request)?
+            .map_err(|error| {
+                NonoError::ActionRequired(format!("could not list enrollment groups: {error}"))
+            })
+    }
+
+    pub(crate) fn groups(
+        &mut self,
+        request: &crate::login_enrollment::GroupRequest,
+    ) -> Result<crate::login_enrollment::GroupResponse> {
+        let endpoint = self.server.groups_endpoint.clone().ok_or_else(|| {
+            NonoError::ActionRequired("this platform does not support CLI group management".into())
+        })?;
+        self.post_enrollment_json(&endpoint, request)?
+            .map_err(|error| NonoError::ActionRequired(format!("group request failed: {error}")))
+    }
+
+    fn post_enrollment_json<T: serde::de::DeserializeOwned>(
+        &mut self,
+        endpoint: &Url,
+        request: &impl serde::Serialize,
+    ) -> Result<std::result::Result<T, OAuthError>> {
         let body = Zeroizing::new(
             serde_json::to_string(request)
                 .map_err(|_| NonoError::ConfigParse("cannot encode enrollment request".into()))?,
         );
-        let response = self.post_body(&endpoint, "application/json", &body)?;
+        let response = self.post_body(endpoint, "application/json", &body)?;
         if response.status != 200 {
-            return match parse_oauth_error(&response.body) {
-                Ok(error) => Ok(EnrollmentOutcome::Error(error)),
-                Err(_) => Err(NonoError::ActionRequired(format!(
+            return parse_oauth_error(&response.body).map(Err).map_err(|_| {
+                NonoError::ActionRequired(format!(
                     "device enrollment returned HTTP {}",
                     response.status
-                ))),
-            };
+                ))
+            });
         }
         serde_json::from_str(&response.body)
-            .map(EnrollmentOutcome::Enrolled)
+            .map(Ok)
             .map_err(|_| NonoError::ConfigParse("invalid enrollment response".into()))
     }
 
@@ -880,6 +927,8 @@ mod tests {
     fn raw_metadata(issuer: &str) -> RawMetadata {
         RawMetadata {
             nono_enrollment_endpoint: None,
+            nono_enrollment_options_endpoint: None,
+            nono_groups_endpoint: None,
             issuer: issuer.to_string(),
             authorization_endpoint: Some(format!("{issuer}/oauth/authorize")),
             token_endpoint: Some(format!("{issuer}/oauth/token")),
@@ -897,6 +946,29 @@ mod tests {
             URL_SAFE_NO_PAD.encode(r#"{"alg":"ES256"}"#),
             URL_SAFE_NO_PAD.encode(claims.to_string())
         )
+    }
+
+    #[test]
+    fn enrollment_options_endpoint_must_share_the_issuer_origin() {
+        let issuer = "https://nono.example.com";
+        for endpoint in [
+            "https://other.example.com/options",
+            "https://nono.example.com/options?token=secret",
+            "https://user@nono.example.com/options",
+        ] {
+            let mut raw = raw_metadata(issuer);
+            raw.nono_enrollment_options_endpoint = Some(endpoint.into());
+            assert!(validate_metadata(issuer, raw).is_err());
+        }
+        let mut raw = raw_metadata(issuer);
+        raw.nono_enrollment_options_endpoint =
+            Some(format!("{issuer}/api/v1/auth/oauth/enrollment-options"));
+        assert!(
+            validate_metadata(issuer, raw)
+                .unwrap()
+                .enrollment_options_endpoint
+                .is_some()
+        );
     }
 
     #[test]

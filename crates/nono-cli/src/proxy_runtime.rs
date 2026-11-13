@@ -2407,8 +2407,7 @@ pub(crate) fn build_proxy_config_from_flags(
 ) -> Result<nono_proxy::config::ProxyConfig> {
     validate_proxy_launch_no_proxy_conflicts(proxy)?;
 
-    let net_policy_json = crate::config::embedded::embedded_network_policy_json();
-    let net_policy = network_policy::load_network_policy(net_policy_json)?;
+    let net_policy = network_policy::load_embedded_network_policy()?;
 
     let mut resolved = if let Some(profile_name) = proxy
         .domain_filter

@@ -65,7 +65,7 @@ fn dispatch_command(
             run_command_with_update(update_handle, silent, || audit_commands::run_audit(args))
         }
         Commands::Platform(args) => run_command_with_update(update_handle, silent, || {
-            platform_client::run_platform(args)
+            platform_client::run_platform(args, silent)
         }),
         Commands::Remote(args) => {
             run_command_with_update(update_handle, silent, || run_remote(args))

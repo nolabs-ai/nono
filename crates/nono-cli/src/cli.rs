@@ -984,7 +984,7 @@ pub struct ProfileShowArgs {
     /// Show raw paths before expansion (e.g., $HOME instead of /Users/luke)
     #[arg(long)]
     pub raw: bool,
-    /// Output format: 'profile' (default) or 'manifest' (capability manifest JSON)
+    /// Output format: profile, manifest, or a portable self-contained bundle
     #[arg(long, value_enum, value_name = "FORMAT")]
     pub format: Option<ProfileShowFormat>,
 }
@@ -993,6 +993,7 @@ pub struct ProfileShowArgs {
 pub enum ProfileShowFormat {
     Profile,
     Manifest,
+    Bundle,
 }
 
 #[derive(Parser, Debug)]
@@ -1059,6 +1060,8 @@ pub struct ProfileGroupsArgs {
 
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SandboxArgs {
+    #[arg(skip)]
+    pub(crate) policy_selection: Option<crate::platform_policy::PolicySelection>,
     // ── Filesystem ───────────────────────────────────────────────────────
     /// Allow read+write access to a directory (recursive)
     #[arg(
@@ -1908,6 +1911,7 @@ impl SandboxArgs {
 impl From<WrapSandboxArgs> for SandboxArgs {
     fn from(args: WrapSandboxArgs) -> Self {
         Self {
+            policy_selection: None,
             allow: args.allow,
             read: args.read,
             write: args.write,
@@ -2729,7 +2733,7 @@ pub enum PlatformCommands {
     /// Authenticate, select a tenant, and enroll this installation
     #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
     #[command(
-        after_help = "EXAMPLES:\n  nono platform login\n  nono platform login --url https://nono.example.com --tenant acme\n  nono platform login --no-enroll"
+        after_help = "EXAMPLES:\n  nono platform login\n  nono platform login --url https://nono.example.com --tenant acme\n  nono platform login --tenant acme --group Engineering\n  nono platform login --no-enroll"
     )]
     Login(LoginArgs),
     /// Revoke the human CLI sign-in; keep device enrollment
@@ -2742,10 +2746,19 @@ pub enum PlatformCommands {
         after_help = "EXAMPLES:\n  nono platform tenant list\n  nono platform tenant use acme --no-enroll"
     )]
     Tenant(TenantArgs),
+    /// List groups or manage this device's memberships in the current tenant
+    #[command(help_template = COMMAND_HELP, subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
+    #[command(
+        after_help = "EXAMPLES:\n  nono platform group list\n  nono platform group memberships\n  nono platform group move --from Engineering --to Production"
+    )]
+    Group(GroupArgs),
+    /// Inspect or refresh this enrollment's assigned policy
+    #[command(help_template = COMMAND_HELP, subcommand_help_heading = "COMMANDS", disable_help_subcommand = true, next_help_heading = "OPTIONS", after_help = "EXAMPLES:\n  nono platform policy status\n  nono platform policy sync\n  nono platform policy show")]
+    Policy(PlatformPolicyArgs),
     /// Replace a revoked device enrollment after fresh authorization
     #[command(name = "re-enroll", help_template = COMMAND_HELP, next_help_heading = "OPTIONS", mut_arg("no_enroll", |arg| arg.hide(true)))]
     #[command(
-        after_help = "EXAMPLES:\n  nono platform re-enroll\n  nono platform re-enroll --tenant acme"
+        after_help = "EXAMPLES:\n  nono platform re-enroll\n  nono platform re-enroll --tenant acme --group Engineering"
     )]
     ReEnroll(LoginArgs),
 
@@ -2777,6 +2790,88 @@ pub struct TenantArgs {
     pub help: Option<bool>,
 }
 
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PlatformPolicyArgs {
+    #[command(subcommand)]
+    pub command: PlatformPolicyCommands,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PlatformPolicyCommands {
+    /// Show cached policy identity and last sync; does not contact the platform
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS", after_help = "EXAMPLES:\n  nono platform policy status\n  nono platform policy status --json")]
+    Status(TenantListArgs),
+    /// Inspect the cached effective policy document
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS", after_help = "EXAMPLES:\n  nono platform policy show\n  nono platform policy show --json")]
+    Show(TenantListArgs),
+    /// Fetch, verify, and cache this enrollment's current assignment
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS", after_help = "EXAMPLES:\n  nono platform policy sync\n  nono platform policy sync --json")]
+    Sync(TenantListArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct GroupArgs {
+    #[command(subcommand)]
+    pub command: GroupCommands,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GroupCommands {
+    /// List permitted groups and mark this device's memberships
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS", after_help = "EXAMPLES:\n  nono platform group list\n  nono platform group list --json")]
+    List(TenantListArgs),
+    /// Refresh and show this device's explicit memberships
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS", after_help = "EXAMPLES:\n  nono platform group memberships")]
+    Memberships(TenantListArgs),
+    /// Add this device to a group
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS", after_help = "EXAMPLES:\n  nono platform group add Engineering")]
+    Add(GroupSelectorArgs),
+    /// Remove this device from a group
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS", after_help = "EXAMPLES:\n  nono platform group remove Engineering")]
+    Remove(GroupSelectorArgs),
+    /// Atomically replace one membership while preserving the others
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS", after_help = "EXAMPLES:\n  nono platform group move --from Engineering --to Production")]
+    Move(GroupMoveArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct GroupSelectorArgs {
+    /// Group name or ID
+    pub group: String,
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct GroupMoveArgs {
+    /// Current group name or ID
+    #[arg(long)]
+    pub from: String,
+    /// Destination group name or ID
+    #[arg(long)]
+    pub to: String,
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum TenantCommands {
     /// List accessible tenants and mark the saved default
@@ -2788,7 +2883,7 @@ pub enum TenantCommands {
     /// Save the default tenant and ensure enrollment unless opted out
     #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
     #[command(
-        after_help = "EXAMPLES:\n  nono platform tenant use acme\n  nono platform tenant use personal --no-enroll"
+        after_help = "EXAMPLES:\n  nono platform tenant use acme\n  nono platform tenant use acme --group Engineering\n  nono platform tenant use personal --no-enroll"
     )]
     Use(TenantUseArgs),
 }
@@ -2809,6 +2904,9 @@ pub struct TenantListArgs {
 pub struct TenantUseArgs {
     /// Tenant name, slug, ID, or personal
     pub tenant: String,
+    /// Enrollment group name or ID for a new device registration
+    #[arg(long)]
+    pub group: Option<String>,
     /// Skip creating an enrollment; retain an existing matching registration
     #[arg(long, env = "NONO_NO_ENROLL", value_parser = clap::builder::BoolishValueParser::new())]
     pub no_enroll: bool,
@@ -2857,6 +2955,10 @@ pub struct LoginArgs {
     /// when already signed in. Remote commands can override this choice for one command
     #[arg(long)]
     pub tenant: Option<String>,
+
+    /// Enrollment group name or ID; existing registrations keep their groups
+    #[arg(long)]
+    pub group: Option<String>,
 
     /// Sign in without enrolling this device; existing enrollment is retained
     #[arg(long, env = "NONO_NO_ENROLL", value_parser = clap::builder::BoolishValueParser::new())]

@@ -366,6 +366,25 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
             theme::current().subtext
         )
     );
+    if let Some(policy) = crate::audit_event_reader::session_policy_json(&session.dir)? {
+        let source = policy["source"].as_str().unwrap_or("unknown");
+        let label = match source {
+            "platform" => format!(
+                "{} · revision {} (platform)",
+                policy["profile_id"].as_str().unwrap_or("Unknown"),
+                policy["revision"]
+            ),
+            "explicit_profile" => format!(
+                "{} (explicit)",
+                policy["profile"].as_str().unwrap_or("Unknown")
+            ),
+            _ => "Local defaults".into(),
+        };
+        eprintln!(
+            "  Policy:   {}",
+            crate::terminal_approval::sanitize_for_terminal(&label)
+        );
+    }
     eprintln!("  Started:  {}", session.metadata.started);
     if let Some(ref ended) = session.metadata.ended {
         eprintln!("  Ended:    {ended}");
@@ -929,6 +948,7 @@ fn print_show_json(session: &SessionInfo) -> Result<()> {
         "merkle_roots": session.metadata.merkle_roots.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
         "network_events": &session.metadata.network_events,
         "command_policy_events": command_policy_events,
+        "policy": crate::audit_event_reader::session_policy_json(&session.dir)?,
         "audit_event_count": session.metadata.audit_event_count,
         "audit_integrity": session.metadata.audit_integrity.as_ref().map(|summary| serde_json::json!({
             "hash_algorithm": summary.hash_algorithm,

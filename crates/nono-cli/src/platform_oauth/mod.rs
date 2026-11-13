@@ -198,7 +198,7 @@ pub(crate) fn refresh_memberships() -> Result<session::SessionRecord> {
     Ok(record)
 }
 
-fn load_session_credentials(
+pub(crate) fn load_session_credentials(
     lock: &session::SessionLock,
     record: &session::SessionRecord,
 ) -> Result<(DpopKey, Zeroizing<String>)> {

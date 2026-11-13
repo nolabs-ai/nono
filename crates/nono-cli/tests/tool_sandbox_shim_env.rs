@@ -255,6 +255,7 @@ fn ordinary_cli_ignores_shim_discovery_variables() {
 fn real_broker_mediates_nested_commands_without_discovery_variables() {
     let _guard = process_guard();
     let t = nono_test!("shim-env");
+    // Use a shell builtin: Ubuntu's Rust env rejects fd-based execveat launches.
     let profile = t.write_profile(
         "shim-env",
         r#"{
@@ -264,12 +265,15 @@ fn real_broker_mediates_nested_commands_without_discovery_variables() {
                 "commands": {
                     "sh": {
                         "executable": "/bin/sh",
-                        "can_use": ["env"],
+                        "can_use": ["show-env"],
                         "sandbox": {"fs_read": ["."]}
                     },
-                    "env": {
-                        "executable": "/usr/bin/env",
-                        "from": {"sh": {"sandbox": {"fs_read": ["."]}}}
+                    "show-env": {
+                        "executable": "/bin/sh",
+                        "from": {"sh": {"sandbox": {
+                            "fs_read": ["."],
+                            "argv_prepend": ["-c", "export -p"]
+                        }}}
                     }
                 }
             }
@@ -285,7 +289,7 @@ fn real_broker_mediates_nested_commands_without_discovery_variables() {
             test -z "${NONO_TOOL_SANDBOX_SHIM_DIR+x}" || exit 92
             test -z "${NONO_TOOL_SANDBOX_URL_SOCKET+x}" || exit 93
             unset NONO_TOOL_SANDBOX_SOCKET NONO_TOOL_SANDBOX_SHIM_DIR NONO_TOOL_SANDBOX_URL_SOCKET
-            env
+            show-env
             "#,
         ))
         .assert_success("nested command reaches the authenticated broker after env sanitization")

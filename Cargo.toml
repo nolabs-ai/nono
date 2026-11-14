@@ -27,6 +27,8 @@ toml = "1.0"
 
 # Logging
 tracing = "0.1"
+# Linux-only sink for proxy audit events, used by nono-cli's target dependencies.
+tracing-journald = "0.3"
 
 # Secure credential handling
 zeroize = { version = "1", features = ["alloc", "serde"] }

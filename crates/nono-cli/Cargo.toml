@@ -104,6 +104,8 @@ aho-corasick = "1"
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir", "hostname"] }
 landlock.workspace = true
+# `--log-journald` sink; other targets have no journald socket.
+tracing-journald.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir", "hostname"] }

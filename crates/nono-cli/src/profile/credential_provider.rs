@@ -592,7 +592,7 @@ mod tests {
             endpoint_policy: Some(nono_proxy::config::EndpointPolicyConfig {
                 allow: vec![nono_proxy::config::EndpointPolicyRule {
                     method: "POST".to_string(),
-                    path: "/".to_string(),
+                    path: "/".into(),
                     backend: None,
                     reason: None,
                     timeout_secs: None,

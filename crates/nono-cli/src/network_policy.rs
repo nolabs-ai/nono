@@ -1438,11 +1438,11 @@ mod tests {
                 endpoints: vec![
                     EndpointRule {
                         method: "GET".to_string(),
-                        path: "/repos/my-org/**".to_string(),
+                        path: "/repos/my-org/**".into(),
                     },
                     EndpointRule {
                         method: "POST".to_string(),
-                        path: "/repos/my-org/*/issues".to_string(),
+                        path: "/repos/my-org/*/issues".into(),
                     },
                 ],
             },
@@ -1541,7 +1541,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![EndpointRule {
                 method: "GET".to_string(),
-                path: "/**".to_string(),
+                path: "/**".into(),
             }],
         }];
 

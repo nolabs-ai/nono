@@ -48,5 +48,5 @@ _Under active authoring; not yet ready for a decision._
   Add a third OS enforcement backend to nono for Windows, alongside Linux (Landlock) and macOS (Seatbelt).
 - **[NEP-0009: Account sign-in from the CLI (`nono login`)](neps/0009-cli-login.md)** — _Non-breaking_
   Add `nono login`, which signs a person in to a nono platform from the terminal.
-- **[NEP-0011: macOS Endpoint Security gate for runtime approvals and hardening](neps/0011-macos-endpoint-security-gate.md)** — _Non-breaking_
-  Add an opt-in macOS enforcement layer built on Endpoint Security's `es_new_descendants_client` (macOS 27+).
+- **[NEP-0011: macOS Endpoint Security layer for runtime approvals and kernel-enforced policy](neps/0011-macos-endpoint-security-gate.md)** — _Non-breaking_
+  Give macOS the runtime approvals and kernel-enforced policy it lacks today.

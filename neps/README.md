@@ -109,5 +109,5 @@ CI fails PRs that leave them stale.
 | 0008 | Session flight recorder | draft | Breaking: not yet assessed |
 | 0009 | Account sign-in from the CLI (`nono login`) | draft | Non-breaking |
 | 0010 | Session terminal capture | accepted | Non-breaking |
-| 0011 | macOS Endpoint Security gate for runtime approvals and hardening | draft | Non-breaking |
+| 0011 | macOS Endpoint Security layer for runtime approvals and kernel-enforced policy | draft | Non-breaking |
 <!-- nep-index:end -->

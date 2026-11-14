@@ -831,6 +831,14 @@ pub struct RouteConfig {
     /// `credential_format`, which shapes the outbound real credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phantom_format: Option<String>,
+    /// Explicit environment variable name for the route's base URL override
+    /// (e.g., "LANGFUSE_ENDPOINT").
+    ///
+    /// When set, the proxy exports the loopback base URL under this name
+    /// instead of the derived `<PREFIX>_BASE_URL`, for tools that expect the
+    /// base URL under a different variable.
+    #[serde(default)]
+    pub base_url_env_var: Option<String>,
 
     /// Optional L7 endpoint rules for method+path filtering.
     ///

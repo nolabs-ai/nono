@@ -712,12 +712,14 @@ impl ProxyHandle {
             // agent a dead end it will try and fail (see #2286). Skip
             // them entirely; the route itself stays in the route store,
             // so proxying and endpoint filtering are unchanged.
-            if prefix.starts_with(crate::config::ENDPOINT_ROUTE_PREFIX) {
+            if !route_exports_env_vars(prefix) {
                 continue;
             }
 
-            // Base URL override (e.g., OPENAI_BASE_URL)
-            let base_url_name = format!("{}_BASE_URL", prefix.to_uppercase());
+            // Base URL override (e.g., OPENAI_BASE_URL). An explicit
+            // base_url_env_var replaces the derived name for tools that
+            // expect a different variable.
+            let base_url_name = base_url_env_name(route, prefix);
             let url = format!("http://127.0.0.1:{}/{}", self.port, prefix);
             vars.push((base_url_name, url));
 
@@ -1116,6 +1118,21 @@ impl crate::token::NonceResolver for CompositeNonceResolver {
     }
 }
 
+/// Whether `credential_env_vars` exports anything for this route. Synthetic
+/// endpoint-filtered routes (`ENDPOINT_ROUTE_PREFIX`) have no SDK to point at.
+fn route_exports_env_vars(prefix: &str) -> bool {
+    !prefix.starts_with(crate::config::ENDPOINT_ROUTE_PREFIX)
+}
+
+/// Env var name carrying a route's loopback base URL: `base_url_env_var` when
+/// set, otherwise `<PREFIX>_BASE_URL`.
+fn base_url_env_name(route: &crate::config::RouteConfig, prefix: &str) -> String {
+    route
+        .base_url_env_var
+        .clone()
+        .unwrap_or_else(|| format!("{}_BASE_URL", prefix.to_uppercase()))
+}
+
 /// Env var name carrying a route's phantom token, if the route has one.
 ///
 /// Uses explicit `env_var` if set (required for URI manager refs), otherwise the
@@ -1151,6 +1168,52 @@ fn phantom_value(route: &crate::config::RouteConfig, token: &str) -> Option<Stri
     }
 }
 
+/// Reject base-URL env var names that another exported var already uses: a
+/// second route's base URL, any route's phantom token var, or a CA var. The
+/// child gets one value per name, so a clash silently drops the other.
+pub fn validate_base_url_env_names(
+    routes: &[crate::config::RouteConfig],
+    intercept_ca_env_vars: &[String],
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    let token_owners: HashMap<String, &str> = routes
+        .iter()
+        .filter_map(|r| {
+            let prefix = r.prefix.trim_matches('/');
+            if !route_exports_env_vars(prefix) {
+                return None;
+            }
+            phantom_env_name(r, prefix).map(|name| (name, prefix))
+        })
+        .collect();
+    let mut base_owners: HashMap<String, &str> = HashMap::new();
+    for route in routes {
+        let prefix = route.prefix.trim_matches('/');
+        if !route_exports_env_vars(prefix) {
+            continue;
+        }
+        let name = base_url_env_name(route, prefix);
+        let clash = if let Some(other) = base_owners.get(&name) {
+            Some(format!("the base URL of route '{other}'"))
+        } else if let Some(other) = token_owners.get(&name) {
+            Some(format!("the phantom token var of route '{other}'"))
+        } else if intercept_ca_env_vars.iter().any(|v| v == &name) {
+            Some("a proxy CA env var".to_string())
+        } else {
+            None
+        };
+        if let Some(clash) = clash {
+            return Err(ProxyError::Config(format!(
+                "route '{prefix}': base URL env var '{name}' is also {clash}; exported \
+                 env var names must be unique"
+            )));
+        }
+        base_owners.insert(name, prefix);
+    }
+    Ok(())
+}
+
 /// Reject `phantom_format` configurations that would make the injected
 /// environment ambiguous or clobber env vars nono sets itself.
 pub fn validate_phantom_formats(
@@ -1159,9 +1222,13 @@ pub fn validate_phantom_formats(
 ) -> Result<()> {
     use std::collections::HashMap;
 
+    validate_base_url_env_names(routes, intercept_ca_env_vars)?;
     let base_url_names: std::collections::HashSet<String> = routes
         .iter()
-        .map(|r| format!("{}_BASE_URL", r.prefix.trim_matches('/').to_uppercase()))
+        .filter_map(|r| {
+            let prefix = r.prefix.trim_matches('/');
+            route_exports_env_vars(prefix).then(|| base_url_env_name(r, prefix))
+        })
         .collect();
     let mut formats: HashMap<String, Option<&str>> = HashMap::new();
     for route in routes {
@@ -2904,6 +2971,113 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_base_url_env_var_equal_to_token_var() {
+        let ca = crate::config::default_intercept_ca_env_vars();
+        let mut explicit = phantom_route("langfuse", Some("LANGFUSE_KEY"), None);
+        explicit.base_url_env_var = Some("LANGFUSE_KEY".to_string());
+        assert!(validate_phantom_formats(&[explicit], &ca).is_err());
+
+        let mut derived = phantom_route("langfuse", None, None);
+        derived.credential_key = Some("langfuse_secret".to_string());
+        derived.base_url_env_var = Some("LANGFUSE_SECRET".to_string());
+        assert!(validate_phantom_formats(&[derived], &ca).is_err());
+
+        // An env:// key with no env_var exports no token var to collide with.
+        let mut uri = phantom_route("langfuse", None, None);
+        uri.base_url_env_var = Some("CRED".to_string());
+        assert!(validate_phantom_formats(&[uri], &ca).is_ok());
+
+        let mut distinct = phantom_route("langfuse", Some("LANGFUSE_KEY"), None);
+        distinct.base_url_env_var = Some("LANGFUSE_ENDPOINT".to_string());
+        assert!(validate_phantom_formats(&[distinct], &ca).is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_base_url_env_var_shared_with_another_route() {
+        let ca = crate::config::default_intercept_ca_env_vars();
+        let mut a = phantom_route("a", Some("A_KEY"), None);
+        a.base_url_env_var = Some("SHARED_ENDPOINT".to_string());
+        let mut b = phantom_route("b", Some("B_KEY"), None);
+        b.base_url_env_var = Some("SHARED_ENDPOINT".to_string());
+        assert!(validate_phantom_formats(&[a.clone(), b], &ca).is_err());
+
+        // An override equal to another route's derived base URL name clashes too.
+        let mut c = phantom_route("c", Some("C_KEY"), None);
+        c.base_url_env_var = Some("A_BASE_URL".to_string());
+        a.base_url_env_var = None;
+        assert!(validate_phantom_formats(&[a, c], &ca).is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_base_url_env_var_equal_to_other_routes_token_var() {
+        let ca = crate::config::default_intercept_ca_env_vars();
+        let token_route = phantom_route("tok", Some("TOK_KEY"), None);
+        let mut base_route = phantom_route("base", Some("BASE_KEY"), None);
+        base_route.base_url_env_var = Some("TOK_KEY".to_string());
+        assert!(validate_phantom_formats(&[token_route, base_route], &ca).is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_base_url_env_var_equal_to_ca_var() {
+        let ca = crate::config::default_intercept_ca_env_vars();
+        let ca_var = ca.first().expect("default CA env vars").clone();
+        let mut route = phantom_route("svc", Some("SVC_KEY"), None);
+        route.base_url_env_var = Some(ca_var);
+        assert!(validate_phantom_formats(&[route], &ca).is_err());
+    }
+
+    #[test]
+    fn test_validate_phantom_format_may_reuse_synthetic_route_base_url_name() {
+        // `_ep_` routes export no base URL var, so their derived name is free.
+        let ca = crate::config::default_intercept_ca_env_vars();
+        let ep_prefix = format!("{}svc", crate::config::ENDPOINT_ROUTE_PREFIX);
+        let ep = phantom_route(&ep_prefix, None, None);
+        let ep_base = format!("{}_BASE_URL", ep_prefix.to_uppercase());
+        let formatted = phantom_route("other", Some(&ep_base), Some("lf_{}"));
+        assert!(validate_phantom_formats(&[ep, formatted], &ca).is_ok());
+    }
+
+    #[test]
+    fn test_validate_base_url_may_reuse_synthetic_route_token_name() {
+        // An `_ep_` route exports no token var either, so its derived name is free.
+        let ca = crate::config::default_intercept_ca_env_vars();
+        let ep_prefix = format!("{}svc", crate::config::ENDPOINT_ROUTE_PREFIX);
+        let mut ep = phantom_route(&ep_prefix, None, None);
+        ep.credential_key = Some("svc_token".to_string());
+        let mut custom = phantom_route("custom", Some("CUSTOM_KEY"), None);
+        custom.base_url_env_var = Some("SVC_TOKEN".to_string());
+        assert!(validate_phantom_formats(&[ep, custom], &ca).is_ok());
+    }
+
+    #[test]
+    fn test_validate_accepts_distinct_exported_env_names() {
+        let ca = crate::config::default_intercept_ca_env_vars();
+        let mut a = phantom_route("a", Some("SHARED_KEY"), None);
+        a.base_url_env_var = Some("A_ENDPOINT".to_string());
+        // Routes may share a token var; base URL names stay distinct.
+        let b = phantom_route("b", Some("SHARED_KEY"), None);
+        let ep = phantom_route(
+            &format!("{}example.com", crate::config::ENDPOINT_ROUTE_PREFIX),
+            None,
+            None,
+        );
+        assert!(validate_phantom_formats(&[a, b, ep], &ca).is_ok());
+    }
+
+    #[test]
+    fn test_validate_phantom_format_cannot_target_overridden_base_url_var() {
+        let ca = crate::config::default_intercept_ca_env_vars();
+        let mut base = phantom_route("langfuse", Some("LANGFUSE_KEY"), None);
+        base.base_url_env_var = Some("LANGFUSE_ENDPOINT".to_string());
+        let formatted = phantom_route("other", Some("LANGFUSE_ENDPOINT"), Some("lf_{}"));
+        assert!(validate_phantom_formats(&[base.clone(), formatted], &ca).is_err());
+
+        // The derived name is free once the override replaces it.
+        let formatted = phantom_route("other", Some("LANGFUSE_BASE_URL"), Some("lf_{}"));
+        assert!(validate_phantom_formats(&[base, formatted], &ca).is_ok());
+    }
+
+    #[test]
     fn test_validate_phantom_formats() {
         let ca = crate::config::default_intercept_ca_env_vars();
         let ok = |routes: Vec<crate::config::RouteConfig>| validate_phantom_formats(&routes, &ca);
@@ -3946,6 +4120,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            base_url_env_var: None,
             phantom_format: None,
             endpoint_rules: Vec::new(),
             endpoint_policy: None,
@@ -4127,6 +4302,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -4857,6 +5033,7 @@ mod tests {
                     proxy: None,
                     env_var: None,
                     phantom_format: None,
+                    base_url_env_var: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4938,6 +5115,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5029,6 +5207,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5082,6 +5261,7 @@ mod tests {
                     proxy: None,
                     env_var: None,
                     phantom_format: None,
+                    base_url_env_var: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -5107,6 +5287,7 @@ mod tests {
                     proxy: None,
                     env_var: None,
                     phantom_format: None,
+                    base_url_env_var: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -5172,6 +5353,7 @@ mod tests {
                     proxy: None,
                     env_var: None,
                     phantom_format: None,
+                    base_url_env_var: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -5198,6 +5380,7 @@ mod tests {
                     proxy: None,
                     env_var: None,
                     phantom_format: None,
+                    base_url_env_var: None,
                     endpoint_rules: vec![endpoint_rule.clone(), endpoint_rule],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -5263,6 +5446,7 @@ mod tests {
                     proxy: None,
                     env_var: None,
                     phantom_format: None,
+                    base_url_env_var: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -5289,6 +5473,7 @@ mod tests {
                     proxy: None,
                     env_var: None,
                     phantom_format: None,
+                    base_url_env_var: None,
                     endpoint_rules: vec![endpoint_rule],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -5343,6 +5528,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -5393,6 +5579,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -5513,6 +5700,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5570,6 +5758,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None, // No explicit env_var — should fall back to uppercase
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 phantom_format: None,
                 endpoint_policy: None,
@@ -5638,6 +5827,7 @@ mod tests {
                 proxy: None,
                 env_var: Some("OPENAI_API_KEY".to_string()),
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5709,6 +5899,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    base_url_env_var: None,
                     phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
@@ -5734,6 +5925,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    base_url_env_var: None,
                     phantom_format: None,
                     endpoint_rules: vec![crate::config::EndpointRule {
                         method: "GET".to_string(),
@@ -5763,6 +5955,139 @@ mod tests {
         assert!(
             vars.iter().all(|(k, _)| !k.starts_with("_EP_")),
             "synthetic endpoint routes must not export _EP_*_BASE_URL vars: {vars:?}"
+        );
+    }
+
+    #[test]
+    fn test_proxy_credential_env_vars_with_base_url_env_var() {
+        // When base_url_env_var is set, the loopback base URL is exported
+        // under that name instead of the derived <PREFIX>_BASE_URL. Some
+        // tools only read the base URL from a name not ending in _BASE_URL.
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handle = ProxyHandle {
+            listener_attach: None,
+            port: 12345,
+            token: Zeroizing::new("test_token".to_string()),
+            audit_log: Some(audit::new_audit_log()),
+            shutdown_tx,
+            loaded_routes: ["langfuse".to_string()].into_iter().collect(),
+            no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            diagnostics: vec![],
+        };
+        let config = ProxyConfig {
+            routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
+                prefix: "langfuse".to_string(),
+                upstream: "https://cloud.langfuse.com".to_string(),
+                credential_key: Some("langfuse_secret".to_string()),
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Basic {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                phantom_format: None,
+                base_url_env_var: Some("LANGFUSE_ENDPOINT".to_string()),
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+                upgrades: vec![],
+                rate_limit: None,
+            }],
+            ..Default::default()
+        };
+
+        let vars = handle.credential_env_vars(&config);
+        assert_eq!(vars.len(), 2); // ENDPOINT + derived API_KEY
+
+        let base = vars
+            .iter()
+            .find(|(k, _)| k == "LANGFUSE_ENDPOINT")
+            .expect("LANGFUSE_ENDPOINT should be exported");
+        assert_eq!(base.1, "http://127.0.0.1:12345/langfuse");
+
+        assert!(
+            vars.iter().all(|(k, _)| k != "LANGFUSE_BASE_URL"),
+            "derived LANGFUSE_BASE_URL must not be exported when base_url_env_var is set"
+        );
+
+        // The phantom token var keeps its own derivation and is unaffected.
+        let token_var = vars
+            .iter()
+            .find(|(k, _)| k == "LANGFUSE_SECRET")
+            .expect("derived phantom token var should still be exported");
+        assert_eq!(token_var.1, "test_token");
+    }
+
+    #[test]
+    fn test_proxy_credential_env_vars_derives_base_url_name_without_override() {
+        // Without base_url_env_var the derived <PREFIX>_BASE_URL name is
+        // used, exactly as before the override existed.
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handle = ProxyHandle {
+            listener_attach: None,
+            port: 12345,
+            token: Zeroizing::new("test_token".to_string()),
+            audit_log: Some(audit::new_audit_log()),
+            shutdown_tx,
+            loaded_routes: ["langfuse".to_string()].into_iter().collect(),
+            no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            diagnostics: vec![],
+        };
+        let config = ProxyConfig {
+            routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
+                prefix: "langfuse".to_string(),
+                upstream: "https://cloud.langfuse.com".to_string(),
+                credential_key: Some("langfuse_secret".to_string()),
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Basic {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                phantom_format: None,
+                base_url_env_var: None,
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+                upgrades: vec![],
+                rate_limit: None,
+            }],
+            ..Default::default()
+        };
+
+        let vars = handle.credential_env_vars(&config);
+        let base = vars
+            .iter()
+            .find(|(k, _)| k == "LANGFUSE_BASE_URL")
+            .expect("derived LANGFUSE_BASE_URL should be exported");
+        assert_eq!(base.1, "http://127.0.0.1:12345/langfuse");
+        assert!(
+            vars.iter().all(|(k, _)| k != "LANGFUSE_ENDPOINT"),
+            "no override var without base_url_env_var"
         );
     }
 
@@ -5804,6 +6129,7 @@ mod tests {
                     proxy: None,
                     env_var: None,
                     phantom_format: None,
+                    base_url_env_var: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -5829,6 +6155,7 @@ mod tests {
                     proxy: None,
                     env_var: Some("GITHUB_TOKEN".to_string()),
                     phantom_format: None,
+                    base_url_env_var: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -5898,6 +6225,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5965,6 +6293,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6006,6 +6335,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6070,6 +6400,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6123,6 +6454,7 @@ mod tests {
                 proxy: None,
                 env_var: Some("ANTHROPIC_API_KEY".to_string()),
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6404,6 +6736,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6452,6 +6785,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6524,6 +6858,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6566,6 +6901,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6610,6 +6946,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6811,6 +7148,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -7741,6 +8079,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -7831,6 +8170,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -7931,6 +8271,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -8060,6 +8401,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "GET".to_string(),
                 path: "/get".to_string(),
@@ -8381,6 +8723,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,

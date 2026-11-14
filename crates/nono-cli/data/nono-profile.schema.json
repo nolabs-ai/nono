@@ -1195,6 +1195,13 @@
           ],
           "description": "Optional template for the phantom token placed in env_var; '{}' is replaced by the session token (e.g. 'ghp_{}'). For clients that reject tokens without a known prefix. The proxy then accepts only this exact value on the route. A compatibility shim, not a per-route secret. Independent of credential_format (outbound). Requires credential_key or auth; not valid with aws_auth, spiffe, or redeem_phantoms alone."
         },
+        "base_url_env_var": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Explicit environment variable name for the proxy base URL (e.g., \"LANGFUSE_ENDPOINT\"). When set, the loopback base URL is exported under this name instead of the derived <PREFIX>_BASE_URL. Use it for tools that expect the base URL under a name not ending in _BASE_URL."
+        },
         "endpoint_rules": {
           "type": "array",
           "items": {

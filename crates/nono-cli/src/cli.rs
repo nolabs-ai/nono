@@ -17,7 +17,7 @@ const COMMAND_HELP: &str = "{about}\n\n\x1b[1mUSAGE\x1b[0m\n  {usage}\n\n{all-ar
 /// with OS-enforced filesystem and network isolation.
 #[derive(Parser, Debug)]
 #[command(name = "nono")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = nono::build_info::VERSION_WITH_REVISION, about, long_about = None)]
 #[command(styles = STYLES, next_help_heading = "OPTIONS")]
 #[command(subcommand_help_heading = "")]
 #[command(help_template = "\

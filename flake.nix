@@ -28,6 +28,9 @@
       inherit version;
       src = self;
 
+      # A pure build has no .git; pass the evaluated revision instead.
+      NONO_BUILD_REV = self.rev or self.dirtyRev or "unknown";
+
       cargoLock.lockFile = "${self}/Cargo.lock";
 
       nativeBuildInputs = [ pkgs.pkg-config ];

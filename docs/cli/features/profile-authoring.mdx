@@ -379,6 +379,39 @@ nono why --scope signal --profile my-agent
 nono why --scope abstract-unix-socket --profile my-agent
 ```
 
+### Pathname Unix Sockets
+
+A filesystem grant does **not** authorize traffic on a pathname `AF_UNIX` socket. Creating the socket
+file needs write access to the directory, but `connect(2)` is a network operation: on macOS Seatbelt
+denies it with `EPERM` unless the profile grants the socket path, even when the directory is writable
+and `nono why` reports the path as allowed. Grant sockets with the `unix_socket*` fields:
+
+| Field | Operations | Matches |
+|-------|------------|---------|
+| `unix_socket` | connect | one socket file |
+| `unix_socket_bind` | connect + bind | one socket file, may not exist yet |
+| `unix_socket_dir` | connect | socket files directly inside the directory |
+| `unix_socket_dir_bind` | connect + bind | ditto |
+| `unix_socket_subtree` | connect | any socket below the directory |
+| `unix_socket_subtree_bind` | connect + bind | ditto |
+
+Use the non-`_bind` form for sockets a program only talks to, and the `_bind` form only for a socket the
+sandboxed process creates itself. Reach for `_subtree` when the socket name is not stable — tools that
+allocate a per-instance socket under a runtime directory use a random name, so a single path cannot
+cover them:
+
+```json
+{
+  "filesystem": {
+    "unix_socket_subtree": ["$HOME/.cache/my-agent/sockets"]
+  }
+}
+```
+
+Each field also adds the filesystem grant it needs, so the directory does not have to be listed twice.
+The grant can only cover a path that exists when the profile is resolved; create runtime directories
+from a `session_hooks.before` script, not from inside the sandbox.
+
 ## Common Patterns
 
 ### Agent with API Credentials

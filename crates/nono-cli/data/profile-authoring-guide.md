@@ -61,6 +61,12 @@ Inherit from another profile by name:
   profile JSON's `extends` list, preserving left-to-right merge order while
   keeping the selected profile as the final override layer. Inherited grants
   can widen sandbox permissions.
+- CLI bases may be profile names, registry references, or file paths, for
+  example `--extends ./project-overlay.json`. Relative paths resolve from the
+  current directory, like `--profile`; use `./` to distinguish local paths
+  from registry references such as `namespace/name`. File bases support JSON
+  comments and resolve their own inheritance before merging. The profile
+  JSON's `extends` field still accepts only names and registry references.
 - Scalar fields: child overrides base.
 - Array fields (`groups.include`, `groups.exclude`, `commands.allow`, `commands.deny`, `filesystem.*`, `allow_domain`, `deny_domain`, `open_port`, `open_port_range`, `listen_port`, `listen_port_range`, `no_proxy`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `groups.exclude` for groups; there is no mechanism to remove inherited filesystem paths. For `allow_domain` entries with endpoint rules, rules for the same domain are merged (appended) rather than replaced. `deny_domain` entries are additive — child profiles can only add more denies, never remove inherited ones.
 - Map fields (`env_credentials`, `hooks`, `custom_credentials`): child entries are merged into base; child keys override matching base keys.

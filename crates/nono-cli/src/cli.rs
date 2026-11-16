@@ -1402,7 +1402,10 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_http2: bool,
 
-    /// Extend the selected profile with an additional base profile for this invocation
+    /// Extend the selected profile with an additional base profile for this invocation.
+    ///
+    /// Accepts a profile name, registry reference, or file path. Relative paths
+    /// resolve from the current directory. Repeat to add multiple bases.
     #[arg(
         long,
         value_name = "PROFILE",
@@ -1511,7 +1514,10 @@ pub struct ProxyArgs {
     )]
     pub profile: Option<String>,
 
-    /// Extend the selected profile with an additional base profile for this invocation
+    /// Extend the selected profile with an additional base profile for this invocation.
+    ///
+    /// Accepts a profile name, registry reference, or file path. Relative paths
+    /// resolve from the current directory. Repeat to add multiple bases.
     #[arg(
         long,
         value_name = "PROFILE",
@@ -1827,7 +1833,10 @@ pub struct WrapSandboxArgs {
     )]
     pub profile: Option<String>,
 
-    /// Extend the selected profile with an additional base profile for this invocation
+    /// Extend the selected profile with an additional base profile for this invocation.
+    ///
+    /// Accepts a profile name, registry reference, or file path. Relative paths
+    /// resolve from the current directory. Repeat to add multiple bases.
     #[arg(
         long,
         value_name = "PROFILE",
@@ -2475,7 +2484,10 @@ pub struct WhyArgs {
     #[arg(long, short = 'p', value_name = "NAME", help_heading = "CONTEXT")]
     pub profile: Option<String>,
 
-    /// Extend the selected profile with an additional base profile for this query
+    /// Extend the selected profile with an additional base profile for this query.
+    ///
+    /// Accepts a profile name, registry reference, or file path. Relative paths
+    /// resolve from the current directory. Repeat to add multiple bases.
     #[arg(
         long,
         value_name = "PROFILE",

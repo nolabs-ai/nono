@@ -153,21 +153,38 @@ fn resolve_program_from_profile_or_cli(
 }
 
 pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
+    let extra_overrides: &[&str] = if run_args.capability_elevation {
+        &["capability-elevation"]
+    } else {
+        &[]
+    };
+    crate::platform_policy::prepare_start(&mut run_args.sandbox, silent, extra_overrides)?;
     let command = run_args.command.clone();
 
     // Load profile once and reuse for binary resolution and command_args.
-    let loaded_profile = match run_args.sandbox.profile.as_ref() {
-        Some(name) => Some((
+    let loaded_profile = match (
+        &run_args.sandbox.managed_profile,
+        run_args.sandbox.profile.as_ref(),
+    ) {
+        (Some(profile), _) => Some((profile.meta.name.clone(), profile.clone())),
+        (None, Some(name)) => Some((
             name.clone(),
             profile::load_profile_with_extends(name, &run_args.sandbox.extends)?,
         )),
-        None => None,
+        (None, None) => None,
     };
 
     // Resolve the program: profile `binary` takes precedence over CLI trailing command.
     let (program, mut cmd_args) = resolve_program_from_profile_or_cli(
         &command,
-        loaded_profile.as_ref().map(|(n, p)| (n.as_str(), p)),
+        loaded_profile.as_ref().map(|(name, profile)| {
+            let source = if run_args.sandbox.managed_profile.is_some() {
+                "<platform-policy>"
+            } else {
+                name.as_str()
+            };
+            (source, profile)
+        }),
         silent,
     )?;
 
@@ -227,7 +244,8 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
     execute_sandboxed(launch_plan)
 }
 
-pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
+pub(crate) fn run_shell(mut args: ShellArgs, silent: bool) -> Result<()> {
+    crate::platform_policy::prepare_start(&mut args.sandbox, silent, &[])?;
     let shell_path = args
         .shell
         .or_else(|| {
@@ -304,6 +322,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         session_recording,
         network,
         session: SessionLaunchOptions {
+            policy: prepared.policy_session.clone(),
             session_id: Some(session_id),
             session_name: args.name,
             detach_sequence: load_configured_detach_sequence()?,

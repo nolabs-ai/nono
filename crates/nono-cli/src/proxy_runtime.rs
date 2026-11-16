@@ -4385,6 +4385,7 @@ mod tests {
         );
 
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),
@@ -4467,6 +4468,7 @@ mod tests {
         use std::collections::HashMap;
 
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),
@@ -4544,6 +4546,7 @@ mod tests {
         use std::collections::HashMap;
 
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),

@@ -53,6 +53,7 @@ mod package_status;
 mod platform;
 mod platform_client;
 mod platform_oauth;
+mod platform_policy;
 mod policy;
 mod profile;
 mod profile_cmd;
@@ -298,6 +299,7 @@ mod tests {
             ..sandbox_args()
         };
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),
@@ -382,6 +384,7 @@ mod tests {
             ..sandbox_args()
         };
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),

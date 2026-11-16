@@ -380,6 +380,7 @@ fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<Enr
         ));
     }
     platform_client::validate_wire_identifier("subject id", &response.subject_id)?;
+    let policy_trust_root = response.policy_trust_root;
     let state = platform_client::PlatformState {
         protocol_version: response.protocol_version,
         platform_url: record.platform_url.clone(),
@@ -394,6 +395,7 @@ fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<Enr
     let reused = previous.as_ref().is_some_and(|previous| {
         previous.subject_id == state.subject_id && previous.key_ref == state.key_ref
     });
+    crate::platform_policy::pin_enrollment_key(&state, policy_trust_root)?;
     platform_client::save_login_enrollment(state, record, &display_name)?;
     Ok(if re_enroll {
         EnrollmentResult::Reenrolled

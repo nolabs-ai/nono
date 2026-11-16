@@ -5,6 +5,7 @@
 //! packs (e.g. nolabs-ai/claude), or user-defined (in `$XDG_CONFIG_HOME/nono/profiles/`).
 
 pub(crate) mod builtin;
+pub(crate) mod bundle;
 mod credential_provider;
 
 pub use credential_provider::{
@@ -3645,6 +3646,26 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
     parse_profile_file(path)
 }
 
+pub(crate) fn validate_delivered_profile(profile: &Profile) -> Result<()> {
+    if profile.session_hooks.before.is_some()
+        || profile.session_hooks.after.is_some()
+        || !profile.hooks.hooks.is_empty()
+    {
+        return Err(NonoError::ProfileParse(
+            "delivered policies cannot contain host or session hooks".into(),
+        ));
+    }
+    if let Some(overrides) = &profile.platform_overrides {
+        for item in [&overrides.macos, &overrides.linux, &overrides.windows]
+            .into_iter()
+            .flatten()
+        {
+            validate_delivered_profile(&item.0)?;
+        }
+    }
+    Ok(())
+}
+
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
 #[allow(deprecated)]
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
@@ -3892,6 +3913,27 @@ fn resolve_extends(
     context_dir: Option<&Path>,
     source_file: Option<&Path>,
 ) -> Result<Profile> {
+    resolve_extends_with(
+        child,
+        visited,
+        depth,
+        context_dir,
+        source_file,
+        &mut load_base_profile_raw,
+    )
+}
+
+fn resolve_extends_with<F>(
+    child: Profile,
+    visited: &mut Vec<String>,
+    depth: usize,
+    context_dir: Option<&Path>,
+    source_file: Option<&Path>,
+    loader: &mut F,
+) -> Result<Profile>
+where
+    F: FnMut(&str, Option<&Path>, Option<&Path>) -> Result<ResolvedBase>,
+{
     let base_names = match child.extends {
         Some(ref names) => names.clone(),
         None => return Ok(child),
@@ -3918,16 +3960,19 @@ fn resolve_extends(
 
         visited.push(base_name.clone());
 
-        let resolved = load_base_profile_raw(base_name, context_dir, source_file)?;
+        let resolved = loader(base_name, context_dir, source_file)?;
         let resolved_base = match resolved {
-            ResolvedBase::Sibling(base, source_path) => resolve_extends(
+            ResolvedBase::Sibling(base, source_path) => resolve_extends_with(
                 base,
                 visited,
                 depth + 1,
                 source_path.parent(),
                 Some(&source_path),
+                loader,
             )?,
-            ResolvedBase::Global(base) => resolve_extends(base, visited, depth + 1, None, None)?,
+            ResolvedBase::Global(base) => {
+                resolve_extends_with(base, visited, depth + 1, None, None, loader)?
+            }
         };
         // Pop to restore the stack to the pre-base state. On the error path
         // above (? propagation), visited is abandoned so the missing pop is harmless.

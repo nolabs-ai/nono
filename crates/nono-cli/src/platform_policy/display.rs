@@ -1,0 +1,215 @@
+use super::{PolicySession, protocol::*};
+use crate::output::{SummaryKind, summary_heading, summary_row};
+use crate::terminal_approval::sanitize_for_terminal as safe_text;
+use crate::theme::{self, fg};
+use chrono::{DateTime, Utc};
+
+fn mode_label(mode: &str) -> &str {
+    match mode {
+        "audit_only" => "Local / audit only",
+        "advisory" => "Advisory",
+        "enforced" => "Enforced",
+        other => other,
+    }
+}
+
+pub(super) fn policy_name(policy: &DeliveredPolicy) -> String {
+    let document = serde_json::from_str::<serde_json::Value>(&policy.profile_json).ok();
+    let name = document.as_ref().and_then(|document| {
+        document
+            .get("root")
+            .unwrap_or(document)
+            .get("meta")?
+            .get("name")?
+            .as_str()
+    });
+    safe_text(
+        name.filter(|name| !name.trim().is_empty())
+            .unwrap_or(&policy.profile_id),
+    )
+}
+
+pub(crate) fn session_summary(session: &PolicySession) -> String {
+    let mut text = summary_heading("Policy", SummaryKind::Info);
+    if let Some(profile) = &session.assigned_profile {
+        let name = session.assigned_name.as_ref().unwrap_or(profile);
+        let label = match session.assigned_revision {
+            Some(revision) => format!("{} · revision {revision}", safe_text(name)),
+            None => safe_text(name),
+        };
+        text.push_str(&summary_row("Profile", &label));
+    }
+    text.push_str(&summary_row(
+        "Mode",
+        &safe_text(mode_label(&session.management_mode)),
+    ));
+    let source = if session.policy_source == "platform" {
+        "Platform"
+    } else if session.management_mode == "advisory" {
+        "Local profile override"
+    } else {
+        "Local profiles"
+    };
+    text.push_str(&summary_row("Source", source));
+    if !session.overrides.is_empty() {
+        let overrides = session
+            .overrides
+            .iter()
+            .map(|name| format!("--{}", safe_text(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&summary_row("Overrides", &overrides));
+    }
+    text.push('\n');
+    text
+}
+
+fn checked_at(issued: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let elapsed = (now - issued).num_seconds().max(0);
+    let age = match elapsed {
+        0..60 => "just now".into(),
+        60..3600 => format!("{} min ago", elapsed / 60),
+        3600..86400 => format!("{} hr ago", elapsed / 3600),
+        _ => format!("{} days ago", elapsed / 86400),
+    };
+    format!("{} · {age}", issued.format("%d %b %Y, %H:%M:%S UTC"))
+}
+
+fn refresh_message(previous: Option<&PolicyClaims>, current: &PolicyClaims) -> String {
+    let Some(previous) = previous else {
+        return match &current.policy {
+            Some(policy) => format!("Fetched revision {}", policy.revision),
+            None => "Checked · local policy applies".into(),
+        };
+    };
+    if previous.assignment_version == current.assignment_version {
+        return "Already current".into();
+    }
+    match (&previous.policy, &current.policy) {
+        (Some(old), Some(new))
+            if old.profile_id == new.profile_id && old.revision != new.revision =>
+        {
+            format!("Updated revision {} → {}", old.revision, new.revision)
+        }
+        (None, Some(new)) => format!("Policy applied · revision {}", new.revision),
+        (Some(_), None) => "Updated · local policy now applies".into(),
+        _ => "Assignment updated".into(),
+    }
+}
+
+pub(crate) fn status_rows(
+    policy: Option<&PolicyClaims>,
+    previous: Option<&PolicyClaims>,
+    refreshed: bool,
+) -> String {
+    let Some(policy) = policy else {
+        return summary_row(
+            if refreshed { "Refresh" } else { "Policy" },
+            if refreshed {
+                "Policy delivery unsupported by platform"
+            } else {
+                "Not checked · use --refresh"
+            },
+        );
+    };
+    let mut text = summary_row("Mode", mode_label(&policy.management_mode));
+    let profile = match &policy.policy {
+        Some(policy) => format!("{} · revision {}", policy_name(policy), policy.revision),
+        None => "Local profiles".into(),
+    };
+    text.push_str(&summary_row("Policy", &profile));
+    let checked = format!(
+        "{} · {}",
+        checked_at(policy.issued_at, Utc::now()),
+        if refreshed { "refreshed" } else { "cached" }
+    );
+    text.push_str(&summary_row(
+        "Checked",
+        &fg(&checked, theme::current().subtext).to_string(),
+    ));
+    if refreshed {
+        text.push_str(&summary_row(
+            "Refresh",
+            &fg(&refresh_message(previous, policy), theme::current().green).to_string(),
+        ));
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_distinguishes_revision_and_assignment_changes() {
+        let before = super::super::tests::claims();
+        let mut after = before.clone();
+        after.issued_at = Utc::now();
+        assert_eq!(refresh_message(Some(&before), &after), "Already current");
+        after.assignment_version = "changed".into();
+        assert_eq!(refresh_message(Some(&before), &after), "Assignment updated");
+        after.policy.as_mut().expect("assigned policy").revision = 8;
+        assert_eq!(
+            refresh_message(Some(&before), &after),
+            "Updated revision 7 → 8"
+        );
+        after.management_mode = "audit_only".into();
+        after.policy = None;
+        assert_eq!(
+            refresh_message(Some(&before), &after),
+            "Updated · local policy now applies"
+        );
+        assert_eq!(refresh_message(None, &before), "Fetched revision 7");
+        assert_eq!(
+            refresh_message(Some(&after), &before),
+            "Policy applied · revision 7"
+        );
+    }
+
+    #[test]
+    fn checked_time_omits_fractional_seconds_and_includes_cache_age() {
+        let issued: DateTime<Utc> = "2026-11-16T15:47:56.660477Z".parse().expect("timestamp");
+        let now = issued + chrono::Duration::seconds(181);
+        assert_eq!(
+            checked_at(issued, now),
+            "16 Nov 2026, 15:47:56 UTC · 3 min ago"
+        );
+    }
+
+    #[test]
+    fn policy_names_accept_bundled_sources_and_strip_terminal_controls() {
+        let mut policy = super::super::tests::claims()
+            .policy
+            .expect("assigned policy");
+        policy.profile_json = r#"{"root":{"meta":{"name":"Engineering\u001b[2J"}}}"#.into();
+        assert_eq!(policy_name(&policy), "Engineering");
+        policy.profile_json = "{}".into();
+        assert_eq!(policy_name(&policy), policy.profile_id);
+    }
+
+    #[test]
+    fn startup_summary_distinguishes_local_overrides_from_platform_options() {
+        let mut session = PolicySession {
+            management_mode: "advisory".into(),
+            assignment_version: "assignment".into(),
+            assigned_profile: Some("internal-policy-id".into()),
+            assigned_name: Some("Engineering".into()),
+            assigned_revision: Some(2),
+            assigned_digest: None,
+            policy_source: "platform".into(),
+            effective_profile_digest: None,
+            overrides: vec!["block-net".into()],
+        };
+        let text = session_summary(&session);
+        assert!(text.contains("Engineering · revision 2"));
+        assert!(text.contains("Platform"));
+        assert!(text.contains("--block-net"));
+        assert!(!text.contains("internal-policy-id"));
+        assert!(!text.contains("Local profile override"));
+        session.policy_source = "local".into();
+        session.overrides = vec!["profile".into()];
+        assert!(session_summary(&session).contains("Local profile override"));
+        session.assigned_name = None;
+        assert!(session_summary(&session).contains("internal-policy-id · revision 2"));
+    }
+}

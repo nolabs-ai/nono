@@ -460,10 +460,9 @@ fn enrollment_status_uses_labels_and_keeps_ids_in_json_only() {
     for label in [
         "Acme (acme)",
         "Alice laptop",
-        "Audit tenant     Acme (acme)",
-        "Registered locally",
-        "Automatic when sessions finish",
-        "11 Nov 2026, 11:28 UTC",
+        "Tenant           Acme (acme)",
+        "Alice laptop · enrolled",
+        "Not checked · use --refresh",
     ] {
         assert!(text.contains(label), "{text}");
     }
@@ -546,10 +545,8 @@ fn remote_only_status_reports_context_without_claiming_device_enrollment() {
     let text = String::from_utf8(status.stdout).expect("text");
     for label in [
         "User             Alice",
-        "Current tenant   Alice (personal)",
-        "CLI sign-in      Stored locally",
-        "Enrollment       Not enrolled",
-        "Local only",
+        "Tenant           Personal",
+        "Device           Not enrolled",
     ] {
         assert!(text.contains(label), "{text}");
     }

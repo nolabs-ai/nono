@@ -2412,7 +2412,47 @@ pub fn list_policy_profiles() -> Result<Vec<String>> {
 /// The policy JSON is embedded at compile time and never changes at runtime,
 /// so we parse it once and cache the result. This avoids re-parsing ~23 KB of
 /// JSON on every call (up to ~18 call sites per CLI invocation).
+static DELIVERED_POLICY: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+
+pub(crate) fn validate_delivered_groups(
+    groups: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<()> {
+    let embedded: serde_json::Value =
+        crate::jsonc::parse(crate::config::embedded::embedded_policy_json())
+            .map_err(NonoError::ConfigParse)?;
+    for (name, value) in groups {
+        if embedded["groups"].get(name).is_some() {
+            return Err(NonoError::ProfileParse(format!(
+                "delivered group '{name}' collides with a built-in group"
+            )));
+        }
+        serde_json::from_value::<Group>(value.clone()).map_err(|error| {
+            NonoError::ProfileParse(format!("invalid delivered group '{name}': {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn use_delivered_groups(
+    groups: std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<()> {
+    validate_delivered_groups(&groups)?;
+    let mut policy = load_policy(crate::config::embedded::embedded_policy_json())?;
+    for (name, value) in groups {
+        let group = serde_json::from_value(value).map_err(|error| {
+            NonoError::ProfileParse(format!("invalid delivered group '{name}': {error}"))
+        })?;
+        policy.groups.insert(name, group);
+    }
+    DELIVERED_POLICY.set(policy).map_err(|_| {
+        NonoError::ProfileParse("a delivered policy is already active in this process".into())
+    })
+}
+
 pub fn load_embedded_policy() -> Result<Policy> {
+    if let Some(policy) = DELIVERED_POLICY.get() {
+        return Ok(policy.clone());
+    }
     static CACHED: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
 
     // The embedded JSON is baked in at build time — parse failure here means
@@ -2432,42 +2472,52 @@ pub fn load_embedded_policy() -> Result<Policy> {
     Ok(policy)
 }
 
-pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
-    // Tolerate missing config dir / lockfile — no packages installed means
-    // no groups to load. This is the common case in tests and fresh installs.
+pub(crate) fn package_group_documents()
+-> Result<std::collections::BTreeMap<String, serde_json::Value>> {
     let lockfile = match package::read_lockfile() {
-        Ok(lf) => lf,
-        Err(_) => return Ok(()),
+        Ok(lockfile) => lockfile,
+        Err(_) => return Ok(std::collections::BTreeMap::new()),
     };
+    let mut documents = std::collections::BTreeMap::new();
     for package_key in lockfile.packages.keys() {
         let (namespace, name) = package_key.split_once('/').ok_or_else(|| {
             NonoError::PackageInstall(format!("invalid lockfile package key '{package_key}'"))
         })?;
-        let groups_path = package::package_groups_path(namespace, name)?;
-        if !groups_path.exists() {
+        let path = package::package_groups_path(namespace, name)?;
+        if !path.exists() {
             continue;
         }
-
-        let content = std::fs::read_to_string(&groups_path).map_err(|e| NonoError::ConfigRead {
-            path: groups_path.clone(),
-            source: e,
+        let content = std::fs::read_to_string(&path).map_err(|source| NonoError::ConfigRead {
+            path: path.clone(),
+            source,
         })?;
-
-        let groups: HashMap<String, Group> = serde_json::from_str(&content).map_err(|e| {
-            NonoError::ConfigParse(format!("failed to parse {}: {e}", groups_path.display()))
-        })?;
-
-        for (group_name, group) in groups {
-            if policy.groups.contains_key(&group_name) {
+        let groups: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(&content).map_err(|error| {
+                NonoError::ConfigParse(format!("failed to parse {}: {error}", path.display()))
+            })?;
+        for (name, group) in groups {
+            if documents.insert(name.clone(), group).is_some() {
                 return Err(NonoError::PackageInstall(format!(
-                    "package group '{}' collides with an existing policy group",
-                    group_name
+                    "package group '{name}' collides with an existing policy group"
                 )));
             }
-            policy.groups.insert(group_name, group);
         }
     }
+    Ok(documents)
+}
 
+pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
+    for (name, value) in package_group_documents()? {
+        if policy.groups.contains_key(&name) {
+            return Err(NonoError::PackageInstall(format!(
+                "package group '{name}' collides with an existing policy group"
+            )));
+        }
+        let group = serde_json::from_value(value).map_err(|error| {
+            NonoError::ConfigParse(format!("invalid package group '{name}': {error}"))
+        })?;
+        policy.groups.insert(name, group);
+    }
     Ok(())
 }
 

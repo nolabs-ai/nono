@@ -551,8 +551,12 @@ fn fd_churn_signals_and_late_descriptors() -> Result<()> {
         struct Restore(libc::sigaction);
         impl Drop for Restore {
             fn drop(&mut self) {
-                // SAFETY: restore the action saved by sigaction.
+                // Ignoring first discards a pending SIGUSR1 another thread has not taken yet.
+                // SAFETY: SIG_IGN is a valid action and self.0 was saved by sigaction.
                 unsafe {
+                    let mut ignore: libc::sigaction = std::mem::zeroed();
+                    ignore.sa_sigaction = libc::SIG_IGN;
+                    libc::sigaction(libc::SIGUSR1, &ignore, std::ptr::null_mut());
                     libc::sigaction(libc::SIGUSR1, &self.0, std::ptr::null_mut());
                 }
             }

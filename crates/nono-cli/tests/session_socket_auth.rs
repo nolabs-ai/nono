@@ -160,7 +160,7 @@ fn exercise_named_listeners(strict: bool) {
                     ' sh "$shared"
                     printf ready > "$shared/ready"
                     i=0
-                    while [ ! -f "$shared/stop" ] && [ "$i" -lt 600 ]; do
+                    while [ ! -f "$shared/stop" ] && [ "$i" -lt 6000 ]; do
                         /bin/sleep 0.05
                         i=$((i + 1))
                     done
@@ -306,7 +306,7 @@ printf '%s\n' "$BROWSER" > "$shared/browser"
 "$BROWSER" https://google.com
 printf ready > "$shared/ready"
 i=0
-while [ ! -f "$shared/stop" ] && [ "$i" -lt 600 ]; do
+while [ ! -f "$shared/stop" ] && [ "$i" -lt 6000 ]; do
     /bin/sleep 0.05
     i=$((i + 1))
 done

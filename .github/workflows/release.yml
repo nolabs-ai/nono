@@ -34,12 +34,12 @@ jobs:
 
           # macOS x86_64 (Intel)
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-26-intel
             artifact: nono
 
           # macOS aarch64 (Apple Silicon)
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-26
             artifact: nono
 
           # Linux aarch64 (ARM64)

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use aws_credential_types::provider::SharedCredentialsProvider;
 use tracing::debug;
 
-use super::endpoints::SigningRegion;
+use super::endpoints::{AwsUpstreamPattern, SigningRegion};
 
 /// A fully-resolved AWS SigV4 route entry.
 pub struct AwsRoute {
@@ -21,9 +21,9 @@ pub struct AwsRoute {
     /// SigV4 signing region: fixed, or derived from each request's host.
     pub region: SigningRegion,
 
-    /// Literal service label of a `{service}.*.amazonaws.com` upstream.
+    /// Wildcard-region shape of the upstream.
     /// `Some` exactly when `region` is [`SigningRegion::FromRequestHost`].
-    pub service_label: Option<String>,
+    pub wildcard: Option<AwsUpstreamPattern>,
 
     /// SigV4 service name (e.g., `"bedrock"`).
     pub service: String,
@@ -151,7 +151,7 @@ impl std::fmt::Debug for AwsRoute {
         let mut s = f.debug_struct("AwsRoute");
         s.field("upstream", &self.upstream)
             .field("region", &self.region)
-            .field("service_label", &self.service_label)
+            .field("wildcard", &self.wildcard)
             .field("service", &self.service);
         match &self.credentials {
             AwsRouteCredentials::Single { profile_key, .. } => {
@@ -278,7 +278,7 @@ impl AwsRouteTable {
         profile: Option<&str>,
         upstream: String,
         region: SigningRegion,
-        service_label: Option<String>,
+        wildcard: Option<AwsUpstreamPattern>,
         service: String,
     ) -> Result<(), String> {
         let provider = self.provider_for(profile).await?;
@@ -287,7 +287,7 @@ impl AwsRouteTable {
             AwsRoute {
                 upstream,
                 region,
-                service_label,
+                wildcard,
                 service,
                 credentials: AwsRouteCredentials::Single {
                     profile_key: profile.map(str::to_owned),
@@ -316,7 +316,7 @@ impl AwsRouteTable {
         profiles: &BTreeMap<String, String>,
         upstream: String,
         region: SigningRegion,
-        service_label: Option<String>,
+        wildcard: Option<AwsUpstreamPattern>,
         service: String,
     ) -> Result<(), String> {
         let mut by_key = BTreeMap::new();
@@ -338,7 +338,7 @@ impl AwsRouteTable {
             AwsRoute {
                 upstream,
                 region,
-                service_label,
+                wildcard,
                 service,
                 credentials: AwsRouteCredentials::ByAccessKeyId(by_key),
                 secret_registry: self.secret_registry.clone(),
@@ -430,7 +430,7 @@ mod tests {
         AwsRoute {
             upstream: "https://sts.us-east-1.amazonaws.com".to_string(),
             region: SigningRegion::Fixed("us-east-1".to_string()),
-            service_label: None,
+            wildcard: None,
             service: "sts".to_string(),
             credentials,
             secret_registry: None,

@@ -26,6 +26,30 @@ fn rule() {
     eprintln!("  {}", theme::fg(&"\u{2500}".repeat(52), t.overlay));
 }
 
+pub(crate) enum SummaryKind {
+    Info,
+    Success,
+    Attention,
+}
+
+pub(crate) fn summary_heading(title: &str, kind: SummaryKind) -> String {
+    let t = theme::current();
+    let title = fg(title, t.brand).bold();
+    match kind {
+        SummaryKind::Info => format!("\n  {title}\n"),
+        SummaryKind::Success => format!("\n  {} {title}\n", fg("✓", t.green)),
+        SummaryKind::Attention => format!("\n  {} {title}\n", fg("!", t.yellow)),
+    }
+}
+
+/// Format one aligned field in a terminal summary.
+pub(crate) fn summary_row(label: &str, value: &str) -> String {
+    format!(
+        "    {}  {value}\n",
+        fg(&format!("{label:<15}"), theme::current().subtext)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Banner
 // ---------------------------------------------------------------------------

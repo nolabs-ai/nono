@@ -426,7 +426,7 @@ mod tests {
         super::AwsRoute {
             upstream: format!("https://{}.{}.amazonaws.com", service, region),
             region: SigningRegion::Fixed(region.to_string()),
-            service_label: None,
+            wildcard: None,
             service: service.to_string(),
             credentials: super::super::route::AwsRouteCredentials::Single {
                 profile_key: None,
@@ -545,7 +545,7 @@ mod tests {
         let route = super::AwsRoute {
             upstream: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
             region: SigningRegion::Fixed("us-east-1".to_string()),
-            service_label: None,
+            wildcard: None,
             service: "bedrock".to_string(),
             credentials: super::super::route::AwsRouteCredentials::Single {
                 profile_key: None,
@@ -631,7 +631,7 @@ mod tests {
         let route = super::AwsRoute {
             upstream: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
             region: super::super::endpoints::SigningRegion::Fixed("us-east-1".to_string()),
-            service_label: None,
+            wildcard: None,
             service: "bedrock".to_string(),
             credentials: super::super::route::AwsRouteCredentials::Single {
                 profile_key: Some("work".to_string()),

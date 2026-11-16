@@ -12266,8 +12266,8 @@ mod tests {
 
         for (upstream, region) in [
             ("https://eks.*.amazonaws.com", Some("us-east-1")),
-            ("https://eks.*.amazonaws.com.cn", None),
-            ("https://*.s3.*.amazonaws.com", None),
+            ("https://*.s3.*.amazonaws.com", Some("us-east-1")),
+            ("https://eks.*.amazonaws.eu", None),
             ("https://*.amazonaws.com", None),
         ] {
             let bad = cred(upstream, region, Some("eks"));

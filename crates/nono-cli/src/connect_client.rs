@@ -3,15 +3,15 @@
 //! The open wire contract is documented in `docs/protocols/remote-attach-v1.md`.
 //! Human authentication is deliberately separate from device enrollment. A
 //! console token comes from an explicit protected file or `NONO_CONNECT_TOKEN`.
-//! Otherwise a device signed in with `nono login` (NEP-0009) refreshes a
+//! Otherwise a device signed in with `nono platform login` (NEP-0009) refreshes a
 //! DPoP-bound OAuth access token; a token-enrolled device without such a
 //! session runs the remote-attach-v1 browser-approved authorization, caches a
 //! device-bound opaque credential, and exchanges it for a short-lived bearer
 //! token.
 
 use std::io::{self, IsTerminal, Write};
-use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use colored::Colorize;
@@ -25,8 +25,10 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::cli::{ConnectArgs, PsArgs};
+use crate::cli::{ConnectArgs, RemoteListArgs};
+use crate::output::{SummaryKind, summary_heading, summary_row};
 use crate::platform_oauth::ApiCredential;
+use crate::terminal_selector::{self, RawTerminal, terminal_size};
 
 const RESPONSE_LIMIT_BYTES: u64 = 1024 * 1024;
 const DISCOVERY_PROTOCOL_V1: &str = "1";
@@ -36,8 +38,6 @@ const DEVICE_AUTH_CACHE_FILENAME: &str = "platform-console-auth.json";
 const DEFAULT_DETACH_SEQUENCE: &[u8] = &[0x1d, b'd'];
 const WEBSOCKET_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const TERMINAL_PROTOCOL_V1: &str = "nono.terminal.v1";
-const SELECTOR_HEADER_ROWS: u16 = 7;
-const SELECTOR_ROWS_PER_SESSION: u16 = 2;
 static REMOTE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Debug, Deserialize)]
@@ -154,11 +154,15 @@ pub(crate) fn run_connect(args: ConnectArgs) -> Result<()> {
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(NonoError::ActionRequired(
-            "nono connect requires an interactive terminal".to_string(),
+            "nono remote connect requires an interactive terminal".to_string(),
         ));
     }
 
-    let access = console_access(args.token_file.as_deref())?;
+    let access = console_access(args.token_file.as_deref(), args.tenant.as_deref())?;
+    run_connect_with_access(args, access)
+}
+
+pub(crate) fn run_connect_with_access(args: ConnectArgs, access: ConsoleAccess) -> Result<()> {
     let attach_url = resolve_attach_url(args.target.as_deref(), args.console.as_deref(), &access)?;
     validate_transport_url(&attach_url)?;
     let detach_sequence = crate::launch_runtime::load_configured_detach_sequence()?
@@ -182,8 +186,8 @@ pub(crate) fn run_connect(args: ConnectArgs) -> Result<()> {
     Ok(())
 }
 
-/// List sessions visible through the enrolled tenant's nono-console.
-pub(crate) fn run_remote_ps(args: &PsArgs) -> Result<()> {
+/// List sessions visible in the current CLI tenant.
+pub(crate) fn run_remote_ps(args: &RemoteListArgs) -> Result<()> {
     // Resolve the environment equivalents here rather than through clap. That
     // keeps a globally configured remote console from affecting local `nono ps`.
     let token_file_env = args
@@ -193,7 +197,7 @@ pub(crate) fn run_remote_ps(args: &PsArgs) -> Result<()> {
         .flatten()
         .map(std::path::PathBuf::from);
     let token_file = args.token_file.as_deref().or(token_file_env.as_deref());
-    let access = console_access(token_file)?;
+    let access = console_access(token_file, args.tenant.as_deref())?;
     let console_env = if args.console.is_none() {
         match std::env::var("NONO_CONSOLE_URL") {
             Ok(value) => Some(value),
@@ -232,39 +236,56 @@ pub(crate) fn take_remote_exit_code() -> Option<i32> {
     }
 }
 
-/// The credential for console requests, and the console a `nono login`
-/// session names.
+/// Credentials and tenant resolved once for a remote command.
 #[derive(Debug)]
 pub(crate) struct ConsoleAccess {
-    pub(crate) credential: ApiCredential,
+    pub(crate) credential: Arc<ApiCredential>,
     pub(crate) session_console: Option<Url>,
-    /// The platform a `nono login` session is signed in to. Display only.
     pub(crate) session_platform: Option<String>,
+    pub(crate) session_tenant: Option<crate::platform_oauth::client::Organization>,
 }
 
-/// Choose the console credential: an explicit token file or
-/// `NONO_CONNECT_TOKEN` first, then the `nono login` session (for the
-/// organization `NONO_ORG` names, or the active one), then an enrolled
-/// device's remote-attach-v1 authorization.
-pub(crate) fn console_access(token_file: Option<&Path>) -> Result<ConsoleAccess> {
+pub(crate) fn console_access(
+    token_file: Option<&Path>,
+    tenant: Option<&str>,
+) -> Result<ConsoleAccess> {
+    let tenant = crate::platform_oauth::tenant_override(tenant)?;
     let explicit = token_file.is_some() || std::env::var_os("NONO_CONNECT_TOKEN").is_some();
-    if !explicit && let Some(session) = crate::platform_oauth::session_access()? {
+    if explicit && tenant.is_some() {
+        return Err(NonoError::ActionRequired(
+            "tenant selection requires `nono platform login`; explicit console tokens already have their own scope".into(),
+        ));
+    }
+    let session = if explicit {
+        None
+    } else {
+        crate::platform_oauth::session_access(tenant.as_deref())?
+    };
+    if session.is_none() && tenant.is_some() {
+        return Err(NonoError::ActionRequired(
+            "tenant selection requires a platform sign-in; run `nono platform login`".into(),
+        ));
+    }
+    console_access_from_session(token_file, session)
+}
+
+pub(crate) fn console_access_from_session(
+    token_file: Option<&Path>,
+    session: Option<crate::platform_oauth::SessionAccess>,
+) -> Result<ConsoleAccess> {
+    if let Some(session) = session {
         return Ok(ConsoleAccess {
             credential: session.credential,
             session_console: session.console_url,
             session_platform: Some(session.platform_url),
+            session_tenant: Some(session.organization),
         });
     }
-    if !explicit && crate::platform_oauth::org_override()?.is_some() {
-        return Err(NonoError::ActionRequired(format!(
-            "{} needs a platform sign-in; run `nono login`",
-            crate::platform_oauth::ORG_ENV
-        )));
-    }
     Ok(ConsoleAccess {
-        credential: load_token(token_file)?,
+        credential: Arc::new(load_token(token_file)?),
         session_console: None,
         session_platform: None,
+        session_tenant: None,
     })
 }
 
@@ -274,6 +295,9 @@ pub(crate) fn resolve_console(explicit: Option<&str>, access: &ConsoleAccess) ->
     match (explicit, &access.session_console) {
         (Some(console), _) => validate_console_url(console),
         (None, Some(console)) => validate_console_url(console.as_str()),
+        (None, None) if access.session_platform.is_some() => Err(NonoError::ActionRequired(
+            "remote sessions are not configured on this platform; ask your administrator to configure nono-console".into(),
+        )),
         (None, None) => discover_console(),
     }
 }
@@ -284,6 +308,9 @@ fn resolve_attach_url(
     access: &ConsoleAccess,
 ) -> Result<Url> {
     let token = &access.credential;
+    if console.is_none() && access.session_platform.is_some() && access.session_console.is_none() {
+        resolve_console(None, access)?;
+    }
     if let Some(target) = target
         && let Ok(url) = Url::parse(target)
         && matches!(url.scheme(), "ws" | "wss")
@@ -360,7 +387,8 @@ pub(crate) fn load_token(path: Option<&Path>) -> Result<ApiCredential> {
 fn acquire_console_credential() -> Result<Zeroizing<String>> {
     let state = crate::platform_client::load_state()?.ok_or_else(|| {
         NonoError::ActionRequired(
-            "not signed in; run `nono login --url <platform>` or provide --token-file".to_string(),
+            "not signed in; run `nono platform login --url <platform>` or provide --token-file"
+                .to_string(),
         )
     })?;
     if state.subject_kind != "device" {
@@ -440,7 +468,7 @@ fn authorize_device(state: &crate::platform_client::PlatformState) -> Result<Zer
     loop {
         if started.elapsed() >= std::time::Duration::from_secs(code.expires_in) {
             return Err(NonoError::ActionRequired(
-                "human authorization expired; run `nono connect` again".to_string(),
+                "human authorization expired; run `nono remote connect` again".to_string(),
             ));
         }
         std::thread::sleep(std::time::Duration::from_secs(code.interval));
@@ -471,7 +499,7 @@ fn authorize_device(state: &crate::platform_client::PlatformState) -> Result<Zer
             }
             "expired" => {
                 return Err(NonoError::ActionRequired(
-                    "human authorization expired; run `nono connect` again".to_string(),
+                    "human authorization expired; run `nono remote connect` again".to_string(),
                 ));
             }
             "authorized" => {
@@ -496,7 +524,7 @@ fn authorize_device(state: &crate::platform_client::PlatformState) -> Result<Zer
                 let token = exchange_console_access_token(state, &cached.credential)?
                     .ok_or_else(|| {
                         NonoError::ActionRequired(
-                            "the new human authorization could not be exchanged; run `nono connect` again"
+                            "the new human authorization could not be exchanged; run `nono remote connect` again"
                                 .to_string(),
                         )
                     })?;
@@ -785,7 +813,7 @@ fn attach_origin_is_authorized(url: &Url, authorized: &[Url]) -> bool {
 /// A direct `wss://` target is taken verbatim from the command line, so it can
 /// be a link the operator was sent rather than one the console issued.
 /// `validate_direct_attach_url` only checks the URL's shape; without an origin
-/// check, `nono connect wss://evil.example/api/v1/sessions/...` opens a socket
+/// check, `nono remote connect wss://evil.example/api/v1/sessions/...` opens a socket
 /// to an attacker and puts `Authorization: Bearer <console token>` in the
 /// upgrade request, handing over live console access for the tenant.
 ///
@@ -830,8 +858,8 @@ fn verify_attach_origin(
     }
 
     Err(NonoError::ActionRequired(format!(
-        "refusing to send console credentials to '{}': it is not the enrolled platform or its \
-         console. Run `nono connect` with no target to choose a session from the enrolled console, \
+        "refusing to send console credentials to '{}': it is not an authorized console. \
+         Run `nono remote connect` with no target to choose a session from your tenant's console, \
          or pass --console to name the console that issued this session.",
         url.host_str().unwrap_or("<no host>")
     )))
@@ -1130,12 +1158,16 @@ fn remote_host_label(access: &ConsoleAccess, console: &Url) -> String {
             .flatten()
             .map(|state| state.platform_url)
     });
-    platform
+    let host = platform
         .as_deref()
         .and_then(|value| Url::parse(value).ok())
         .filter(|url| url.host_str().is_some())
         .map(|url| console_label(&url))
-        .unwrap_or_else(|| console_label(console))
+        .unwrap_or_else(|| console_label(console));
+    match &access.session_tenant {
+        Some(tenant) => format!("{host} · {}", crate::platform_client::tenant_label(tenant)),
+        None => host,
+    }
 }
 
 fn terminal_text(value: &str) -> String {
@@ -1151,7 +1183,7 @@ fn remote_name(session: &RemoteSession) -> &str {
 }
 
 /// The session name, or its global ID when the runtime recorded no name, so
-/// the row still names something `nono connect` accepts.
+/// the row still names something `nono remote connect` accepts.
 fn remote_display_name(session: &RemoteSession) -> &str {
     session
         .record
@@ -1226,240 +1258,47 @@ fn select_interactively(sessions: &[RemoteSession], host: &str) -> Result<Remote
             "the console has no live sessions visible to this user".to_string(),
         ));
     }
-    let terminal = SelectionTerminal::enter()?;
-    let mut selected = 0;
-    loop {
-        draw_session_selector(sessions, selected, host)?;
-        match read_selector_key(&io::stdin())? {
-            SelectorKey::Up => selected = selected.checked_sub(1).unwrap_or(sessions.len() - 1),
-            SelectorKey::Down => selected = (selected + 1) % sessions.len(),
-            SelectorKey::Home => selected = 0,
-            SelectorKey::End => selected = sessions.len() - 1,
-            SelectorKey::Select => {
-                drop(terminal);
-                return sessions.get(selected).map(clone_session).ok_or_else(|| {
-                    NonoError::ConfigParse("session selection is out of range".to_string())
-                });
+    let items = sessions
+        .iter()
+        .map(|session| {
+            let row = RemoteDisplayRow::from_session(session);
+            let marker = Some(remote_status_dot(&row));
+            let metadata = row.metadata().unwrap_or_default();
+            terminal_selector::Item {
+                label: row.name,
+                context: host.to_string(),
+                status: row.status,
+                metadata,
+                marker,
             }
-            SelectorKey::Cancel => {
-                return Err(NonoError::ActionRequired(
-                    "remote session selection cancelled".to_string(),
-                ));
-            }
-            SelectorKey::Ignore => {}
-        }
-    }
-}
-
-struct SelectionTerminal {
-    _raw_terminal: RawTerminal,
-}
-
-impl SelectionTerminal {
-    fn enter() -> Result<Self> {
-        let raw_terminal = RawTerminal::enter()?;
-        let mut stdout = io::stdout().lock();
-        stdout
-            .write_all(b"\x1b[?1049h\x1b[?25l")
-            .map_err(NonoError::Io)?;
-        stdout.flush().map_err(NonoError::Io)?;
-        Ok(Self {
-            _raw_terminal: raw_terminal,
         })
-    }
-}
-
-impl Drop for SelectionTerminal {
-    fn drop(&mut self) {
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(b"\x1b[?25h\x1b[?1049l");
-        let _ = stdout.flush();
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SelectorKey {
-    Up,
-    Down,
-    Home,
-    End,
-    Select,
-    Cancel,
-    Ignore,
-}
-
-fn draw_session_selector(sessions: &[RemoteSession], selected: usize, host: &str) -> Result<()> {
-    let (columns, rows) = terminal_size();
-    let columns = usize::from(columns);
-    let visible = usize::from(
-        rows.saturating_sub(SELECTOR_HEADER_ROWS)
-            .checked_div(SELECTOR_ROWS_PER_SESSION)
-            .unwrap_or(1)
-            .max(1),
-    )
-    .min(sessions.len());
-    let mut first = selected.saturating_sub(visible / 2);
-    first = first.min(sessions.len().saturating_sub(visible));
-    let last = first + visible;
-    let theme = crate::theme::current();
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(b"\x1b[2J\x1b[H").map_err(NonoError::Io)?;
-    write_terminal_line(
-        &mut stdout,
-        &format!(
-            "  {}  {}  {}",
-            "NONO CONNECT".bold(),
-            host.bold(),
-            format!("{} live", sessions.len()).dimmed(),
-        ),
-    )?;
-    write_terminal_line(&mut stdout, "")?;
-    write_terminal_line(
-        &mut stdout,
-        &format!("  {}", "Choose a session to connect to".bold()),
-    )?;
-    write_terminal_line(
-        &mut stdout,
-        &format!(
-            "  {}",
-            "↑/↓ or j/k move  ·  enter connect  ·  q cancel".dimmed()
-        ),
-    )?;
-    write_terminal_line(&mut stdout, "")?;
-
-    for (index, session) in sessions.iter().enumerate().take(last).skip(first) {
-        let row = RemoteDisplayRow::from_session(session);
-        let active = index == selected;
-        let pointer = if active {
-            crate::theme::fg("❯", theme.brand).bold().to_string()
-        } else {
-            " ".to_string()
-        };
-        // `name  host  status`, each part truncated against what remains of
-        // the line so styling never splits a truncated string.
-        let mut budget = columns.saturating_sub(8).max(12);
-        let name = crate::command_display::truncate_chars(&row.name, budget);
-        budget = budget.saturating_sub(name.chars().count() + 2);
-        let host_text = crate::command_display::truncate_chars(host, budget);
-        budget = budget.saturating_sub(host_text.chars().count() + 2);
-        let status = crate::command_display::truncate_chars(&row.status, budget);
-        let name = if active {
-            name.bold().to_string()
-        } else {
-            name
-        };
-        write_terminal_line(
-            &mut stdout,
-            &format!(
-                "  {pointer} {} {name}  {}  {status}",
-                remote_status_dot(&row),
-                host_text.dimmed(),
-            ),
-        )?;
-        // Always draw the second line so every entry keeps the fixed height
-        // the scroll window assumes.
-        let metadata = crate::command_display::truncate_chars(
-            &row.metadata().unwrap_or_default(),
-            columns.saturating_sub(7).max(12),
-        );
-        write_terminal_line(&mut stdout, &format!("      {}", metadata.dimmed()))?;
-    }
-
-    if visible < sessions.len() {
-        write_terminal_line(
-            &mut stdout,
-            &format!(
-                "  {}",
-                format!("showing {}–{} of {}", first + 1, last, sessions.len()).dimmed()
-            ),
-        )?;
-    }
-    stdout.flush().map_err(NonoError::Io)
-}
-
-fn write_terminal_line(output: &mut impl Write, line: &str) -> Result<()> {
-    output.write_all(line.as_bytes()).map_err(NonoError::Io)?;
-    output.write_all(b"\r\n").map_err(NonoError::Io)
-}
-
-// Read directly from the descriptor that we poll. Buffered stdin can read ahead
-// past Escape, making an arrow key look like a standalone Escape to poll().
-fn read_selector_byte(input: &impl AsFd) -> Result<u8> {
-    let mut byte = [0_u8; 1];
-    loop {
-        match nix::unistd::read(input, &mut byte) {
-            Ok(0) => {
-                return Err(NonoError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "terminal input closed",
-                )));
-            }
-            Ok(_) => return Ok(byte[0]),
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(error) => return Err(NonoError::Io(error.into())),
-        }
-    }
-}
-
-fn read_selector_key(input: &impl AsFd) -> Result<SelectorKey> {
-    match read_selector_byte(input)? {
-        b'k' | b'K' => Ok(SelectorKey::Up),
-        b'j' | b'J' => Ok(SelectorKey::Down),
-        b'g' => Ok(SelectorKey::Home),
-        b'G' => Ok(SelectorKey::End),
-        b'\r' | b'\n' => Ok(SelectorKey::Select),
-        b'q' | b'Q' | 0x03 => Ok(SelectorKey::Cancel),
-        0x1b => read_escape_key(input),
-        _ => Ok(SelectorKey::Ignore),
-    }
-}
-
-fn read_escape_key(input: &impl AsFd) -> Result<SelectorKey> {
-    if !selector_input_pending(input, 40)? {
-        return Ok(SelectorKey::Cancel);
-    }
-    let prefix = read_selector_byte(input)?;
-    if !matches!(prefix, b'[' | b'O') {
-        return Ok(SelectorKey::Ignore);
-    }
-    match read_selector_byte(input)? {
-        b'A' => Ok(SelectorKey::Up),
-        b'B' => Ok(SelectorKey::Down),
-        b'H' => Ok(SelectorKey::Home),
-        b'F' => Ok(SelectorKey::End),
-        _ => Ok(SelectorKey::Ignore),
-    }
-}
-
-fn selector_input_pending(input: &impl AsFd, timeout_ms: i32) -> Result<bool> {
-    let mut descriptor = nix::libc::pollfd {
-        fd: input.as_fd().as_raw_fd(),
-        events: nix::libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: `descriptor` points to one initialized `pollfd`, the count is
-    // exactly one, and `poll` only mutates its `revents` field.
-    let result = unsafe { nix::libc::poll(&mut descriptor, 1, timeout_ms) };
-    if result < 0 {
-        return Err(NonoError::Io(io::Error::last_os_error()));
-    }
-    Ok(result > 0 && descriptor.revents & nix::libc::POLLIN != 0)
+        .collect::<Vec<_>>();
+    let selected = terminal_selector::select(
+        &terminal_selector::Picker {
+            title: "NONO CONNECT",
+            context: host,
+            summary: &format!("{} live", sessions.len()),
+            prompt: "Choose a session to connect to",
+            confirm_label: "connect",
+        },
+        &items,
+    )?
+    .ok_or_else(|| NonoError::ActionRequired("remote session selection cancelled".into()))?;
+    sessions
+        .get(selected)
+        .map(clone_session)
+        .ok_or_else(|| NonoError::ConfigParse("session selection is out of range".to_string()))
 }
 
 fn print_connect_target(session: &RemoteSession, host: &str) {
     let row = RemoteDisplayRow::from_session(session);
-    let theme = crate::theme::current();
-    eprintln!();
-    eprintln!(
-        "  {} {}",
-        crate::theme::fg("◆", theme.brand),
-        row.name.bold(),
-    );
-    let details = match row.metadata() {
-        Some(metadata) => format!("{metadata} · {host}"),
-        None => host.to_string(),
-    };
-    eprintln!("    {}", details.dimmed());
+    let mut text = summary_heading("Connecting to remote session", SummaryKind::Info);
+    text.push_str(&summary_row("Session", &row.name));
+    text.push_str(&summary_row("Platform", host));
+    if let Some(metadata) = row.metadata() {
+        text.push_str(&summary_row("Details", &metadata));
+    }
+    eprintln!("{text}");
 }
 
 fn clone_session(session: &RemoteSession) -> RemoteSession {
@@ -1642,7 +1481,7 @@ fn format_detach_sequence(sequence: &[u8]) -> String {
 
 async fn attach(
     mut url: Url,
-    token: ApiCredential,
+    token: Arc<ApiCredential>,
     detach_sequence: Vec<u8>,
 ) -> Result<AttachOutcome> {
     let (initial_cols, initial_rows) = terminal_size();
@@ -1856,62 +1695,6 @@ where
         .map_err(ws_error)
 }
 
-struct RawTerminal {
-    original: nix::sys::termios::Termios,
-    screen: crate::pty_proxy::AltScreenTracker,
-}
-
-impl RawTerminal {
-    fn enter() -> Result<Self> {
-        use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
-        let stdin = io::stdin();
-        let original = tcgetattr(&stdin).map_err(|error| {
-            NonoError::ConfigParse(format!("could not read terminal mode: {error}"))
-        })?;
-        let mut raw = original.clone();
-        cfmakeraw(&mut raw);
-        tcsetattr(&stdin, SetArg::TCSANOW, &raw).map_err(|error| {
-            NonoError::ConfigParse(format!("could not enter raw terminal mode: {error}"))
-        })?;
-        Ok(Self {
-            original,
-            screen: Default::default(),
-        })
-    }
-}
-
-impl Drop for RawTerminal {
-    fn drop(&mut self) {
-        crate::pty_proxy::restore_terminal_modes_after_attach(
-            self.screen.in_alt_screen,
-            terminal_size().1,
-        );
-        let stdin = io::stdin();
-        let _ = nix::sys::termios::tcsetattr(
-            &stdin,
-            nix::sys::termios::SetArg::TCSANOW,
-            &self.original,
-        );
-    }
-}
-
-fn terminal_size() -> (u16, u16) {
-    let mut size = nix::libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: TIOCGWINSZ only writes the fixed-size `winsize` structure.
-    let result =
-        unsafe { nix::libc::ioctl(nix::libc::STDOUT_FILENO, nix::libc::TIOCGWINSZ, &mut size) };
-    if result == 0 && size.ws_col > 0 && size.ws_row > 0 {
-        (size.ws_col, size.ws_row)
-    } else {
-        (80, 24)
-    }
-}
-
 struct DetachMatch {
     forward: Vec<u8>,
     detach: bool,
@@ -2040,34 +1823,6 @@ impl DetachMatcher {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn selector_reads_queued_arrow_sequences_without_cancelling() -> Result<()> {
-        let (input, mut writer) = std::os::unix::net::UnixStream::pair().map_err(NonoError::Io)?;
-        writer
-            .write_all(b"\x1b[B\x1b[A\x1bOB\x1bOA\x1b[H\x1b[F\r")
-            .map_err(NonoError::Io)?;
-        for expected in [
-            SelectorKey::Down,
-            SelectorKey::Up,
-            SelectorKey::Down,
-            SelectorKey::Up,
-            SelectorKey::Home,
-            SelectorKey::End,
-            SelectorKey::Select,
-        ] {
-            assert_eq!(read_selector_key(&input)?, expected);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn selector_standalone_escape_still_cancels() -> Result<()> {
-        let (input, mut writer) = std::os::unix::net::UnixStream::pair().map_err(NonoError::Io)?;
-        writer.write_all(b"\x1b").map_err(NonoError::Io)?;
-        assert_eq!(read_selector_key(&input)?, SelectorKey::Cancel);
-        Ok(())
-    }
 
     /// Regression: with both rustls providers enabled there is no process
     /// default, and `connect_async` panicked building its TLS config. The
@@ -2245,13 +2000,39 @@ mod tests {
     #[test]
     fn remote_host_label_prefers_signed_in_platform() {
         let access = ConsoleAccess {
-            credential: ApiCredential::Bearer(Zeroizing::new("token".to_string())),
+            credential: Arc::new(ApiCredential::Bearer(Zeroizing::new("token".to_string()))),
             session_console: None,
             session_platform: Some("https://app.nolabs.dev".to_string()),
+            session_tenant: None,
         };
         let console = Url::parse("https://console.internal.example:8443").unwrap();
 
         assert_eq!(remote_host_label(&access, &console), "app.nolabs.dev");
+    }
+
+    #[test]
+    fn signed_in_platform_without_console_does_not_discover_from_enrollment() {
+        let access = ConsoleAccess {
+            credential: Arc::new(ApiCredential::Bearer(Zeroizing::new("token".into()))),
+            session_console: None,
+            session_platform: Some("https://platform.example.com".into()),
+            session_tenant: None,
+        };
+        for result in [
+            resolve_console(None, &access),
+            resolve_attach_url(
+                Some("wss://other.example.com/api/v1/sessions/x/terminal"),
+                None,
+                &access,
+            ),
+        ] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("remote sessions are not configured")
+            );
+        }
     }
 
     #[test]

@@ -533,6 +533,8 @@ Path patterns use standard glob syntax (same as `.gitignore` and nono profile `i
 | `/api/**` | Zero or more segments (e.g., `/api/v1/data/export`) |
 | `*` | Any method (when used as the method field) |
 
+Trailing slashes are ignored on both patterns and request paths, so `/repos/` and `/repos` match the same requests (`/repos` and `/repos/`, but not `/repos/x`). This applies to `--allow-domain` URLs as well: `https://api.github.com/repos/my-org/my-repo/issues/` allows exactly the requests that `https://api.github.com/repos/my-org/my-repo/issues` allows.
+
 ## Localhost IPC
 
 Use `--open-port` to allow bidirectional localhost TCP on a specific port (connect + listen). This enables IPC between sandboxed processes — for example, an MCP server in one sandbox and an AI agent in another.

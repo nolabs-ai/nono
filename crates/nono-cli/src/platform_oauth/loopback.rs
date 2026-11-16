@@ -81,7 +81,8 @@ impl LoopbackListener {
         loop {
             if Instant::now() >= deadline {
                 return Err(NonoError::ActionRequired(
-                    "sign-in timed out waiting for the browser; run `nono login` again".to_string(),
+                    "sign-in timed out waiting for the browser; run `nono platform login` again"
+                        .to_string(),
                 ));
             }
             let stream = match self.listener.accept() {
@@ -245,7 +246,7 @@ fn parse_callback_target(target: &str) -> Option<std::collections::HashMap<Strin
 }
 
 fn respond(stream: &mut TcpStream, status: &str) {
-    let body = "nono login: request rejected\n";
+    let body = "nono platform login: request rejected\n";
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",

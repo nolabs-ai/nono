@@ -345,7 +345,7 @@ where
 fn aws_region_denial_reason(route: &str, host: &str) -> String {
     format!(
         "AWS route '{route}': host '{host}' is not a canonical \
-         {{service}}.{{region}}.amazonaws.com commercial-region host on port 443"
+         {{service}}.{{region}} AWS endpoint host on port 443 in the route partition"
     )
 }
 
@@ -592,34 +592,36 @@ pub(crate) async fn select_intercept_route<'a>(
                 // refusal rejects the request below.
                 // AWS wildcard-region routes show the derived region; a host
                 // that yields none is denied before prompting.
-                let aws_region = match &route.aws_wildcard_service_label {
-                    Some(label) => match crate::aws::endpoints::derive_region(host, port, label) {
-                        Some(region) => Some(region),
-                        None => {
-                            let concrete_upstream = format!(
-                                "https://{}",
-                                reverse::format_host_header(UpstreamScheme::Https, host, port)
-                            );
-                            let deny_reason = aws_region_denial_reason(prefix, host);
-                            warn!("tls_intercept: {}", deny_reason);
-                            audit::log_denied(
-                                audit_log,
-                                audit::ProxyMode::ConnectIntercept,
-                                &audit::EventContext {
-                                    denial_category: Some(
-                                        nono::undo::NetworkAuditDenialCategory::HostDenied,
-                                    ),
-                                    route_id: Some(prefix),
-                                    upstream: Some(&concrete_upstream),
-                                    ..audit::EventContext::default()
-                                },
-                                host,
-                                port,
-                                &deny_reason,
-                            );
-                            return RouteSelection::Rejected(403);
+                let aws_region = match &route.aws_wildcard {
+                    Some(pattern) => {
+                        match crate::aws::endpoints::derive_region(host, port, pattern) {
+                            Some(region) => Some(region),
+                            None => {
+                                let concrete_upstream = format!(
+                                    "https://{}",
+                                    reverse::format_host_header(UpstreamScheme::Https, host, port)
+                                );
+                                let deny_reason = aws_region_denial_reason(prefix, host);
+                                warn!("tls_intercept: {}", deny_reason);
+                                audit::log_denied(
+                                    audit_log,
+                                    audit::ProxyMode::ConnectIntercept,
+                                    &audit::EventContext {
+                                        denial_category: Some(
+                                            nono::undo::NetworkAuditDenialCategory::HostDenied,
+                                        ),
+                                        route_id: Some(prefix),
+                                        upstream: Some(&concrete_upstream),
+                                        ..audit::EventContext::default()
+                                    },
+                                    host,
+                                    port,
+                                    &deny_reason,
+                                );
+                                return RouteSelection::Rejected(403);
+                            }
                         }
-                    },
+                    }
                     None => None,
                 };
                 let approval = crate::endpoint_approval::PendingApproval {
@@ -874,6 +876,10 @@ pub(crate) enum CredentialResolution<'a> {
     /// The request must be rejected with this HTTP status; the denial has
     /// already been audited.
     Rejected(u16),
+    /// Host credential capture failed; return a safe diagnostic, not backend output.
+    CaptureFailed,
+    /// The route requires a managed credential, but none is available.
+    Unavailable,
     /// Forward the request, optionally injecting `credential`.
     Forward {
         credential: Option<ResolvedCredential<'a>>,
@@ -942,7 +948,7 @@ pub(crate) async fn resolve_managed_credential<'a>(
             port,
             &reason,
         );
-        return CredentialResolution::Rejected(503);
+        return CredentialResolution::Unavailable;
     }
 
     // AWS SigV4 signing is not yet implemented. Return 501 so the caller knows
@@ -997,7 +1003,7 @@ pub(crate) async fn resolve_managed_credential<'a>(
                     port,
                     &reason,
                 );
-                return CredentialResolution::Rejected(503);
+                return CredentialResolution::CaptureFailed;
             }
         }
     }
@@ -1225,6 +1231,14 @@ where
                 _ => "Service Unavailable",
             };
             reverse::send_error_generic(tls_stream, status, msg).await?;
+            return Ok(());
+        }
+        CredentialResolution::CaptureFailed => {
+            reverse::send_credential_capture_error(tls_stream, req.method == "HEAD").await?;
+            return Ok(());
+        }
+        CredentialResolution::Unavailable => {
+            reverse::send_credential_unavailable_error(tls_stream, req.method == "HEAD").await?;
             return Ok(());
         }
         CredentialResolution::Forward { credential } => credential,
@@ -1830,10 +1844,10 @@ where
         "https://{}",
         reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port)
     );
-    let (region, region_source) = match (&aws.region, aws.service_label.as_deref()) {
+    let (region, region_source) = match (&aws.region, aws.wildcard.as_ref()) {
         (SigningRegion::Fixed(r), _) => (r.clone(), "route"),
-        (SigningRegion::FromRequestHost, Some(label)) => {
-            match crate::aws::endpoints::derive_region(ctx.host, ctx.port, label) {
+        (SigningRegion::FromRequestHost, Some(pattern)) => {
+            match crate::aws::endpoints::derive_region(ctx.host, ctx.port, pattern) {
                 Some(r) => (r, "request_host"),
                 None => {
                     let reason = aws_region_denial_reason(service.unwrap_or("unknown"), ctx.host);
@@ -2419,6 +2433,7 @@ fn parse_request_line(line: &str) -> Result<(String, String, String)> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::capture::tests::FailureKind;
 
     #[test]
     fn handshake_validity_errors_suggest_clocks_and_expiry() {
@@ -4642,6 +4657,56 @@ mod tests {
         assert!(matches!(selection, RouteSelection::Rejected(403)));
     }
 
+    #[tokio::test]
+    async fn http1_intercept_reports_credential_capture_failure() {
+        assert_http1_credential_failure("POST", FailureKind::Capture).await;
+    }
+
+    #[tokio::test]
+    async fn http1_head_reports_credential_capture_failure_without_body() {
+        assert_http1_credential_failure("HEAD", FailureKind::Capture).await;
+    }
+
+    #[tokio::test]
+    async fn http1_intercept_reports_credential_unavailable() {
+        assert_http1_credential_failure("POST", FailureKind::Unavailable).await;
+    }
+
+    #[tokio::test]
+    async fn http1_intercept_head_reports_credential_unavailable_without_body() {
+        assert_http1_credential_failure("HEAD", FailureKind::Unavailable).await;
+    }
+
+    async fn assert_http1_credential_failure(method: &str, failure: FailureKind) {
+        use crate::capture::tests::{FailingCaptureBackend, FailureFixture, assert_http1_failure};
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let fixture = FailureFixture::new(failure).await;
+            let session_token = Zeroizing::new("session-token".to_string());
+            let filter = ProxyFilter::allow_all();
+            let mut ctx = test_intercept_ctx(&session_token, &fixture.connector, &filter);
+            ctx.host = "127.0.0.1";
+            ctx.port = fixture.port();
+            ctx.route_id = Some("capture");
+            ctx.route_store = Arc::clone(&fixture.route_store);
+            ctx.credential_store = Arc::clone(&fixture.credential_store);
+            ctx.credential_capture_backend = Some(Arc::new(FailingCaptureBackend));
+
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            client.write_all(format!(
+                "{method} /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer session-token\r\nContent-Length: 0\r\n\r\n",
+                fixture.port(),
+            ).as_bytes()).await.unwrap();
+            handle_inner_request(&mut server, &ctx).await.unwrap();
+            drop(server);
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert_http1_failure(&response, method == "HEAD", failure);
+            fixture.assert_no_upstream_connection();
+        }).await.unwrap();
+    }
+
     fn test_intercept_ctx<'a>(
         session_token: &'a Zeroizing<String>,
         connector: &'a tokio_rustls::TlsConnector,
@@ -5713,7 +5778,7 @@ mod tests {
 
         // `zz-fake-9` matches the route pattern but is not a valid region label.
         for host in [
-            "eks.us-gov-west-1.amazonaws.com",
+            "eks.us-iso-east-1.amazonaws.com",
             "eks.zz-fake-9.amazonaws.com",
         ] {
             let selection = select_intercept_route(

@@ -22,6 +22,13 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
+/// Safe client-facing diagnostic shared by all proxy transports. Never include
+/// credential references, route details, or backend errors.
+pub(crate) const CREDENTIAL_UNAVAILABLE_BODY: &str = concat!(
+    r#"{"error":"credential_unavailable","message":"nono could not load the managed credential. "#,
+    r#"Check the host credential configuration and proxy logs."}"#,
+);
+
 /// A loaded credential ready for injection.
 ///
 /// Contains only credential-specific fields (injection mode, header name/value,
@@ -619,9 +626,9 @@ impl CredentialStore {
                 ) else {
                     continue;
                 };
-                let service_label =
+                let wildcard =
                     match crate::aws::endpoints::validate_aws_upstream(&route.upstream, aws_auth) {
-                        Ok(pattern) => pattern.map(|p| p.service_label),
+                        Ok(pattern) => pattern,
                         Err(_) => continue,
                     };
                 debug!(
@@ -645,7 +652,7 @@ impl CredentialStore {
                                 profiles,
                                 route.upstream.clone(),
                                 region,
-                                service_label,
+                                wildcard,
                                 service,
                             )
                             .await
@@ -657,7 +664,7 @@ impl CredentialStore {
                                 profile_opt,
                                 route.upstream.clone(),
                                 region,
-                                service_label,
+                                wildcard,
                                 service,
                             )
                             .await

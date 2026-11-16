@@ -420,7 +420,8 @@
           "/etc/mise",
           "~/.local/bin/mise",
           "~/.config/mise",
-          "~/.local/share/mise"
+          "~/.local/share/mise",
+          "~/.tool-versions"
         ]
       }
     },

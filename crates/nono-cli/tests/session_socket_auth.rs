@@ -333,6 +333,10 @@ printf session-test-token
                 Err(err) => panic!("upstream accept: {err}"),
             }
         };
+        // macOS accepted sockets inherit O_NONBLOCK from the listener.
+        connection
+            .set_nonblocking(false)
+            .expect("blocking connection");
         connection
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");

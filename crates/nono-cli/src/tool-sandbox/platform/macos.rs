@@ -1010,6 +1010,9 @@ fn handle_shim_stream_inner(
     let peer_pid =
         crate::session_auth::authenticate(stream.as_raw_fd(), state.session_socket_auth, |pid| {
             owns_orphan(state, pid)
+        })
+        .inspect_err(|err| {
+            warn!("Rejected command-mediation connection: socket authentication failed: {err}");
         })?;
     let auth = authenticate_shim(peer_pid, state)?;
     let request: ToolSandboxShimRequest = read_frame(stream)?;
@@ -1891,6 +1894,13 @@ fn owns_orphan(state: &ToolSandboxState, pid: u32) -> bool {
     session_id_of(pid)
         .and_then(|sid| state.session_lineage.resolve_sid(sid))
         .is_some()
+        || (!matches!(&state.lineage, LineageMarker::Disabled)
+            && crate::session_auth::verify_reparented_ancestry(pid, |daemon_pid| {
+                state
+                    .lineage
+                    .resolve_severed_command(daemon_pid, &state.plan.config, &state.policy_root)
+                    .is_some()
+            }))
 }
 
 fn resolve_caller(

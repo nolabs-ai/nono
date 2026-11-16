@@ -1286,6 +1286,9 @@ fn handle_shim_stream_inner(
     let peer_pid =
         crate::session_auth::authenticate(stream.as_raw_fd(), state.session_socket_auth, |pid| {
             owns_orphan(state, pid)
+        })
+        .inspect_err(|err| {
+            warn!("Rejected command-mediation connection: socket authentication failed: {err}");
         })?;
     let shim_fd = recv_fd_via_socket(stream.as_raw_fd())?;
     let request: ToolSandboxShimRequest = read_frame(stream)?;

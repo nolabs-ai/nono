@@ -265,9 +265,13 @@ fn exercise_named_listeners(strict: bool) {
     fs::write(shared.join("stop"), "stop").expect("stop owner");
     let completed = owner_thread.join().expect("owner thread");
     if strict {
-        completed.assert_stderr_contains(
-            "Rejected command-mediation URL connection: socket authentication failed:",
-        );
+        completed
+            .assert_stderr_contains(
+                "Rejected command-mediation connection: socket authentication failed:",
+            )
+            .assert_stderr_contains(
+                "Rejected command-mediation URL connection: socket authentication failed:",
+            );
     }
 }
 
@@ -433,6 +437,97 @@ printf session-test-token
         completed.assert_stderr_contains("Rejected credential capture URL connection:");
     }
     upstream_thread.join().expect("upstream thread");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn daemon_attribution_preserves_command_policy_with_authentication_on_and_off() {
+    let t = nono_test!("socket-daemon");
+    let bin = t.root().join("bin");
+    fs::create_dir(&bin).expect("fixture directory");
+    let source = bin.join("daemon.c");
+    let daemon = bin.join("daemon");
+    fs::write(&source, include_str!("fixtures/session_socket_daemon.c")).expect("C fixture");
+    let compiler = std::process::Command::new("cc")
+        .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&daemon)
+        .output()
+        .expect("compile daemon fixture");
+    assert!(
+        compiler.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiler.stderr)
+    );
+
+    for (strict, matches_daemon) in [(false, true), (true, true), (true, false), (false, false)] {
+        let data = t
+            .workspace()
+            .join(format!("daemon-{strict}-{matches_daemon}"));
+        fs::create_dir(&data).expect("daemon workspace");
+        fs::write(data.join("unmatched"), "0\n").expect("nonmatching helper result");
+        let profile = t.write_profile("daemon", &json!({
+            "extends": "default",
+            "security": {"session_socket_auth": strict},
+            "workdir": {"access": "readwrite"},
+            "command_policies": {"commands": {
+                "daemon": {
+                    "executable": daemon,
+                    "daemon_pid_source": {"argv": ["/bin/cat", data.join(if matches_daemon {"pid"} else {"unmatched"})]},
+                    "can_use": ["leaf"],
+                    "sandbox": {"fs_read": [bin, "/usr", "/bin"], "fs_write": [data]}
+                },
+                "leaf": {"executable": "/bin/echo", "from": {
+                    "daemon": {"sandbox": {"fs_write": [data]}}
+                }}
+            }}
+        }).to_string());
+        let completed = t
+            .run()
+            .profile(&profile)
+            .allow_cwd()
+            .no_rollback()
+            .env("TMPDIR", "/tmp")
+            .exec(
+                Argv::new("/bin/sh")
+                    .arg("-c")
+                    .arg(
+                        r#"
+                set -eu
+                daemon "$1"
+                for name in pid result; do
+                    i=0
+                    while [ ! -s "$1/$name" ] && [ "$i" -lt 400 ]; do
+                        /bin/sleep 0.05
+                        i=$((i+1))
+                    done
+                    test -s "$1/$name"
+                    if [ "$name" = pid ]; then printf go > "$1/go"; fi
+                done
+            "#,
+                    )
+                    .arg("daemon-test")
+                    .arg(&data),
+            )
+            .assert_success("daemon request completed");
+        assert_eq!(
+            fs::read_to_string(data.join("result")).expect("tool exit"),
+            if matches_daemon { "0\n" } else { "126\n" },
+            "strict={strict}, matches_daemon={matches_daemon}: {}\n{}",
+            fs::read_to_string(data.join("error")).expect("tool error"),
+            completed.stderr(),
+        );
+        assert_eq!(
+            fs::read_to_string(data.join("output")).expect("tool output"),
+            if matches_daemon { "verified\n" } else { "" }
+        );
+        if strict && !matches_daemon {
+            completed.assert_stderr_contains(
+                "Rejected command-mediation connection: socket authentication failed:",
+            );
+        }
+    }
 }
 
 #[test]

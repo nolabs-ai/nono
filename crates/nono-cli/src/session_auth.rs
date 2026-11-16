@@ -98,14 +98,43 @@ fn verify_membership(
 }
 
 fn walk_ancestry(
-    mut process: Process,
+    process: Process,
     root: u32,
+    inspect: impl FnMut(u32) -> Result<Process>,
+) -> Result<bool> {
+    walk_ancestry_until(process, root == 1, |process| process.pid == root, inspect)
+}
+
+/// Bind a caller to a verified, reparented daemon through a stable ancestry chain.
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_reparented_ancestry(
+    pid: u32,
+    mut owns_daemon: impl FnMut(u32) -> bool,
+) -> bool {
+    inspect(pid)
+        .and_then(|process| {
+            walk_ancestry_until(
+                process,
+                false,
+                |ancestor| ancestor.parent == 1 && owns_daemon(ancestor.pid),
+                inspect,
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn walk_ancestry_until(
+    mut process: Process,
+    include_init: bool,
+    mut accepts: impl FnMut(Process) -> bool,
     mut inspect: impl FnMut(u32) -> Result<Process>,
 ) -> Result<bool> {
     let mut ancestry: Vec<Process> = Vec::new();
     for _ in 0..MAX_ANCESTRY {
-        if process.pid == root {
+        ancestry.push(process);
+        if accepts(process) {
             // Reparenting or PID reuse during the walk must not manufacture an edge.
+            // Include the matched anchor: daemon verification may run a helper.
             for observed in ancestry {
                 if inspect(observed.pid)? != observed {
                     return Err(denied());
@@ -114,12 +143,11 @@ fn walk_ancestry(
             return Ok(true);
         }
         if process.parent == 0
-            || (process.parent == 1 && root != 1)
+            || (process.parent == 1 && !include_init)
             || process.parent == process.pid
         {
             return Ok(false);
         }
-        ancestry.push(process);
         process = inspect(process.parent)?;
     }
     Err(denied())
@@ -384,6 +412,81 @@ mod tests {
                 !walk_ancestry(caller, 44, |_| panic!("must not inspect past ancestry end"))
                     .expect("unrelated ancestry")
             );
+        }
+    }
+
+    #[test]
+    fn verified_anchor_rechecks_the_entire_chain_after_attribution() {
+        use std::cell::Cell;
+
+        let caller = Process {
+            pid: 42,
+            parent: 43,
+            birth: (3, 0),
+        };
+        let parent = Process {
+            pid: 43,
+            parent: 44,
+            birth: (2, 0),
+        };
+        let daemon = Process {
+            pid: 44,
+            parent: 1,
+            birth: (1, 0),
+        };
+        for changed in [
+            None,
+            Some(Process {
+                parent: 99,
+                ..caller
+            }),
+            Some(Process {
+                birth: (4, 0),
+                ..caller
+            }),
+            Some(Process {
+                parent: 99,
+                ..parent
+            }),
+            Some(Process {
+                birth: (4, 0),
+                ..parent
+            }),
+            Some(Process {
+                parent: 99,
+                ..daemon
+            }),
+            Some(Process {
+                birth: (4, 0),
+                ..daemon
+            }),
+        ] {
+            let attributed = Cell::new(false);
+            let result = walk_ancestry_until(
+                caller,
+                false,
+                |process| {
+                    if process.parent != 1 {
+                        return false;
+                    }
+                    assert_eq!(process.pid, daemon.pid);
+                    attributed.set(true);
+                    true
+                },
+                |pid| {
+                    if attributed.get()
+                        && let Some(changed) = changed.filter(|changed| changed.pid == pid)
+                    {
+                        return Ok(changed);
+                    }
+                    [caller, parent, daemon]
+                        .into_iter()
+                        .find(|process| process.pid == pid)
+                        .ok_or_else(denied)
+                },
+            );
+            assert!(attributed.get());
+            assert_eq!(result.is_ok_and(|owned| owned), changed.is_none());
         }
     }
 

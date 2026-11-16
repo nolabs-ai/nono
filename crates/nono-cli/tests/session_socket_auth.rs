@@ -263,7 +263,12 @@ fn exercise_named_listeners(strict: bool) {
     );
 
     fs::write(shared.join("stop"), "stop").expect("stop owner");
-    owner_thread.join().expect("owner thread");
+    let completed = owner_thread.join().expect("owner thread");
+    if strict {
+        completed.assert_stderr_contains(
+            "Rejected command-mediation URL connection: socket authentication failed:",
+        );
+    }
 }
 
 #[test]

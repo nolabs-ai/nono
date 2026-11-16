@@ -220,6 +220,7 @@ impl ProxyCredentialCaptureBackend {
         entries: &HashMap<String, crate::profile::CredentialCaptureEntry>,
         session_id: String,
         outer_caps: CapabilitySet,
+        session_socket_auth: bool,
     ) -> Result<Self> {
         let mut resolved = HashMap::new();
         for (name, entry) in entries {
@@ -318,7 +319,7 @@ impl ProxyCredentialCaptureBackend {
         }
         Ok(Self {
             session_id,
-            session_socket_auth: false,
+            session_socket_auth,
             entries: resolved,
             cache: Mutex::new(HashMap::new()),
             active: Mutex::new(HashSet::new()),
@@ -2641,10 +2642,13 @@ fn build_credential_capture_backend_with_registry(
         return Ok(None);
     }
     crate::session_auth::validate_support(session_socket_auth)?;
-    let mut backend =
-        ProxyCredentialCaptureBackend::new(credential_capture, session_id, outer_caps)?
-            .with_secret_registry(secret_registry);
-    backend.session_socket_auth = session_socket_auth;
+    let backend = ProxyCredentialCaptureBackend::new(
+        credential_capture,
+        session_id,
+        outer_caps,
+        session_socket_auth,
+    )?
+    .with_secret_registry(secret_registry);
     Ok(Some(Arc::new(backend)))
 }
 
@@ -5149,6 +5153,7 @@ mod tests {
             &entries,
             "sess-test".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "github".to_string(),
@@ -5340,6 +5345,7 @@ mod tests {
                         &entries,
                         "sess-reaper".to_string(),
                         CapabilitySet::default(),
+                        false,
                     )
                     .expect("capture backend");
                     let reaper = Reaper::start();
@@ -5442,6 +5448,7 @@ mod tests {
             &entries,
             "sess-timeout".to_string(),
             CapabilitySet::default(),
+            false,
         )?;
         backend.entries.get_mut("test").expect("test entry").timeout = Duration::from_millis(200);
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -5493,6 +5500,7 @@ mod tests {
             &entries,
             "sess-parallel".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
 
@@ -5554,6 +5562,7 @@ mod tests {
             &entries,
             "sess-test".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "empty".to_string(),
@@ -5587,6 +5596,7 @@ mod tests {
             &entries,
             "sess-test".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "github".to_string(),
@@ -5627,6 +5637,7 @@ mod tests {
             &entries,
             "sess-test".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "github".to_string(),
@@ -5668,6 +5679,7 @@ mod tests {
             &entries,
             "sess-test".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -5726,6 +5738,7 @@ mod tests {
             &entries,
             "sess-provider".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -5788,6 +5801,7 @@ mod tests {
             &entries,
             "sess-provider".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -5830,6 +5844,7 @@ mod tests {
             &entries,
             "sess-stdin".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -5880,6 +5895,7 @@ mod tests {
             &entries,
             "sess-browser".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -5909,6 +5925,7 @@ mod tests {
             &entries,
             "sess-ghost".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -5943,6 +5960,7 @@ mod tests {
             &entries,
             "sess-mixed".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -5990,6 +6008,7 @@ mod tests {
             &entries,
             "sess-ghost-provider".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -6279,6 +6298,7 @@ mod tests {
             &entries,
             "sess-not-exec".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -6313,6 +6333,7 @@ mod tests {
             &entries,
             "sess-dangling".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -6342,6 +6363,7 @@ mod tests {
             &entries,
             "sess-directory".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -6729,6 +6751,7 @@ mod tests {
                 &entries,
                 "sess-stdio-stdin".to_string(),
                 nono::CapabilitySet::default(),
+                false,
             )?;
             let response = nono_proxy::capture::CredentialCaptureBackend::capture(
                 &backend,
@@ -6811,6 +6834,7 @@ mod tests {
                 &entries,
                 "sess-inherit-stdin".to_string(),
                 nono::CapabilitySet::default(),
+                false,
             )?;
             let response = nono_proxy::capture::CredentialCaptureBackend::capture(
                 &backend,

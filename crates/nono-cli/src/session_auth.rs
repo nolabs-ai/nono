@@ -6,6 +6,9 @@ use nono::supervisor::socket::peer_credentials;
 use nono::{NonoError, Result};
 use std::os::fd::RawFd;
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 const MAX_ANCESTRY: usize = 128;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,9 +35,9 @@ pub(crate) fn authenticate(
     }
     let lifetime = PeerLifetime::new(socket)?;
     let process = inspect(peer.pid)?;
-    if !descends_from(process, std::process::id())? && !owns_orphan(peer.pid) {
-        return Err(denied());
-    }
+    verify_membership(process, std::process::id(), owns_orphan, inspect)?;
+    #[cfg(target_os = "macos")]
+    macos::verify_ownership(socket, peer.pid)?;
     lifetime.verify(socket)?;
     if inspect(peer.pid)?.birth != process.birth || peer_credentials(socket)?.pid != peer.pid {
         return Err(denied());
@@ -49,6 +52,8 @@ pub(crate) fn validate_support(enabled: bool) -> Result<()> {
             NonoError::SandboxInit(format!("cannot probe session socket authentication: {err}"))
         })?;
         PeerLifetime::new(socket.as_raw_fd())?;
+        #[cfg(target_os = "macos")]
+        macos::verify_ownership(socket.as_raw_fd(), std::process::id())?;
     }
     Ok(())
 }
@@ -76,8 +81,20 @@ fn socket_option<const N: usize>(socket: RawFd, level: i32, option: i32) -> Resu
     Ok(value)
 }
 
-fn descends_from(process: Process, root: u32) -> Result<bool> {
-    walk_ancestry(process, root, inspect)
+fn verify_membership(
+    process: Process,
+    root: u32,
+    owns_orphan: impl FnOnce(u32) -> bool,
+    inspect: impl FnMut(u32) -> Result<Process>,
+) -> Result<()> {
+    // An ancestor may exit during the walk. Protected lineage is independent
+    // proof of membership, including when ancestry could not be inspected.
+    // The caller must still pass the lifetime and identity checks afterwards.
+    if walk_ancestry(process, root, inspect).unwrap_or(false) || owns_orphan(process.pid) {
+        Ok(())
+    } else {
+        Err(denied())
+    }
 }
 
 fn walk_ancestry(
@@ -246,7 +263,83 @@ mod tests {
     #[test]
     fn ancestry_does_not_accept_an_unrelated_root() {
         let process = inspect(std::process::id()).expect("inspect self");
-        assert!(!descends_from(process, u32::MAX).expect("walk"));
+        assert!(!walk_ancestry(process, u32::MAX, inspect).expect("walk"));
+    }
+
+    #[test]
+    fn ancestry_failure_requires_independent_lineage_proof() {
+        let caller = Process {
+            pid: 42,
+            parent: 43,
+            birth: (1, 0),
+        };
+        for owns_caller in [false, true] {
+            let mut fallback_called = false;
+            let result = verify_membership(
+                caller,
+                44,
+                |pid| {
+                    assert_eq!(pid, caller.pid);
+                    fallback_called = true;
+                    owns_caller
+                },
+                |pid| {
+                    assert_eq!(pid, caller.parent);
+                    Err(denied())
+                },
+            );
+            assert!(
+                fallback_called,
+                "an unreadable ancestor must allow a lineage check"
+            );
+            assert_eq!(result.is_ok(), owns_caller);
+        }
+    }
+
+    #[test]
+    fn verified_ancestry_does_not_consult_orphan_lineage() {
+        let root = Process {
+            pid: 44,
+            parent: 1,
+            birth: (0, 0),
+        };
+        let caller = Process {
+            pid: 42,
+            parent: root.pid,
+            birth: (1, 0),
+        };
+        verify_membership(
+            caller,
+            root.pid,
+            |_| panic!("verified descendants do not need orphan lineage"),
+            |pid| match pid {
+                42 => Ok(caller),
+                44 => Ok(root),
+                _ => panic!("unexpected ancestor {pid}"),
+            },
+        )
+        .expect("verified descendant");
+    }
+
+    #[test]
+    fn unrelated_ancestry_requires_independent_lineage_proof() {
+        let caller = Process {
+            pid: 42,
+            parent: 1,
+            birth: (1, 0),
+        };
+        for owns_caller in [false, true] {
+            let result = verify_membership(
+                caller,
+                44,
+                |pid| {
+                    assert_eq!(pid, caller.pid);
+                    owns_caller
+                },
+                |_| panic!("ancestry ends before the supervisor"),
+            );
+            assert_eq!(result.is_ok(), owns_caller);
+        }
     }
 
     #[test]

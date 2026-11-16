@@ -1156,7 +1156,7 @@ fn handle_url_open_stream(
     ) {
         Ok(pid) => pid,
         Err(err) => {
-            debug!("command-mediation URL open: peer pid resolution failed: {err}");
+            warn!("Rejected command-mediation URL connection: socket authentication failed: {err}");
             return;
         }
     };

@@ -870,6 +870,14 @@ fn open_path_rule(
 /// `root`, so a root taken from another mount namespace resolves exactly as a
 /// process in that namespace would see the path.
 fn open_in_root(root: BorrowedFd<'_>, path: &Path) -> nix::Result<OwnedFd> {
+    match open_in_root_strict(root, path) {
+        Err(nix::errno::Errno::EXDEV) => open_procfs_magic_link_in_root(root, path),
+        result => result,
+    }
+}
+
+/// `openat2(RESOLVE_IN_ROOT)` of `path` beneath `root`, refusing magic links.
+fn open_in_root_strict(root: BorrowedFd<'_>, path: &Path) -> nix::Result<OwnedFd> {
     use std::os::unix::ffi::OsStrExt;
     const RESOLVE_IN_ROOT: u64 = 0x10;
     let relative = path.strip_prefix("/").unwrap_or(path);
@@ -908,6 +916,60 @@ fn open_in_root(root: BorrowedFd<'_>, path: &Path) -> nix::Result<OwnedFd> {
     }
     // SAFETY: openat2 returned a fresh descriptor that nothing else owns.
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// `RESOLVE_IN_ROOT` refuses every magic link with `EXDEV`, including the
+/// `/proc/<pid>/fd/<n>` grants nono adds for redirected stdio. Resolve the
+/// parent directory inside `root` as usual and, only when that directory is on
+/// procfs, follow the final component: a procfs magic link names an object
+/// the kernel holds, not a path that a mount mask could hide. Magic links in
+/// any other position, and symlinks outside procfs, stay refused.
+fn open_procfs_magic_link_in_root(root: BorrowedFd<'_>, path: &Path) -> nix::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    const PROC_SUPER_MAGIC: libc::c_long = 0x9fa0;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(nix::errno::Errno::EXDEV);
+    };
+    let parent = open_in_root_dir(root, parent)?;
+    // SAFETY: zeroed statfs is valid storage for the kernel to fill.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `stat` is live stack storage and `parent` is open.
+    if unsafe { libc::fstatfs(parent.as_raw_fd(), &mut stat) } < 0 {
+        return Err(nix::errno::Errno::last());
+    }
+    #[allow(clippy::unnecessary_cast)]
+    if stat.f_type as libc::c_long != PROC_SUPER_MAGIC {
+        return Err(nix::errno::Errno::EXDEV);
+    }
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| nix::errno::Errno::EINVAL)?;
+    // SAFETY: `name` is a single NUL-terminated component; `parent` is open.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(nix::errno::Errno::last());
+    }
+    // SAFETY: openat returned a fresh descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Open a directory with `RESOLVE_IN_ROOT` (no magic links anywhere).
+fn open_in_root_dir(root: BorrowedFd<'_>, path: &Path) -> nix::Result<OwnedFd> {
+    let fd = open_in_root_strict(root, path)?;
+    // SAFETY: zeroed stat is valid storage for the kernel to fill.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `stat` is live stack storage and `fd` is open.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } < 0 {
+        return Err(nix::errno::Errno::last());
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(nix::errno::Errno::ENOTDIR);
+    }
+    Ok(fd)
 }
 
 /// Legacy check: whether the simple block-all seccomp filter can be used.

@@ -83,6 +83,8 @@ struct RawOpenHow {
 pub struct MountMask {
     path: PathBuf,
     tmpfs_mode: u32,
+    tmpfs_size: Option<u64>,
+    tmpfs_inodes: Option<u64>,
 }
 
 impl MountMask {
@@ -93,6 +95,8 @@ impl MountMask {
         Self {
             path: path.into(),
             tmpfs_mode: 0o700,
+            tmpfs_size: None,
+            tmpfs_inodes: None,
         }
     }
 
@@ -101,6 +105,16 @@ impl MountMask {
     #[must_use]
     pub fn tmpfs_mode(mut self, mode: u32) -> Self {
         self.tmpfs_mode = mode & 0o7777;
+        self
+    }
+
+    /// Limit the tmpfs that covers a directory mask to `size` bytes and
+    /// `inodes` inodes. Without a limit the kernel default applies (half of
+    /// RAM). Ignored for non-directory masks. Zero means "kernel default".
+    #[must_use]
+    pub fn tmpfs_limits(mut self, size: u64, inodes: u64) -> Self {
+        self.tmpfs_size = (size > 0).then_some(size);
+        self.tmpfs_inodes = (inodes > 0).then_some(inodes);
         self
     }
 
@@ -251,8 +265,13 @@ struct Identity {
 
 #[derive(Debug)]
 enum OperationKind {
-    /// tmpfs over a directory. `mode` is the tmpfs `mode=` value.
-    MaskDirectory { mode: CString },
+    /// tmpfs over a directory, with its `mode=`, `size=` and `nr_inodes=`
+    /// values.
+    MaskDirectory {
+        mode: CString,
+        size: Option<CString>,
+        inodes: Option<CString>,
+    },
     /// Inert `/dev/null` bind over a non-directory.
     MaskFile,
     /// Bind the host inode at `target` back over a mask. `base` indexes the
@@ -304,8 +323,13 @@ impl PreparedMountMask {
     /// with more operations than can be reported.
     pub fn prepare(masks: &[MountMask], rebinds: &[PathBuf]) -> Result<Self> {
         let mut skipped = Vec::new();
-        let mut mask_entries: Vec<(PathBuf, u32, Identity)> = Vec::new();
+        let mut mask_entries: Vec<(PathBuf, &MountMask, Identity)> = Vec::new();
         for mask in masks {
+            if mask.path.parent().is_none() {
+                return Err(NonoError::SandboxInit(
+                    "the filesystem root cannot be masked".to_string(),
+                ));
+            }
             let identity = match inspect(&mask.path)? {
                 Ok(identity) => identity,
                 Err(reason) => {
@@ -318,7 +342,7 @@ impl PreparedMountMask {
                 }
             };
             if !mask_entries.iter().any(|(path, ..)| *path == mask.path) {
-                mask_entries.push((mask.path.clone(), mask.tmpfs_mode, identity));
+                mask_entries.push((mask.path.clone(), mask, identity));
             }
         }
         let mut rebind_entries: Vec<(PathBuf, Identity)> = Vec::new();
@@ -354,9 +378,9 @@ impl PreparedMountMask {
         mask_entries.retain(|(mask, ..)| !rebind_entries.iter().any(|(path, _)| path == mask));
 
         // Masks before re-binds at equal depth; shallower paths first.
-        let mut planned: Vec<(PathBuf, Identity, Option<u32>)> = mask_entries
+        let mut planned: Vec<(PathBuf, Identity, Option<&MountMask>)> = mask_entries
             .into_iter()
-            .map(|(path, mode, identity)| (path, identity, Some(mode)))
+            .map(|(path, mask, identity)| (path, identity, Some(mask)))
             .chain(
                 rebind_entries
                     .into_iter()
@@ -373,7 +397,7 @@ impl PreparedMountMask {
 
         let mut operations: Vec<Operation> = Vec::new();
         let mut sources = Vec::new();
-        for (path, identity, mask_mode) in planned {
+        for (path, identity, mask) in planned {
             // The deepest operation already applied at or above this path
             // decides what the child sees here.
             let covering = operations
@@ -386,16 +410,24 @@ impl PreparedMountMask {
                 OperationKind::Rebind { .. } => None,
             });
             let target = c_path(&path)?;
-            match mask_mode {
-                Some(mode) => {
+            match mask {
+                Some(mask) => {
                     if hidden_by.is_some() {
                         continue;
                     }
                     let kind = if identity.is_dir {
+                        let option = |value: String| {
+                            CString::new(value).map_err(|_| {
+                                NonoError::SandboxInit("invalid tmpfs option".to_string())
+                            })
+                        };
                         OperationKind::MaskDirectory {
-                            mode: CString::new(format!("{mode:o}")).map_err(|_| {
-                                NonoError::SandboxInit("invalid tmpfs mode".to_string())
-                            })?,
+                            mode: option(format!("{:o}", mask.tmpfs_mode))?,
+                            size: mask.tmpfs_size.map(|v| option(v.to_string())).transpose()?,
+                            inodes: mask
+                                .tmpfs_inodes
+                                .map(|v| option(v.to_string()))
+                                .transpose()?,
                         }
                     } else {
                         OperationKind::MaskFile
@@ -534,7 +566,9 @@ impl PreparedMountMask {
         let mut result = Ok(());
         for (index, op) in self.operations.iter().enumerate() {
             let step = match &op.kind {
-                OperationKind::MaskDirectory { mode } => mask_directory(op, mode),
+                OperationKind::MaskDirectory { mode, size, inodes } => {
+                    mask_directory(op, mode, size.as_ref(), inodes.as_ref())
+                }
                 OperationKind::MaskFile => {
                     if null_fd < 0 {
                         match open_null() {
@@ -553,9 +587,13 @@ impl PreparedMountMask {
                     components,
                     slot,
                 } => match (self.operations.get(*base), self.sources.get(*slot)) {
-                    (Some(base), Some(source)) => {
-                        rebind(&base.target, components, source.get(), op.identity.is_dir)
-                    }
+                    (Some(base), Some(source)) => rebind(
+                        &base.target,
+                        base.identity,
+                        components,
+                        source.get(),
+                        op.identity.is_dir,
+                    ),
                     _ => Err((MountMaskStep::Open, libc::EINVAL)),
                 },
             };
@@ -862,27 +900,42 @@ fn clone_tree(source: RawFd, recursive: bool) -> StepResult<RawFd> {
     }
 }
 
-fn mask_directory(op: &Operation, mode: &CString) -> StepResult<()> {
+fn fsconfig_string(
+    fs: RawFd,
+    key: &std::ffi::CStr,
+    value: Option<&CString>,
+) -> std::result::Result<(), i32> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    // SAFETY: NUL-terminated key and value that outlive the call; scalar fd.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_fsconfig,
+            fs,
+            FSCONFIG_SET_STRING,
+            key.as_ptr(),
+            value.as_ptr(),
+            0,
+        )
+    };
+    if rc < 0 { Err(raw_errno()) } else { Ok(()) }
+}
+
+fn mask_directory(
+    op: &Operation,
+    mode: &CString,
+    size: Option<&CString>,
+    inodes: Option<&CString>,
+) -> StepResult<()> {
     let target = open_verified(&op.target, op.identity)?;
     let result = (|| {
         let fs = fsopen_tmpfs().map_err(|e| (MountMaskStep::CreateTmpfs, e))?;
-        // SAFETY: static NUL-terminated key, NUL-terminated value owned by
-        // the prepared plan; scalar fd.
-        let configured = unsafe {
-            libc::syscall(
-                libc::SYS_fsconfig,
-                fs,
-                FSCONFIG_SET_STRING,
-                c"mode".as_ptr(),
-                mode.as_ptr(),
-                0,
-            )
-        };
-        let mounted = if configured < 0 {
-            Err(raw_errno())
-        } else {
-            fsconfig_create(fs).and_then(|()| fsmount(fs, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV))
-        };
+        let mounted = fsconfig_string(fs, c"mode", Some(mode))
+            .and_then(|()| fsconfig_string(fs, c"size", size))
+            .and_then(|()| fsconfig_string(fs, c"nr_inodes", inodes))
+            .and_then(|()| fsconfig_create(fs))
+            .and_then(|()| fsmount(fs, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV));
         close(fs);
         let mount = mounted.map_err(|e| (MountMaskStep::CreateTmpfs, e))?;
         let attached = set_attributes(mount, 0, false).and_then(|()| attach(mount, target));
@@ -913,6 +966,7 @@ fn mask_file(op: &Operation, null_fd: RawFd) -> StepResult<()> {
 /// the pre-opened source over it.
 fn rebind(
     base_target: &CString,
+    base_identity: Identity,
     components: &[CString],
     source: RawFd,
     is_dir: bool,
@@ -923,8 +977,20 @@ fn rebind(
     if source < 0 {
         return Err((MountMaskStep::Open, libc::EBADF));
     }
-    // The base path now resolves to the tmpfs this plan mounted over it.
+    // The base path must now resolve to the tmpfs this plan mounted over it,
+    // never to the host directory beneath: a fresh tmpfs has its own device.
     let mut dir = openat2(libc::AT_FDCWD, base_target, libc::O_DIRECTORY)?;
+    match fstat(dir) {
+        Ok(stat) if stat.st_dev != base_identity.dev => {}
+        Ok(_) => {
+            close(dir);
+            return Err((MountMaskStep::Verify, libc::EXDEV));
+        }
+        Err(error) => {
+            close(dir);
+            return Err(error);
+        }
+    }
     for name in parents {
         let next = make_directory(dir, name).and_then(|()| openat2(dir, name, libc::O_DIRECTORY));
         close(dir);
@@ -995,6 +1061,19 @@ mod tests {
         std::os::unix::fs::symlink(base.path(), &link).expect("symlink");
         let error = PreparedMountMask::prepare(&[MountMask::new(&link)], &[]).expect_err("link");
         assert!(error.to_string().contains("canonical"), "{error}");
+    }
+
+    #[test]
+    fn the_root_cannot_be_masked() {
+        let error = PreparedMountMask::prepare(&[MountMask::new("/")], &[]).expect_err("root");
+        assert!(error.to_string().contains("root"), "{error}");
+    }
+
+    #[test]
+    fn tmpfs_limits_are_carried_and_zero_means_default() {
+        let mask = MountMask::new("/x").tmpfs_limits(1 << 20, 0);
+        assert_eq!(mask.tmpfs_size, Some(1 << 20));
+        assert_eq!(mask.tmpfs_inodes, None);
     }
 
     #[test]

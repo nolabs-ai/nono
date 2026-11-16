@@ -237,21 +237,30 @@ pub fn query_path(
 /// filesystem deny for a socket path into a Seatbelt `network-outbound` deny.
 /// Linux Landlock filesystem denies do not mediate AF_UNIX operations.
 /// Answer a pathname socket query for a path hidden by the Linux mount mask
-/// (`linux.isolate.mounts`). Returns `None` when no mask covers the path, or
-/// when an explicit grant re-binds it through the mask; the regular socket
-/// query then decides.
+/// (`linux.isolate.mounts`), from the paths the applied plan masks and
+/// re-binds. The deepest of those at or above the path decides what the
+/// sandbox sees there, exactly as the mounts stack: a mask hides the path,
+/// and a re-bind (of the socket, or of any directory above it, whichever
+/// grant caused it) shows the host's. Returns `None` when the path is not
+/// hidden; the regular socket query then decides.
 #[must_use]
 pub fn query_masked_unix_socket(
     path: &Path,
-    op: nono::UnixSocketOp,
-    caps: &CapabilitySet,
     masked_paths: &[std::path::PathBuf],
+    rebound_paths: &[std::path::PathBuf],
 ) -> Option<QueryResult> {
     let resolved = try_canonicalize(path);
-    let mask = masked_paths
-        .iter()
-        .find(|mask| resolved.starts_with(mask))?;
-    if caps.matching_unix_socket(&resolved, op).is_some() {
+    let deepest = |paths: &[std::path::PathBuf]| {
+        paths
+            .iter()
+            .filter(|candidate| resolved.starts_with(candidate))
+            .max_by_key(|candidate| candidate.components().count())
+            .cloned()
+    };
+    let mask = deepest(masked_paths)?;
+    if deepest(rebound_paths)
+        .is_some_and(|rebind| rebind.components().count() > mask.components().count())
+    {
         return None;
     }
     Some(QueryResult::Denied {
@@ -1098,36 +1107,37 @@ mod tests {
         let socket = root.join("agent.sock");
         let _listener = UnixListener::bind(&socket).expect("bind");
         let masked = vec![root.clone()];
+        let is_masked = |result: Option<QueryResult>| matches!(&result, Some(QueryResult::Denied { reason, .. }) if reason == "isolation_mount_masked");
 
-        let denied = query_masked_unix_socket(
-            &socket,
-            UnixSocketOp::Connect,
-            &CapabilitySet::new(),
-            &masked,
-        )
-        .expect("masked path is answered");
+        assert!(is_masked(query_masked_unix_socket(&socket, &masked, &[])));
         assert!(
-            matches!(&denied, QueryResult::Denied { reason, .. } if reason == "isolation_mount_masked"),
-            "{denied:?}"
+            query_masked_unix_socket(&socket, &masked, std::slice::from_ref(&socket)).is_none(),
+            "a re-bound socket is reachable"
         );
+        assert!(query_masked_unix_socket(Path::new("/elsewhere.sock"), &masked, &[]).is_none());
+    }
 
-        let mut caps = CapabilitySet::new();
-        caps.add_unix_socket(
-            UnixSocketCapability::new_file(&socket, UnixSocketMode::Connect).expect("grant"),
-        );
-        assert!(
-            query_masked_unix_socket(&socket, UnixSocketOp::Connect, &caps, &masked).is_none(),
-            "a granted socket is re-bound through the mask"
-        );
-        assert!(
-            query_masked_unix_socket(
-                Path::new("/elsewhere.sock"),
-                UnixSocketOp::Connect,
-                &CapabilitySet::new(),
-                &masked
-            )
-            .is_none()
-        );
+    #[cfg(unix)]
+    #[test]
+    fn test_query_masked_unix_socket_follows_the_mount_stack() {
+        let dir = tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical");
+        let granted_dir = root.join("app");
+        let inner_mask = granted_dir.join("private");
+        std::fs::create_dir_all(&inner_mask).expect("mkdir");
+        let socket = granted_dir.join("agent.sock");
+        let _listener = UnixListener::bind(&socket).expect("bind");
+        let hidden = inner_mask.join("x.sock");
+
+        // A read grant of the directory re-binds it, so its sockets connect.
+        let masked = vec![root.clone(), inner_mask.clone()];
+        let rebound = vec![granted_dir.clone()];
+        assert!(query_masked_unix_socket(&socket, &masked, &rebound).is_none());
+        // A mask beneath the re-bound directory hides its subtree again.
+        assert!(query_masked_unix_socket(&hidden, &masked, &rebound).is_some());
+        // A grant exactly at a directory mask is not re-bound by the plan, so
+        // the path stays masked even though a grant names it.
+        assert!(query_masked_unix_socket(&socket, std::slice::from_ref(&root), &[]).is_some());
     }
 
     #[test]

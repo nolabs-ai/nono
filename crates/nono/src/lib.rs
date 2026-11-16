@@ -95,7 +95,7 @@ pub use path::try_canonicalize;
 pub use resource::ResourceLimits;
 #[cfg(target_os = "linux")]
 pub use sandbox::{
-    DetectedAbi, LandlockScopePolicy, MAX_ENFORCED_ABI, MountMask, NamespaceProbe,
+    DetectedAbi, LandlockScopePolicy, MAX_ENFORCED_ABI, MountMask, MountMaskWatch, NamespaceProbe,
     NamespaceProbeStage, NamespaceSpec, PreparedMountMask, SeccompOpts, detect_abi, is_wsl2,
     kernel_abi_version, landlock_scope_policy,
 };

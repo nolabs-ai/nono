@@ -53,6 +53,9 @@ pub(super) struct Bootstrap {
     /// Loopback listener created inside the child's network namespace, when
     /// namespace isolation requested a proxy bridge.
     pub bridge: Option<OwnedFd>,
+    /// Watch over the child's mount masks, pinned after the child applied
+    /// them and before it ran untrusted code.
+    pub mount_watch: Option<nono::MountMaskWatch>,
 }
 
 pub(super) struct Command<'a> {
@@ -341,6 +344,7 @@ pub(super) fn spawn(
     // handshake returns DETACHED or cleanup has killed AND reaped the child.
     let mut ruleset = None;
     let mut cleanup_dir = None;
+    let mut mount_watch = None;
     #[cfg(test)]
     let mut late_fd = None;
     let handshake = (|| -> Result<(RawFd, Option<OwnedFd>)> {
@@ -393,6 +397,10 @@ pub(super) fn spawn(
                     }
                     _ => return Err(failure("invalid mount confirmation")),
                 }
+                // Record the mounts now, while the child still runs only
+                // nono's code: a host-side change that removes a mask later
+                // is detected against this state.
+                mount_watch = Some(nono::MountMaskWatch::attach(pid, plan)?);
                 Some(
                     open(
                         format!("/proc/{pid}/root").as_str(),
@@ -521,6 +529,7 @@ pub(super) fn spawn(
         child: nix::unistd::Pid::from_raw(pid),
         network,
         bridge,
+        mount_watch,
     })
 }
 

@@ -18,17 +18,33 @@ use std::path::{Path, PathBuf};
 /// runtime directory and `/tmp`. Pathname `connect(2)` is not governed by
 /// Landlock below ABI 9, so these sockets are hidden rather than mediated.
 /// Any change to this list is a security change.
+///
+/// A directory is preferred over the socket inside it where the daemon owns
+/// the whole directory: a directory mask also hides sockets created after
+/// launch, and is not lost when the daemon recreates its socket. Sockets that
+/// live directly in a shared directory (`/run/docker.sock`) can only be masked
+/// as files; the session's mount watch terminates the sandbox if the host
+/// removes one of those masks.
 const DEFAULT_SYSTEM_MASKS: &[&str] = &[
     // D-Bus system bus.
     "/run/dbus",
-    // Container runtimes: each socket grants root-equivalent control.
+    // Container and VM managers: each socket grants root-equivalent control.
     "/run/docker.sock",
     "/var/run/docker.sock",
-    "/run/containerd/containerd.sock",
-    "/run/podman/podman.sock",
+    "/run/docker",
+    "/run/containerd",
+    "/run/k3s",
+    "/run/crio",
+    "/run/podman",
+    "/run/libvirt",
+    "/var/lib/incus/unix.socket",
+    "/var/lib/lxd/unix.socket",
+    "/var/snap/lxd/common/lxd/unix.socket",
     // snapd and the systemd system manager's private socket.
     "/run/snapd.socket",
     "/run/systemd/private",
+    // Smart cards and hardware tokens (pcscd).
+    "/run/pcscd",
 ];
 /// Mode of the tmpfs over the user's runtime directory, matching systemd.
 const RUNTIME_DIR_MODE: u32 = 0o700;
@@ -36,6 +52,16 @@ const RUNTIME_DIR_MODE: u32 = 0o700;
 const PRIVATE_TMP_MODE: u32 = 0o1777;
 /// Mode of the tmpfs over other masked directories.
 const SYSTEM_DIR_MODE: u32 = 0o755;
+/// Size and inode limits of the tmpfs over the user's runtime directory. A
+/// grant of the whole directory makes it writable, so it gets room for
+/// sockets and small state files, but not half of RAM.
+const RUNTIME_DIR_SIZE: u64 = 16 << 20;
+/// Size limit of the tmpfs over other masked directories, which hold only
+/// re-bind mount points.
+const SYSTEM_DIR_SIZE: u64 = 1 << 20;
+/// Inode limit of every non-`/tmp` mask tmpfs: enough for the mount points
+/// of every re-bind a plan can hold.
+const MASK_INODES: u64 = 16_384;
 
 /// Reject configurations that namespace isolation cannot satisfy, before
 /// anything is started.
@@ -127,22 +153,11 @@ pub(crate) fn prepare_mount_mask(
     caps: &CapabilitySet,
     workdir: &Path,
 ) -> Result<PreparedMountMask> {
-    let masks = mask_list(isolate, workdir)?;
-    let rebinds: Vec<PathBuf> = caps
-        .fs_capabilities()
-        .iter()
-        .map(|cap| cap.resolved.clone())
-        .chain(
-            caps.unix_socket_capabilities()
-                .iter()
-                .map(|cap| cap.resolved.clone()),
-        )
-        .collect();
-    let plan = PreparedMountMask::prepare(&masks, &rebinds)?;
+    let plan = plan_mount_mask(isolate, caps, workdir)?;
     for skipped in plan.skipped() {
-        let under_mask = masks
-            .iter()
-            .any(|mask| skipped.path.starts_with(mask.path()));
+        let under_mask = plan
+            .masked_paths()
+            .any(|mask| skipped.path.starts_with(mask));
         match skipped.reason {
             MountSkipReason::Missing | MountSkipReason::Inaccessible if skipped.is_mask => {
                 tracing::debug!(
@@ -166,19 +181,87 @@ pub(crate) fn prepare_mount_mask(
     Ok(plan)
 }
 
-/// Host paths `isolate` masks on this host, for diagnostics and `nono why`.
-/// Paths that do not exist (and so are not masked) are left out. Empty when
-/// `mounts` is off or the list cannot be built.
-pub(crate) fn masked_host_paths(isolate: &LinuxIsolateConfig, workdir: &Path) -> Vec<PathBuf> {
-    if !isolate.mounts {
-        return Vec::new();
+/// Build the plan without logging, for `nono why` and the sandbox state. It
+/// inspects paths only; nothing is mounted until a child applies it.
+pub(crate) fn plan_mount_mask(
+    isolate: &LinuxIsolateConfig,
+    caps: &CapabilitySet,
+    workdir: &Path,
+) -> Result<PreparedMountMask> {
+    let masks = mask_list(isolate, workdir)?;
+    let rebinds: Vec<PathBuf> = caps
+        .fs_capabilities()
+        .iter()
+        .map(|cap| cap.resolved.clone())
+        .chain(
+            caps.unix_socket_capabilities()
+                .iter()
+                .map(|cap| cap.resolved.clone()),
+        )
+        .collect();
+    PreparedMountMask::prepare(&masks, &rebinds)
+}
+
+/// The masked and re-bound paths of `plan`, as the sandbox state records
+/// them and `nono why` reads them.
+pub(crate) fn mount_view(plan: &PreparedMountMask) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    (
+        plan.masked_paths().map(Path::to_path_buf).collect(),
+        plan.rebound_paths().map(Path::to_path_buf).collect(),
+    )
+}
+
+/// The mask that hides `path` in the sandbox, if any: the deepest masked or
+/// re-bound path at or above it decides, as the mounts stack.
+pub(crate) fn hiding_mask<'a>(plan: &'a PreparedMountMask, path: &Path) -> Option<&'a Path> {
+    let depth = |p: &Path| p.components().count();
+    let mask = plan
+        .masked_paths()
+        .filter(|mask| path.starts_with(mask))
+        .max_by_key(|mask| depth(mask))?;
+    let rebound = plan
+        .rebound_paths()
+        .filter(|rebind| path.starts_with(rebind))
+        .any(|rebind| depth(rebind) > depth(mask));
+    (!rebound).then_some(mask)
+}
+
+/// Refuse to launch in a working directory the masks hide: it does not exist
+/// in the sandbox, and the launch would otherwise fail with a bare EACCES.
+pub(crate) fn reject_hidden_workdir(plan: &PreparedMountMask, current_dir: &Path) -> Result<()> {
+    match hiding_mask(plan, current_dir) {
+        None => Ok(()),
+        Some(mask) => Err(NonoError::SandboxInit(format!(
+            "the working directory {} is hidden by the linux.isolate.mounts mask over {}. \
+             Grant it (--allow-cwd, or workdir access in the profile) so it is re-bound \
+             through the mask, or start from a directory outside the mask.",
+            current_dir.display(),
+            mask.display()
+        ))),
     }
-    mask_list(isolate, workdir)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|mask| mask.path().to_path_buf())
-        .filter(|path| std::fs::symlink_metadata(path).is_ok())
-        .collect()
+}
+
+/// `$XDG_RUNTIME_DIR`, if it names a directory the caller owns. The variable
+/// is untrusted: honouring any absolute path would let it replace an
+/// arbitrary directory (`/usr`) with an empty tmpfs.
+fn trusted_runtime_dir() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+    if !runtime.is_absolute() {
+        return None;
+    }
+    let runtime = nono::try_canonicalize(&runtime);
+    let metadata = std::fs::symlink_metadata(&runtime).ok()?;
+    let owned = metadata.is_dir()
+        && metadata.uid() == nix::unistd::getuid().as_raw()
+        && runtime.parent().is_some();
+    if !owned {
+        tracing::debug!(
+            "XDG_RUNTIME_DIR {} is not a directory owned by this user; not masking it",
+            runtime.display()
+        );
+    }
+    owned.then_some(runtime)
 }
 
 /// The full mask list: user runtime directory, private `/tmp`, system IPC
@@ -186,26 +269,37 @@ pub(crate) fn masked_host_paths(isolate: &LinuxIsolateConfig, workdir: &Path) ->
 /// symlinked location (`/var/run` -> `/run`) masks the real target.
 fn mask_list(isolate: &LinuxIsolateConfig, workdir: &Path) -> Result<Vec<MountMask>> {
     let mut masks: Vec<MountMask> = Vec::new();
-    let mut push = |path: PathBuf, mode: u32| {
+    let mut push = |path: PathBuf, mask: fn(PathBuf) -> MountMask| {
         let path = nono::try_canonicalize(&path);
-        if !masks.iter().any(|mask| mask.path() == path) {
-            masks.push(MountMask::new(path).tmpfs_mode(mode));
+        if !masks.iter().any(|existing| existing.path() == path) {
+            masks.push(mask(path));
         }
+    };
+    let runtime_mask = |path| {
+        MountMask::new(path)
+            .tmpfs_mode(RUNTIME_DIR_MODE)
+            .tmpfs_limits(RUNTIME_DIR_SIZE, MASK_INODES)
+    };
+    let system_mask = |path| {
+        MountMask::new(path)
+            .tmpfs_mode(SYSTEM_DIR_MODE)
+            .tmpfs_limits(SYSTEM_DIR_SIZE, MASK_INODES)
     };
     // The environment is untrusted: mask the standard per-user runtime
     // directory whether or not $XDG_RUNTIME_DIR points at it.
     push(
         PathBuf::from(format!("/run/user/{}", nix::unistd::getuid())),
-        RUNTIME_DIR_MODE,
+        runtime_mask,
     );
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
-        && runtime.is_absolute()
-    {
-        push(runtime, RUNTIME_DIR_MODE);
+    if let Some(runtime) = trusted_runtime_dir() {
+        push(runtime, runtime_mask);
     }
-    push(PathBuf::from("/tmp"), PRIVATE_TMP_MODE);
+    // The private /tmp keeps the kernel's default size, like a host tmpfs /tmp.
+    push(PathBuf::from("/tmp"), |path| {
+        MountMask::new(path).tmpfs_mode(PRIVATE_TMP_MODE)
+    });
     for path in DEFAULT_SYSTEM_MASKS {
-        push(PathBuf::from(path), SYSTEM_DIR_MODE);
+        push(PathBuf::from(path), system_mask);
     }
     for raw in &isolate.extra_masks {
         let expanded = crate::profile::expand_vars(raw, workdir)?;
@@ -216,7 +310,7 @@ fn mask_list(isolate: &LinuxIsolateConfig, workdir: &Path) -> Result<Vec<MountMa
                 expanded.display()
             )));
         }
-        push(expanded, SYSTEM_DIR_MODE);
+        push(expanded, system_mask);
     }
     Ok(masks)
 }

@@ -351,7 +351,11 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         &domain_endpoints,
         &flags,
     );
-    let cap_file_path = cap_file.unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut cap_file = cap_file;
+    let cap_file_path = cap_file
+        .as_ref()
+        .map_or_else(|| std::path::PathBuf::from("/dev/null"), |f| f.path.clone());
     if cap_file_path != Path::new("/dev/null") {
         caps.add_fs(FsCapability::new_file(&cap_file_path, AccessMode::Read)?);
     }
@@ -722,6 +726,17 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     {
         let plan = crate::isolation::prepare_mount_mask(&flags.isolate, &caps, &requested_workdir)?;
         crate::output::print_mount_mask(&plan, flags.silent);
+        crate::isolation::reject_hidden_workdir(&plan, &current_dir)?;
+        // Record exactly what this plan masks and re-binds, so `nono why
+        // --self` answers from the applied plan rather than recomputing it.
+        if let Some(CapabilityStateFile { path, file, state }) = cap_file.as_mut()
+            && let Some(isolation) = state.isolation.as_mut()
+        {
+            (isolation.masked_paths, isolation.rebound_paths) = crate::isolation::mount_view(&plan);
+            if let Err(error) = state.rewrite(file, path) {
+                warn!("cannot record the mount mask in the sandbox state file: {error}");
+            }
+        }
         Some(plan)
     } else {
         None
@@ -913,6 +928,14 @@ fn validate_command_policy_execution_support() -> Result<()> {
     }
 }
 
+/// A written sandbox state file, kept open so launch-time facts decided after
+/// it was granted (the applied mount mask) can still be recorded in it.
+struct CapabilityStateFile {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    state: sandbox_state::SandboxState,
+}
+
 fn write_capability_state_file(
     caps: &CapabilitySet,
     bypass_protection_paths: &[crate::policy::AppliedBypass],
@@ -921,7 +944,7 @@ fn write_capability_state_file(
     denied_domains: &[String],
     domain_endpoints: &[sandbox_state::DomainEndpointState],
     flags: &ExecutionFlags,
-) -> Option<std::path::PathBuf> {
+) -> Option<CapabilityStateFile> {
     let mut state = sandbox_state::SandboxState::from_caps_with_denies(
         caps,
         bypass_protection_paths,
@@ -945,14 +968,22 @@ fn write_capability_state_file(
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-            masked_paths: crate::isolation::masked_host_paths(&flags.isolate, &flags.workdir),
+            // Filled in from the applied plan once it is built.
+            masked_paths: Vec::new(),
+            rebound_paths: Vec::new(),
         });
     }
 
     for _ in 0..8 {
         let cap_file = next_capability_state_file_path();
-        match state.write_to_file(&cap_file) {
-            Ok(()) => return Some(cap_file),
+        match state.create_file(&cap_file) {
+            Ok(file) => {
+                return Some(CapabilityStateFile {
+                    path: cap_file,
+                    file,
+                    state,
+                });
+            }
             Err(NonoError::ConfigWrite { source, .. })
                 if source.kind() == std::io::ErrorKind::AlreadyExists =>
             {

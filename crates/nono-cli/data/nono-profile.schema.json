@@ -703,7 +703,7 @@
         "mounts": {
           "type": "boolean",
           "default": false,
-          "description": "Run in a new user + mount namespace that masks host IPC endpoints: an empty tmpfs over $XDG_RUNTIME_DIR (and /run/user/<uid>), masks over /run/dbus, the Docker, containerd, Podman and snapd sockets and /run/systemd/private, and a private per-session /tmp. Paths the profile grants, including unix_socket grants, are re-bound through the masks; a grant of a whole masked directory applies to the session's private copy. Cannot be combined with security.capability_elevation."
+          "description": "Run in a new user + mount namespace that masks host IPC endpoints: an empty tmpfs over $XDG_RUNTIME_DIR (and /run/user/<uid>), masks over /run/dbus, container and VM manager sockets (Docker, containerd, k3s, CRI-O, Podman, libvirt, Incus, LXD), snapd, pcscd and /run/systemd/private, and a private per-session /tmp. If the host removes a mask during the session (for example by recreating a daemon socket), nono terminates the sandbox. Paths the profile grants, including unix_socket grants, are re-bound through the masks; a grant of a whole masked directory applies to the session's private copy. Cannot be combined with security.capability_elevation."
         },
         "extra_masks": {
           "type": "array",

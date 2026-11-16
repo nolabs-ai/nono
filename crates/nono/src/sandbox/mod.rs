@@ -13,6 +13,8 @@ mod linux;
 #[cfg(target_os = "linux")]
 mod linux_mount_mask;
 #[cfg(target_os = "linux")]
+mod linux_mount_watch;
+#[cfg(target_os = "linux")]
 mod linux_namespace;
 
 #[cfg(target_os = "macos")]
@@ -41,6 +43,8 @@ pub use linux_namespace::{
 pub use linux_mount_mask::{
     MountMask, MountMaskStep, MountSkipReason, PreparedMountMask, RawMountMaskError, SkippedMount,
 };
+#[cfg(target_os = "linux")]
+pub use linux_mount_watch::MountMaskWatch;
 
 // Re-export Linux WSL2 detection
 #[cfg(target_os = "linux")]

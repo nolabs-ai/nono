@@ -1062,7 +1062,7 @@ pub struct ProfileGroupsArgs {
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SandboxArgs {
     #[arg(skip)]
-    pub(crate) managed_profile: Option<crate::profile::Profile>,
+    pub(crate) managed_profile: Option<crate::profile::bundle::ManagedProfile>,
     #[arg(skip)]
     pub(crate) policy_session: Option<crate::platform_policy::PolicySession>,
     // ── Filesystem ───────────────────────────────────────────────────────

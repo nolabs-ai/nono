@@ -690,8 +690,8 @@ fn prepare_profile_with_options(
     }
 
     let (loaded_profile, resolved_command_binaries) = if let Some(profile) = &args.managed_profile {
-        let binaries = validate_command_policy_runtime_support(profile)?;
-        (Some(profile.clone()), binaries)
+        let binaries = validate_command_policy_runtime_support(&profile.profile)?;
+        (Some(profile.profile.clone()), binaries)
     } else if let Some(ref profile_name) = args.profile {
         // Missing fully-qualified package profiles may offer to install the
         // exact registry package from every normal loading call site.

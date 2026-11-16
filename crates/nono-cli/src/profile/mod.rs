@@ -3667,8 +3667,15 @@ pub(crate) fn validate_delivered_profile(profile: &Profile) -> Result<()> {
 }
 
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
+pub(crate) fn finalize_profile(profile: Profile) -> Result<Profile> {
+    finalize_profile_with_policy(profile, &crate::policy::load_embedded_policy()?)
+}
+
 #[allow(deprecated)]
-pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
+pub(crate) fn finalize_profile_with_policy(
+    mut profile: Profile,
+    policy: &crate::policy::Policy,
+) -> Result<Profile> {
     profile = apply_platform_overrides(profile)?;
     // apply_platform_overrides merges platform-specific custom_credentials,
     // env_credentials, and environment.set_vars into the profile, so those
@@ -3686,7 +3693,7 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     validate_profile_network_denial_audit(&profile)?;
     validate_profile_session_recording(&profile)?;
     validate_profile_domain_patterns(&profile)?;
-    merge_implicit_default_groups(&mut profile)?;
+    merge_implicit_default_groups(&mut profile, policy)?;
     // Re-run after extends/platform overrides: base and child profiles can
     // independently add no_proxy and allow_domain entries that only conflict
     // once the final effective profile has been assembled.
@@ -3732,13 +3739,19 @@ pub(crate) fn resolve_and_finalize_profile(profile: Profile) -> Result<Profile> 
 ///
 /// The built-in `default` profile is now the canonical source of implicit
 /// groups. The `default` profile itself does not inherit any additional groups.
-fn implicit_default_groups(profile: &Profile) -> Result<Vec<String>> {
+fn implicit_default_groups(
+    profile: &Profile,
+    policy: &crate::policy::Policy,
+) -> Result<Vec<String>> {
     if profile.meta.name == "default" {
         return Ok(Vec::new());
     }
 
-    let default = crate::policy::get_policy_profile("default")?
+    let default = policy
+        .profiles
+        .get("default")
         .ok_or_else(|| NonoError::ProfileNotFound("default".to_string()))?;
+    let default = finalize_profile_with_policy(default.to_raw_profile(), policy)?;
     Ok(default.groups.include)
 }
 
@@ -3752,12 +3765,14 @@ fn implicit_default_groups(profile: &Profile) -> Result<Vec<String>> {
 ///
 /// This means exclusions win even if the same group is also added explicitly in
 /// `groups.include`.
-fn merge_implicit_default_groups(profile: &mut Profile) -> Result<()> {
-    let policy = crate::policy::load_embedded_policy()?;
+fn merge_implicit_default_groups(
+    profile: &mut Profile,
+    policy: &crate::policy::Policy,
+) -> Result<()> {
     let exclusions = &profile.groups.exclude;
-    crate::policy::validate_group_exclusions(&policy, exclusions)?;
+    crate::policy::validate_group_exclusions(policy, exclusions)?;
 
-    let mut merged = implicit_default_groups(profile)?;
+    let mut merged = implicit_default_groups(profile, policy)?;
     // Append profile-specific groups (avoiding duplicates)
     let mut seen: std::collections::HashSet<String> = merged.iter().cloned().collect();
     for g in &profile.groups.include {
@@ -6048,7 +6063,11 @@ mod tests {
             ..Default::default()
         };
 
-        merge_implicit_default_groups(&mut profile).expect("merge should succeed");
+        merge_implicit_default_groups(
+            &mut profile,
+            &crate::policy::load_embedded_policy().expect("policy"),
+        )
+        .expect("merge should succeed");
 
         // Should contain base groups
         assert!(
@@ -6095,7 +6114,11 @@ mod tests {
             ..Default::default()
         };
 
-        merge_implicit_default_groups(&mut profile).expect("merge should succeed");
+        merge_implicit_default_groups(
+            &mut profile,
+            &crate::policy::load_embedded_policy().expect("policy"),
+        )
+        .expect("merge should succeed");
 
         assert!(
             !profile

@@ -469,9 +469,7 @@ pub(crate) fn prepare_start(
     };
     if mode == "advisory" && !local_override {
         let policy = claims.as_ref().and_then(|c| c.policy.as_ref()).ok_or_else(|| NonoError::ActionRequired("platform policy could not be refreshed; explicitly choose --profile to run locally".into()))?;
-        let (raw, groups) = profile::bundle::parse_delivered(&policy.profile_json)?;
-        crate::policy::use_delivered_groups(groups)?;
-        let loaded = profile::finalize_profile(raw)?;
+        let loaded = profile::bundle::ManagedProfile::parse(&policy.profile_json)?;
         session.policy_source = "platform".into();
         args.managed_profile = Some(loaded);
     }

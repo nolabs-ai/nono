@@ -696,7 +696,10 @@ impl CapabilitySetExt for CapabilitySet {
         let allow_parent_of_protected = profile.allow_parent_of_protected.unwrap_or(false);
 
         // Resolve policy groups from the already-finalized profile.
-        let loaded_policy = policy::load_embedded_policy()?;
+        let loaded_policy = match &args.managed_profile {
+            Some(managed) => managed.policy.clone(),
+            None => policy::load_embedded_policy()?,
+        };
         let groups = profile.groups.include.clone();
         let mut resolved = policy::resolve_groups(&loaded_policy, &groups, &mut caps)?;
         debug!("Resolved {} policy groups", resolved.names.len());

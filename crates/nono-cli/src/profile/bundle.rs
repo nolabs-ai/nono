@@ -8,6 +8,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedProfile {
+    pub profile: Profile,
+    pub policy: crate::policy::Policy,
+}
+
+impl ManagedProfile {
+    pub(crate) fn parse(text: &str) -> Result<Self> {
+        let (profile, policy) = parse_delivered(text)?;
+        let profile = super::finalize_profile_with_policy(profile, &policy)?;
+        Ok(Self { profile, policy })
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileBundle {
@@ -174,9 +188,7 @@ fn resolve(bundle: &ProfileBundle) -> Result<Profile> {
     Ok(profile)
 }
 
-pub(crate) fn parse_delivered(
-    text: &str,
-) -> Result<(Profile, BTreeMap<String, serde_json::Value>)> {
+pub(crate) fn parse_delivered(text: &str) -> Result<(Profile, crate::policy::Policy)> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|error| NonoError::ProfileParse(error.to_string()))?;
     let bundle = if value.get("root").is_some() {
@@ -190,14 +202,74 @@ pub(crate) fn parse_delivered(
         }
     };
     let profile = resolve(&bundle)?;
-    crate::policy::validate_delivered_groups(&bundle.groups)?;
-    Ok((profile, bundle.groups))
+    let policy = crate::policy::delivered_policy(&bundle.groups)?;
+    Ok((profile, policy))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability_ext::CapabilitySetExt;
     use serde_json::json;
+
+    #[test]
+    fn delivered_groups_are_isolated_between_launches_and_local_policy() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("environment lock");
+        // Linux's default groups grant /tmp, so deny targets must live elsewhere.
+        let root = tempfile::Builder::new()
+            .prefix("managed-groups-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("root");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::write(&first, "first").expect("first");
+        std::fs::write(&second, "second").expect("second");
+        let prepare = |path: &Path| {
+            ManagedProfile::parse(&json!({
+                "root": {"meta":{"name":"managed"}, "groups":{"include":["launch-scope"]}},
+                "profiles": {},
+                "groups": {"launch-scope":{"description":"launch-specific deny", "deny":{"access":[path]}}}
+            }).to_string()).expect("managed profile")
+        };
+        let first_profile = prepare(&first);
+        let second_profile = prepare(&second);
+        for (managed, denied, other) in [
+            (&first_profile, &first, &second),
+            (&second_profile, &second, &first),
+            (&first_profile, &first, &second),
+        ] {
+            let args = crate::cli::SandboxArgs {
+                managed_profile: Some(managed.clone()),
+                ..Default::default()
+            };
+            let prepared = nono::CapabilitySet::from_profile(&managed.profile, root.path(), &args)
+                .expect("capabilities");
+            assert!(prepared.deny_paths.contains(denied));
+            assert!(!prepared.deny_paths.contains(other));
+            assert!(
+                !crate::policy::load_embedded_policy()
+                    .expect("local policy")
+                    .groups
+                    .contains_key("launch-scope")
+            );
+        }
+    }
+
+    #[test]
+    fn delivered_required_groups_cannot_be_excluded() {
+        let text = json!({
+            "root": {"meta":{"name":"managed"}, "groups":{"exclude":["tenant-required"]}},
+            "profiles": {},
+            "groups": {"tenant-required":{"description":"required", "required":true}}
+        })
+        .to_string();
+        assert!(
+            ManagedProfile::parse(&text)
+                .expect_err("required group")
+                .to_string()
+                .contains("tenant-required")
+        );
+    }
 
     #[test]
     fn delivered_sources_evaluate_predicates_only_on_the_device() {
@@ -216,7 +288,14 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(profile.filesystem.read, ["$HOME/mac-only"]);
         }
-        assert_eq!(groups["delivered-test"]["allow"]["read"][0], "$HOME/shared");
+        assert_eq!(
+            groups.groups["delivered-test"]
+                .allow
+                .as_ref()
+                .expect("allow")
+                .read,
+            ["$HOME/shared"]
+        );
     }
 
     #[test]

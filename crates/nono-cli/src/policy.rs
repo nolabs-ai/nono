@@ -2407,52 +2407,26 @@ pub fn list_policy_profiles() -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Load the embedded policy and return the parsed Policy struct.
-///
-/// The policy JSON is embedded at compile time and never changes at runtime,
-/// so we parse it once and cache the result. This avoids re-parsing ~23 KB of
-/// JSON on every call (up to ~18 call sites per CLI invocation).
-static DELIVERED_POLICY: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
-
-pub(crate) fn validate_delivered_groups(
+pub(crate) fn delivered_policy(
     groups: &std::collections::BTreeMap<String, serde_json::Value>,
-) -> Result<()> {
-    let embedded: serde_json::Value =
-        crate::jsonc::parse(crate::config::embedded::embedded_policy_json())
-            .map_err(NonoError::ConfigParse)?;
+) -> Result<Policy> {
+    let mut policy = load_policy(crate::config::embedded::embedded_policy_json())?;
     for (name, value) in groups {
-        if embedded["groups"].get(name).is_some() {
+        if policy.groups.contains_key(name) {
             return Err(NonoError::ProfileParse(format!(
                 "delivered group '{name}' collides with a built-in group"
             )));
         }
-        serde_json::from_value::<Group>(value.clone()).map_err(|error| {
+        let group = serde_json::from_value::<Group>(value.clone()).map_err(|error| {
             NonoError::ProfileParse(format!("invalid delivered group '{name}': {error}"))
         })?;
+        policy.groups.insert(name.clone(), group);
     }
-    Ok(())
+    Ok(policy)
 }
 
-pub(crate) fn use_delivered_groups(
-    groups: std::collections::BTreeMap<String, serde_json::Value>,
-) -> Result<()> {
-    validate_delivered_groups(&groups)?;
-    let mut policy = load_policy(crate::config::embedded::embedded_policy_json())?;
-    for (name, value) in groups {
-        let group = serde_json::from_value(value).map_err(|error| {
-            NonoError::ProfileParse(format!("invalid delivered group '{name}': {error}"))
-        })?;
-        policy.groups.insert(name, group);
-    }
-    DELIVERED_POLICY.set(policy).map_err(|_| {
-        NonoError::ProfileParse("a delivered policy is already active in this process".into())
-    })
-}
-
+/// Cache local policy independently of the policy delivered for any launch.
 pub fn load_embedded_policy() -> Result<Policy> {
-    if let Some(policy) = DELIVERED_POLICY.get() {
-        return Ok(policy.clone());
-    }
     static CACHED: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
 
     // The embedded JSON is baked in at build time — parse failure here means

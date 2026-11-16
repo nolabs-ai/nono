@@ -1,7 +1,7 @@
 # Managed advisory policy protocol v1
 
-An enrolled device discovers its effective session mode at every `nono run` or
-`nono shell` startup. `nono platform status` reads the last verified result;
+An enrolled device discovers its effective session mode at every `nono run`,
+`nono shell` or `nono wrap` startup. `nono platform status` reads the last verified result;
 `nono platform status --refresh` performs the same discovery explicitly.
 Enrollment continues to return `management_mode: audit_only` for compatibility.
 Only the freshly verified assignment decides managed session behaviour. Status JSON
@@ -61,6 +61,8 @@ referenced package group definitions. Inheritance references are rewritten to bu
 identifiers. `$HOME`, `$WORKDIR`, conditional entries and platform overrides remain
 unresolved. The device uses its existing inheritance resolver against that map only,
 and installs the delivered group definitions without loading local package groups.
+A launch carries its own resolved group policy alongside the profile; it never
+changes the process-wide local policy cache.
 A profile with no dependencies may also be delivered directly. Host/session hooks are rejected; executable package delivery
 is outside this protocol. The client applies its own OS overrides and expands paths
 using its existing policy machinery. Existing platform approval-evaluation limitations
@@ -99,6 +101,12 @@ digest identifies the finalized profile, not the complete OS sandbox or every fl
 The existing audit hash chain covers the extension and existing ingest delivers it.
 Fleet exposes the last reported session separately from the currently assigned policy
 and retains the audit ingest/verification status. Older sessions remain unknown.
+
+`nono wrap` verifies and applies static managed policy, including on `--dry-run`.
+It refuses proxy rules and managed settings that require a supervisor, including
+runtime elevation, command policies and recording, with instructions to use
+`nono run`. Direct exec cannot deliver session audit evidence; advisory launches
+through `wrap` display that limitation, including when a local override is selected.
 
 ## Terminal output
 

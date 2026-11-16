@@ -1129,6 +1129,7 @@ fn test_schema_security_config_matches_rust_model() {
         &schema,
         "SecurityConfig",
         &[
+            "session_socket_auth",
             "signal_mode",
             "process_info_mode",
             "ipc_mode",

@@ -355,6 +355,7 @@ pub struct StartupTimeoutConfig<'a> {
 /// `NONO_SUPERVISOR_PATH`). The parent runs an IPC event loop that handles
 /// capability expansion requests and URL open delegations.
 pub struct SupervisorConfig<'a> {
+    pub session_socket_auth: bool,
     /// Protected nono state roots that must never be granted dynamically.
     pub protected_roots: &'a [std::path::PathBuf],
     /// The session's resolved deny paths (deny groups and profile
@@ -3889,6 +3890,22 @@ fn handle_url_listener_connection(
         }
     };
 
+    let peer_pid = match crate::session_auth::authenticate(
+        sock.as_raw_fd(),
+        config.session_socket_auth,
+        |pid| {
+            config
+                .tool_sandbox_runtime
+                .is_some_and(|runtime| runtime.owns_orphan(pid))
+        },
+    ) {
+        Ok(pid) => pid,
+        Err(err) => {
+            warn!("Rejected URL listener connection: {err}");
+            return;
+        }
+    };
+
     let msg = match sock.recv_message() {
         Ok(m) => m,
         Err(e) => {
@@ -3898,7 +3915,9 @@ fn handle_url_listener_connection(
     };
 
     match msg {
-        SupervisorMessage::OpenUrl(url_request) => {
+        SupervisorMessage::OpenUrl(mut url_request) => {
+            url_request.child_pid = peer_pid;
+            url_request.session_id = config.session_id.to_string();
             let request_id = url_request.request_id.clone();
             let (success, error, push_denial) =
                 match validate_and_open_url(&url_request.url, config) {
@@ -5689,6 +5708,7 @@ mod tests {
 
         let backend = DenyAll;
         let sup_cfg = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -5821,6 +5841,7 @@ mod tests {
         // ProxyOnly mode with proxy_port set, but seccomp_proxy_fallback is false
         // (simulating V4+ where Landlock handles networking).
         let sup_cfg = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -5914,24 +5935,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_url_allowed_origin() {
-        let backend = TestDenyBackend;
-        let origins = vec!["https://claude.ai".to_string()];
-        let config = SupervisorConfig {
+    fn url_test_config<'a>(
+        caps: &'a CapabilitySet,
+        redaction_policy: &'a nono::ScrubPolicy,
+    ) -> SupervisorConfig<'a> {
+        SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
-            approval_backend: &backend,
+            approval_backend: &TestDenyBackend,
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
-            caps: &nono::CapabilitySet::default(),
-            open_url_origins: &origins,
+            caps,
+            open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
             proxy_handle: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
+            redaction_policy,
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -5952,6 +5974,84 @@ mod tests {
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
+        }
+    }
+
+    #[test]
+    fn default_url_listener_uses_server_identity_for_audit() {
+        use crate::audit_integrity::{AUDIT_EVENTS_FILENAME, AuditEventPayload, AuditRecorder};
+
+        let dir = tempfile::Builder::new()
+            .prefix("url-audit-")
+            .tempdir_in("/tmp")
+            .expect("tempdir");
+        let path = dir.path().join("s");
+        let listener = SupervisorListener::bind(&path).expect("bind listener");
+        let recorder = Arc::new(Mutex::new(
+            AuditRecorder::new(dir.path().to_path_buf()).expect("audit recorder"),
+        ));
+        let caps = CapabilitySet::default();
+        let redactions = nono::ScrubPolicy::secure_default();
+        let config = SupervisorConfig {
+            audit_recorder: Some(recorder),
+            ..url_test_config(&caps, &redactions)
+        };
+        assert!(!config.session_socket_auth);
+
+        for supplied_session in ["", "forged-session"] {
+            let mut client = SupervisorSocket::connect(&path).expect("connect");
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("read timeout");
+            client
+                .send_message(&SupervisorMessage::OpenUrl(
+                    nono::supervisor::UrlOpenRequest {
+                        request_id: format!("url-{supplied_session}"),
+                        url: "https://denied.example/".to_string(),
+                        child_pid: u32::MAX,
+                        session_id: supplied_session.to_string(),
+                    },
+                ))
+                .expect("send request");
+
+            // Deny the URL before invoking a browser, while exercising the real
+            // default-mode listener and its audit attribution.
+            handle_url_listener_connection(&listener, &config, &mut Vec::new());
+            assert!(matches!(
+                client.recv_response().expect("URL policy response"),
+                SupervisorResponse::UrlOpened { success: false, .. }
+            ));
+        }
+
+        let mut recorded = 0;
+        crate::audit_event_reader::for_each_event_record(
+            &dir.path().join(AUDIT_EVENTS_FILENAME),
+            false,
+            |record| {
+                let AuditEventPayload::UrlOpen {
+                    request, success, ..
+                } = record.event
+                else {
+                    panic!("expected URL audit event");
+                };
+                assert!(!success);
+                assert_eq!(request.child_pid, std::process::id());
+                assert_eq!(request.session_id, config.session_id);
+                recorded += 1;
+            },
+        )
+        .expect("read audit records");
+        assert_eq!(recorded, 2);
+    }
+
+    #[test]
+    fn test_validate_url_allowed_origin() {
+        let origins = vec!["https://claude.ai".to_string()];
+        let caps = CapabilitySet::default();
+        let redactions = nono::ScrubPolicy::secure_default();
+        let config = SupervisorConfig {
+            open_url_origins: &origins,
+            ..url_test_config(&caps, &redactions)
         };
 
         // Allowed origin: validation passes
@@ -5970,6 +6070,7 @@ mod tests {
     fn test_validate_url_blocks_non_https() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6028,6 +6129,7 @@ mod tests {
         let backend = TestDenyBackend;
         let origins = vec!["https://claude.ai".to_string()];
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6102,6 +6204,7 @@ mod tests {
     fn test_validate_url_localhost() {
         let backend = TestDenyBackend;
         let config_allow = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6137,6 +6240,7 @@ mod tests {
             tool_sandbox_runtime: None,
         };
         let config_deny = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6191,6 +6295,7 @@ mod tests {
     fn test_validate_url_max_length() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6350,6 +6455,7 @@ mod tests {
 
         let backend = TestBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6413,6 +6519,7 @@ mod tests {
         let backend = TestDenyBackend;
         let origins = vec!["https://idp.example.com".to_string()];
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6465,6 +6572,7 @@ mod tests {
     fn test_validate_url_ipv6_localhost() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6536,6 +6644,7 @@ mod tests {
     fn test_validate_url_rejects_data_scheme() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,

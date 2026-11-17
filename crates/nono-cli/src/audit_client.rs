@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 const OUTBOX_DIRNAME: &str = "audit-outbox";
 const RECEIPT_FILENAME: &str = "platform-ingest-receipt.json";
+const PROFILE_FILENAME: &str = "platform-audit-profile.json";
 const RESPONSE_LIMIT_BYTES: u64 = 1024 * 1024;
 const QUEUE_SCHEMA_V2: u32 = 2;
 
@@ -160,6 +161,21 @@ pub(crate) fn capture_enrollment(session_dir: &Path) -> Result<()> {
         &session_dir.join("platform-audit-origin.json"),
         &crate::platform_client::load_active_state()?,
     )
+}
+
+pub(crate) fn capture_profile(session_dir: &Path, profile_ref: Option<&str>) -> Result<()> {
+    write_json_secure(&session_dir.join(PROFILE_FILENAME), &profile_ref)
+}
+
+fn session_profile(session_dir: &Path) -> Result<Option<String>> {
+    let path = session_dir.join(PROFILE_FILENAME);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(NonoError::ConfigRead { path, source }),
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|_| NonoError::ConfigParse("invalid audit session profile reference".into()))
 }
 
 fn session_origin(session_dir: &Path) -> Result<Option<PlatformState>> {
@@ -350,7 +366,7 @@ fn build_queued_audit(
             session_id: metadata.session_id.clone(),
             shipper_id: state.subject_id.clone(),
             principal_id: None,
-            profile_ref: None,
+            profile_ref: session_profile(session_dir)?,
             merkle_root: integrity.merkle_root.to_string(),
             hash_chain_head: Some(integrity.chain_head.to_string()),
             started_at: metadata.started.clone(),
@@ -588,6 +604,7 @@ mod tests {
         assert_eq!(envelope.tenant_id, "acme");
         assert_eq!(envelope.shipper_id, "subject-1");
         assert_eq!(envelope.session_id, "session-1");
+        assert_eq!(envelope.profile_ref, None);
         assert!(envelope.events_ndjson.contains("session_started"));
         assert!(envelope.events_ndjson.contains("session_ended"));
         assert_eq!(
@@ -599,6 +616,48 @@ mod tests {
         assert_eq!(shipped_metadata["session_id"], "session-1");
         assert_eq!(shipped_metadata["command"], serde_json::json!(["true"]));
         assert_eq!(shipped_metadata["exit_code"], 0);
+    }
+
+    #[test]
+    fn captured_profile_survives_queue_reload_without_changing_session_digest() {
+        for profile in [Some("customer-project"), Some("nolabs-ai/claude"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+            recorder
+                .record_session_started("2026-07-01T10:00:00Z".into(), vec!["true".into()])
+                .unwrap();
+            recorder
+                .record_session_ended("2026-07-01T10:00:01Z".into(), 0)
+                .unwrap();
+            let metadata = metadata("profile-session", recorder.finalize().unwrap());
+            let original_digest = compute_session_digest(&metadata).unwrap();
+            capture_profile(dir.path(), profile).unwrap();
+            let queued = build_queued_audit(dir.path(), &metadata, &state()).unwrap();
+            assert_eq!(
+                queued.current_envelope().unwrap().profile_ref.as_deref(),
+                profile
+            );
+            assert_eq!(
+                queued.current_envelope().unwrap().session_digest,
+                original_digest.to_string()
+            );
+            let path = dir.path().join("queued.json");
+            write_json_secure(&path, &queued).unwrap();
+            capture_profile(dir.path(), Some("changed-after-queueing")).unwrap();
+            let reloaded = load_queued(&path).unwrap();
+            assert_eq!(reloaded.wire_body().unwrap(), queued.wire_body().unwrap());
+        }
+    }
+
+    #[test]
+    fn captured_profile_rejects_malformed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(PROFILE_FILENAME),
+            br#"{"profile":"wrong-shape"}"#,
+        )
+        .unwrap();
+        assert!(session_profile(dir.path()).is_err());
     }
 
     #[test]
@@ -688,6 +747,7 @@ mod tests {
             .record_session_ended("2026-07-01T10:00:01Z".to_string(), 0)
             .unwrap();
         let recovered_metadata = metadata("session-recover", recorder.finalize().unwrap());
+        capture_profile(&session_dir, Some("nolabs-ai/codex@1.2.3")).unwrap();
         write_json_secure(
             &session_dir.join("platform-audit-origin.json"),
             &Some(state()),
@@ -721,6 +781,10 @@ mod tests {
         let queued = load_queued(&queued_paths().unwrap()[0]).unwrap();
         assert!(matches!(queued, QueuedAudit::V2(_)));
         assert_eq!(queued.session_id(), "session-recover");
+        assert_eq!(
+            queued.current_envelope().unwrap().profile_ref.as_deref(),
+            Some("nolabs-ai/codex@1.2.3")
+        );
 
         assert!(recover_missing_queue_items().unwrap().is_empty());
         assert_eq!(queued_paths().unwrap().len(), 1);

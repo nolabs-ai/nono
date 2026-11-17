@@ -251,6 +251,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         rollback.destination.as_ref(),
         session.session_id.as_deref(),
     )?;
+    if let Some(state) = &audit_state {
+        crate::audit_client::capture_profile(&state.session_dir, config.profile_save_base)?;
+    }
     warn_if_rollback_flags_ignored(rollback, silent);
 
     // Create the session guard (writes session file) and PTY pair BEFORE

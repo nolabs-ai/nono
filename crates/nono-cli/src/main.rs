@@ -53,6 +53,7 @@ mod package_status;
 mod platform;
 mod platform_client;
 mod platform_oauth;
+mod platform_policy;
 mod policy;
 mod profile;
 mod profile_cmd;
@@ -140,14 +141,16 @@ fn main() {
     // keeps it. `Err` means a default is already installed, which is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let matches = Cli::command().get_matches();
-    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    let mut command = Cli::command();
+    let matches = command.get_matches_mut();
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     init_tracing(&cli);
     init_theme(&cli);
     let command_blocking_warnings = collect_cli_warnings(&cli);
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
-    let cli_result = run_cli(cli);
+    let cli_result =
+        platform_policy::inputs::capture(&mut cli, &command, &matches).and_then(|()| run_cli(cli));
     tool_sandbox::log_main_total();
     #[cfg(unix)]
     if cli_result.is_ok()
@@ -300,6 +303,7 @@ mod tests {
             ..sandbox_args()
         };
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),
@@ -385,6 +389,7 @@ mod tests {
             ..sandbox_args()
         };
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),

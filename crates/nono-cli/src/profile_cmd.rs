@@ -881,6 +881,15 @@ fn print_profile_line(
 
 #[allow(deprecated)] // reads profile.commands.{allow,deny} (deprecated v0.33.0)
 pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
+    if matches!(args.format, Some(crate::cli::ProfileShowFormat::Portable)) {
+        let profile = profile::bundle::export(std::path::Path::new(&args.profile))?;
+        println!(
+            "{}",
+            serde_json::to_string(&profile)
+                .map_err(|error| NonoError::ProfileParse(error.to_string()))?
+        );
+        return Ok(());
+    }
     // Order matters: `load_profile_extends` opens an internal
     // `WarningSuppressionGuard` for its preview parse, so deprecation
     // warnings fire only on the subsequent real `load_profile` call.

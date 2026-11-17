@@ -10,8 +10,9 @@ use crate::output;
 use crate::profile;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
-    prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
-    should_auto_enable_claude_launch_services, validate_proxy_conflicts,
+    has_proxy_intent, prepare_sandbox, print_allow_gpu_warning,
+    print_allow_launch_services_warning, should_auto_enable_claude_launch_services,
+    validate_proxy_conflicts,
 };
 use crate::theme;
 use nono::{CapabilitySet, NonoError, Result};
@@ -153,21 +154,33 @@ fn resolve_program_from_profile_or_cli(
 }
 
 pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
+    crate::platform_policy::prepare_start(&mut run_args.sandbox, silent)?;
     let command = run_args.command.clone();
 
     // Load profile once and reuse for binary resolution and command_args.
-    let loaded_profile = match run_args.sandbox.profile.as_ref() {
-        Some(name) => Some((
+    let loaded_profile = match (
+        &run_args.sandbox.managed_profile,
+        run_args.sandbox.profile.as_ref(),
+    ) {
+        (Some(managed), _) => Some((managed.profile.meta.name.clone(), managed.profile.clone())),
+        (None, Some(name)) => Some((
             name.clone(),
             profile::load_profile_with_extends(name, &run_args.sandbox.extends)?,
         )),
-        None => None,
+        (None, None) => None,
     };
 
     // Resolve the program: profile `binary` takes precedence over CLI trailing command.
     let (program, mut cmd_args) = resolve_program_from_profile_or_cli(
         &command,
-        loaded_profile.as_ref().map(|(n, p)| (n.as_str(), p)),
+        loaded_profile.as_ref().map(|(name, profile)| {
+            let source = if run_args.sandbox.managed_profile.is_some() {
+                "<platform-policy>"
+            } else {
+                name.as_str()
+            };
+            (source, profile)
+        }),
         silent,
     )?;
 
@@ -227,7 +240,8 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
     execute_sandboxed(launch_plan)
 }
 
-pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
+pub(crate) fn run_shell(mut args: ShellArgs, silent: bool) -> Result<()> {
+    crate::platform_policy::prepare_start(&mut args.sandbox, silent)?;
     let shell_path = args
         .shell
         .or_else(|| {
@@ -304,6 +318,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         session_recording,
         network,
         session: SessionLaunchOptions {
+            policy: prepared.policy_session.clone(),
             session_id: Some(session_id),
             session_name: args.name,
             detach_sequence: load_configured_detach_sequence()?,
@@ -359,7 +374,8 @@ fn reject_network_approvals_under_wrap(
 }
 
 pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
-    let args: SandboxArgs = wrap_args.sandbox.into();
+    let mut args: SandboxArgs = wrap_args.sandbox.into();
+    crate::platform_policy::prepare_start(&mut args, silent)?;
     let command = wrap_args.command;
     let no_diagnostics = wrap_args.no_diagnostics;
 
@@ -369,31 +385,13 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     let program = program.clone();
     let cmd_args = cmd_args.to_vec();
 
-    if args.dry_run {
-        let prepared = prepare_sandbox(&args, silent)?;
-        reject_resource_limits_under_wrap(&prepared.caps)?;
-        reject_network_approvals_under_wrap(&args, &prepared.network_approval_backends)?;
-        reject_run_only_sandbox_policy("wrap", &args, &prepared)?;
-        if !prepared.secrets.is_empty() && !silent {
-            eprintln!(
-                "  Would inject {} credential(s) as environment variables",
-                prepared.secrets.len()
-            );
-        }
-        let redaction_policy = profile_redaction_policy(
-            &prepared.redaction_extra_env_vars,
-            &prepared.redaction_derived_env_vars,
-        )?;
-        output::print_dry_run(&program, &cmd_args, &redaction_policy, silent);
-        return Ok(());
-    }
-
     let prepared = prepare_sandbox(&args, silent)?;
     reject_resource_limits_under_wrap(&prepared.caps)?;
     reject_network_approvals_under_wrap(&args, &prepared.network_approval_backends)?;
     reject_run_only_sandbox_policy("wrap", &args, &prepared)?;
 
-    if prepared.upstream_proxy.is_some()
+    if has_proxy_intent(&args, &prepared)
+        || !prepared.deny_domain.is_empty()
         || matches!(
             prepared.caps.network_mode(),
             nono::NetworkMode::ProxyOnly { .. }
@@ -431,6 +429,48 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
              exec cannot run the seccomp supervisor. Use `nono run --allow-gpu` instead."
                 .to_string(),
         ));
+    }
+
+    if args.managed_profile.is_some()
+        && (prepared.capability_elevation
+            || prepared
+                .command_policies
+                .as_ref()
+                .is_some_and(crate::command_policy::CommandPoliciesConfig::is_active)
+            || prepared
+                .session_recording
+                .as_ref()
+                .is_some_and(profile::SessionRecordingConfig::is_enabled))
+    {
+        return Err(NonoError::ConfigParse(
+            "nono wrap cannot apply platform policy requiring runtime approvals, command policies or recording; use `nono run` instead.".into(),
+        ));
+    }
+
+    if args.dry_run {
+        if !prepared.secrets.is_empty() && !silent {
+            eprintln!(
+                "  Would inject {} credential(s) as environment variables",
+                prepared.secrets.len()
+            );
+        }
+        let redaction_policy = profile_redaction_policy(
+            &prepared.redaction_extra_env_vars,
+            &prepared.redaction_derived_env_vars,
+        )?;
+        output::print_dry_run(&program, &cmd_args, &redaction_policy, silent);
+        return Ok(());
+    }
+
+    if args
+        .policy_session
+        .as_ref()
+        .is_some_and(|policy| policy.management_mode == "advisory")
+        && !silent
+    {
+        output::print_warning(
+            "nono wrap has no supervisor and cannot deliver session audit evidence; use `nono run` for audited sessions.",
+        );
     }
 
     if prepared.allow_launch_services_active {

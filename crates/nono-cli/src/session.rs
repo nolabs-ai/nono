@@ -22,6 +22,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 /// Session state persisted to `$XDG_STATE_HOME/nono/sessions/{session_id}.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) policy: Option<crate::platform_policy::PolicySession>,
     pub session_id: String,
     pub name: Option<String>,
     pub supervisor_pid: u32,
@@ -1041,6 +1043,7 @@ mod tests {
     #[test]
     fn test_session_record_roundtrip() {
         let record = SessionRecord {
+            policy: None,
             session_id: "a3f7c2".to_string(),
             name: Some("test".to_string()),
             supervisor_pid: 1234,
@@ -1082,6 +1085,7 @@ mod tests {
         let path = dir.path().join("test.json");
 
         let record = SessionRecord {
+            policy: None,
             session_id: "abc123".to_string(),
             name: None,
             supervisor_pid: 100,
@@ -1114,6 +1118,7 @@ mod tests {
         let path = dir.path().join("update.json");
 
         let mut record = SessionRecord {
+            policy: None,
             session_id: "def456".to_string(),
             name: None,
             supervisor_pid: 200,
@@ -1162,6 +1167,7 @@ mod tests {
         // We can't easily test SessionGuard::new because it uses sessions_dir().
         // Instead, test the update_session_file + load roundtrip that Drop uses.
         let mut record = SessionRecord {
+            policy: None,
             session_id: "guard1".to_string(),
             name: None,
             supervisor_pid: 300,
@@ -1199,6 +1205,7 @@ mod tests {
         make_private_dir(dir.path());
         let path = dir.path().join("guard-exit.json");
         let record = SessionRecord {
+            policy: None,
             session_id: "guard-exit".to_string(),
             name: None,
             supervisor_pid: 300,
@@ -1275,6 +1282,7 @@ mod tests {
         std::fs::create_dir_all(&sessions_path).expect("mkdir");
 
         let record = SessionRecord {
+            policy: None,
             session_id: "aabbcc".to_string(),
             name: None,
             supervisor_pid: 400,

@@ -114,6 +114,7 @@ fn create_session_runtime_state(
         })
         .unwrap_or_else(session::generate_session_id);
     let session_record = session::SessionRecord {
+        policy: session.policy.clone(),
         session_id: short_session_id.clone(),
         name: Some(
             session
@@ -302,6 +303,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             .lock()
             .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
         recorder.record_session_started(started.clone(), command.to_vec())?;
+        if let Some(policy) = &session.policy {
+            recorder.record_extension_event("platform_policy", policy)?;
+        }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(tool_sandbox_runtime) = config.tool_sandbox_runtime {
             #[cfg(target_os = "linux")]

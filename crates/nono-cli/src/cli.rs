@@ -984,7 +984,7 @@ pub struct ProfileShowArgs {
     /// Show raw paths before expansion (e.g., $HOME instead of /Users/luke)
     #[arg(long)]
     pub raw: bool,
-    /// Output format: 'profile' (default) or 'manifest' (capability manifest JSON)
+    /// Output format: profile, manifest, or portable (self-contained policy sources)
     #[arg(long, value_enum, value_name = "FORMAT")]
     pub format: Option<ProfileShowFormat>,
 }
@@ -993,6 +993,8 @@ pub struct ProfileShowArgs {
 pub enum ProfileShowFormat {
     Profile,
     Manifest,
+    /// Self-contained profile sources with dependencies and device predicates preserved.
+    Portable,
 }
 
 #[derive(Parser, Debug)]
@@ -1059,6 +1061,12 @@ pub struct ProfileGroupsArgs {
 
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SandboxArgs {
+    #[arg(skip)]
+    pub(crate) policy_inputs: crate::platform_policy::inputs::PolicyInputs,
+    #[arg(skip)]
+    pub(crate) managed_profile: Option<crate::profile::bundle::ManagedProfile>,
+    #[arg(skip)]
+    pub(crate) policy_session: Option<crate::platform_policy::PolicySession>,
     // ── Filesystem ───────────────────────────────────────────────────────
     /// Allow read+write access to a directory (recursive)
     #[arg(
@@ -1668,6 +1676,8 @@ pub struct ProxyArgs {
 
 #[derive(Parser, Debug, Clone, Default)]
 pub struct WrapSandboxArgs {
+    #[arg(skip)]
+    pub(crate) policy_inputs: crate::platform_policy::inputs::PolicyInputs,
     // ── Filesystem ───────────────────────────────────────────────────────
     /// Allow read+write access to a directory (recursive)
     #[arg(
@@ -1908,6 +1918,9 @@ impl SandboxArgs {
 impl From<WrapSandboxArgs> for SandboxArgs {
     fn from(args: WrapSandboxArgs) -> Self {
         Self {
+            policy_inputs: args.policy_inputs,
+            managed_profile: None,
+            policy_session: None,
             allow: args.allow,
             read: args.read,
             write: args.write,
@@ -2893,6 +2906,9 @@ pub struct LogoutArgs {
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct PlatformStatusArgs {
+    /// Fetch and verify the current platform policy assignment
+    #[arg(long)]
+    pub refresh: bool,
     /// Print status as JSON
     #[arg(long)]
     pub json: bool,

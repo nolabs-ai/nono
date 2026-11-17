@@ -43,6 +43,7 @@ pub(crate) struct LaunchPlan {
 
 #[derive(Clone, Default)]
 pub(crate) struct SessionLaunchOptions {
+    pub(crate) policy: Option<crate::platform_policy::PolicySession>,
     pub(crate) session_id: Option<String>,
     pub(crate) detached_start: bool,
     pub(crate) session_name: Option<String>,
@@ -490,6 +491,7 @@ pub(crate) fn prepare_run_launch_plan(
         diagnostics_json,
         diagnostic_verbosity: args.verbose,
         session: SessionLaunchOptions {
+            policy: prepared.policy_session.clone(),
             session_id: Some(session_id),
             detached_start: run_args.detached,
             session_name: run_args.name,

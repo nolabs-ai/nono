@@ -89,33 +89,22 @@ impl RelayPromptGate {
     /// active or the caller is the supervisor thread. Returns `None` when the
     /// pause is not in effect by `deadline`, so the caller can fail closed.
     fn run_paused<T>(&self, deadline: Instant, prompt: impl FnOnce() -> T) -> Option<T> {
-        self.run_preferring_paused(deadline, |paused| paused.then(prompt))
-    }
-
-    /// Run `f` with the relay paused when the pause takes effect by
-    /// `deadline`, and run it anyway when it does not. `f` receives whether
-    /// the terminal is free to write to: true when no relay is active, the
-    /// caller is the supervisor thread, or the pause is in effect.
-    fn run_preferring_paused<T>(&self, deadline: Instant, f: impl FnOnce(bool) -> T) -> T {
         let mut state = self.lock();
         let gated = state
             .owner
             .is_some_and(|owner| owner != std::thread::current().id());
         if !gated {
             drop(state);
-            return f(true);
+            return Some(prompt());
         }
         state.pending = state.pending.saturating_add(1);
         let pending = PendingPrompt { gate: self };
         if !self.wait_until_paused(state, deadline) {
-            // Release the pending count first so the supervisor does not
-            // pause the relay for work that no longer wants it.
-            drop(pending);
-            return f(false);
+            return None;
         }
-        let result = f(true);
+        let result = prompt();
         drop(pending);
-        result
+        Some(result)
     }
 
     fn wait_until_paused(&self, mut state: MutexGuard<'_, GateState>, deadline: Instant) -> bool {
@@ -172,15 +161,6 @@ pub(crate) fn register_relay() -> RelayRegistration<'static> {
 /// [`RelayPromptGate::run_paused`].
 pub(crate) fn run_with_relay_paused<T>(deadline: Instant, prompt: impl FnOnce() -> T) -> Option<T> {
     GATE.run_paused(deadline, prompt)
-}
-
-/// Run `f` with the PTY relay paused when that can be arranged by
-/// `deadline`, otherwise run it without the pause. `f` is told whether the
-/// terminal is free to write to. For best-effort output (such as an approval
-/// backend status notice) that must never change the outcome of `f`. See
-/// [`RelayPromptGate::run_preferring_paused`].
-pub(crate) fn run_preferring_relay_paused<T>(deadline: Instant, f: impl FnOnce(bool) -> T) -> T {
-    GATE.run_preferring_paused(deadline, f)
 }
 
 /// Service off-thread prompt requests from the supervisor loop.
@@ -260,57 +240,6 @@ mod tests {
         assert!(result.is_none());
         assert!(!ran.load(Ordering::SeqCst), "prompt must not run unpaused");
         assert_eq!(gate.lock().pending, 0);
-    }
-
-    #[test]
-    fn best_effort_runs_unpaused_when_pause_never_arrives() {
-        let gate = leak_gate();
-        let _registration = gate.register();
-
-        let result = std::thread::spawn(move || {
-            gate.run_preferring_paused(Instant::now() + Duration::from_millis(20), |paused| {
-                (paused, 7)
-            })
-        })
-        .join()
-        .expect("join requester");
-
-        assert_eq!(
-            result,
-            (false, 7),
-            "work still runs, told the terminal is busy"
-        );
-        assert_eq!(gate.lock().pending, 0);
-    }
-
-    #[test]
-    fn best_effort_reports_terminal_free_while_relay_is_paused() {
-        let gate = leak_gate();
-        let _registration = gate.register();
-        let relay_paused = &*Box::leak(Box::new(AtomicBool::new(false)));
-
-        let requester = std::thread::spawn(move || {
-            gate.run_preferring_paused(Instant::now() + Duration::from_secs(5), |paused| {
-                (paused, relay_paused.load(Ordering::SeqCst))
-            })
-        });
-        while gate.lock().pending == 0 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        gate.service(|hold| {
-            relay_paused.store(true, Ordering::SeqCst);
-            hold();
-            relay_paused.store(false, Ordering::SeqCst);
-        });
-
-        assert_eq!(requester.join().expect("join requester"), (true, true));
-        assert_eq!(gate.lock().pending, 0);
-    }
-
-    #[test]
-    fn best_effort_without_relay_reports_terminal_free() {
-        let gate = leak_gate();
-        assert!(gate.run_preferring_paused(Instant::now(), |paused| paused));
     }
 
     #[test]

@@ -560,6 +560,25 @@ async fn webhook_retry_and_signed_polls_retain_the_attempt_id() {
 }
 
 #[tokio::test]
+async fn unsigned_webhook_is_given_only_the_remaining_budget() {
+    let mut webhook = WebhookServer::start().await;
+    let backend = webhook.backend();
+    // Pretend most of the backend's timeout was already spent before the POST.
+    let started = Instant::now()
+        .checked_sub(DEADLINE - Duration::from_secs(3))
+        .unwrap();
+    let query = tokio::task::spawn_blocking(move || backend.request_unsigned(b"{}", started));
+    let request = webhook.next().await;
+    let hint: u64 = request.headers["x-nono-timeout-secs"].parse().unwrap();
+    assert!(
+        (1..=3).contains(&hint),
+        "hint {hint}s exceeds the remaining budget"
+    );
+    request.respond(200, r#"{"decision":"allow"}"#);
+    assert!(query.await.unwrap().unwrap().is_granted());
+}
+
+#[tokio::test]
 async fn unix_webhook_posts_root_to_localhost_and_applies_decisions() {
     let mut webhook = WebhookServer::start_unix().await;
     let session = Session::new(Arc::new(webhook.backend()), "session-a");

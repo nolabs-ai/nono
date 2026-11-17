@@ -254,8 +254,8 @@ const PLATFORM_APPROVALS_PATH: &str = "/api/v1/approvals";
 /// Pause between polls when the server answers `pending` immediately instead
 /// of holding the request open.
 const PLATFORM_POLL_BACKOFF: Duration = Duration::from_millis(250);
-/// Longest a webhook query waits for the PTY relay to pause so it can show
-/// its "waiting for approval" notice. Past this it queries without a notice.
+/// Longest a webhook query waits for the PTY relay to pause so it can print a
+/// status notice. Past this the notice is skipped.
 const BACKEND_NOTICE_PAUSE_WAIT: Duration = Duration::from_secs(1);
 /// Header carrying the client's remaining patience so the server-side hold and
 /// deadline match this backend's `timeout_secs`.
@@ -455,22 +455,47 @@ impl WebhookApproval {
             })
     }
 
+    /// Print a status notice for the user, pausing the PTY relay only for
+    /// the print itself so the agent's terminal stays live while the backend
+    /// decides. Off the supervisor thread, waiting for the pause is bounded
+    /// by [`BACKEND_NOTICE_PAUSE_WAIT`] and by what is left of this backend's
+    /// timeout; if the pause does not arrive in time the notice is skipped.
+    /// Returns whether the notice was shown. Never affects the decision.
+    fn show_notice(&self, started: Instant, print: impl FnOnce() -> bool) -> bool {
+        let remaining = self.timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return false;
+        }
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(BACKEND_NOTICE_PAUSE_WAIT.min(remaining))
+            .unwrap_or(now);
+        crate::relay_prompt_gate::run_with_relay_paused(deadline, print).unwrap_or(false)
+    }
+
     /// Unsigned contract: one blocking POST, the response body is the
     /// decision. Any approval endpoint that does not verify enrolled
     /// identities speaks this (`docs/protocols/approval-webhook-v1.md`).
+    /// The request gets only what is left of this backend's timeout, both as
+    /// its HTTP timeout and as the server hold hint.
     fn request_unsigned(&self, body: &[u8], started: Instant) -> Result<ApprovalDecision> {
+        let remaining = self.timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(ApprovalDecision::Timeout);
+        }
         let mut response = self
             .http
             .post(&self.url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(Some(remaining))
             .build()
             .header("Content-Type", "application/json")
             .header(
                 "User-Agent",
                 &format!("nono-cli/{}", env!("CARGO_PKG_VERSION")),
             )
-            .header(HEADER_TIMEOUT_SECS, &self.timeout.as_secs().to_string())
+            .header(HEADER_TIMEOUT_SECS, &remaining.as_secs().max(1).to_string())
             .send(body)
             .map_err(|e| {
                 NonoError::SandboxInit(format!("approval webhook '{}' failed: {e}", self.name))
@@ -676,7 +701,10 @@ impl ApprovalBackend for WebhookApproval {
             ))
         })?;
         let started = Instant::now();
-        let query = || match &self.platform {
+        let announced = self.show_notice(started, || {
+            crate::terminal_approval::announce_backend_query(&self.name, request, self.timeout)
+        });
+        let decision = match &self.platform {
             None => self.request_unsigned(&body, started),
             Some(state) => self.drive_platform_approval(
                 request.request_id(),
@@ -685,27 +713,13 @@ impl ApprovalBackend for WebhookApproval {
                 |step, remaining| self.send_platform(state, step, remaining),
             ),
         };
-        // Tell the user the agent is waiting on this backend. Off the
-        // supervisor thread the PTY relay owns the terminal, so ask it to
-        // pause for the wait. The notice is best effort: if the pause does
-        // not take effect quickly, query without it. The clock started above,
-        // so the wait counts against this backend's timeout.
-        let pause_deadline = started
-            .checked_add(BACKEND_NOTICE_PAUSE_WAIT.min(self.timeout))
-            .unwrap_or(started);
-        crate::relay_prompt_gate::run_preferring_relay_paused(pause_deadline, |terminal_free| {
-            let announced = terminal_free
-                && crate::terminal_approval::announce_backend_query(
-                    &self.name,
-                    request,
-                    self.timeout,
-                );
-            let decision = query();
-            if announced {
+        if announced {
+            self.show_notice(started, || {
                 crate::terminal_approval::announce_backend_decision(&self.name, &decision);
-            }
-            decision
-        })
+                true
+            });
+        }
+        decision
     }
 
     fn backend_name(&self) -> &str {
@@ -1408,6 +1422,21 @@ mod tests {
             platform: None,
             poll_backoff: Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn unsigned_webhook_times_out_without_sending_once_budget_is_spent() {
+        // The URL is unreachable; returning Timeout proves no request was made.
+        let backend = test_webhook(Duration::from_secs(1));
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now);
+        assert!(matches!(
+            backend.request_unsigned(b"{}", started).unwrap(),
+            ApprovalDecision::Timeout
+        ));
+        // Nor is a notice shown for a backend with no time left.
+        assert!(!backend.show_notice(started, || panic!("notice must be skipped")));
     }
 
     fn reply(status: u16, body: &str) -> HttpReply {

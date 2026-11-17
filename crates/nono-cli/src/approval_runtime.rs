@@ -457,19 +457,18 @@ impl WebhookApproval {
 
     /// Print a status notice for the user, pausing the PTY relay only for
     /// the print itself so the agent's terminal stays live while the backend
-    /// decides. Off the supervisor thread, waiting for the pause is bounded
-    /// by [`BACKEND_NOTICE_PAUSE_WAIT`] and by what is left of this backend's
-    /// timeout; if the pause does not arrive in time the notice is skipped.
+    /// decides. Waiting for the pause is bounded by [`BACKEND_NOTICE_PAUSE_WAIT`]
+    /// and the caller's deadline. Completion notices get their own deadline.
     /// Returns whether the notice was shown. Never affects the decision.
-    fn show_notice(&self, started: Instant, print: impl FnOnce() -> bool) -> bool {
-        let remaining = self.timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
+    fn show_notice(deadline: Instant, print: impl FnOnce() -> bool) -> bool {
+        let now = Instant::now();
+        if now >= deadline {
             return false;
         }
-        let now = Instant::now();
         let deadline = now
-            .checked_add(BACKEND_NOTICE_PAUSE_WAIT.min(remaining))
-            .unwrap_or(now);
+            .checked_add(BACKEND_NOTICE_PAUSE_WAIT)
+            .unwrap_or(now)
+            .min(deadline);
         crate::relay_prompt_gate::run_with_relay_paused(deadline, print).unwrap_or(false)
     }
 
@@ -701,7 +700,8 @@ impl ApprovalBackend for WebhookApproval {
             ))
         })?;
         let started = Instant::now();
-        let announced = self.show_notice(started, || {
+        let deadline = started.checked_add(self.timeout).unwrap_or(started);
+        let announced = Self::show_notice(deadline, || {
             crate::terminal_approval::announce_backend_query(&self.name, request, self.timeout)
         });
         let decision = match &self.platform {
@@ -714,7 +714,9 @@ impl ApprovalBackend for WebhookApproval {
             ),
         };
         if announced {
-            self.show_notice(started, || {
+            let now = Instant::now();
+            let deadline = now.checked_add(BACKEND_NOTICE_PAUSE_WAIT).unwrap_or(now);
+            Self::show_notice(deadline, || {
                 crate::terminal_approval::announce_backend_decision(&self.name, &decision);
                 true
             });
@@ -1435,8 +1437,30 @@ mod tests {
             backend.request_unsigned(b"{}", started).unwrap(),
             ApprovalDecision::Timeout
         ));
-        // Nor is a notice shown for a backend with no time left.
-        assert!(!backend.show_notice(started, || panic!("notice must be skipped")));
+        // An initial notice cannot consume time after the query deadline.
+        assert!(!WebhookApproval::show_notice(started, || panic!(
+            "notice must be skipped"
+        )));
+    }
+
+    #[test]
+    fn completion_notices_have_a_fresh_deadline_after_the_query_expires() {
+        let backend = test_webhook(Duration::from_secs(1));
+        let started = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+        let timeout = backend.request_unsigned(b"{}", started).unwrap();
+        for decision in [
+            timeout,
+            ApprovalDecision::Granted,
+            ApprovalDecision::DeniedForSession,
+        ] {
+            let now = Instant::now();
+            let deadline = now.checked_add(BACKEND_NOTICE_PAUSE_WAIT).unwrap();
+            assert!(WebhookApproval::show_notice(deadline, || {
+                assert!(started.elapsed() >= backend.timeout);
+                crate::terminal_approval::announce_backend_decision("test", &Ok(decision));
+                true
+            }));
+        }
     }
 
     fn reply(status: u16, body: &str) -> HttpReply {

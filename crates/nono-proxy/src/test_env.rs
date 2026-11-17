@@ -42,3 +42,25 @@ impl Drop for EnvVarGuard {
         }
     }
 }
+
+/// Network approval backend that returns a fixed decision and counts how many
+/// times it was consulted, so tests can assert prompting and that the session
+/// cache suppresses re-prompting.
+pub struct CountingBackend {
+    pub decision: nono::ApprovalDecision,
+    pub calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl nono::ApprovalBackend for CountingBackend {
+    fn request_approval(
+        &self,
+        _request: &nono::ApprovalRequest,
+    ) -> nono::Result<nono::ApprovalDecision> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.decision.clone())
+    }
+
+    fn backend_name(&self) -> &str {
+        "counting"
+    }
+}

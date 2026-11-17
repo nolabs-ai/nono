@@ -142,6 +142,56 @@ mod tests {
     use super::*;
     use crate::capability::AccessMode;
 
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn endpoint_request_operation_serde_round_trip() {
+        for operation in [None, Some("Unknown"), Some("DescribeInstances")] {
+            let request = ApprovalRequest::Endpoint {
+                request_id: "r".to_string(),
+                route_id: "ssm".to_string(),
+                credential_route: Some("ssm".to_string()),
+                upstream: "https://ssm.us-east-1.amazonaws.com".to_string(),
+                method: "POST".to_string(),
+                path: "/".to_string(),
+                rule_label: "endpoint_policy.approve[POST /]".to_string(),
+                operation: operation.map(str::to_string),
+                reason: None,
+                child_pid: 0,
+                session_id: "s".to_string(),
+            };
+            let json = serde_json::to_value(&request).unwrap();
+            // Always serialized, `null` for non-AWS routes.
+            assert!(json.get("operation").is_some());
+            let back: ApprovalRequest = serde_json::from_value(json).unwrap();
+            assert_eq!(
+                serde_json::to_value(&back).unwrap()["operation"],
+                serde_json::json!(operation)
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn endpoint_request_without_operation_field_deserializes() {
+        let json = serde_json::json!({
+            "capability_type": "endpoint",
+            "request_id": "r",
+            "route_id": "api",
+            "upstream": "https://api.example.com",
+            "method": "GET",
+            "path": "/",
+            "rule_label": "endpoint_policy.default",
+            "reason": null,
+            "child_pid": 0,
+            "session_id": "s"
+        });
+        let request: ApprovalRequest = serde_json::from_value(json).unwrap();
+        match request {
+            ApprovalRequest::Endpoint { operation, .. } => assert_eq!(operation, None),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
     struct TestDenyBackend;
 
     impl ApprovalBackend for TestDenyBackend {
@@ -236,10 +286,12 @@ mod tests {
         let endpoint = ApprovalRequest::Endpoint {
             request_id: "endpoint-001".to_string(),
             route_id: "internal-api".to_string(),
+            credential_route: None,
             upstream: "https://api.internal.example".to_string(),
             method: "POST".to_string(),
             path: "/v1/tasks/1/comments".to_string(),
             rule_label: "endpoint_policy.approve[POST /v1/tasks/*/comments]".to_string(),
+            operation: None,
             reason: None,
             child_pid: 42,
             session_id: "sess-004".to_string(),
@@ -259,6 +311,32 @@ mod tests {
         };
         assert_eq!(cmd.request_id(), "cmd-001");
         assert_eq!(cmd.session_id(), "sess-003");
+    }
+
+    #[test]
+    fn endpoint_request_credential_route_is_null_or_named() {
+        let json = serde_json::json!({
+            "capability_type": "endpoint",
+            "request_id": "endpoint-002",
+            "route_id": "_ep_github.com",
+            "upstream": "https://github.com",
+            "method": "GET",
+            "path": "/torvalds/linux/info/refs",
+            "rule_label": "endpoint_policy.approve[GET /torvalds/linux/**]",
+            "reason": null,
+            "child_pid": 0,
+            "session_id": "sess-005"
+        });
+        let request: ApprovalRequest =
+            serde_json::from_value(json).expect("endpoint request deserializes");
+        match &request {
+            ApprovalRequest::Endpoint {
+                credential_route, ..
+            } => assert_eq!(credential_route, &None),
+            other => panic!("expected endpoint request, got {other:?}"),
+        }
+        let encoded = serde_json::to_value(&request).expect("endpoint request serializes");
+        assert_eq!(encoded["credential_route"], serde_json::Value::Null);
     }
 
     #[test]

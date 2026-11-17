@@ -90,6 +90,10 @@ pub struct EventContext<'a> {
     pub denial_category: Option<NetworkAuditDenialCategory>,
     pub endpoint_policy_action: Option<&'a str>,
     pub endpoint_policy_rule: Option<&'a str>,
+    /// Resolved AWS operation name (or `Unknown`) for `aws_auth` routes.
+    pub endpoint_operation: Option<&'a str>,
+    /// Wire protocol the AWS operation was read from.
+    pub endpoint_protocol: Option<&'a str>,
     pub approval_backend: Option<&'a str>,
     pub upstream: Option<&'a str>,
     pub spiffe_context: Option<nono::undo::SpiffeAuditContext>,
@@ -224,6 +228,8 @@ fn ctx_event(
         denial_category: ctx.denial_category.clone(),
         endpoint_policy_action: ctx.endpoint_policy_action.map(str::to_string),
         endpoint_policy_rule: ctx.endpoint_policy_rule.map(str::to_string),
+        endpoint_operation: ctx.endpoint_operation.map(str::to_string),
+        endpoint_protocol: ctx.endpoint_protocol.map(str::to_string),
         approval_backend: ctx.approval_backend.map(str::to_string),
         credential_capture_action: None,
         credential_capture_name: None,
@@ -347,9 +353,9 @@ pub fn log_denied(
     push_event(audit_log, event);
 }
 
-/// Records a runtime host-approval decision on the CONNECT (transparent tunnel)
-/// path — the outcome of an interactive/backend prompt for a host that is not
-/// on the static allowlist.
+/// Records a runtime host-approval decision — the outcome of an
+/// interactive/backend prompt for a host that is not on the static allowlist,
+/// on either the CONNECT tunnel or the plain-HTTP forward-proxy path (`mode`).
 ///
 /// `decision` distinguishes the approval lifecycle states
 /// ([`NetworkAuditDecision::ApproveGranted`] / [`ApproveDenied`] / etc.) from a
@@ -358,8 +364,9 @@ pub fn log_denied(
 /// backend; `reason` carries the denial reason on refusal.
 ///
 /// [`ApproveDenied`]: NetworkAuditDecision::ApproveDenied
-pub fn log_connect_approval(
+pub fn log_host_approval(
     audit_log: Option<&SharedAuditLog>,
+    mode: ProxyMode,
     ctx: &EventContext<'_>,
     host: &str,
     port: u16,
@@ -368,20 +375,20 @@ pub fn log_connect_approval(
 ) {
     info!(
         target: "nono_proxy::audit",
-        mode = %ProxyMode::Connect,
+        mode = %mode,
         host = host,
         port = port,
         decision = ?decision,
         approval_backend = ctx.approval_backend,
         reason = reason,
-        "connect host approval decision"
+        "host approval decision"
     );
 
     push_event(
         audit_log,
         NetworkAuditEvent {
             timestamp_unix_ms: now_unix_millis(),
-            mode: map_mode(ProxyMode::Connect),
+            mode: map_mode(mode),
             decision,
             route_id: ctx.route_id.map(str::to_string),
             auth_mechanism: ctx.auth_mechanism.clone(),
@@ -391,6 +398,8 @@ pub fn log_connect_approval(
             denial_category: ctx.denial_category.clone(),
             endpoint_policy_action: ctx.endpoint_policy_action.map(str::to_string),
             endpoint_policy_rule: ctx.endpoint_policy_rule.map(str::to_string),
+            endpoint_operation: ctx.endpoint_operation.map(str::to_string),
+            endpoint_protocol: ctx.endpoint_protocol.map(str::to_string),
             approval_backend: ctx.approval_backend.map(str::to_string),
             credential_capture_action: None,
             credential_capture_name: None,
@@ -461,7 +470,13 @@ pub fn log_l7_policy_decision(
     info!(
         target: AUDIT_TARGET,
         "l7 endpoint policy decision mode={mode} target={target} method={method} path={path} \
-         decision={decision:?} endpoint_policy_action={action} endpoint_policy_rule={rule_label}{}{}",
+         decision={decision:?} endpoint_policy_action={action} endpoint_policy_rule={rule_label}{}{}{}",
+        ctx.endpoint_operation
+            .map(|op| format!(
+                " operation={op} protocol={}",
+                ctx.endpoint_protocol.unwrap_or("none")
+            ))
+            .unwrap_or_default(),
         reason.as_deref()
             .map(|reason| format!(" reason={reason}"))
             .unwrap_or_default(),

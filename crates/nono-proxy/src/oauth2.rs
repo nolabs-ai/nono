@@ -17,6 +17,7 @@
 //!   as the rest of the proxy. No additional HTTP client dependencies.
 
 use crate::error::{ProxyError, Result};
+use crate::secret_registry::SecretRegistry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -70,6 +71,22 @@ pub struct TokenCache {
     token: Arc<RwLock<CachedToken>>,
     config: OAuth2ExchangeConfig,
     tls_connector: TlsConnector,
+    /// Where each newly obtained access token is registered for terminal
+    /// redaction, with the non-secret name it is registered under.
+    secret_registry: Option<RegistryTarget>,
+}
+
+/// A session secret registry plus the non-secret name values are filed under.
+#[derive(Clone)]
+struct RegistryTarget {
+    registry: SecretRegistry,
+    name: String,
+}
+
+impl RegistryTarget {
+    fn register(&self, value: &str) {
+        self.registry.register(&self.name, value);
+    }
 }
 
 impl std::fmt::Debug for TokenCache {
@@ -117,7 +134,25 @@ impl TokenCache {
             })),
             config,
             tls_connector,
+            secret_registry: None,
         })
+    }
+
+    /// Register the current access token, and every token obtained by a later
+    /// refresh, in `registry` under `name` (NEP-0010 §3.1).
+    #[must_use]
+    pub fn with_secret_registry(mut self, registry: SecretRegistry, name: &str) -> Self {
+        let target = RegistryTarget {
+            registry,
+            name: name.to_string(),
+        };
+        // `new` and `new_from_parts` are the only writers, and both return
+        // before this runs, so the lock is uncontended.
+        if let Ok(guard) = self.token.try_read() {
+            target.register(guard.access_token.as_str());
+        }
+        self.secret_registry = Some(target);
+        self
     }
 
     /// Create a `TokenCache` with a pre-populated token (for testing).
@@ -138,6 +173,7 @@ impl TokenCache {
             })),
             config,
             tls_connector,
+            secret_registry: None,
         }
     }
 
@@ -172,6 +208,10 @@ impl TokenCache {
                     "OAuth2 token refreshed, expires in {}s",
                     expires_in.as_secs()
                 );
+                // Register before the token is handed out for injection.
+                if let Some(target) = &self.secret_registry {
+                    target.register(new_token.as_str());
+                }
                 guard.access_token = new_token;
                 guard.expires_at = Instant::now() + expires_in;
                 guard.access_token.clone()
@@ -449,6 +489,7 @@ pub struct SpiffeAssertionTokenCache {
     extra_params: Vec<(String, String)>,
     tls_connector: TlsConnector,
     pub workload_spiffe_id: String,
+    secret_registry: Option<RegistryTarget>,
 }
 
 impl std::fmt::Debug for SpiffeAssertionTokenCache {
@@ -487,7 +528,25 @@ impl SpiffeAssertionTokenCache {
             extra_params,
             tls_connector,
             workload_spiffe_id,
+            secret_registry: None,
         })
+    }
+
+    /// Register the current access token, and every token obtained by a later
+    /// refresh, in `registry` under `name` (NEP-0010 §3.1).
+    #[must_use]
+    pub fn with_secret_registry(mut self, registry: SecretRegistry, name: &str) -> Self {
+        let target = RegistryTarget {
+            registry,
+            name: name.to_string(),
+        };
+        // Only `new` writes the token, and it returns before this runs, so
+        // the lock is uncontended.
+        if let Ok(guard) = self.token.try_read() {
+            target.register(guard.access_token.as_str());
+        }
+        self.secret_registry = Some(target);
+        self
     }
 
     pub async fn get_or_refresh(&self) -> Result<Zeroizing<String>> {
@@ -517,6 +576,9 @@ impl SpiffeAssertionTokenCache {
                     "OAuth2 jwt-bearer token refreshed, expires in {}s",
                     expires_in.as_secs()
                 );
+                if let Some(target) = &self.secret_registry {
+                    target.register(new_token.as_str());
+                }
                 guard.access_token = new_token;
                 guard.expires_at = Instant::now() + expires_in;
                 Ok(guard.access_token.clone())
@@ -919,6 +981,78 @@ mod tests {
         .unwrap();
         server.await.unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn test_refresh_registers_new_token_before_use() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+            let json = r#"{"access_token":"refreshed-token-abc123","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            reader
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+            reader.get_mut().shutdown().await.unwrap();
+        });
+
+        let config = OAuth2ExchangeConfig {
+            token_url: format!("http://{addr}/oauth/token"),
+            client_id: Zeroizing::new("test-client".to_string()),
+            client_secret: Zeroizing::new("test-secret".to_string()),
+            scope: String::new(),
+        };
+        let registry = SecretRegistry::new();
+        // Already expired, so the next use refreshes.
+        let cache = TokenCache::new_from_parts(
+            config,
+            make_test_tls_connector(),
+            "initial-token-xyz789",
+            Duration::ZERO,
+        )
+        .with_secret_registry(registry.clone(), "my-api");
+        assert_eq!(registry.version(), 1, "initial token registered");
+
+        let token = tokio::time::timeout(Duration::from_secs(5), cache.get_or_refresh())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(token.as_str(), "refreshed-token-abc123");
+
+        let (_, entries) = registry.snapshot();
+        let values: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_str()))
+            .collect();
+        assert!(values.contains(&("my-api", "initial-token-xyz789")));
+        assert!(values.contains(&("my-api", "refreshed-token-abc123")));
+    }
+
+    #[tokio::test]
+    async fn test_cache_without_registry_is_unchanged() {
+        let cache = make_test_cache("plain-token", Duration::from_secs(3600));
+        assert_eq!(cache.get_or_refresh().await.as_str(), "plain-token");
     }
 
     /// Build a `TokenCache` with a pre-populated token for unit tests.

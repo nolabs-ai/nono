@@ -117,7 +117,7 @@ window before accepting a response. An empty response defaults to denial.
 
 ### Webhook / Policy Approval
 
-- **Webhook** (implemented): HTTP callback to an external approval service. Set `"type": "webhook"` with a `url`.
+- **Webhook** (implemented): HTTP callback to an external approval service. Set `"type": "webhook"` with a `url`. A local helper can listen on a Unix socket instead (`"url": "unix:///abs/path.sock"`); the launch is refused if the sandbox could replace that socket.
 - **Chain** (implemented): compose backends with `all`/`any` decision modes via `"type": "chain"`.
 - **Policy** (planned): automatic decisions based on predefined rules.
 

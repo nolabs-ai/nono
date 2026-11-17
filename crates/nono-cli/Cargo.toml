@@ -1,6 +1,6 @@
 [package]
 name = "nono-cli"
-version = "0.81.0"
+version = "0.82.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -40,8 +40,8 @@ system-keyring = ["dep:keyring", "nono/system-keyring", "nono-proxy/system-keyri
 test-trust-overrides = []
 
 [dependencies]
-nono = { version = "0.81.0", path = "../nono", default-features = false }
-nono-proxy = { version = "0.81.0", path = "../nono-proxy", default-features = false }
+nono = { version = "0.82.0", path = "../nono", default-features = false }
+nono-proxy = { version = "0.82.0", path = "../nono-proxy", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 colored = "3"
@@ -73,9 +73,14 @@ keyring = { version = "4", features = ["v1"], optional = true, default-features 
 sigstore-sign.workspace = true
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "signal"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+# Explicit provider for the terminal WebSocket: both rustls providers are in
+# the graph, so rustls has no process default (see connect_client.rs).
+rustls = { version = "0.23.46", features = ["ring"] }
+rustls-native-certs = "0.8.5"
 futures-util = "0.3"
 
-ureq = { version = "3", features = ["platform-verifier", "socks-proxy"] }
+ureq = { version = "~3.5", features = ["platform-verifier", "socks-proxy"] }
+socket2 = "0.6"
 semver = "1"
 
 zeroize.workspace = true
@@ -93,13 +98,15 @@ tempfile.workspace = true
 vt100 = "0.18.1"
 shlex = "2"
 jsonc-parser = { version = "0.34", features = ["serde"] }
+zstd = "0.14"
+aho-corasick = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }
+nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir", "hostname"] }
 landlock.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }
+nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir", "hostname"] }
 security-framework = "3"
 security-framework-sys = "2"
 core-foundation = "0.10"
@@ -115,7 +122,7 @@ serde.workspace = true
 # dev-dependency, so publishing nono-cli does not require this crate on
 # crates.io.
 nono-test-support = { path = "../nono-test-support" }
-jsonschema = "0.60"
+jsonschema = "0.61"
 proptest = "1"
 
 [lints]

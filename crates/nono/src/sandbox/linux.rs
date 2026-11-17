@@ -11,7 +11,7 @@ use landlock::{
 };
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
@@ -826,16 +826,23 @@ fn normalize_path_access(
 ///
 /// Returning the same descriptor used for metadata validation prevents a path
 /// replacement between type/device classification and rule installation.
-fn open_path_rule(cap: &crate::capability::FsCapability, abi: ABI) -> Result<OpenedPathRule> {
+fn open_path_rule(
+    cap: &crate::capability::FsCapability,
+    abi: ABI,
+    root: Option<BorrowedFd<'_>>,
+) -> Result<OpenedPathRule> {
     // Do not use std::fs::OpenOptions::custom_flags here. On musl, O_ACCMODE
     // includes O_PATH, so Rust's standard-library access-mode mask strips the
     // flag and turns this into an ordinary permission-checked read open.
-    let path_fd = open(
-        &cap.resolved,
-        OFlag::O_PATH | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| {
+    let opened = match root {
+        None => open(
+            &cap.resolved,
+            OFlag::O_PATH | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ),
+        Some(root) => open_in_root(root, &cap.resolved),
+    };
+    let path_fd = opened.map_err(|e| {
         NonoError::SandboxInit(format!(
             "Cannot open Landlock rule path {}: {}",
             cap.resolved.display(),
@@ -856,6 +863,113 @@ fn open_path_rule(cap: &crate::capability::FsCapability, abi: ABI) -> Result<Ope
         path_fd: file.into(),
         access,
     })
+}
+
+/// Open `path` as an `O_PATH` descriptor, resolving it inside `root` as if
+/// `root` were `/`. `RESOLVE_IN_ROOT` keeps `..` and absolute symlinks inside
+/// `root`, so a root taken from another mount namespace resolves exactly as a
+/// process in that namespace would see the path.
+fn open_in_root(root: BorrowedFd<'_>, path: &Path) -> nix::Result<OwnedFd> {
+    match open_in_root_strict(root, path) {
+        Err(nix::errno::Errno::EXDEV) => open_procfs_magic_link_in_root(root, path),
+        result => result,
+    }
+}
+
+/// `openat2(RESOLVE_IN_ROOT)` of `path` beneath `root`, refusing magic links.
+fn open_in_root_strict(root: BorrowedFd<'_>, path: &Path) -> nix::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    const RESOLVE_IN_ROOT: u64 = 0x10;
+    let relative = path.strip_prefix("/").unwrap_or(path);
+    let relative = if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    };
+    let relative = std::ffi::CString::new(relative.as_os_str().as_bytes())
+        .map_err(|_| nix::errno::Errno::EINVAL)?;
+    /// `struct open_how`; libc's is non-exhaustive.
+    #[repr(C)]
+    struct RawOpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let how = RawOpenHow {
+        flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_IN_ROOT,
+    };
+    // SAFETY: `relative` is NUL-terminated and `how` is a live stack value of
+    // the size passed; `root` is a valid borrowed descriptor.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            relative.as_ptr(),
+            &how as *const RawOpenHow,
+            std::mem::size_of::<RawOpenHow>(),
+        )
+    };
+    if fd < 0 {
+        return Err(nix::errno::Errno::last());
+    }
+    // SAFETY: openat2 returned a fresh descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// `RESOLVE_IN_ROOT` refuses every magic link with `EXDEV`, including the
+/// `/proc/<pid>/fd/<n>` grants nono adds for redirected stdio. Resolve the
+/// parent directory inside `root` as usual and, only when that directory is on
+/// procfs, follow the final component: a procfs magic link names an object
+/// the kernel holds, not a path that a mount mask could hide. Magic links in
+/// any other position, and symlinks outside procfs, stay refused.
+fn open_procfs_magic_link_in_root(root: BorrowedFd<'_>, path: &Path) -> nix::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    const PROC_SUPER_MAGIC: libc::c_long = 0x9fa0;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(nix::errno::Errno::EXDEV);
+    };
+    let parent = open_in_root_dir(root, parent)?;
+    // SAFETY: zeroed statfs is valid storage for the kernel to fill.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `stat` is live stack storage and `parent` is open.
+    if unsafe { libc::fstatfs(parent.as_raw_fd(), &mut stat) } < 0 {
+        return Err(nix::errno::Errno::last());
+    }
+    #[allow(clippy::unnecessary_cast)]
+    if stat.f_type as libc::c_long != PROC_SUPER_MAGIC {
+        return Err(nix::errno::Errno::EXDEV);
+    }
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| nix::errno::Errno::EINVAL)?;
+    // SAFETY: `name` is a single NUL-terminated component; `parent` is open.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(nix::errno::Errno::last());
+    }
+    // SAFETY: openat returned a fresh descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Open a directory with `RESOLVE_IN_ROOT` (no magic links anywhere).
+fn open_in_root_dir(root: BorrowedFd<'_>, path: &Path) -> nix::Result<OwnedFd> {
+    let fd = open_in_root_strict(root, path)?;
+    // SAFETY: zeroed stat is valid storage for the kernel to fill.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `stat` is live stack storage and `fd` is open.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } < 0 {
+        return Err(nix::errno::Errno::last());
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(nix::errno::Errno::ENOTDIR);
+    }
+    Ok(fd)
 }
 
 /// Legacy check: whether the simple block-all seccomp filter can be used.
@@ -986,7 +1100,22 @@ pub fn prepare_landlock_with_abi(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
 ) -> Result<PreparedLandlockSandbox> {
-    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly)
+    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly, None)
+}
+
+/// Like [`prepare_landlock_with_abi`], but resolve every filesystem rule path
+/// inside `root` instead of the caller's root directory.
+///
+/// Pass a descriptor for `/proc/<pid>/root` of a child in another mount
+/// namespace, so each rule attaches to the inode that child sees at the path
+/// (for example a tmpfs mounted over a granted directory).
+#[must_use = "preparation failure must prevent sandbox launch"]
+pub fn prepare_landlock_with_abi_in_root(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+    root: BorrowedFd<'_>,
+) -> Result<PreparedLandlockSandbox> {
+    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly, Some(root))
 }
 
 /// Apply Landlock filesystem/process sandboxing and use seccomp for TCP
@@ -1020,13 +1149,25 @@ pub fn prepare_seccomp_with_abi(
     abi: &DetectedAbi,
     opts: SeccompOpts,
 ) -> Result<PreparedLandlockSandbox> {
-    prepare_with_abi_inner(caps, abi, opts.tcp_network.into())
+    prepare_with_abi_inner(caps, abi, opts.tcp_network.into(), None)
+}
+
+/// Like [`prepare_seccomp_with_abi`], but resolve every filesystem rule path
+/// inside `root`; see [`prepare_landlock_with_abi_in_root`].
+pub fn prepare_seccomp_with_abi_in_root(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+    opts: SeccompOpts,
+    root: BorrowedFd<'_>,
+) -> Result<PreparedLandlockSandbox> {
+    prepare_with_abi_inner(caps, abi, opts.tcp_network.into(), Some(root))
 }
 
 fn prepare_with_abi_inner(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
     tcp_network: TcpNetworkEnforcement,
+    root: Option<BorrowedFd<'_>>,
 ) -> Result<PreparedLandlockSandbox> {
     let target_abi = abi.enforced_abi();
     let scopes = requested_scopes(caps, abi)?;
@@ -1124,7 +1265,7 @@ fn prepare_with_abi_inner(
 
     let mut path_rules = Vec::with_capacity(caps.fs_capabilities().len());
     for cap in caps.fs_capabilities() {
-        let opened = open_path_rule(cap, target_abi)?;
+        let opened = open_path_rule(cap, target_abi, root)?;
         let path_fd = move_fd_above_stdio(opened.path_fd).map_err(|e| {
             NonoError::SandboxInit(format!(
                 "Cannot reserve Landlock rule descriptor for {}: {}",
@@ -1442,7 +1583,7 @@ fn apply_with_abi_inner(
         std::collections::HashSet::new();
 
     for cap in caps.fs_capabilities() {
-        let opened = open_path_rule(cap, target_abi)?;
+        let opened = open_path_rule(cap, target_abi, None)?;
         let access = opened.access.effective;
 
         if !opened.access.dropped.is_empty() {
@@ -4072,6 +4213,14 @@ mod tests {
     }
 
     #[test]
+    fn test_read_access_includes_execute_write_does_not() {
+        let read = access_to_landlock(AccessMode::Read, ABI::V3);
+        assert!(read.effective.contains(AccessFs::Execute));
+        let write = access_to_landlock(AccessMode::Write, ABI::V3);
+        assert!(!write.effective.contains(AccessFs::Execute));
+    }
+
+    #[test]
     fn test_access_conversion_v3() {
         let abi = ABI::V3;
 
@@ -4155,14 +4304,14 @@ mod tests {
         let device_cap =
             crate::capability::FsCapability::new_file("/dev/null", AccessMode::ReadWrite)
                 .expect("device capability");
-        let device_rule = open_path_rule(&device_cap, ABI::V5).expect("open device rule");
+        let device_rule = open_path_rule(&device_cap, ABI::V5, None).expect("open device rule");
         assert!(device_rule.access.effective.contains(AccessFs::IoctlDev));
 
         let regular = tempfile::NamedTempFile::new().expect("regular file");
         let regular_cap =
             crate::capability::FsCapability::new_file(regular.path(), AccessMode::ReadWrite)
                 .expect("regular file capability");
-        let regular_rule = open_path_rule(&regular_cap, ABI::V5).expect("open regular rule");
+        let regular_rule = open_path_rule(&regular_cap, ABI::V5, None).expect("open regular rule");
         assert!(!regular_rule.access.effective.contains(AccessFs::IoctlDev));
 
         let ordinary_dir = tempfile::tempdir().expect("ordinary directory");
@@ -4170,7 +4319,7 @@ mod tests {
             crate::capability::FsCapability::new_dir(ordinary_dir.path(), AccessMode::ReadWrite)
                 .expect("ordinary directory capability");
         let ordinary_dir_rule =
-            open_path_rule(&ordinary_dir_cap, ABI::V5).expect("open ordinary directory rule");
+            open_path_rule(&ordinary_dir_cap, ABI::V5, None).expect("open ordinary directory rule");
         assert!(
             !ordinary_dir_rule
                 .access
@@ -4183,7 +4332,7 @@ mod tests {
                 crate::capability::FsCapability::new_dir("/dev/pts", AccessMode::ReadWrite)
                     .expect("device directory capability");
             let device_dir_rule =
-                open_path_rule(&device_dir_cap, ABI::V5).expect("open device directory rule");
+                open_path_rule(&device_dir_cap, ABI::V5, None).expect("open device directory rule");
             assert!(
                 device_dir_rule
                     .access
@@ -4197,7 +4346,7 @@ mod tests {
     fn test_open_path_rule_retains_o_path_flag() {
         let cap = crate::capability::FsCapability::new_file("/dev/null", AccessMode::Read)
             .expect("device capability");
-        let rule = open_path_rule(&cap, ABI::V1).expect("open path rule");
+        let rule = open_path_rule(&cap, ABI::V1, None).expect("open path rule");
         let flags = nix::fcntl::fcntl(&rule.path_fd, nix::fcntl::FcntlArg::F_GETFL)
             .expect("inspect path fd flags");
 
@@ -4227,7 +4376,7 @@ mod tests {
         let cap = crate::capability::FsCapability::new_file(&gitconfig_link, AccessMode::Read)
             .expect("gitconfig capability");
 
-        let rule = open_path_rule(&cap, ABI::V5).expect("open multi-hop symlink rule");
+        let rule = open_path_rule(&cap, ABI::V5, None).expect("open multi-hop symlink rule");
         assert!(rule.access.effective.contains(AccessFs::ReadFile));
     }
 
@@ -4240,7 +4389,7 @@ mod tests {
             .expect("file capability");
         std::fs::remove_file(&path).expect("remove file");
 
-        let Err(error) = open_path_rule(&cap, ABI::V5) else {
+        let Err(error) = open_path_rule(&cap, ABI::V5, None) else {
             panic!("removed path must fail closed");
         };
         assert!(matches!(error, NonoError::SandboxInit(_)));
@@ -5721,7 +5870,7 @@ mod tests {
             .expect("file capability");
         std::fs::remove_file(&file_path).expect("remove file");
         std::fs::create_dir(&file_path).expect("replace file with directory");
-        let Err(error) = open_path_rule(&file_cap, ABI::V2) else {
+        let Err(error) = open_path_rule(&file_cap, ABI::V2, None) else {
             panic!("shared path rule builder must reject a replacement directory");
         };
         assert!(matches!(error, NonoError::ExpectedFile(_)));
@@ -5743,7 +5892,7 @@ mod tests {
             .expect("directory capability");
         std::fs::remove_dir(&dir_path).expect("remove directory");
         std::fs::write(&dir_path, b"data").expect("replace directory with file");
-        let Err(error) = open_path_rule(&dir_cap, ABI::V2) else {
+        let Err(error) = open_path_rule(&dir_cap, ABI::V2, None) else {
             panic!("shared path rule builder must reject a replacement file");
         };
         assert!(matches!(error, NonoError::ExpectedDirectory(_)));

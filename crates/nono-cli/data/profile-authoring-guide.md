@@ -154,6 +154,8 @@ Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_fil
 
 An effective command sandbox whose network policy includes `network.allow_domain` receives a dedicated loopback proxy and a fresh proxy credential. Its proxy policy does not inherit the session sandbox's broader domain allowlist: the session sandbox may allow `"*"`, while the effective command sandbox for controlled `curl` invocations is limited to `github.com`. The session network policy's domain denials still apply. The supervisor replaces proxy-control environment variables immediately before execution, and the command sandbox may connect only to its dedicated proxy. Changing those variables, opting out with `NO_PROXY`, or using direct sockets does not grant access to the session proxy or direct network unless the command sandbox policy separately grants raw TCP access.
 
+Endpoint policy rules on `aws_auth` credentials may add `operations`, a list of AWS operation-name globs (`[A-Za-z0-9_*?]`, case-sensitive). Requests whose operation cannot be determined match the name `Unknown`; prefer `default: deny` plus allow rules. See the AWS SigV4 section of the credential injection docs.
+
 Proxy credentials granted by the same effective command sandbox are served by that dedicated proxy. Their reverse routes may reach their configured upstreams and still enforce `endpoint_policy`, but those upstreams are not added to the command's domain allowlist: direct or ordinary forward-proxy access remains denied unless `network.allow_domain` also permits it.
 
 A command sandbox policy that grants a proxy credential without `network.allow_domain` also receives a dedicated proxy. Its domain allowlist is empty, so only its explicitly granted credential routes are usable.
@@ -352,8 +354,13 @@ Endpoint policy uses the same decision order as invocation policy: `deny`, then 
 | `signal_mode`         | string          | `"isolated"` | One of: `"isolated"`, `"allow_same_sandbox"`, `"allow_all"`. |
 | `process_info_mode`   | string          | `"isolated"` | One of: `"isolated"`, `"allow_same_sandbox"`, `"allow_all"`. |
 | `ipc_mode`            | string          | `"shared_memory_only"` | One of: `"shared_memory_only"`, `"full"`. Use `"full"` for multiprocessing (enables POSIX semaphores). macOS only. |
+| `session_socket_auth` | boolean         | `false`      | Authenticate callers of named session IPC sockets using kernel peer identity and verified ancestry or protected tool lineage. Requires Linux 6.5+ on Linux; also supported on macOS. Startup fails if the required kernel feature is unavailable. |
 | `capability_elevation`| boolean         | `false`      | Enable runtime capability elevation via seccomp-notify. Linux only. |
+| `approval_backends`   | map of string to backend | `{}` | Named backends that answer supervised-mode file and capability prompts instead of the terminal. Same shape as `network.approval_backends` (see [Network approvals](#network-approvals)). |
+| `approval_defaults`   | object          | `null`       | `{ "backend": "<name>" }`: which `approval_backends` entry answers by default. |
 | `wsl2_proxy_policy`  | string          | `"error"`    | WSL2 only. Controls behavior when proxy-only network mode cannot be kernel-enforced. `"error"`: refuse to run (fail-secure). `"insecure_proxy"`: allow degraded execution where credential proxy runs but child is not prevented from bypassing it. See [WSL2 docs](https://nono.sh/docs/cli/internals/wsl2). |
+
+With `session_socket_auth` enabled, browser helpers must stay alive until authentication completes. Credential-capture browser helpers must retain their ancestry; untracked daemonized helpers are rejected. The option does not change URL or command policies. Regardless of its value, named URL listeners use kernel-derived caller PIDs and the receiving session's ID for attribution. Use `--profile`; capability manifest export rejects profiles with session socket authentication enabled.
 
 ### filesystem
 
@@ -449,6 +456,37 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 | `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). Defines the route only — the proxy does not activate unless the service name also appears in `credentials`. |
 | `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). |
 | `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. |
+| `approval_backends`     | map of string to backend          | `{}`     | Named backends that are asked before connecting to a host outside the allowlist (see [Network approvals](#network-approvals)). A non-empty map turns on the proxy and makes an empty allowlist ask for every host. |
+| `approval_defaults`     | object                            | `null`   | `{ "backend": "<name>" }`: which `approval_backends` entry answers host approvals. |
+
+#### Network approvals
+
+With `approval_backends`, a host outside `allow_domain` is sent for approval instead of denied. Used by `nono run`, `nono shell`, and `nono proxy`. A backend is one of:
+
+- `{ "type": "terminal" }`: ask on the terminal.
+- `{ "type": "webhook", "url": "..." }`: ask an HTTP endpoint (`https://...`), or a local helper on a Unix socket (`unix:///abs/path.sock`).
+- `{ "type": "chain", "mode": "all" | "any", "backends": [...] }`: combine other backends.
+
+Each backend takes an optional `timeout_secs`.
+
+```json
+{
+  "network": {
+    "allow_domain": ["github.com"],
+    "approval_backends": {
+      "prompt": { "type": "terminal", "timeout_secs": 120 },
+      "dialog": { "type": "webhook", "url": "unix:///Users/me/.myhelper/s/approval.sock" },
+      "either": { "type": "chain", "mode": "any", "backends": ["dialog", "prompt"] }
+    },
+    "approval_defaults": { "backend": "either" }
+  }
+}
+```
+
+- `network.block: true` and `--block-net` cannot be combined with approval backends.
+- Explicit `deny_domain` entries and metadata/link-local addresses are never sent for approval.
+- With a `unix://` webhook, the launch is refused if the sandbox could write to the socket or a directory above it. Keep the socket in a directory the sandbox can't write.
+- `security.approval_backends` and `command_policies.approval_backends` take the same backend shapes.
 
 #### Hostname wildcard patterns
 
@@ -1149,7 +1187,9 @@ preferably, use `unix_socket_dir_bind` with a dedicated directory.
 
 Add `"loopback": true` (requires `network`) to let the command use TCP on the namespace's own loopback, for local dev servers and tests. Egress stays proxy-only and the host's localhost stays unreachable.
 
-Network isolation does not block pathname Unix sockets (such as `/run/docker.sock`); use `linux.af_unix_mediation` for those.
+Add `"mounts": true` to mask host IPC endpoints (`$XDG_RUNTIME_DIR`, the D-Bus system bus, container runtime sockets) and give the session a private `/tmp`. Paths the profile grants beneath a mask, including `unix_socket` grants, stay reachable. `"extra_masks": ["$HOME/.corp/agent.sock"]` adds masks (requires `mounts`); lists merge by deduplicated append, so no layer can remove a mask. `mounts` cannot be combined with `security.capability_elevation`.
+
+Network isolation does not block pathname Unix sockets (such as `/run/docker.sock`); use `mounts` to hide them or `linux.af_unix_mediation` to mediate them. Any filesystem grant beneath a mask is re-bound, so a read grant of a directory under `$XDG_RUNTIME_DIR` makes every socket in it connectable.
 
 #### Linux
 

@@ -140,6 +140,7 @@ struct ChildLaunchResult {
 }
 
 struct ToolSandboxState {
+    session_socket_auth: bool,
     runtime_dir: PathBuf,
     socket_path: PathBuf,
     /// Dedicated URL-open listener socket path, present only when at least one
@@ -163,6 +164,8 @@ struct ToolSandboxState {
     /// Agent's resolved filesystem deny paths; a command's live cwd under any of
     /// these is rejected (the agent's broad allow may otherwise cover them).
     deny_paths: Vec<PathBuf>,
+    /// `unix://` approval sockets no command sandbox may be able to replace.
+    approval_sockets: Vec<(String, PathBuf)>,
     /// The agent's deny paths paired with the bypass_protection paths that lift
     /// them. A command policy's own keychain grant is authorized against this,
     /// so a mediated command can never exceed the agent's keychain authority.
@@ -283,6 +286,7 @@ impl PreparedToolSandboxRuntime {
 
     pub(crate) fn prepare(input: super::ToolSandboxPrepare<'_>) -> Result<Self> {
         let super::ToolSandboxPrepare {
+            session_socket_auth,
             config,
             resolved_command_binaries,
             audit_context,
@@ -290,6 +294,7 @@ impl PreparedToolSandboxRuntime {
             blocked_commands,
             outer_caps,
             deny_paths,
+            approval_sockets,
             bypass_protection_paths,
             policy_root,
             proxy_credentials,
@@ -362,6 +367,7 @@ impl PreparedToolSandboxRuntime {
         let lineage = LineageMarker::build(&plan.config, plan.daemon_pid_source_helpers.clone());
         let runtime = Self {
             inner: Arc::new(ToolSandboxState {
+                session_socket_auth,
                 runtime_dir,
                 socket_path,
                 url_socket_path,
@@ -373,6 +379,7 @@ impl PreparedToolSandboxRuntime {
                 policy_root: policy_root.to_path_buf(),
                 outer_caps: outer_caps.clone(),
                 deny_paths: deny_paths.to_vec(),
+                approval_sockets: approval_sockets.to_vec(),
                 deny_policy,
                 keychain_deny_rules,
                 keychain_db_forms,
@@ -515,6 +522,10 @@ impl PreparedToolSandboxRuntime {
             resolved_program,
             file_id(&metadata),
         ))
+    }
+
+    pub(crate) fn owns_orphan(&self, pid: u32) -> bool {
+        owns_orphan(&self.inner, pid)
     }
 
     /// Starts the IPC accept loop in a background thread. Returns immediately;
@@ -846,10 +857,14 @@ fn handle_url_open_stream(
         return;
     }
 
-    let peer_pid = match peer_pid_from_stream(&stream) {
+    let peer_pid = match crate::session_auth::authenticate(
+        stream.as_raw_fd(),
+        state.session_socket_auth,
+        |pid| owns_orphan(state, pid),
+    ) {
         Ok(pid) => pid,
         Err(err) => {
-            debug!("command-mediation URL open: peer pid resolution failed: {err}");
+            warn!("Rejected command-mediation URL connection: socket authentication failed: {err}");
             return;
         }
     };
@@ -992,7 +1007,14 @@ fn handle_shim_stream_inner(
     session_id: &str,
     audit_recorder: Option<Arc<Mutex<crate::audit_integrity::AuditRecorder>>>,
 ) -> Result<(i32, Vec<u8>)> {
-    let auth = authenticate_shim(stream, state)?;
+    let peer_pid =
+        crate::session_auth::authenticate(stream.as_raw_fd(), state.session_socket_auth, |pid| {
+            owns_orphan(state, pid)
+        })
+        .inspect_err(|err| {
+            warn!("Rejected command-mediation connection: socket authentication failed: {err}");
+        })?;
+    let auth = authenticate_shim(peer_pid, state)?;
     let request: ToolSandboxShimRequest = read_frame(stream)?;
     // Ack before receiving stdio FDs: on macOS, sendmsg with SCM_RIGHTS ancillary
     // data returns EMSGSIZE if the peer's receive buffer still holds unread frame
@@ -1814,8 +1836,7 @@ struct ShimAuth {
     command: String,
 }
 
-fn authenticate_shim(stream: &UnixStream, state: &ToolSandboxState) -> Result<ShimAuth> {
-    let peer_pid = peer_pid_from_stream(stream)?;
+fn authenticate_shim(peer_pid: u32, state: &ToolSandboxState) -> Result<ShimAuth> {
     let exe_path = exe_path_for_pid(peer_pid)?;
     let command = state.shims_by_path.get(&exe_path).cloned().ok_or_else(|| {
         NonoError::SandboxInit(format!(
@@ -1839,28 +1860,6 @@ fn authenticate_shim(stream: &UnixStream, state: &ToolSandboxState) -> Result<Sh
         )));
     }
     Ok(ShimAuth { peer_pid, command })
-}
-
-fn peer_pid_from_stream(stream: &UnixStream) -> Result<u32> {
-    // SAFETY: getsockopt with LOCAL_PEERPID is stable on macOS.
-    let mut pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            &mut pid as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if ret != 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "command-mediation: getsockopt(LOCAL_PEERPID) failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(pid as u32)
 }
 
 fn exe_path_for_pid(pid: u32) -> Result<PathBuf> {
@@ -1889,6 +1888,19 @@ fn exe_path_for_pid(pid: u32) -> Result<PathBuf> {
 enum Caller {
     Session,
     Command { name: String },
+}
+
+fn owns_orphan(state: &ToolSandboxState, pid: u32) -> bool {
+    session_id_of(pid)
+        .and_then(|sid| state.session_lineage.resolve_sid(sid))
+        .is_some()
+        || (!matches!(&state.lineage, LineageMarker::Disabled)
+            && crate::session_auth::verify_reparented_ancestry(pid, |daemon_pid| {
+                state
+                    .lineage
+                    .resolve_severed_command(daemon_pid, &state.plan.config, &state.policy_root)
+                    .is_some()
+            }))
 }
 
 fn resolve_caller(
@@ -3228,6 +3240,10 @@ fn build_child_caps(
     // wins, so a rule like `(allow process-exec* (literal "/usr/bin/security"))`
     // overrides the exec gate's earlier `(deny process-exec*)`.
     add_unsafe_seatbelt_rules(&mut caps, policy)?;
+    crate::approval_runtime::reject_child_replaceable_approval_sockets(
+        &caps,
+        &state.approval_sockets,
+    )?;
     Ok(caps)
 }
 
@@ -3436,11 +3452,10 @@ fn add_outer_process_exec_gate(caps: &mut CapabilitySet, state: &ToolSandboxStat
         denied.insert(deny_only.path.clone());
     }
     // This sandbox is a routing guard, not the command sandbox selected by policy.
-    // It permits ordinary agent process execution, then denies configured
-    // policy command binaries by exact path so those tools must be reached
-    // through the broker shim on PATH. The supervisor applies the actual
+    // Exec is already scoped to the read set by the library profile; this denies
+    // configured policy command binaries by exact path so those tools must be
+    // reached through the broker shim on PATH. The supervisor applies the actual
     // command sandbox to the approved grandchild invocation.
-    caps.add_platform_rule("(allow process-exec*)")?;
     add_controlled_source_denies(caps, denied)
 }
 
@@ -5793,6 +5808,7 @@ mod tests {
         let runtime_dir = PathBuf::from("/tmp/nono-tool-sandbox-test");
         let shim_dir = runtime_dir.join("shims");
         ToolSandboxState {
+            session_socket_auth: false,
             runtime_dir: runtime_dir.clone(),
             socket_path: runtime_dir.join("supervisor.sock"),
             url_socket_path: None,
@@ -5804,6 +5820,7 @@ mod tests {
             policy_root: PathBuf::from("/tmp"),
             outer_caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
+            approval_sockets: Vec::new(),
             deny_policy: crate::policy::EffectiveDenyPolicy::new(&[], &[]),
             keychain_deny_rules: Vec::new(),
             keychain_db_forms: Vec::new(),
@@ -6823,7 +6840,7 @@ mod tests {
     }
 
     #[test]
-    fn outer_process_exec_gate_allows_exec_but_denies_controlled_paths() -> Result<()> {
+    fn outer_process_exec_gate_has_no_blanket_allow_and_denies_controlled_paths() -> Result<()> {
         let temp = test_tempdir()?;
         let bin_dir = temp.path().join("bin");
         create_dir(&bin_dir)?;
@@ -6843,7 +6860,7 @@ mod tests {
 
         let rules = caps.platform_rules();
         assert!(
-            rules
+            !rules
                 .iter()
                 .any(|rule| rule.as_str() == "(allow process-exec*)")
         );

@@ -105,9 +105,45 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
         &proxy.credential_capture,
         proxy.session_id.clone(),
         nono::CapabilitySet::default(),
+        proxy.session_socket_auth,
     )?;
-    let approval_registry =
-        crate::approval_runtime::build_proxy_approval_registry(proxy.command_policies.as_ref())?;
+    let approval_registry = crate::approval_runtime::build_proxy_approval_registry(
+        proxy.command_policies.as_ref(),
+        Some((
+            &proxy.network_approval_backends,
+            proxy
+                .network_approval_defaults
+                .as_ref()
+                .and_then(|defaults| defaults.backend.clone()),
+        )),
+        &proxy.session_id,
+    )?;
+    // Host approvals for allowlist misses, resolved exactly as on `run`. A
+    // configured backend that can't be built is an error, never a silent
+    // fallback to the static allowlist.
+    let network_approval_backend = crate::approval_runtime::resolve_supervised_approval_backend(
+        &proxy.network_approval_backends,
+        proxy
+            .network_approval_defaults
+            .as_ref()
+            .and_then(|defaults| defaults.backend.clone()),
+    )?;
+    if let Some(backend) = network_approval_backend.as_ref()
+        && crate::approval_runtime::backend_reaches_terminal(
+            &proxy.network_approval_backends,
+            backend.backend_name(),
+        )
+        && !crate::terminal_prompt::consent_prompt_available()
+    {
+        tracing::warn!(
+            "network approval backend '{}' prompts on the terminal, but no terminal is \
+             available; every host outside the allowlist will be denied",
+            backend.backend_name()
+        );
+    }
+    let network_approval_name = network_approval_backend
+        .as_ref()
+        .map(|backend| backend.backend_name().to_string());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -117,16 +153,25 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
 
     let handle = rt
         .block_on(async {
-            nono_proxy::server::start_with_approval_and_capture_registry(
+            nono_proxy::server::start_with_network_approval(
                 proxy_config.clone(),
                 approval_registry,
                 credential_capture_backend,
+                None,
+                network_approval_backend,
+                proxy.session_id.clone(),
             )
             .await
         })
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy: {}", e)))?;
 
-    print_connection_info(&handle, &proxy_config, args.no_auth, silent);
+    print_connection_info(
+        &handle,
+        &proxy_config,
+        args.no_auth,
+        network_approval_name.as_deref(),
+        silent,
+    );
 
     // Block the foreground until the user interrupts, then shut down cleanly.
     rt.block_on(async {
@@ -192,18 +237,35 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
     };
     let network = loaded.as_ref().map(|p| &p.network);
 
+    let network_approval_backends = network
+        .map(|n| n.approval_backends.clone())
+        .unwrap_or_default();
+    // Same rule as `run`: approvals cannot lift a hard block, so a profile
+    // that asks for both is ambiguous and refused.
+    if network.is_some_and(|n| n.block) && !network_approval_backends.is_empty() {
+        return Err(NonoError::ConfigParse(
+            "network.block: true cannot be combined with network.approval_backends: a hard \
+             network block cannot be approved. For approval-only networking, set \
+             network.block to false (or omit it); otherwise remove the approval backends."
+                .to_string(),
+        ));
+    }
+
     let network_profile = args
         .network_profile
         .clone()
         .or_else(|| network.and_then(|n| n.resolved_network_profile().map(String::from)));
 
-    let mut allow_domain: Vec<profile::AllowDomainEntry> =
+    let profile_allow_domain: Vec<profile::AllowDomainEntry> =
         network.map(|n| n.allow_domain.clone()).unwrap_or_default();
-    allow_domain.extend(
-        args.allow_proxy
-            .iter()
-            .map(|s| crate::proxy_runtime::parse_allow_domain_arg(s)),
-    );
+    let cli_allow_domain: Vec<profile::AllowDomainEntry> = args
+        .allow_proxy
+        .iter()
+        .map(|s| crate::proxy_runtime::parse_allow_domain_arg(s))
+        .collect();
+    // Merge so a CLI entry for a profile domain adds to its rules instead of
+    // producing a second route that replaces them.
+    let allow_domain = profile::merge_allow_domain(&profile_allow_domain, &cli_allow_domain);
 
     let mut deny_domain: Vec<String> = network.map(|n| n.deny_domain.clone()).unwrap_or_default();
     deny_domain.extend(args.deny_proxy.iter().cloned());
@@ -268,7 +330,7 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
     // `prepare_proxy_launch_options` on the sandboxed path.
     let (plain_entries, endpoint_entries): (Vec<_>, Vec<_>) = allow_domain
         .into_iter()
-        .partition(|e| !matches!(e, profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
+        .partition(|e| !e.has_endpoint_restrictions());
 
     let domain_filter =
         if network_profile.is_some() || !plain_entries.is_empty() || !deny_domain.is_empty() {
@@ -359,6 +421,10 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
     let enable_h2 = args.allow_http2 || network.map(|n| n.allow_http2).unwrap_or(false);
 
     Ok(ProxyLaunchOptions {
+        session_socket_auth: loaded
+            .as_ref()
+            .and_then(|profile| profile.security.session_socket_auth)
+            .unwrap_or(false),
         domain_filter,
         endpoint_filter,
         credentials: credentials_intent,
@@ -371,6 +437,10 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         credential_routes,
         session_id: crate::session::generate_session_id(),
         enable_h2,
+        // A non-empty map makes the filter strict: an empty allowlist then
+        // prompts for every host instead of allowing all of them.
+        network_approval_backends,
+        network_approval_defaults: network.and_then(|n| n.approval_defaults.clone()),
         ..ProxyLaunchOptions::default()
     })
 }
@@ -380,6 +450,7 @@ fn print_connection_info(
     handle: &nono_proxy::server::ProxyHandle,
     config: &nono_proxy::config::ProxyConfig,
     no_auth: bool,
+    network_approval: Option<&str>,
     silent: bool,
 ) {
     let addr = config.bind_addr;
@@ -414,6 +485,18 @@ fn print_connection_info(
         println!(
             "  export HTTP_PROXY=http://nono:{}@{}:{}",
             *handle.token, addr, port
+        );
+    }
+
+    if let Some(backend) = network_approval {
+        println!();
+        println!(
+            "  network approvals: hosts outside the allowlist are sent to backend '{}'",
+            backend
+        );
+        println!(
+            "  {}",
+            "\"always allow/deny\" answers apply to every client until the proxy stops".dimmed()
         );
     }
 
@@ -657,6 +740,66 @@ mod tests {
             .map(crate::profile::AllowDomainEntry::domain)
             .collect();
         assert_eq!(domains, vec!["solo.example.com"]);
+    }
+
+    #[test]
+    fn profile_network_approval_backends_carry_through_and_make_filter_strict() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("approvals.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "approval-test" },
+                "network": {
+                    "approval_backends": {
+                        "dialog": { "type": "webhook", "url": "unix:///run/helper/approval.sock" }
+                    },
+                    "approval_defaults": { "backend": "dialog" }
+                }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("approval-only profile is valid");
+        assert!(opts.network_approval_backends.contains_key("dialog"));
+        assert_eq!(
+            opts.network_approval_defaults
+                .as_ref()
+                .and_then(|defaults| defaults.backend.as_deref()),
+            Some("dialog")
+        );
+        // An empty allowlist must ask for every host, not allow all of them.
+        let config = build_proxy_config_from_flags(&opts).expect("proxy config");
+        assert!(config.strict_filter);
+    }
+
+    #[test]
+    fn profile_network_block_with_approval_backends_is_rejected() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("block.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "block-test" },
+                "network": {
+                    "block": true,
+                    "approval_backends": { "prompt": { "type": "terminal" } },
+                    "approval_defaults": { "backend": "prompt" }
+                }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        match build_launch_options(&args) {
+            Ok(_) => panic!("network.block with approval backends must be rejected"),
+            Err(err) => assert!(err.to_string().contains("cannot be approved"), "{err}"),
+        }
     }
 
     #[test]

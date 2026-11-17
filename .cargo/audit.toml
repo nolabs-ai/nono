@@ -1,14 +1,4 @@
 # Workspace cargo-audit configuration.
-#
-# Temporary exception: `aws-config`'s required `credentials-login` feature
-# pins `p256` 0.13 and therefore vulnerable `crypto-bigint` 0.5.5.
-# Remove once AWS adopts `p256` 0.14. Review by 2026-11-10.
-#
-# Upstream: https://github.com/smithy-lang/smithy-rs/tree/main/aws/rust-runtime/aws-config
-# Crate: https://crates.io/crates/aws-config
-# Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0387.html
 
 [advisories]
-ignore = [
-    "RUSTSEC-2026-0387",
-]
+ignore = []

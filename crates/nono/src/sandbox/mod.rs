@@ -11,6 +11,10 @@ use crate::error::Result;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+mod linux_mount_mask;
+#[cfg(target_os = "linux")]
+mod linux_mount_watch;
+#[cfg(target_os = "linux")]
 mod linux_namespace;
 
 #[cfg(target_os = "macos")]
@@ -34,6 +38,14 @@ pub use linux_namespace::{
     write_id_maps,
 };
 
+// Re-export Linux opt-in mount masking mechanism (NEP-0004, Phase 2)
+#[cfg(target_os = "linux")]
+pub use linux_mount_mask::{
+    MountMask, MountMaskStep, MountSkipReason, PreparedMountMask, RawMountMaskError, SkippedMount,
+};
+#[cfg(target_os = "linux")]
+pub use linux_mount_watch::MountMaskWatch;
+
 // Re-export Linux WSL2 detection
 #[cfg(target_os = "linux")]
 pub use linux::is_wsl2;
@@ -47,8 +59,9 @@ pub use linux::{
     UnixSocketKind, classify_access_from_flags, classify_af_unix, continue_notif, deny_notif,
     inject_fd, install_seccomp_af_unix_filter, install_seccomp_notify,
     install_seccomp_proxy_filter, notif_id_valid, prepare_landlock_with_abi,
-    prepare_seccomp_af_unix_filter, prepare_seccomp_openat_filter, prepare_seccomp_proxy_filter,
-    prepare_seccomp_with_abi, probe_seccomp_block_network_support, read_mmsghdr_dests,
+    prepare_landlock_with_abi_in_root, prepare_seccomp_af_unix_filter,
+    prepare_seccomp_openat_filter, prepare_seccomp_proxy_filter, prepare_seccomp_with_abi,
+    prepare_seccomp_with_abi_in_root, probe_seccomp_block_network_support, read_mmsghdr_dests,
     read_msghdr_dest, read_notif_path, read_notif_sockaddr, read_open_how, recv_notif,
     resolve_notif_path, respond_notif_errno, validate_openat2_size,
 };

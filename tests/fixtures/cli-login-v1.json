@@ -1,0 +1,44 @@
+{
+  "dpop_key": {
+    "jwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "l8tFrhx-34tV3hRICRDY9zCkDlpBhF42UQUfWVAWBFs",
+      "y": "9VE4jf_Ok_o64zbTTlcuNJajHmt6v9TDVrU0CdvGRDA"
+    },
+    "jkt": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I",
+    "fingerprint": "0ZcO:CORZ:NYy-:DWpq"
+  },
+  "metadata_urls": [
+    {
+      "platform_url": "https://nono.example.com",
+      "metadata_url": "https://nono.example.com/.well-known/oauth-authorization-server"
+    },
+    {
+      "platform_url": "https://example.com/platform",
+      "metadata_url": "https://example.com/.well-known/oauth-authorization-server/platform"
+    }
+  ],
+  "dpop_htu": [
+    {
+      "request_url": "https://nono.example.com/oauth/token?ignored=1",
+      "htu": "https://nono.example.com/oauth/token"
+    },
+    {
+      "request_url": "wss://console.example.com/api/v1/sessions/local:host:abc/terminal?cols=80&rows=24",
+      "htu": "https://console.example.com/api/v1/sessions/local:host:abc/terminal"
+    }
+  ],
+  "completion_urls": [
+    {
+      "platform_url": "https://nono.example.com",
+      "error": null,
+      "url": "https://nono.example.com/platform/cli/complete?result=success"
+    },
+    {
+      "platform_url": "https://example.com/platform",
+      "error": "access_denied",
+      "url": "https://example.com/platform/platform/cli/complete?result=error&error=access_denied"
+    }
+  ]
+}

@@ -12,7 +12,7 @@
 
 use crate::audit;
 use crate::error::{ProxyError, Result};
-use crate::filter::ProxyFilter;
+use crate::filter::{CheckResult, ProxyFilter};
 use crate::token;
 use nono::net_filter::{FilterResult, HostFilter};
 use nono::supervisor::{ApprovalDecision, ApprovalRequest};
@@ -43,9 +43,10 @@ const NETWORK_APPROVAL_BACKSTOP_GRACE: Duration = Duration::from_secs(30);
 /// plus [`NETWORK_APPROVAL_BACKSTOP_GRACE`].
 const NETWORK_APPROVAL_UNBOUNDED_BACKSTOP: Duration = Duration::from_secs(600);
 
-/// Map coordinating in-flight approval prompts, keyed by `(host, port)`, so
-/// concurrent connections await the active prompt before attempting their own.
-pub type InFlightMap = Mutex<HashMap<(String, u16), Arc<InFlight>>>;
+/// Map coordinating in-flight approval prompts, keyed by `(host, port)` for
+/// CONNECT, so concurrent connections await the active prompt before
+/// attempting their own. L7 endpoint approvals key it by approval scope.
+pub type InFlightMap<K = (String, u16)> = Mutex<HashMap<K, Arc<InFlight>>>;
 
 /// Shared slot coordinating concurrent first-touch approval attempts for one
 /// `(host, port)`.
@@ -64,7 +65,7 @@ pub struct InFlight {
 }
 
 impl InFlight {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             tx: watch::channel(None).0,
         })
@@ -76,7 +77,7 @@ impl InFlight {
     }
 
     /// Await the leader's decision. Cancellation is published by its guard.
-    async fn await_decision(&self) -> ApprovalDecision {
+    pub(crate) async fn await_decision(&self) -> ApprovalDecision {
         let mut rx = self.tx.subscribe();
         loop {
             if let Some(decision) = rx.borrow_and_update().clone() {
@@ -84,7 +85,7 @@ impl InFlight {
             }
             if rx.changed().await.is_err() {
                 return ApprovalDecision::Denied {
-                    reason: "network approval leader disappeared".to_string(),
+                    reason: "approval leader disappeared".to_string(),
                 };
             }
         }
@@ -94,20 +95,31 @@ impl InFlight {
 /// Release the slot and wake followers even if the leader future is cancelled.
 /// Followers retain an Arc to the sender, so channel closure alone cannot
 /// detect a vanished leader.
-struct InFlightLeader<'a> {
-    map: &'a InFlightMap,
-    key: (String, u16),
+pub(crate) struct InFlightLeader<'a, K: Eq + std::hash::Hash = (String, u16)> {
+    map: &'a InFlightMap<K>,
+    key: K,
     shared: Arc<InFlight>,
     decision: Option<ApprovalDecision>,
 }
 
-impl InFlightLeader<'_> {
-    fn resolve(mut self, decision: ApprovalDecision) {
+impl<'a, K: Eq + std::hash::Hash> InFlightLeader<'a, K> {
+    /// Become the leader for `key`. The caller holds the `map` lock, checked
+    /// that `key` has no slot, and inserted `shared` under it.
+    pub(crate) fn new(map: &'a InFlightMap<K>, key: K, shared: Arc<InFlight>) -> Self {
+        Self {
+            map,
+            key,
+            shared,
+            decision: None,
+        }
+    }
+
+    pub(crate) fn resolve(mut self, decision: ApprovalDecision) {
         self.decision = Some(decision);
     }
 }
 
-impl Drop for InFlightLeader<'_> {
+impl<K: Eq + std::hash::Hash> Drop for InFlightLeader<'_, K> {
     fn drop(&mut self) {
         let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         // Remove before waking followers so a single-use grant cannot make
@@ -118,13 +130,14 @@ impl Drop for InFlightLeader<'_> {
             self.decision
                 .take()
                 .unwrap_or_else(|| ApprovalDecision::Denied {
-                    reason: "network approval leader cancelled".to_string(),
+                    reason: "approval leader cancelled".to_string(),
                 }),
         );
     }
 }
 
-/// Interactive network-approval context threaded into the CONNECT handler.
+/// Interactive network-approval context threaded into the CONNECT and
+/// plain-HTTP forward-proxy handlers.
 ///
 /// Present only when the profile's `network:` section configures an approval
 /// backend. When absent, a host that is not on the allowlist is denied exactly
@@ -234,65 +247,26 @@ pub async fn handle_connect(
     // Check host against filter (DNS resolution happens here)
     let check = filter.check_host(&host, port).await?;
 
-    // Resolve the set of vetted upstream addresses to connect to. An allowed
-    // host uses the addresses the filter already resolved. A host that is not
-    // on the allowlist may still proceed if the operator interactively approves
-    // it (or approved it earlier this session) — but only a plain allowlist
-    // miss is eligible; metadata / link-local / deny-list denials are hard and
-    // never reach a prompt. See `maybe_approve_host`.
-    //
-    // `approved_backend` carries the approval backend name when the host was
-    // authorized by an operator decision (interactive or session-cached), so
-    // the success audit below records `ApproveGranted` rather than a plain
-    // allowlist `Allow` — keeping the audit trail able to distinguish a runtime
-    // approval from a static allowlist hit.
-    let mut approved_backend: Option<String> = None;
-    let resolved: Vec<SocketAddr> = if check.result.is_allowed() {
-        check.resolved_addrs
-    } else {
-        match maybe_approve_host(&host, port, &check.result, network_approval, filter).await? {
-            ApprovalOutcome::Approved { addrs, backend } => {
-                approved_backend = Some(backend);
-                addrs
-            }
-            ApprovalOutcome::Denied { backend, reason } => {
-                // The operator (or a cached session decision / backend) refused
-                // this host, or the approved host was blocked by the SSRF guard.
-                // Record it as an approval denial, distinct from a static deny.
-                let reason = reason.unwrap_or_else(|| check.result.reason());
-                audit::log_connect_approval(
-                    audit_log,
-                    &audit::EventContext {
-                        denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
-                        approval_backend: Some(&backend),
-                        ..audit::EventContext::default()
-                    },
-                    &host,
-                    port,
-                    nono::undo::NetworkAuditDecision::ApproveDenied,
-                    Some(&reason),
-                );
-                send_response(stream, 403, &format!("Forbidden: {}", reason)).await?;
-                return Err(ProxyError::HostDenied { host, reason });
-            }
-            ApprovalOutcome::NotApplicable => {
-                // Not approval-eligible (hard SSRF/deny-list denial) or no
-                // backend configured: the historical static-deny audit path.
-                let reason = check.result.reason();
-                audit::log_denied(
-                    audit_log,
-                    audit::ProxyMode::Connect,
-                    &audit::EventContext {
-                        denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
-                        ..audit::EventContext::default()
-                    },
-                    &host,
-                    port,
-                    &reason,
-                );
-                send_response(stream, 403, &format!("Forbidden: {}", reason)).await?;
-                return Err(ProxyError::HostDenied { host, reason });
-            }
+    // Resolve the set of vetted upstream addresses, consulting the approval
+    // backend on a plain allowlist miss. See `authorize_host`.
+    let (resolved, approved_backend) = match authorize_host(
+        audit::ProxyMode::Connect,
+        &host,
+        port,
+        check,
+        network_approval,
+        filter,
+        audit_log,
+    )
+    .await?
+    {
+        HostAuthorization::Authorized {
+            addrs,
+            approval_backend,
+        } => (addrs, approval_backend),
+        HostAuthorization::Denied { reason } => {
+            send_response(stream, 403, &format!("Forbidden: {}", reason)).await?;
+            return Err(ProxyError::HostDenied { host, reason });
         }
     };
 
@@ -336,8 +310,9 @@ pub async fn handle_connect(
     if let Some(backend) = approved_backend.as_deref() {
         // Host was authorized by a runtime approval decision, not the static
         // allowlist — record it as such, with the deciding backend.
-        audit::log_connect_approval(
+        audit::log_host_approval(
             audit_log,
+            audit::ProxyMode::Connect,
             &audit::EventContext {
                 approval_backend: Some(backend),
                 ..audit::EventContext::default()
@@ -365,6 +340,93 @@ pub async fn handle_connect(
     Ok(())
 }
 
+/// The result of [`authorize_host`].
+pub(crate) enum HostAuthorization {
+    /// The host may be reached at `addrs`. `approval_backend` names the backend
+    /// when the host was authorized by a runtime approval decision rather than
+    /// the static allowlist, so the caller can audit `ApproveGranted`.
+    Authorized {
+        addrs: Vec<SocketAddr>,
+        approval_backend: Option<String>,
+    },
+    /// The host is denied and the denial is already audited. The caller writes
+    /// its own 403 carrying `reason`.
+    Denied { reason: String },
+}
+
+/// Turn a host-filter result into the vetted upstream addresses to connect to,
+/// shared by the CONNECT and plain-HTTP forward paths.
+///
+/// An allowed host uses the addresses the filter already resolved. A host that
+/// is not on the allowlist may still proceed if the operator interactively
+/// approves it (or approved it earlier this session) — but only a plain
+/// allowlist miss is eligible; metadata / link-local / deny-list denials are
+/// hard and never reach a prompt. See [`maybe_approve_host`].
+///
+/// Denials are audited here (`ApproveDenied` for a refused approval, a plain
+/// `HostDenied` deny otherwise). A granted approval is left to the caller to
+/// audit, since each path records it at a different point.
+pub(crate) async fn authorize_host(
+    mode: audit::ProxyMode,
+    host: &str,
+    port: u16,
+    check: CheckResult,
+    network_approval: Option<&NetworkApproval<'_>>,
+    filter: &ProxyFilter,
+    audit_log: Option<&audit::SharedAuditLog>,
+) -> Result<HostAuthorization> {
+    if check.result.is_allowed() {
+        return Ok(HostAuthorization::Authorized {
+            addrs: check.resolved_addrs,
+            approval_backend: None,
+        });
+    }
+
+    match maybe_approve_host(host, port, &check.result, network_approval, filter).await? {
+        ApprovalOutcome::Approved { addrs, backend } => Ok(HostAuthorization::Authorized {
+            addrs,
+            approval_backend: Some(backend),
+        }),
+        ApprovalOutcome::Denied { backend, reason } => {
+            // The operator (or a cached session decision / backend) refused
+            // this host, or the approved host was blocked by the SSRF guard.
+            // Record it as an approval denial, distinct from a static deny.
+            let reason = reason.unwrap_or_else(|| check.result.reason());
+            audit::log_host_approval(
+                audit_log,
+                mode,
+                &audit::EventContext {
+                    denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                    approval_backend: Some(&backend),
+                    ..audit::EventContext::default()
+                },
+                host,
+                port,
+                nono::undo::NetworkAuditDecision::ApproveDenied,
+                Some(&reason),
+            );
+            Ok(HostAuthorization::Denied { reason })
+        }
+        ApprovalOutcome::NotApplicable => {
+            // Not approval-eligible (hard SSRF/deny-list denial) or no
+            // backend configured: the historical static-deny audit path.
+            let reason = check.result.reason();
+            audit::log_denied(
+                audit_log,
+                mode,
+                &audit::EventContext {
+                    denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                    ..audit::EventContext::default()
+                },
+                host,
+                port,
+                &reason,
+            );
+            Ok(HostAuthorization::Denied { reason })
+        }
+    }
+}
+
 /// The result of evaluating a not-allowlisted host for interactive approval.
 enum ApprovalOutcome {
     /// Not approval-eligible (a hard SSRF/deny-list denial), or no approval
@@ -388,8 +450,8 @@ enum ApprovalOutcome {
     },
 }
 
-/// Decide whether a not-allowed host may still be tunnelled, via the session
-/// cache or an interactive approval prompt.
+/// Decide whether a not-allowed host may still be reached (CONNECT tunnel or
+/// plain-HTTP forward), via the session cache or an interactive approval prompt.
 ///
 /// Only a plain allowlist miss ([`FilterResult::DenyNotAllowed`]) is eligible.
 /// A metadata / link-local / deny-list denial ([`FilterResult::DenyHost`] /
@@ -441,12 +503,7 @@ async fn maybe_approve_host(
                 None => {
                     let shared = InFlight::new();
                     map.insert(key.clone(), Arc::clone(&shared));
-                    Ok(InFlightLeader {
-                        map: approval.in_flight,
-                        key: key.clone(),
-                        shared,
-                        decision: None,
-                    })
+                    Ok(InFlightLeader::new(approval.in_flight, key.clone(), shared))
                 }
             }
         };
@@ -609,7 +666,10 @@ async fn connect_to_resolved(addrs: &[SocketAddr], host: &str) -> Result<TcpStre
     let mut last_err = None;
     for addr in addrs {
         match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Ok(stream)) => {
+                crate::upstream_socket::set_liveness(&stream);
+                return Ok(stream);
+            }
             Ok(Err(e)) => {
                 debug!("Connect to {} failed: {}", addr, e);
                 last_err = Some(e.to_string());
@@ -709,6 +769,16 @@ async fn write_upstream_failure<S: AsyncWrite + Unpin>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_to_resolved_sets_liveness() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addrs = [listener.local_addr().unwrap()];
+
+        let stream = connect_to_resolved(&addrs, "upstream.test").await.unwrap();
+
+        crate::upstream_socket::assert_liveness(&stream);
+    }
 
     #[test]
     fn test_parse_connect_with_port() {
@@ -905,24 +975,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// An approval backend that returns a fixed decision and counts how many
-    /// times it was consulted, so tests can assert the session cache suppresses
-    /// re-prompting.
-    struct CountingBackend {
-        decision: ApprovalDecision,
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl nono::ApprovalBackend for CountingBackend {
-        fn request_approval(&self, _request: &ApprovalRequest) -> nono::Result<ApprovalDecision> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.decision.clone())
-        }
-
-        fn backend_name(&self) -> &str {
-            "counting"
-        }
-    }
+    use crate::test_env::CountingBackend;
 
     fn deny_not_allowed(host: &str) -> FilterResult {
         FilterResult::DenyNotAllowed {

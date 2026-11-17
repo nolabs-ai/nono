@@ -26,6 +26,30 @@ fn rule() {
     eprintln!("  {}", theme::fg(&"\u{2500}".repeat(52), t.overlay));
 }
 
+pub(crate) enum SummaryKind {
+    Info,
+    Success,
+    Attention,
+}
+
+pub(crate) fn summary_heading(title: &str, kind: SummaryKind) -> String {
+    let t = theme::current();
+    let title = fg(title, t.brand).bold();
+    match kind {
+        SummaryKind::Info => format!("\n  {title}\n"),
+        SummaryKind::Success => format!("\n  {} {title}\n", fg("✓", t.green)),
+        SummaryKind::Attention => format!("\n  {} {title}\n", fg("!", t.yellow)),
+    }
+}
+
+/// Format one aligned field in a terminal summary.
+pub(crate) fn summary_row(label: &str, value: &str) -> String {
+    format!(
+        "    {}  {value}\n",
+        fg(&format!("{label:<15}"), theme::current().subtext)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Banner
 // ---------------------------------------------------------------------------
@@ -512,18 +536,24 @@ pub fn print_abi_info(silent: bool) {
 
 /// Print the requested namespace isolation set (NEP-0004), if any.
 #[cfg(target_os = "linux")]
-pub fn print_isolation(isolate: crate::profile::LinuxIsolateConfig, silent: bool) {
+pub fn print_isolation(isolate: &crate::profile::LinuxIsolateConfig, silent: bool) {
     if silent || isolate.is_empty() {
         return;
     }
     let t = theme::current();
-    let detail = if isolate.network && isolate.loopback {
-        "user namespace; network: loopback only, TCP on loopback allowed, any egress via the nono proxy"
+    let network = if isolate.network && isolate.loopback {
+        "; network: loopback only, TCP on loopback allowed, any egress via the nono proxy"
     } else if isolate.network {
-        "user namespace; network: loopback only, any egress via the nono proxy"
+        "; network: loopback only, any egress via the nono proxy"
     } else {
-        "user namespace"
+        ""
     };
+    let mounts = if isolate.mounts {
+        "; mounts: host IPC endpoints masked, private /tmp"
+    } else {
+        ""
+    };
+    let detail = format!("user namespace{network}{mounts}");
     eprintln!(
         "  {} {}",
         badge(" iso ", t.blue, BADGE_FG_DARK),
@@ -532,6 +562,36 @@ pub fn print_isolation(isolate: crate::profile::LinuxIsolateConfig, silent: bool
             t.subtext,
         )
     );
+}
+
+/// Print what the mount mask hides and which grants it re-binds (NEP-0004).
+#[cfg(target_os = "linux")]
+pub fn print_mount_mask(plan: &nono::PreparedMountMask, silent: bool) {
+    if silent {
+        return;
+    }
+    let t = theme::current();
+    let join = |paths: Vec<&std::path::Path>| {
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let masked = join(plan.masked_paths().collect());
+    eprintln!(
+        "  {} {}",
+        badge(" iso ", t.blue, BADGE_FG_DARK),
+        fg(&format!("masked: {masked}"), t.subtext)
+    );
+    let rebound: Vec<_> = plan.rebound_paths().collect();
+    if !rebound.is_empty() {
+        eprintln!(
+            "  {} {}",
+            badge(" iso ", t.blue, BADGE_FG_DARK),
+            fg(&format!("re-bound grants: {}", join(rebound)), t.subtext)
+        );
+    }
 }
 
 /// Print the Landlock scope policy derived from the current capabilities.

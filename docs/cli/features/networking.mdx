@@ -61,11 +61,11 @@ In a profile, set `network.block` to `true`:
 Neither `--block-net` nor `network.block: true` can be lifted by a runtime
 approval. Configuring `network.approval_backends` together with either effective
 hard block is rejected before launch. For approval-only networking with an empty
-`allow_domain`, omit the hard block (or set `network.block: false`); the configured
-backend activates a strict proxy and otherwise eligible, directly handled
-CONNECT targets need approval. Inherited profile blocks remain hard blocks. The explicit `--allow-net`
-CLI override instead clears the profile block and approval settings and grants
-unrestricted networking.
+`allow_domain`, omit the hard block (or set `network.block: false`); the
+configured backend activates a strict proxy and otherwise eligible, directly
+handled CONNECT and plain-HTTP targets need approval. Inherited profile blocks
+remain hard blocks. The explicit `--allow-net` CLI override instead clears the
+profile block and approval settings and grants unrestricted networking.
 
 ## CONNECT Tunnel (Domain Filtering)
 
@@ -91,14 +91,79 @@ When `--allow-domain` is given a URL with a path (e.g., `https://github.com/org/
 
 Use `nono why --self --host https://github.com/some/path` inside the sandbox to check whether a specific URL is permitted and see the configured endpoint rules.
 
+### Endpoint Approvals
+
+In a profile, an `allow_domain` entry can carry an `endpoint_policy` instead of
+`endpoints`, with the same shape credential routes use. Requests matching an
+`approve` rule ask the approval backend instead of being refused:
+
+```json
+{
+  "network": {
+    "allow_domain": [
+      {
+        "domain": "github.com",
+        "endpoint_policy": {
+          "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }],
+          "approve": [{ "method": "*", "path": "/*/*/**", "reason": "repository access" }],
+          "default": { "decision": "deny" }
+        }
+      }
+    ],
+    "approval_backends": { "review": { "type": "terminal" } },
+    "approval_defaults": { "backend": "review" }
+  }
+}
+```
+
+- `network.approval_backends` also turns on host approval: a CONNECT to a host
+  that is not allowed asks instead of being refused, and an approved host gets
+  a plain tunnel with no endpoint rules. Deny hosts you never want reachable
+  with `deny_domain`. When `command_policies` declares approval backends,
+  endpoint requests use those instead.
+- `endpoints` stays the shorthand: an allow list with default deny. An entry
+  sets one or the other, not both.
+- Rules are checked `deny`, then `approve`, then `allow`, then `default`. A
+  path matching both an `approve` and an `allow` rule asks, so keep `allow`
+  rules out of the `approve` patterns.
+- `deny` rules never reach the backend, and a credential route on the same host
+  cannot allow what this policy denies, through either CONNECT or its
+  `*_BASE_URL` reverse proxy.
+- Entries for the same domain are merged, including `--allow-domain` flags: a
+  flag adds its path to the `allow` rules and keeps the profile's `deny` and
+  `approve` rules. In an inherited profile, a `default` left out keeps the
+  base profile's.
+- An approved request is handled like an allowed one: a credential route that
+  covers it injects its credential under its own rules; otherwise the request
+  goes out unchanged. When this policy and the credential route would both
+  ask, nono asks once.
+- An "always" answer lasts for the proxy session and covers the request's
+  method on its host, for the matched rule with its `*` segments filled in. For
+  `/*/*/**`, approving `GET /torvalds/linux/info/refs` also covers
+  `GET /torvalds/linux/HEAD` but asks again for
+  `POST /torvalds/linux/git-upload-pack` and for `/torvalds/other/...`. The
+  prompt's rule label shows that scope (`GET /torvalds/linux/**`). When the
+  `default` asks, an answer covers only that exact method and path. A session
+  answer never overrides a `deny` rule or the `default`.
+- Approvals asked by a credential route's own `endpoint_policy` are always
+  one-shot: "always" counts for that request only.
+- On an AWS domain (`amazonaws.com`, `amazonaws.com.cn` or `api.aws`), rules
+  can also match the AWS operation with `operations`, as on an `aws_auth`
+  credential (see [Matching AWS operations](/cli/features/credential-injection#matching-aws-operations)).
+  This filters requests the agent signs with its own AWS credentials; nono
+  forwards them unchanged. An "always" answer then also covers only the
+  operation it was given for. Such a domain is served over HTTP/1.1 and its
+  request bodies are buffered (up to 16 MiB). `operations` on any other domain
+  is rejected.
+
 ![Proxy architecture flow](/assets/proxy-flow.png)
 
 ### Runtime Host Approval
 
-For `nono run` and `nono shell`, configure `network.approval_backends` to ask
-before connecting to hosts outside the static allowlist. Backends can be
-`terminal`, `webhook`, or `chain`. An approval-only profile needs no static
-allowlist entry or other proxy feature:
+For `nono run`, `nono shell`, and standalone `nono proxy`, configure
+`network.approval_backends` to ask before connecting to hosts outside the
+static allowlist. Backends can be `terminal`, `webhook`, or `chain`. An
+approval-only profile needs no static allowlist entry or other proxy feature:
 
 ```json
 {
@@ -119,13 +184,13 @@ Save this as `approval-only.json` and launch it with:
 nono run --profile ./approval-only.json --allow-cwd -- my-agent
 ```
 
-A non-empty backend map activates a strict proxy:
-an empty allowlist means eligible CONNECT destinations require approval, not
-unrestricted networking. Direct outbound traffic remains blocked. Static
-allowlist grants do not prompt; explicit host denies and metadata/link-local
-SSRF protections cannot be approved. Approved destinations are resolved and
-checked again before each connection. Without a backend map, static-policy
-behavior is unchanged; `approval_defaults` alone does not activate the proxy.
+A non-empty backend map activates a strict proxy: an empty allowlist means
+eligible CONNECT and plain-HTTP destinations require approval, not unrestricted
+networking. Direct outbound traffic remains blocked. Static allowlist grants do
+not prompt; explicit host denies and metadata/link-local SSRF protections cannot
+be approved. Approved destinations are resolved and checked again before each
+connection. Without a backend map, static-policy behavior is unchanged;
+`approval_defaults` alone does not activate the proxy.
 
 `--block-net` and `network.block: true` are hard blocks, not approval triggers.
 They cannot be combined with approval backends, including when a block is
@@ -142,11 +207,18 @@ the answer. Expiry denies, restores terminal state, and releases the prompt
 reader; expired queued work cannot open a later prompt. Set this timeout on the
 backend itself. A terminal backend without an available terminal denies.
 
-Host approvals apply to direct CONNECT tunnels, including destinations that
-bypass an enterprise upstream proxy. CONNECTs forwarded to the enterprise
-proxy do not consult these backends and need static allowlist grants. The
-standalone `nono proxy` does not load network approval backends, and `nono wrap`
-rejects them because it cannot host an approval proxy.
+Host approvals apply to direct CONNECT tunnels and plain-HTTP (`http://`)
+forward-proxy requests, including destinations that bypass an enterprise
+upstream proxy. Both paths share the same backend, "Always" decisions, and
+in-flight prompt. Requests forwarded to the enterprise proxy do not consult
+these backends and need static allowlist grants.
+`nono wrap` rejects them because it cannot host an approval proxy.
+
+For a local approval helper, point a `webhook` backend at a Unix socket
+(`"url": "unix:///abs/path/approval.sock"`) instead of a loopback port. A
+sandbox that may listen on TCP ports can take a loopback port over when the
+helper is not holding it. `run` and `shell` refuse to launch if the sandbox
+could write to the socket or any directory above it, or bind it.
 
 See the [approval webhook protocol](https://github.com/nolabs-ai/nono/blob/main/docs/protocols/approval-webhook-v1.md)
 for webhook configuration, chain behavior, and grant scope.
@@ -273,7 +345,7 @@ nono run --allow-cwd --network-profile enterprise \
   --upstream-proxy squid.corp:3128 -- my-agent
 ```
 
-CONNECT requests are chained through the corporate proxy. Cloud metadata endpoints are still denied regardless. Forwarded CONNECTs use static host policy, not runtime host approvals. When network approval backends are configured, forwarded destinations therefore need static allowlist grants; only direct/upstream-bypass CONNECTs can consult `network.approval_backends`.
+CONNECT requests are chained through the corporate proxy. Cloud metadata endpoints are still denied regardless. Forwarded CONNECTs and plain-HTTP requests use static host policy, not runtime host approvals. When network approval backends are configured, forwarded destinations therefore need static allowlist grants; only direct/upstream-bypass requests can consult `network.approval_backends`.
 
 ### Bypassing the External Proxy
 
@@ -342,7 +414,7 @@ On startup it prints the proxy URL (with the embedded credential), the raw token
   Press Ctrl-C to stop.
 ```
 
-Static network and credential settings are loaded from `--profile` and extended/overridden by explicit flags. Unlike `run` and `shell`, standalone `nono proxy` does not load `network.approval_backends`; do not use an approval-only profile to restrict it. Allow-domains and credentials are merged on top of the profile; the network profile and upstream proxy are overridden by flags. Credential injection for known services and `cmd://` credential-capture routes carry through the profile exactly as they do under `nono run`.
+Static network and credential settings are loaded from `--profile` and extended/overridden by explicit flags. `network.approval_backends` work as they do under `run`: an approval-only profile makes the proxy strict, and allowlist misses are sent to the configured backend. "Always allow" and "Always deny" answers apply to every client of the proxy until it stops. A terminal backend needs the proxy to run in a terminal; without one, every miss is denied. Allow-domains and credentials are merged on top of the profile; the network profile and upstream proxy are overridden by flags. Credential injection for known services and `cmd://` credential-capture routes carry through the profile exactly as they do under `nono run`.
 
 ### Flags
 
@@ -460,6 +532,8 @@ Path patterns use standard glob syntax (same as `.gitignore` and nono profile `i
 | `/repos/*/issues` | One segment wildcard (e.g., `/repos/myrepo/issues`) |
 | `/api/**` | Zero or more segments (e.g., `/api/v1/data/export`) |
 | `*` | Any method (when used as the method field) |
+
+Trailing slashes are ignored on both patterns and request paths, so `/repos/` and `/repos` match the same requests (`/repos` and `/repos/`, but not `/repos/x`). This applies to `--allow-domain` URLs as well: `https://api.github.com/repos/my-org/my-repo/issues/` allows exactly the requests that `https://api.github.com/repos/my-org/my-repo/issues` allows.
 
 ## Localhost IPC
 

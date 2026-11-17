@@ -23,6 +23,13 @@ work without privilege everywhere, including restricted containers. On hosts
 that support it, Landlock's kernel audit can be added as a kernel-backed
 layer that a hostile agent cannot evade.
 
+## Implementation status
+
+Unimplemented as of 2026-11-02. The existing audit log is the foundation;
+the full syscall trap, kernel reader, access events, usage summaries and
+coverage accounting remain proposed. Performance, source fidelity and
+verifier compatibility remain acceptance questions; `breaking` is unassessed.
+
 ## Motivation
 
 An operator investigating a session needs to answer, after the fact:
@@ -51,14 +58,16 @@ denied correctly. The gap is the evidence.
 | Command policy | mediated tool commands | Yes |
 | Seatbelt (macOS) | every denial in supervised mode, via `log stream` | Diagnostics only, capped at 50 (`sandbox_log.rs`) |
 | cgroup resource limits | OOM kills, process-count cap | End-of-session terminal report only |
-| Mount namespace isolation (NEP-0004) | hidden paths (`ENOENT`) | Not a denial; layout not recorded |
+
+NEP-0004's mount masks remain planned. When implemented, their hidden paths
+(`ENOENT`) and effective layout will also need coverage in the recorder.
 
 Capability elevation is off by default (`security.capability_elevation`), so
 by default no filesystem denial reaches the audit log on either platform.
 
 Process attribution is also missing where the kernel provides it: capability
 requests record `child.as_raw()`, the session's top-level process
-(`crates/nono-cli/src/exec_strategy/supervisor_linux.rs:659`), not
+(`crates/nono-cli/src/exec_strategy/supervisor_linux.rs`), not
 `notif.pid`, the task that made the call.
 
 ### Goals

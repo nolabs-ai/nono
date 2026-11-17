@@ -85,6 +85,10 @@
       "$ref": "#/$defs/RollbackConfig",
       "description": "Rollback snapshot configuration controlling which files are excluded from undo snapshots."
     },
+    "session_recording": {
+      "$ref": "#/$defs/SessionRecordingConfig",
+      "description": "Session terminal recording. Records the session's terminal into its audit log. Settings can only be raised by extending profiles and launch flags."
+    },
     "open_urls": {
       "oneOf": [
         { "$ref": "#/$defs/OpenUrlConfig" },
@@ -593,6 +597,11 @@
       "description": "Security configuration for process-level isolation modes.",
       "additionalProperties": false,
       "properties": {
+        "session_socket_auth": {
+          "oneOf": [{ "type": "boolean" }, { "type": "null" }],
+          "default": false,
+          "description": "Opt-in authentication of named IPC callers against the owning nono session, including brokered tools. Defaults to false for compatibility. Requires Linux 6.5+ on Linux; enabling it on an unsupported kernel fails at startup."
+        },
         "signal_mode": {
           "oneOf": [
             { "$ref": "#/$defs/ProfileSignalMode" },
@@ -657,7 +666,7 @@
             { "$ref": "#/$defs/LinuxAfUnixMediation" },
             { "type": "null" }
           ],
-          "description": "Opt-in pathname AF_UNIX mediation. 'off' preserves compatibility. 'pathname' requires explicit filesystem.unix_socket* grants for pathname Unix socket connect/bind."
+          "description": "Opt-in pathname AF_UNIX mediation. 'off' preserves compatibility. 'pathname' requires explicit filesystem.unix_socket* grants for pathname Unix socket connect/bind; with security.capability_elevation, an ungranted connect/bind is put to the security approval backend. Bind approval requires an existing filesystem write grant on the parent directory."
         },
         "sandbox_policy": {
           "oneOf": [
@@ -673,7 +682,7 @@
     },
     "LinuxIsolateConfig": {
       "type": "object",
-      "description": "Opt-in namespace isolation (NEP-0004). Every field defaults to false. Fields merge by logical OR across profile layers and the CLI: any layer can enable a namespace and none can disable it. Requested isolation that the host cannot provide is a startup error, never a silent downgrade. Inert on macOS. Not supported by `nono wrap`.",
+      "description": "Opt-in namespace isolation (NEP-0004). Every field defaults to false (extra_masks to empty). Boolean fields merge by logical OR across profile layers, packs and the CLI: any layer can enable a namespace and none can disable it. extra_masks merges by deduplicated append, so no layer can remove a mask. Requested isolation that the host cannot provide is a startup error, never a silent downgrade. Inert on macOS. Not supported by `nono wrap`.",
       "additionalProperties": false,
       "properties": {
         "network": {
@@ -695,6 +704,17 @@
           "type": "boolean",
           "default": false,
           "description": "Run in a new user + UTS namespace (hostname changes do not affect the host)."
+        },
+        "mounts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run in a new user + mount namespace that masks host IPC endpoints: an empty tmpfs over $XDG_RUNTIME_DIR (and /run/user/<uid>), masks over /run/dbus, container and VM manager sockets (Docker, containerd, k3s, CRI-O, Podman, libvirt, Incus, LXD), snapd, pcscd and /run/systemd/private, and a private per-session /tmp. If the host removes a mask during the session (for example by recreating a daemon socket), nono terminates the sandbox. Paths the profile grants, including unix_socket grants, are re-bound through the masks; a grant of a whole masked directory applies to the session's private copy. Cannot be combined with security.capability_elevation."
+        },
+        "extra_masks": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Additional host paths to mask (a directory gets an empty tmpfs; a socket or file becomes unreachable). Additive only: no layer can remove a default or inherited mask. Requires mounts. Supports variable expansion ($HOME, $XDG_RUNTIME_DIR, $WORKDIR, ...); a path that does not exist on the host is skipped."
         }
       }
     },
@@ -922,7 +942,7 @@
               { "$ref": "#/$defs/AllowDomainWithEndpoints" }
             ]
           },
-          "description": "Additional domains to allow through the proxy. Entries can be plain hostname strings (CONNECT tunnel, no L7 filtering) or objects with endpoint rules (TLS-intercepted method+path filtering). When endpoints are present, only matching requests are allowed (default-deny)."
+          "description": "Additional domains to allow through the proxy. Entries can be plain hostname strings (CONNECT tunnel, no L7 filtering) or objects with endpoint rules (TLS-intercepted method+path filtering). When endpoints are present, only matching requests are allowed (default-deny). endpoint_policy adds deny and approve rules."
         },
         "credentials": {
           "type": "array",
@@ -1184,6 +1204,13 @@
           ],
           "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op://, bw://, apple-password://, file://, or cmd://). Optional for env:// (derived from the URI)."
         },
+        "phantom_format": {
+          "oneOf": [
+            { "type": "string", "pattern": "^[A-Za-z0-9._~-]+\\{\\}[A-Za-z0-9._~-]*$", "maxLength": 66 },
+            { "type": "null" }
+          ],
+          "description": "Optional template for the phantom token placed in env_var; '{}' is replaced by the session token (e.g. 'ghp_{}'). For clients that reject tokens without a known prefix. The proxy then accepts only this exact value on the route. A compatibility shim, not a per-route secret. Independent of credential_format (outbound). Requires credential_key or auth; not valid with aws_auth, spiffe, or redeem_phantoms alone."
+        },
         "endpoint_rules": {
           "type": "array",
           "items": {
@@ -1254,9 +1281,14 @@
     },
     "AllowDomainWithEndpoints": {
       "type": "object",
-      "description": "Domain with fine-grained method+path endpoint restrictions. Requires TLS interception for L7 filtering. When endpoints is non-empty, only matching method+path combinations are allowed (default-deny).",
+      "description": "Domain with fine-grained method+path endpoint restrictions. Requires TLS interception for L7 filtering. Set either endpoints (an allow list; everything else is denied) or endpoint_policy (allow/deny/approve rules), not both.",
       "additionalProperties": false,
-      "required": ["domain", "endpoints"],
+      "required": ["domain"],
+      "anyOf": [
+        { "required": ["endpoints"] },
+        { "required": ["endpoint_policy"] }
+      ],
+      "not": { "required": ["endpoints", "endpoint_policy"] },
       "properties": {
         "domain": {
           "type": "string",
@@ -1266,6 +1298,10 @@
           "type": "array",
           "items": { "$ref": "#/$defs/EndpointRule" },
           "description": "L7 method+path rules. Only requests matching at least one rule are allowed."
+        },
+        "endpoint_policy": {
+          "$ref": "#/$defs/EndpointPolicyConfig",
+          "description": "L7 policy checked deny, then approve, then allow, then default. A request matching an approve rule asks the approval backend; a session answer covers the rule with its * segments filled in."
         }
       }
     },
@@ -1425,6 +1461,12 @@
       "type": "object",
       "description": "AWS SigV4 signing configuration for a credential route. All fields are optional: an empty {} block uses the default credential chain with region and service auto-detected from the upstream URL.",
       "additionalProperties": false,
+      "not": {
+        "allOf": [
+          { "required": ["profile"], "properties": { "profile": { "not": { "type": "null" } } } },
+          { "required": ["profiles"], "properties": { "profiles": { "not": { "type": "null" } } } }
+        ]
+      },
       "properties": {
         "profile": {
           "oneOf": [
@@ -1433,12 +1475,24 @@
           ],
           "description": "AWS profile name to use for credentials. If omitted, the default credential chain is used (environment variables → AWS_PROFILE → default profile → instance metadata). Must be non-empty if set."
         },
+        "profiles": {
+          "oneOf": [
+            {
+              "type": "object",
+              "minProperties": 1,
+              "propertyNames": { "pattern": "^[A-Z0-9]{16,128}$" },
+              "additionalProperties": { "type": "string", "minLength": 1, "pattern": "^\\S+$" }
+            },
+            { "type": "null" }
+          ],
+          "description": "Operator-approved signing profiles keyed by placeholder access key ID. Each request signs as the profile mapped to the access key ID in its own SigV4 Authorization header; a missing or unlisted key is rejected with 403. Give the sandboxed client one placeholder key per allowed profile. Each profile may be mapped at most once (checked at load; not expressible in this schema). Mutually exclusive with profile."
+        },
         "region": {
           "oneOf": [
             { "type": "string" },
             { "type": "null" }
           ],
-          "description": "Explicit SigV4 signing region (e.g., \"us-east-1\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set."
+          "description": "Explicit SigV4 signing region (e.g., \"us-east-1\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set. Must be omitted when the upstream is `https://{service}.*.amazonaws.com`; the region is then taken from each request's host."
         },
         "service": {
           "oneOf": [
@@ -1781,7 +1835,7 @@
         },
         "url": {
           "type": "string",
-          "description": "Webhook URL for webhook approval backends. Optional when auth is platform: nono then derives <platform_url>/api/v1/approvals from its enrollment."
+          "description": "Webhook URL for webhook approval backends: http(s)://... or unix:///abs/path.sock. Optional when auth is platform: nono then derives <platform_url>/api/v1/approvals from its enrollment."
         },
         "auth": {
           "type": "string",
@@ -2035,6 +2089,11 @@
           "items": { "type": "string" },
           "description": "Directory read grants in the selected command sandbox policy."
         },
+        "exec_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Extra files or directories this command may exec, such as helpers it runs by absolute path (Linux only)."
+        },
         "fs_read_file": {
           "type": "array",
           "items": { "type": "string" },
@@ -2158,7 +2217,13 @@
         "path": { "type": "string" },
         "backend": { "$ref": "#/$defs/CommandPolicyIdentifier" },
         "reason": { "type": "string" },
-        "timeout_secs": { "type": "integer", "minimum": 1 }
+        "timeout_secs": { "type": "integer", "minimum": 1 },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "description": "AWS operation-name globs; valid only with aws_auth or on an AWS domain (amazonaws.com, amazonaws.com.cn, api.aws). 'Unknown' matches requests whose operation cannot be determined.",
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9_*?]{1,256}$" }
+        }
       }
     },
     "InvocationPolicyConfig": {
@@ -2347,6 +2412,21 @@
           "type": "array",
           "items": { "type": "integer", "minimum": 0, "maximum": 65535 },
           "description": "Raw TCP bind ports. Requires Landlock ABI v4+ TCP support."
+        },
+        "open_port": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 65535 },
+          "description": "Localhost ports this command may bind and connect to. Port 0: macOS only (localhost:* outbound)."
+        },
+        "open_port_range": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Inclusive localhost port ranges this command may bind and connect to, as [start, end] pairs."
         }
       }
     },
@@ -2498,6 +2578,59 @@
           "type": "integer",
           "minimum": 1,
           "description": "Optional timeout in seconds. If set, the hook is killed (SIGTERM then SIGKILL) after this duration. If absent, no timeout is enforced."
+        }
+      }
+    },
+    "SessionRecordingConfig": {
+      "type": "object",
+      "description": "Session terminal recording. Records terminal output, input and terminal facts as asciicast v2 chunks linked into the session's audit log. Known credential values are removed and password-mode input is never recorded. Every setting can only be raised: an extending profile or launch flag can turn recording on, make it required, record input, raise max_bytes or add a destination, but never undo what a base profile set.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Record the session's terminal. Requires the audit log."
+        },
+        "required": {
+          "type": "boolean",
+          "description": "Stop the session rather than run it unrecorded, and exit with status 74 if the recording is incomplete. Implies enabled."
+        },
+        "input": {
+          "type": "string",
+          "enum": ["on", "off"],
+          "description": "Record typed input (on), or only mark that input happened (off). Defaults to on for terminal sessions and off for sessions without a terminal."
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Uncompressed size at which the recording stops. Defaults to 268435456 (256 MiB)."
+        },
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Also write the recording to this new file, with a chunk manifest beside it at <file>.manifest.json. Relative paths resolve against the launch directory; $WORKDIR and ~ are expanded. The file must not already exist. Honoured only in user-authored profiles. Implies enabled."
+        },
+        "delivery": {
+          "type": "object",
+          "description": "Upload each recording chunk as it closes. Implies enabled.",
+          "additionalProperties": false,
+          "required": ["receiver"],
+          "properties": {
+            "receiver": {
+              "type": "string",
+              "enum": ["platform"],
+              "description": "platform: the platform this host is enrolled with."
+            },
+            "required": {
+              "type": "boolean",
+              "description": "Fail the session (exit status 74) when chunks cannot be delivered by session end. Also makes the recording required."
+            },
+            "flush_timeout_secs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 600,
+              "description": "How long session end waits for undelivered chunks. Defaults to 30."
+            }
+          }
         }
       }
     },

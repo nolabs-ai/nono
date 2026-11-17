@@ -5,7 +5,9 @@
 
 use crate::profile::CustomCredentialDef;
 use nono::{NonoError, Result};
-use nono_proxy::config::{EndpointRule, InjectMode, ProxyConfig, RouteConfig};
+use nono_proxy::config::{
+    ENDPOINT_ROUTE_PREFIX, EndpointRule, InjectMode, ProxyConfig, RouteConfig,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::debug;
@@ -246,6 +248,7 @@ pub fn resolve_credentials(
                 query_param_name: cred.query_param_name.clone(),
                 proxy: cred.proxy.clone(),
                 env_var: cred.env_var.clone(),
+                phantom_format: cred.phantom_format.clone(),
                 endpoint_rules: cred.endpoint_rules.clone(),
                 endpoint_policy: cred.endpoint_policy.clone(),
                 tls_ca: cred
@@ -301,6 +304,7 @@ pub fn resolve_credentials(
                 query_param_name: None,
                 proxy: None,
                 env_var: cred.env_var.clone(),
+                phantom_format: None,
                 endpoint_rules: cred.endpoint_rules.clone(),
                 endpoint_policy: None,
                 tls_ca: None, // Built-in credentials don't support custom CAs
@@ -315,6 +319,12 @@ pub fn resolve_credentials(
         }
         // We already validated existence above, so this else branch won't be hit
     }
+
+    nono_proxy::server::validate_phantom_formats(
+        &routes,
+        &nono_proxy::config::default_intercept_ca_env_vars(),
+    )
+    .map_err(|e| NonoError::ConfigParse(e.to_string()))?;
 
     Ok(routes)
 }
@@ -434,8 +444,12 @@ pub fn partition_allow_domain(
                 let expanded = expand_proxy_allow(policy, std::slice::from_ref(host));
                 plain_hosts.extend(expanded);
             }
-            crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
-                if endpoints.is_empty() {
+            crate::profile::AllowDomainEntry::WithEndpoints {
+                domain,
+                endpoints,
+                endpoint_policy,
+            } => {
+                if !entry.has_endpoint_restrictions() {
                     let expanded = expand_proxy_allow(policy, std::slice::from_ref(domain));
                     plain_hosts.extend(expanded);
                 } else {
@@ -445,7 +459,12 @@ pub fn partition_allow_domain(
                                 .to_string(),
                         ));
                     }
-                    let prefix = format!("_ep_{}", domain);
+                    if !endpoints.is_empty() && endpoint_policy.is_some() {
+                        return Err(NonoError::ConfigParse(format!(
+                            "allow_domain entry '{domain}' sets both endpoints and endpoint_policy; use one"
+                        )));
+                    }
+                    let prefix = format!("{ENDPOINT_ROUTE_PREFIX}{domain}");
                     let scheme = if is_loopback_domain(domain) {
                         "http"
                     } else {
@@ -464,8 +483,11 @@ pub fn partition_allow_domain(
                         query_param_name: None,
                         proxy: None,
                         env_var: None,
+                        phantom_format: None,
                         endpoint_rules: endpoints.clone(),
-                        endpoint_policy: None,
+                        endpoint_policy: endpoint_policy
+                            .as_ref()
+                            .map(crate::profile::AllowDomainEndpointPolicy::to_proxy),
                         tls_ca: None,
                         tls_client_cert: None,
                         tls_client_key: None,
@@ -633,6 +655,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -678,6 +701,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -719,6 +743,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -770,6 +795,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -861,6 +887,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -899,6 +926,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -937,6 +965,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -980,6 +1009,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("OPENAI_API_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -999,6 +1029,71 @@ mod tests {
             Some("OPENAI_API_KEY".to_string()),
             "env_var must be propagated from CustomCredentialDef to RouteConfig"
         );
+    }
+
+    fn phantom_cred(env_var: &str, fmt: Option<&str>) -> crate::profile::CustomCredentialDef {
+        crate::profile::CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://CRED".to_string()),
+            auth: None,
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: Some(env_var.to_string()),
+            phantom_format: fmt.map(str::to_string),
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_credentials_propagates_phantom_format() {
+        let policy = load_network_policy(embedded_network_policy_json()).expect("policy loads");
+        let mut custom = HashMap::new();
+        custom.insert(
+            "github".to_string(),
+            phantom_cred("GH_TOKEN", Some("ghp_{}")),
+        );
+        let routes =
+            resolve_credentials(&policy, &["github".to_string()], &custom).expect("resolves");
+        assert_eq!(routes[0].phantom_format.as_deref(), Some("ghp_{}"));
+    }
+
+    #[test]
+    fn test_resolve_credentials_rejects_conflicting_phantom_formats() {
+        let policy = load_network_policy(embedded_network_policy_json()).expect("policy loads");
+        let mut custom = HashMap::new();
+        custom.insert(
+            "one".to_string(),
+            phantom_cred("SHARED_TOKEN", Some("ghp_{}")),
+        );
+        custom.insert("two".to_string(), phantom_cred("SHARED_TOKEN", None));
+        let names = vec!["one".to_string(), "two".to_string()];
+        assert!(resolve_credentials(&policy, &names, &custom).is_err());
+    }
+
+    #[test]
+    fn test_resolve_credentials_rejects_phantom_format_on_base_url_var() {
+        let policy = load_network_policy(embedded_network_policy_json()).expect("policy loads");
+        let mut custom = HashMap::new();
+        custom.insert(
+            "one".to_string(),
+            phantom_cred("TWO_BASE_URL", Some("ghp_{}")),
+        );
+        custom.insert("two".to_string(), phantom_cred("TWO_TOKEN", None));
+        let names = vec!["one".to_string(), "two".to_string()];
+        assert!(resolve_credentials(&policy, &names, &custom).is_err());
     }
 
     #[test]
@@ -1117,6 +1212,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("LD_PRELOAD".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1212,6 +1308,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1265,6 +1362,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1336,6 +1434,7 @@ mod tests {
             crate::profile::AllowDomainEntry::Plain("api.openai.com".to_string()),
             crate::profile::AllowDomainEntry::WithEndpoints {
                 domain: "api.github.com".to_string(),
+                endpoint_policy: None,
                 endpoints: vec![
                     EndpointRule {
                         method: "GET".to_string(),
@@ -1355,7 +1454,10 @@ mod tests {
         assert_eq!(endpoint_routes.len(), 1);
 
         let route = &endpoint_routes[0];
-        assert_eq!(route.prefix, "_ep_api.github.com");
+        assert_eq!(
+            route.prefix,
+            format!("{ENDPOINT_ROUTE_PREFIX}api.github.com")
+        );
         assert_eq!(route.upstream, "https://api.github.com");
         assert!(route.credential_key.is_none());
         assert_eq!(route.endpoint_rules.len(), 2);
@@ -1372,6 +1474,7 @@ mod tests {
 
         let entries = vec![crate::profile::AllowDomainEntry::WithEndpoints {
             domain: "api.example.com".to_string(),
+            endpoint_policy: None,
             endpoints: vec![],
         }];
 
@@ -1382,12 +1485,60 @@ mod tests {
     }
 
     #[test]
+    fn test_partition_allow_domain_with_endpoint_policy() {
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+        let entries: Vec<crate::profile::AllowDomainEntry> = serde_json::from_str(
+            r#"[{
+                "domain": "github.com",
+                "endpoint_policy": {
+                    "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }],
+                    "approve": [{ "method": "*", "path": "/*/*/**", "reason": "outside the org" }],
+                    "default": { "decision": "deny" }
+                }
+            }]"#,
+        )
+        .unwrap();
+
+        let (plain_hosts, routes) = partition_allow_domain(&policy, &entries).unwrap();
+
+        assert!(plain_hosts.is_empty());
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix, "_ep_github.com");
+        assert!(routes[0].endpoint_rules.is_empty());
+        let route_policy = routes[0].endpoint_policy.as_ref().unwrap();
+        assert_eq!(route_policy.approve[0].path, "/*/*/**");
+        assert_eq!(route_policy.deny.len(), 1);
+    }
+
+    #[test]
+    fn test_partition_allow_domain_rejects_endpoints_with_endpoint_policy() {
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+        let entries: Vec<crate::profile::AllowDomainEntry> = serde_json::from_str(
+            r#"[{
+                "domain": "github.com",
+                "endpoints": [{ "method": "GET", "path": "/my-org/**" }],
+                "endpoint_policy": { "approve": [{ "method": "*", "path": "/**" }] }
+            }]"#,
+        )
+        .unwrap();
+
+        let err = partition_allow_domain(&policy, &entries).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("both endpoints and endpoint_policy")
+        );
+    }
+
+    #[test]
     fn test_partition_allow_domain_rejects_empty_domain() {
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).unwrap();
 
         let entries = vec![crate::profile::AllowDomainEntry::WithEndpoints {
             domain: String::new(),
+            endpoint_policy: None,
             endpoints: vec![EndpointRule {
                 method: "GET".to_string(),
                 path: "/**".to_string(),
@@ -1424,6 +1575,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("MOCK_API_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1468,6 +1620,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("SVC_A_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1493,6 +1646,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("SVC_B_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,

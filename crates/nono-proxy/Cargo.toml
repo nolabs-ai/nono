@@ -1,6 +1,6 @@
 [package]
 name = "nono-proxy"
-version = "0.81.0"
+version = "0.82.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -18,7 +18,7 @@ default = ["system-keyring"]
 system-keyring = ["nono/system-keyring"]
 
 [dependencies]
-nono = { version = "0.81.0", path = "../nono", default-features = false }
+nono = { version = "0.82.0", path = "../nono", default-features = false }
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -38,6 +38,8 @@ subtle = "2"
 url.workspace = true
 urlencoding = "2"
 globset.workspace = true
+# Keepalive and TCP_USER_TIMEOUT on upstream sockets (upstream_socket.rs).
+socket2 = { version = "0.6", features = ["all"] }
 
 # AWS SigV4 signing support (smithy-rs, no service SDK required)
 # `credentials-login` is required to resolve an active `aws login` session
@@ -46,12 +48,14 @@ globset.workspace = true
 # feature(s) enabled: credentials-login", so an `aws_auth` route cannot sign for
 # an SSO-logged-in operator — the primary intended use of host-side credential
 # resolution.
-aws-config = { version = "1", features = [
+aws-config = { version = "1.13.1", features = [
     "behavior-version-latest",
     "credentials-login",
 ] }
 aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-types = "1"
+aws-runtime = "1"
 
 # TLS for upstream connections (reverse proxy mode)
 hyper-rustls = { version = "0.27.10", features = ["http1", "http2", "ring", "webpki-tokio"] }

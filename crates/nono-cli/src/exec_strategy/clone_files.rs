@@ -27,6 +27,12 @@ const ACK: u8 = 0xa1;
 // Sent instead of READY when namespace entry fails, followed by the failing
 // stage code and errno, so the parent can name what the host refused.
 const NAMESPACE_FAILED: u8 = 0xe1;
+// Mount masking: the parent sends MOUNT_GO once the id maps are written; the
+// child answers with an 8-byte record led by MOUNTED or MOUNT_FAILED (then the
+// failed step, the operation index and the errno).
+const MOUNT_GO: u8 = 0xb1;
+const MOUNTED: u8 = 0xb2;
+const MOUNT_FAILED: u8 = 0xe2;
 const BOOTSTRAP_SECONDS: i64 = 15;
 
 // All supervised notification sessions hold this lock until their listener
@@ -47,6 +53,9 @@ pub(super) struct Bootstrap {
     /// Loopback listener created inside the child's network namespace, when
     /// namespace isolation requested a proxy bridge.
     pub bridge: Option<OwnedFd>,
+    /// Watch over the child's mount masks, pinned after the child applied
+    /// them and before it ran untrusted code.
+    pub mount_watch: Option<nono::MountMaskWatch>,
 }
 
 pub(super) struct Command<'a> {
@@ -92,29 +101,36 @@ fn namespace_confines_tcp(config: &ExecConfig<'_>) -> bool {
         .is_some_and(|spec| spec.has_network() && spec.loopback_tcp_enabled())
 }
 
+/// Prepare the child's Landlock policy. With `root` (the child's
+/// `/proc/<pid>/root` under a mount mask) every rule path is resolved as the
+/// child sees it, so a grant of a masked directory such as `/tmp` attaches to
+/// the session's private tmpfs rather than the hidden host directory.
 fn prepare(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
     policy: LinuxSandboxPolicy,
     namespace_tcp: bool,
+    root: Option<std::os::fd::BorrowedFd<'_>>,
 ) -> Result<PreparedLandlockSandbox> {
-    match (policy, namespace_tcp) {
-        (LinuxSandboxPolicy::Auto, false) => {
-            sandbox::prepare_seccomp_with_abi(caps, abi, nono::SeccompOpts::network_baseline())
-        }
+    let opts = match (policy, namespace_tcp) {
+        (LinuxSandboxPolicy::Auto, false) => Some(nono::SeccompOpts::network_baseline()),
         // TCP confined by the network namespace: no Landlock TCP rules, but
         // UDP, raw and non-IP sockets stay denied by the static baseline.
-        (LinuxSandboxPolicy::Auto, true) => sandbox::prepare_seccomp_with_abi(
-            caps,
-            abi,
-            nono::SeccompOpts::external_tcp_with_baseline(),
-        ),
+        (LinuxSandboxPolicy::Auto, true) => Some(nono::SeccompOpts::external_tcp_with_baseline()),
         // External delegates TCP already; Landlock policy installs no seccomp,
         // so with loopback it keeps Landlock filesystem rules only.
         (LinuxSandboxPolicy::External, _) | (LinuxSandboxPolicy::Landlock, true) => {
-            sandbox::prepare_seccomp_with_abi(caps, abi, nono::SeccompOpts::external_tcp())
+            Some(nono::SeccompOpts::external_tcp())
         }
-        (LinuxSandboxPolicy::Landlock, false) => sandbox::prepare_landlock_with_abi(caps, abi),
+        (LinuxSandboxPolicy::Landlock, false) => None,
+    };
+    match (opts, root) {
+        (Some(opts), None) => sandbox::prepare_seccomp_with_abi(caps, abi, opts),
+        (Some(opts), Some(root)) => {
+            sandbox::prepare_seccomp_with_abi_in_root(caps, abi, opts, root)
+        }
+        (None, None) => sandbox::prepare_landlock_with_abi(caps, abi),
+        (None, Some(root)) => sandbox::prepare_landlock_with_abi_in_root(caps, abi, root),
     }
 }
 
@@ -163,6 +179,38 @@ fn namespace_failure(record: [u8; 5]) -> NonoError {
     NonoError::SandboxInit(format!(
         "namespace isolation failed while {step}: {}. The startup probe succeeded, so the \
          host refused the launch itself; nono does not run without the requested isolation.",
+        std::io::Error::from_raw_os_error(errno)
+    ))
+}
+
+fn mount_failure(plan: &nono::PreparedMountMask, record: [u8; 7]) -> NonoError {
+    let step = sandbox::MountMaskStep::from_code(record[0])
+        .map_or("an unknown step", sandbox::MountMaskStep::describe);
+    let index = u16::from_ne_bytes([record[1], record[2]]);
+    let errno = i32::from_ne_bytes([record[3], record[4], record[5], record[6]]);
+    let action = if plan.operation_is_rebind(index) {
+        "re-binding granted path"
+    } else {
+        "masking"
+    };
+    let path = plan.operation_path(index).map_or_else(
+        || String::from("<unknown path>"),
+        |p| p.display().to_string(),
+    );
+    let cause = match errno {
+        libc::ESTALE => {
+            " The path changed between preparation and launch (it was replaced or a symlink \
+             appeared)."
+        }
+        libc::EPERM | libc::EACCES => {
+            " A security module (AppArmor or SELinux mount rules) or a seccomp filter may \
+             forbid mounting in user namespaces."
+        }
+        _ => "",
+    };
+    NonoError::SandboxInit(format!(
+        "namespace isolation failed while {action} {path} ({step}): {}.{cause} nono does not \
+         run without the requested isolation.",
         std::io::Error::from_raw_os_error(errno)
     ))
 }
@@ -229,6 +277,11 @@ pub(super) fn spawn(
     if let Some(ref spec) = namespaces {
         spec.validate()?;
     }
+    let mount_mask = config.mount_mask;
+    // A mount namespace is created exactly when there is a plan to apply in it.
+    if namespaces.is_some_and(|spec| spec.has_mounts()) != mount_mask.is_some() {
+        return Err(failure("mount namespace and mount mask plan disagree"));
+    }
     if network.is_none() && namespaces.is_none() {
         return Err(failure("nothing requires the raw-clone bootstrap"));
     }
@@ -237,6 +290,7 @@ pub(super) fn spawn(
         &abi,
         config.sandbox_policy,
         namespace_confines_tcp(config),
+        None,
     )?;
     let gate = config
         .tool_sandbox_runtime
@@ -272,6 +326,7 @@ pub(super) fn spawn(
             &baseline,
             network.as_ref(),
             namespaces.as_ref(),
+            mount_mask,
             gate.as_ref().map(AsRawFd::as_raw_fd),
             child.as_raw_fd(),
             parent.as_raw_fd(),
@@ -289,6 +344,7 @@ pub(super) fn spawn(
     // handshake returns DETACHED or cleanup has killed AND reaped the child.
     let mut ruleset = None;
     let mut cleanup_dir = None;
+    let mut mount_watch = None;
     #[cfg(test)]
     let mut late_fd = None;
     let handshake = (|| -> Result<(RawFd, Option<OwnedFd>)> {
@@ -320,6 +376,41 @@ pub(super) fn spawn(
             // the ruleset below, so its ids are mapped before it runs further.
             sandbox::write_id_maps(pid)?;
         }
+        // With the ids mapped, the child applies its mount masks; only then
+        // can rule paths be resolved in its mount namespace.
+        let child_root = match mount_mask {
+            None => None,
+            Some(plan) => {
+                if !transfer(parent.as_raw_fd(), &mut [MOUNT_GO], true, Some(pid)) {
+                    return Err(failure("cannot release child to mount"));
+                }
+                let mut record = [0_u8; 8];
+                if !transfer(parent.as_raw_fd(), &mut record, false, Some(pid)) {
+                    return Err(failure("child died or timed out while mounting"));
+                }
+                match record[0] {
+                    MOUNTED => {}
+                    MOUNT_FAILED => {
+                        let mut detail = [0_u8; 7];
+                        detail.copy_from_slice(&record[1..]);
+                        return Err(mount_failure(plan, detail));
+                    }
+                    _ => return Err(failure("invalid mount confirmation")),
+                }
+                // Record the mounts now, while the child still runs only
+                // nono's code: a host-side change that removes a mask later
+                // is detected against this state.
+                mount_watch = Some(nono::MountMaskWatch::attach(pid, plan)?);
+                Some(
+                    open(
+                        format!("/proc/{pid}/root").as_str(),
+                        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(|_| failure("cannot open child root directory"))?,
+                )
+            }
+        };
         #[cfg(test)]
         if command.fault == Fault::LateFd {
             // SAFETY: owned endpoint duplicated after the original fd snapshot.
@@ -338,7 +429,9 @@ pub(super) fn spawn(
             &abi,
             config.sandbox_policy,
             namespace_confines_tcp(config),
+            child_root.as_ref().map(std::os::fd::AsFd::as_fd),
         )?;
+        drop(child_root);
         ruleset = Some(above_stdio(prepared.create_ruleset()?)?);
         let Some(ref ruleset) = ruleset else {
             return Err(failure("missing ruleset"));
@@ -436,6 +529,7 @@ pub(super) fn spawn(
         child: nix::unistd::Pid::from_raw(pid),
         network,
         bridge,
+        mount_watch,
     })
 }
 
@@ -445,6 +539,7 @@ fn child_exec(
     baseline: &PreparedLandlockSandbox,
     network: Option<&PreparedSeccompNotifyFilter>,
     namespaces: Option<&nono::NamespaceSpec>,
+    mount_mask: Option<&nono::PreparedMountMask>,
     gate: Option<RawFd>,
     socket: RawFd,
     parent_socket: RawFd,
@@ -493,6 +588,31 @@ fn child_exec(
     };
     if !transfer(socket, &mut [READY], true, None) {
         die(126);
+    }
+    if let Some(plan) = mount_mask {
+        // Wait for the id maps: re-bind mount points are created as files.
+        let mut go = [0_u8];
+        if !transfer(socket, &mut go, false, None) || go[0] != MOUNT_GO {
+            die(126);
+        }
+        let mut record = [0_u8; 8];
+        match plan.apply_raw() {
+            Ok(()) => record[0] = MOUNTED,
+            Err(error) => {
+                record[0] = MOUNT_FAILED;
+                record[1] = error.step().code();
+                record[2..4].copy_from_slice(&error.operation().to_ne_bytes());
+                record[4..].copy_from_slice(&error.errno().to_ne_bytes());
+            }
+        }
+        if !transfer(socket, &mut record, true, None) {
+            die(126);
+        }
+        if record[0] != MOUNTED {
+            // Stay alive until the parent has read the record and kills us.
+            let _ = transfer(socket, &mut [0_u8], false, None);
+            die(126);
+        }
     }
     #[cfg(test)]
     if command.fault == Fault::PendingSignal {

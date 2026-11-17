@@ -127,6 +127,9 @@ pub const BARE_NONCE_LEN: usize = BARE_NONCE_PREFIX.len() + PHANTOM_BODY_HEX_LEN
 /// Number of hex characters in a minted phantom body (32 bytes → 64 hex).
 pub const PHANTOM_BODY_HEX_LEN: usize = 64;
 
+/// Maximum combined prefix+suffix length of a route `phantom_format`.
+pub const PHANTOM_ROUTE_AFFIX_MAX_LEN: usize = 64;
+
 /// A `prefix + <64 hex body> + suffix` phantom shape, split around the single
 /// `{}` placeholder. Exists so a client that classifies a credential by
 /// sniffing a literal token prefix recognises the phantom.
@@ -164,6 +167,35 @@ impl PhantomTemplate {
             prefix: prefix.to_string(),
             suffix: suffix.to_string(),
         })
+    }
+
+    /// Parse a route `phantom_format`. Stricter than [`Self::parse`]: affixes are
+    /// limited to RFC 3986 unreserved bytes so the phantom is valid unescaped in
+    /// every inject mode, and may not contain `nono_` (it would read as a broker
+    /// nonce to the phantom scanners).
+    pub fn parse_route(template: &str) -> std::result::Result<Self, String> {
+        let parsed = Self::parse(template)?;
+        for affix in [&parsed.prefix, &parsed.suffix] {
+            if !affix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
+            {
+                return Err(format!(
+                    "phantom_format '{template}' may only contain letters, digits, '.', '_', '~' and '-' around '{{}}'"
+                ));
+            }
+            if affix.to_ascii_lowercase().contains(BARE_NONCE_PREFIX) {
+                return Err(format!(
+                    "phantom_format '{template}' must not contain '{BARE_NONCE_PREFIX}'"
+                ));
+            }
+        }
+        if parsed.prefix.len().saturating_add(parsed.suffix.len()) > PHANTOM_ROUTE_AFFIX_MAX_LEN {
+            return Err(format!(
+                "phantom_format '{template}' prefix and suffix must total at most {PHANTOM_ROUTE_AFFIX_MAX_LEN} bytes"
+            ));
+        }
+        Ok(parsed)
     }
 
     /// Byte length of any phantom rendered from this template.
@@ -374,6 +406,45 @@ pub(crate) fn validate_basic_auth(encoded: &str, session_token: &Zeroizing<Strin
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn parse_route_accepts_valid_templates() {
+        for t in ["ghp_{}", "github_pat_{}", "sk-ant-oat01-{}", "pre-{}-post"] {
+            assert!(PhantomTemplate::parse_route(t).is_ok(), "{t}");
+        }
+        let max = "a".repeat(PHANTOM_ROUTE_AFFIX_MAX_LEN);
+        assert!(PhantomTemplate::parse_route(&format!("{max}{{}}")).is_ok());
+    }
+
+    #[test]
+    fn parse_route_rejects_invalid_templates() {
+        let too_long = format!("{}{{}}", "a".repeat(PHANTOM_ROUTE_AFFIX_MAX_LEN + 1));
+        for t in [
+            "{}",
+            "{}_x",
+            "a{}{}",
+            "Bearer {}",
+            "token {}",
+            "a/{}",
+            "a?{}",
+            "a#{}",
+            "a&{}",
+            "a={}",
+            "a%{}",
+            "a+{}",
+            "a:{}",
+            "a\"{}",
+            "a\r{}",
+            "é{}",
+            "nono_{}",
+            "xNONO_{}",
+            "a{}nono_",
+            "noplaceholder",
+        ] {
+            assert!(PhantomTemplate::parse_route(t).is_err(), "{t:?}");
+        }
+        assert!(PhantomTemplate::parse_route(&too_long).is_err());
+    }
+
     use super::*;
 
     const HEX64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

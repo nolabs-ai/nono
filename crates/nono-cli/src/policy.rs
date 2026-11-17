@@ -177,6 +177,7 @@ impl ProfileDef {
             hooks: self.hooks.clone(),
             session_hooks: profile::SessionHooks::default(),
             rollback: self.rollback.clone(),
+            session_recording: None,
             open_urls: self.open_urls.clone(),
             allow_launch_services: self.allow_launch_services,
             allow_gpu: self.allow_gpu,
@@ -1041,6 +1042,8 @@ pub(crate) fn add_glob_deny_rules(
         let re = glob_to_seatbelt_regex_with_literal_prefix(&prefix_str, glob_suffix)?;
         caps.add_platform_rule(format!("(allow file-read-metadata (regex #\"{re}\"))"))?;
         caps.add_platform_rule(format!("(deny file-read-data (regex #\"{re}\"))"))?;
+        caps.add_platform_rule(format!("(deny process-exec* (regex #\"{re}\"))"))?;
+        caps.add_platform_rule(format!("(deny file-map-executable (regex #\"{re}\"))"))?;
         caps.add_platform_rule(format!("(deny file-write* (regex #\"{re}\"))"))?;
         // Unix socket connect(2) is mediated as network-outbound, not file I/O.
         caps.add_platform_rule(format!("(deny network-outbound (regex #\"{re}\"))"))?;
@@ -1175,6 +1178,9 @@ pub(crate) fn emit_macos_deny_rules_for_path(path: &Path, caps: &mut CapabilityS
 
     caps.add_platform_rule(format!("(allow file-read-metadata ({}))", file_filter))?;
     caps.add_platform_rule(format!("(deny file-read-data ({}))", file_filter))?;
+    // A denied read must not stay executable or mappable.
+    caps.add_platform_rule(format!("(deny process-exec* ({}))", file_filter))?;
+    caps.add_platform_rule(format!("(deny file-map-executable ({}))", file_filter))?;
     caps.add_platform_rule(format!("(deny file-write* ({}))", file_filter))?;
     caps.add_platform_rule(format!("(deny network-outbound ({}))", network_filter))?;
     Ok(())
@@ -1821,6 +1827,54 @@ fn emit_macos_socket_bypass_rules(
     Ok(())
 }
 
+/// Seatbelt hole shape for one bypass path.
+///
+/// Non-directories stay exact: regular files, pathname sockets, and missing
+/// paths. `Path::is_file()` is false for sockets, so this uses `!is_dir()`.
+///
+/// A directory stays exact when a user-intent exact-file grant names that
+/// path and no directory grant names that same path. `allow_file` stores a
+/// directory used as a lock file with `is_file: true`. A directory grant of
+/// the bypass path itself still opens `subpath`. A parent directory grant
+/// does not widen an exact-file bypass. The grant may name either the
+/// canonical path or the expanded symlink path.
+fn bypass_hole_is_literal(caps: &CapabilitySet, canonical: &Path, expanded: &Path) -> bool {
+    if !canonical.is_dir() {
+        return true;
+    }
+    let mut saw_exact_file = false;
+    let mut saw_directory_grant = false;
+    for cap in caps.fs_capabilities() {
+        if !cap.source.is_user_intent() {
+            continue;
+        }
+        let names_bypass = cap.resolved == canonical
+            || cap.original == canonical
+            || cap.resolved == expanded
+            || cap.original == expanded;
+        if !names_bypass {
+            continue;
+        }
+        if cap.is_file {
+            saw_exact_file = true;
+        } else {
+            saw_directory_grant = true;
+        }
+    }
+    saw_exact_file && !saw_directory_grant
+}
+
+/// True when `deny` is covered by this bypass and should leave `deny_paths`.
+///
+/// A subtree hole covers the bypass path and its descendants. A literal hole
+/// covers only the bypass path, so a child `filesystem.deny` stays in force.
+fn bypass_removes_deny(deny: &Path, canonical: &Path, expanded: &Path, literal: bool) -> bool {
+    if literal {
+        return deny == canonical || deny == expanded;
+    }
+    deny.starts_with(canonical) || deny.starts_with(expanded)
+}
+
 /// Apply deny overrides for specific paths, punching targeted holes through deny groups.
 ///
 /// For each override path:
@@ -1917,7 +1971,7 @@ pub fn apply_deny_overrides(
             canonical.display()
         );
 
-        let is_file = !canonical.is_dir();
+        let is_file = bypass_hole_is_literal(caps, &canonical, &expanded);
 
         // On macOS: emit Seatbelt allow rules to punch through deny.
         // Only emit rules matching the effective access mode from the union
@@ -1944,6 +1998,8 @@ pub fn apply_deny_overrides(
 
                 if grant_has_read {
                     caps.add_platform_rule(format!("(allow file-read-data ({}))", filter))?;
+                    caps.add_platform_rule(format!("(allow process-exec* ({}))", filter))?;
+                    caps.add_platform_rule(format!("(allow file-map-executable ({}))", filter))?;
                 }
                 if grant_has_write {
                     caps.add_platform_rule(format!("(allow file-write* ({}))", filter))?;
@@ -1953,14 +2009,16 @@ pub fn apply_deny_overrides(
             emit_macos_socket_bypass_rules(caps, &canonical, &expanded, is_file)?;
         }
 
-        // Remove deny entries that the override covers (equal or child of the override path).
-        // Check both the canonical and expanded (symlink) forms so that deny entries
-        // recorded for either the symlink or its target are removed.
-        // Do NOT remove broader deny entries when the override is a child — e.g.,
-        // overriding ~/.aws must not remove a deny on the entire home directory.
+        // Remove deny entries that the override covers. Check both the
+        // canonical and expanded (symlink) forms so that deny entries recorded
+        // for either the symlink or its target are removed. A subtree hole
+        // also removes descendants. A literal hole removes only the bypass
+        // path, so a child deny stays. Do NOT remove a broader parent deny
+        // when the override is a child: overriding ~/.aws must not remove a
+        // deny on the entire home directory.
         let mut removed_denies = Vec::new();
         deny_paths.retain(|dp| {
-            if dp.starts_with(&canonical) || dp.starts_with(&expanded) {
+            if bypass_removes_deny(dp, &canonical, &expanded, is_file) {
                 removed_denies.push(dp.clone());
                 false
             } else {
@@ -2349,11 +2407,25 @@ pub fn list_policy_profiles() -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Load the embedded policy and return the parsed Policy struct.
-///
-/// The policy JSON is embedded at compile time and never changes at runtime,
-/// so we parse it once and cache the result. This avoids re-parsing ~23 KB of
-/// JSON on every call (up to ~18 call sites per CLI invocation).
+pub(crate) fn delivered_policy(
+    groups: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<Policy> {
+    let mut policy = load_policy(crate::config::embedded::embedded_policy_json())?;
+    for (name, value) in groups {
+        if policy.groups.contains_key(name) {
+            return Err(NonoError::ProfileParse(format!(
+                "delivered group '{name}' collides with a built-in group"
+            )));
+        }
+        let group = serde_json::from_value::<Group>(value.clone()).map_err(|error| {
+            NonoError::ProfileParse(format!("invalid delivered group '{name}': {error}"))
+        })?;
+        policy.groups.insert(name.clone(), group);
+    }
+    Ok(policy)
+}
+
+/// Cache local policy independently of the policy delivered for any launch.
 pub fn load_embedded_policy() -> Result<Policy> {
     static CACHED: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
 
@@ -2374,42 +2446,52 @@ pub fn load_embedded_policy() -> Result<Policy> {
     Ok(policy)
 }
 
-pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
-    // Tolerate missing config dir / lockfile — no packages installed means
-    // no groups to load. This is the common case in tests and fresh installs.
+pub(crate) fn package_group_documents()
+-> Result<std::collections::BTreeMap<String, serde_json::Value>> {
     let lockfile = match package::read_lockfile() {
-        Ok(lf) => lf,
-        Err(_) => return Ok(()),
+        Ok(lockfile) => lockfile,
+        Err(_) => return Ok(std::collections::BTreeMap::new()),
     };
+    let mut documents = std::collections::BTreeMap::new();
     for package_key in lockfile.packages.keys() {
         let (namespace, name) = package_key.split_once('/').ok_or_else(|| {
             NonoError::PackageInstall(format!("invalid lockfile package key '{package_key}'"))
         })?;
-        let groups_path = package::package_groups_path(namespace, name)?;
-        if !groups_path.exists() {
+        let path = package::package_groups_path(namespace, name)?;
+        if !path.exists() {
             continue;
         }
-
-        let content = std::fs::read_to_string(&groups_path).map_err(|e| NonoError::ConfigRead {
-            path: groups_path.clone(),
-            source: e,
+        let content = std::fs::read_to_string(&path).map_err(|source| NonoError::ConfigRead {
+            path: path.clone(),
+            source,
         })?;
-
-        let groups: HashMap<String, Group> = serde_json::from_str(&content).map_err(|e| {
-            NonoError::ConfigParse(format!("failed to parse {}: {e}", groups_path.display()))
-        })?;
-
-        for (group_name, group) in groups {
-            if policy.groups.contains_key(&group_name) {
+        let groups: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(&content).map_err(|error| {
+                NonoError::ConfigParse(format!("failed to parse {}: {error}", path.display()))
+            })?;
+        for (name, group) in groups {
+            if documents.insert(name.clone(), group).is_some() {
                 return Err(NonoError::PackageInstall(format!(
-                    "package group '{}' collides with an existing policy group",
-                    group_name
+                    "package group '{name}' collides with an existing policy group"
                 )));
             }
-            policy.groups.insert(group_name, group);
         }
     }
+    Ok(documents)
+}
 
+pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
+    for (name, value) in package_group_documents()? {
+        if policy.groups.contains_key(&name) {
+            return Err(NonoError::PackageInstall(format!(
+                "package group '{name}' collides with an existing policy group"
+            )));
+        }
+        let group = serde_json::from_value(value).map_err(|error| {
+            NonoError::ConfigParse(format!("invalid package group '{name}': {error}"))
+        })?;
+        policy.groups.insert(name, group);
+    }
     Ok(())
 }
 
@@ -2867,13 +2949,15 @@ mod tests {
         if cfg!(target_os = "macos") {
             // On macOS, Seatbelt platform rules should be generated
             let rules = caps.platform_rules();
-            assert_eq!(rules.len(), 4);
+            assert_eq!(rules.len(), 6);
             assert!(rules[0].contains("allow file-read-metadata"));
             assert!(rules[1].contains("deny file-read-data"));
-            assert!(rules[2].contains("deny file-write*"));
+            assert!(rules[2].contains("deny process-exec*"));
+            assert!(rules[3].contains("deny file-map-executable"));
+            assert!(rules[4].contains("deny file-write*"));
             assert!(
-                rules[3].contains("deny network-outbound")
-                    && rules[3].contains("subpath \"/nonexistent/test/deny\"")
+                rules[5].contains("deny network-outbound")
+                    && rules[5].contains("subpath \"/nonexistent/test/deny\"")
             );
         } else {
             // On Linux, no platform rules generated (Landlock has no deny semantics)
@@ -3128,9 +3212,13 @@ mod tests {
         );
 
         if cfg!(target_os = "macos") {
-            // Should have 8 rules: 4 for symlink path + 4 for resolved target
+            // Should have 12 rules: 6 for symlink path + 6 for resolved target
             let rules = caps.platform_rules();
-            assert_eq!(rules.len(), 8, "expected 8 Seatbelt rules for symlink deny");
+            assert_eq!(
+                rules.len(),
+                12,
+                "expected 12 Seatbelt rules for symlink deny"
+            );
         }
     }
 
@@ -3265,8 +3353,8 @@ mod tests {
                 let rules = caps.platform_rules();
                 assert_eq!(
                     rules.len(),
-                    8,
-                    "expected 8 Seatbelt rules (4 original + 4 resolved); got: {:?}",
+                    12,
+                    "expected 12 Seatbelt rules (6 original + 6 resolved); got: {:?}",
                     rules
                 );
             }
@@ -4932,6 +5020,212 @@ mod tests {
     }
 
     #[test]
+    fn test_exact_file_directory_bypass_stays_literal_and_keeps_child_denies() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let lock_dir = dir.path().join("claude.lock");
+        std::fs::create_dir_all(&lock_dir).expect("mkdir lock dir");
+        let child = lock_dir.join("secret");
+        std::fs::write(&child, "hidden").expect("write child");
+
+        let lock_canonical = lock_dir.canonicalize().expect("canonicalize lock dir");
+        let child_canonical = child.canonicalize().expect("canonicalize child");
+        let parent_canonical = dir.path().canonicalize().expect("canonicalize parent");
+
+        let mut deny_paths = vec![
+            parent_canonical.clone(),
+            lock_canonical.clone(),
+            child_canonical.clone(),
+        ];
+        let mut caps = CapabilitySet::new();
+        // Parent directory grant must not widen the exact-file hole.
+        caps.add_fs(
+            FsCapability::new_dir(dir.path(), AccessMode::ReadWrite).expect("parent grant"),
+        );
+        caps.add_fs(FsCapability {
+            original: lock_dir.clone(),
+            resolved: lock_canonical.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        let bypasses =
+            apply_deny_overrides(std::slice::from_ref(&lock_dir), &mut deny_paths, &mut caps)
+                .expect("exact-file directory bypass");
+
+        assert!(
+            bypasses
+                .iter()
+                .any(|bypass| bypass.path == lock_canonical && bypass.is_file),
+            "exact-file directory bypass must stay literal, got: {bypasses:?}"
+        );
+        assert!(
+            deny_paths.contains(&child_canonical),
+            "child deny must survive a literal bypass, remaining: {deny_paths:?}"
+        );
+        assert!(
+            !deny_paths.contains(&lock_canonical),
+            "the bypass path itself is removed, remaining: {deny_paths:?}"
+        );
+        assert!(
+            deny_paths.contains(&parent_canonical),
+            "parent deny must survive, remaining: {deny_paths:?}"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let rules = caps.platform_rules().join("\n");
+            assert!(
+                rules.contains("literal"),
+                "Seatbelt hole must be a literal path, got: {rules}"
+            );
+            assert!(
+                !rules.contains("subpath"),
+                "exact-file directory bypass must not emit subpath, got: {rules}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_exact_file_symlink_form_stays_literal() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let real = dir.path().join("claude.lock");
+        std::fs::create_dir_all(&real).expect("mkdir lock");
+        let child = real.join("secret");
+        std::fs::write(&child, "hidden").expect("write child");
+        let link = dir.path().join("link.lock");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let real_canonical = real.canonicalize().expect("canonicalize lock");
+        let child_canonical = child.canonicalize().expect("canonicalize child");
+        assert_ne!(
+            link, real_canonical,
+            "the symlink form must differ from the canonical path"
+        );
+
+        let mut deny_paths = vec![real_canonical.clone(), child_canonical.clone()];
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(
+            FsCapability::new_dir(dir.path(), AccessMode::ReadWrite).expect("parent grant"),
+        );
+        caps.add_fs(FsCapability {
+            original: link.clone(),
+            resolved: link.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        let bypasses =
+            apply_deny_overrides(std::slice::from_ref(&link), &mut deny_paths, &mut caps)
+                .expect("symlink-form exact-file bypass");
+
+        assert!(
+            bypasses.iter().any(|bypass| bypass.is_file),
+            "an exact-file grant stored as the symlink must stay literal, got: {bypasses:?}"
+        );
+        assert!(
+            deny_paths.contains(&child_canonical),
+            "child deny must survive a literal bypass, remaining: {deny_paths:?}"
+        );
+        assert!(
+            !deny_paths.contains(&real_canonical),
+            "the bypass path itself is removed, remaining: {deny_paths:?}"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let rules = caps.platform_rules().join("\n");
+            assert!(
+                rules.contains("literal"),
+                "Seatbelt hole must be a literal path, got: {rules}"
+            );
+            assert!(
+                !rules.contains("subpath"),
+                "symlink-form exact-file bypass must not emit subpath, got: {rules}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_directory_grant_symlink_form_still_opens_subtree() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let real = dir.path().join("aws");
+        std::fs::create_dir_all(&real).expect("mkdir aws");
+        let child = real.join("credentials");
+        std::fs::write(&child, "secret").expect("write credentials");
+        let link = dir.path().join("aws-link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let real_canonical = real.canonicalize().expect("canonicalize aws");
+        let child_canonical = child.canonicalize().expect("canonicalize child");
+        let mut deny_paths = vec![real_canonical.clone(), child_canonical.clone()];
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(
+            FsCapability::new_dir(dir.path(), AccessMode::ReadWrite).expect("parent grant"),
+        );
+        caps.add_fs(FsCapability {
+            original: link.clone(),
+            resolved: link.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::Profile,
+        });
+
+        let bypasses =
+            apply_deny_overrides(std::slice::from_ref(&link), &mut deny_paths, &mut caps)
+                .expect("symlink-form directory bypass");
+
+        assert!(
+            bypasses.iter().any(|bypass| !bypass.is_file),
+            "a directory grant stored as the symlink stays a subtree, got: {bypasses:?}"
+        );
+        assert!(
+            deny_paths.is_empty(),
+            "subtree bypass removes the directory and its child denies, remaining: {deny_paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_directory_grant_bypass_still_opens_subtree() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let granted = dir.path().join("aws");
+        std::fs::create_dir_all(&granted).expect("mkdir aws");
+        let child = granted.join("credentials");
+        std::fs::write(&child, "secret").expect("write credentials");
+
+        let granted_canonical = granted.canonicalize().expect("canonicalize grant");
+        let child_canonical = child.canonicalize().expect("canonicalize child");
+        let mut deny_paths = vec![granted_canonical.clone(), child_canonical.clone()];
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability::new_dir(&granted, AccessMode::ReadWrite).expect("dir grant"));
+
+        let bypasses =
+            apply_deny_overrides(std::slice::from_ref(&granted), &mut deny_paths, &mut caps)
+                .expect("directory bypass");
+
+        assert!(
+            bypasses
+                .iter()
+                .any(|bypass| bypass.path == granted_canonical && !bypass.is_file),
+            "a directory grant bypass stays a subtree, got: {bypasses:?}"
+        );
+        assert!(
+            deny_paths.is_empty(),
+            "subtree bypass removes the directory and its child denies, remaining: {deny_paths:?}"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let rules = caps.platform_rules().join("\n");
+            assert!(
+                rules.contains("subpath"),
+                "directory grant bypass must emit subpath, got: {rules}"
+            );
+        }
+    }
+
+    #[test]
     fn test_apply_deny_overrides_rejects_missing_grant() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let denied = dir.path().join("denied");
@@ -5522,6 +5816,29 @@ mod tests {
         assert!(
             read_paths.iter().any(|p| p == "/System/Volumes"),
             "system_read_macos should still grant /System/Volumes for firmlink resolution: {read_paths:?}"
+        );
+        // Exec is scoped to the read set, so platform helper dirs must be readable.
+        assert!(
+            read_paths.iter().any(|p| p == "/usr/libexec"),
+            "system_read_macos must grant /usr/libexec: {read_paths:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_deny_rules_also_deny_exec_and_map_executable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("bin");
+        std::fs::write(&file, b"x").expect("write");
+        let mut caps = CapabilitySet::new();
+        emit_macos_deny_rules_for_path(&file, &mut caps).expect("emit");
+        let rules = caps.platform_rules();
+        assert!(rules.iter().any(|r| r.contains("deny file-read-data")));
+        assert!(rules.iter().any(|r| r.contains("deny file-map-executable")));
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.contains("deny process-exec*") && r.contains("literal"))
         );
     }
 

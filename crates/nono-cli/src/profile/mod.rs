@@ -5,6 +5,7 @@
 //! packs (e.g. nolabs-ai/claude), or user-defined (in `$XDG_CONFIG_HOME/nono/profiles/`).
 
 pub(crate) mod builtin;
+pub(crate) mod bundle;
 mod credential_provider;
 
 pub use credential_provider::{
@@ -322,6 +323,14 @@ pub struct CustomCredentialDef {
     #[serde(default)]
     pub env_var: Option<String>,
 
+    /// Template for the phantom token placed in `env_var`, with `{}` replaced by
+    /// the session token (e.g., "ghp_{}"), for clients that reject tokens
+    /// lacking a known prefix. The route then accepts only the rendered value.
+    /// A compatibility shim, not a per-route secret. Independent of
+    /// `credential_format`, which shapes the outbound real credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phantom_format: Option<String>,
+
     /// Optional L7 endpoint rules for method+path filtering.
     /// When non-empty, only matching method+path combinations are allowed.
     #[serde(default)]
@@ -569,6 +578,61 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
     }
 }
 
+/// Env var names nono sets itself; a formatted phantom must not overwrite them.
+fn is_reserved_phantom_env_var(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("NONO_")
+        || matches!(
+            upper.as_str(),
+            "HTTP_PROXY" | "HTTPS_PROXY" | "NO_PROXY" | "ALL_PROXY" | "NODE_USE_ENV_PROXY"
+        )
+        || upper.ends_with("_BASE_URL")
+}
+
+/// Validate `phantom_format`: template shape, compatible auth mode, and a
+/// phantom env var that does not collide with nono's own.
+fn validate_phantom_format(name: &str, cred: &CustomCredentialDef) -> Result<()> {
+    let Some(ref fmt) = cred.phantom_format else {
+        return Ok(());
+    };
+    nono_proxy::token::PhantomTemplate::parse_route(fmt).map_err(|e| {
+        NonoError::ProfileParse(format!(
+            "custom credential '{name}': invalid phantom_format: {e}"
+        ))
+    })?;
+    if cred.credential_key.is_none() && cred.auth.is_none() {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{name}': 'phantom_format' requires 'credential_key' or 'auth' \
+             (not valid with 'aws_auth' or 'redeem_phantoms' alone)"
+        )));
+    }
+    let env_name = match (&cred.env_var, &cred.credential_key) {
+        (Some(ev), _) => Some(ev.clone()),
+        (None, Some(key)) if !key.contains("://") => Some(key.to_uppercase()),
+        // Matches the proxy's derivation for OAuth2 jwt-bearer assertion routes.
+        (None, None)
+            if cred
+                .auth
+                .as_ref()
+                .is_some_and(|a| a.client_assertion.is_some()) =>
+        {
+            Some(format!("{}_API_KEY", name.to_uppercase()))
+        }
+        _ => None,
+    };
+    let Some(ev) = env_name else {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{name}': 'phantom_format' needs an explicit 'env_var'"
+        )));
+    };
+    if is_reserved_phantom_env_var(&ev) {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{name}': 'phantom_format' cannot target reserved env var '{ev}'"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a custom credential definition for security issues.
 ///
 /// Checks:
@@ -666,6 +730,17 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
     // Validate aws_auth if present
     if let Some(ref aws) = cred.aws_auth {
         validate_aws_auth(name, aws)?;
+        nono_proxy::aws::endpoints::validate_aws_upstream(&cred.upstream, aws)
+            .map_err(|e| NonoError::ProfileParse(format!("custom credential '{}': {}", name, e)))?;
+    }
+
+    if let Some(ref policy) = cred.endpoint_policy {
+        validate_endpoint_policy_operations(
+            &format!("custom credential '{name}'"),
+            policy,
+            &cred.upstream,
+            cred.aws_auth.is_some(),
+        )?;
     }
 
     // Validate credential_key if present
@@ -708,6 +783,8 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
             )));
         }
     }
+
+    validate_phantom_format(name, cred)?;
 
     // Validate upstream URL (HTTPS required, HTTP only for loopback)
     validate_upstream_url(&cred.upstream, name)?;
@@ -917,6 +994,53 @@ fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
     Ok(())
 }
 
+/// `operations` rules need `aws_auth` or an AWS upstream and must use the
+/// restricted glob charset. Warns when a default-allow policy has no
+/// deny/approve rule that matches `Unknown`, since an unidentifiable request
+/// would then be allowed.
+fn validate_endpoint_policy_operations(
+    subject: &str,
+    policy: &nono_proxy::config::EndpointPolicyConfig,
+    upstream: &str,
+    has_aws_auth: bool,
+) -> Result<()> {
+    let mut has_operations = false;
+    for rule in policy
+        .deny
+        .iter()
+        .chain(&policy.approve)
+        .chain(&policy.allow)
+    {
+        let Some(ops) = &rule.operations else {
+            continue;
+        };
+        has_operations = true;
+        nono_proxy::aws::endpoints::validate_operations_upstream(upstream, has_aws_auth)
+            .map_err(|e| NonoError::ProfileParse(format!("{subject}: {e}")))?;
+        nono_proxy::config::compile_operation_globs(ops)
+            .map_err(|e| NonoError::ProfileParse(format!("{subject}: {e}")))?;
+    }
+    if has_operations
+        && policy.default.decision == nono_proxy::config::EndpointPolicyDecision::Allow
+    {
+        let unknown_restricted = policy
+            .deny
+            .iter()
+            .chain(&policy.approve)
+            .filter_map(|r| r.operations.as_ref())
+            .any(|ops| nono_proxy::config::operations_match_unknown(ops));
+        if !unknown_restricted {
+            tracing::warn!(
+                "{} uses default: allow with operations rules but nothing \
+                 denies or approves the 'Unknown' operation; requests whose operation cannot \
+                 be determined will be allowed. Prefer default: deny with allow rules.",
+                subject
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Validate AWS SigV4 signing configuration subfields.
 ///
 /// - `profile`: non-empty, no whitespace (whitespace breaks the AWS INI config
@@ -933,6 +1057,18 @@ fn validate_aws_auth(name: &str, aws: &nono_proxy::config::AwsAuthConfig) -> Res
              with no whitespace; omit the field to use the default credential chain",
             name
         )));
+    }
+
+    if let Some(ref profiles) = aws.profiles {
+        if aws.profile.is_some() {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{}' cannot set both aws_auth.profile and \
+                 aws_auth.profiles; list every allowed profile in profiles",
+                name
+            )));
+        }
+        nono_proxy::config::validate_aws_auth_profiles(profiles)
+            .map_err(|e| NonoError::ProfileParse(format!("custom credential '{}': {}", name, e)))?;
     }
 
     if let Some(ref region) = aws.region
@@ -1246,6 +1382,7 @@ fn custom_credential_from_manifest_entry(cred: &nono::manifest::Credential) -> C
             .env_var
             .as_ref()
             .map(|value| value.as_str().to_string()),
+        phantom_format: None,
         endpoint_rules,
         endpoint_policy: None,
         tls_ca: None,
@@ -1312,12 +1449,26 @@ fn validate_profile_env_var_patterns(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
-/// Validate `network.allow_domain`/`deny_domain` hostname patterns.
+/// Validate `network.allow_domain`/`deny_domain` hostname patterns, and
+/// `operations` rules in `allow_domain` endpoint policies.
 fn validate_profile_domain_patterns(profile: &Profile) -> Result<()> {
     for entry in &profile.network.allow_domain {
         nono::net_filter::validate_host_pattern(entry.domain()).map_err(|err| {
             NonoError::ProfileParse(format!("network.allow_domain entry invalid: {err}"))
         })?;
+        if let AllowDomainEntry::WithEndpoints {
+            domain,
+            endpoint_policy: Some(policy),
+            ..
+        } = entry
+        {
+            validate_endpoint_policy_operations(
+                &format!("network.allow_domain entry '{domain}'"),
+                &policy.to_proxy(),
+                &format!("https://{domain}"),
+                false,
+            )?;
+        }
     }
     for pattern in &profile.network.deny_domain {
         nono::net_filter::validate_host_pattern(pattern).map_err(|err| {
@@ -1733,8 +1884,15 @@ where
 /// Can be either a plain hostname string (backward compatible, CONNECT tunnel)
 /// or an object with a domain and endpoint rules (requires TLS interception
 /// for L7 method+path filtering).
+///
+/// Unknown keys are rejected, so a misspelled `endpoint_policy` cannot turn
+/// the entry into an unrestricted domain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(
+    untagged,
+    deny_unknown_fields,
+    expecting = "a domain string, or an object with `domain` and optionally one of `endpoints` or `endpoint_policy` (no other keys)"
+)]
 pub enum AllowDomainEntry {
     /// Plain hostname — allowed via CONNECT tunnel without L7 inspection.
     Plain(String),
@@ -1743,9 +1901,56 @@ pub enum AllowDomainEntry {
     /// are allowed (default-deny).
     WithEndpoints {
         domain: String,
-        #[serde(default)]
+        /// Allow-list shorthand: matching requests are allowed, everything
+        /// else is denied. Mutually exclusive with `endpoint_policy`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         endpoints: Vec<nono_proxy::config::EndpointRule>,
+        /// Explicit `allow`/`deny`/`approve` policy, the same shape credential
+        /// routes use. Mutually exclusive with `endpoints`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint_policy: Option<AllowDomainEndpointPolicy>,
     },
+}
+
+/// `endpoint_policy` on an `allow_domain` entry. The same shape as a credential
+/// route's policy, except that an omitted `default` stays unset so profile
+/// inheritance can tell it apart from an explicit one; it means `deny` when
+/// the policy is enforced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowDomainEndpointPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<nono_proxy::config::EndpointPolicyDefault>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<nono_proxy::config::EndpointPolicyRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approve: Vec<nono_proxy::config::EndpointPolicyRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<nono_proxy::config::EndpointPolicyRule>,
+}
+
+impl AllowDomainEndpointPolicy {
+    /// The policy the proxy enforces.
+    #[must_use]
+    pub fn to_proxy(&self) -> nono_proxy::config::EndpointPolicyConfig {
+        nono_proxy::config::EndpointPolicyConfig {
+            default: self.default.clone().unwrap_or_default(),
+            deny: self.deny.clone(),
+            approve: self.approve.clone(),
+            allow: self.allow.clone(),
+        }
+    }
+}
+
+impl From<nono_proxy::config::EndpointPolicyConfig> for AllowDomainEndpointPolicy {
+    fn from(policy: nono_proxy::config::EndpointPolicyConfig) -> Self {
+        Self {
+            default: Some(policy.default),
+            deny: policy.deny,
+            approve: policy.approve,
+            allow: policy.allow,
+        }
+    }
 }
 
 impl AllowDomainEntry {
@@ -1754,6 +1959,24 @@ impl AllowDomainEntry {
         match self {
             Self::Plain(s) => s,
             Self::WithEndpoints { domain, .. } => domain,
+        }
+    }
+
+    /// `true` when the entry restricts method+path and so needs TLS
+    /// interception.
+    pub fn has_endpoint_restrictions(&self) -> bool {
+        match self {
+            Self::Plain(_) => false,
+            Self::WithEndpoints {
+                endpoints,
+                endpoint_policy,
+                ..
+            } => {
+                !endpoints.is_empty()
+                    || endpoint_policy
+                        .as_ref()
+                        .is_some_and(|policy| !policy.to_proxy().allows_all_without_l7())
+            }
         }
     }
 }
@@ -1848,10 +2071,10 @@ pub struct NetworkConfig {
     ///
     /// A named backend here (e.g. `terminal`, `webhook`, or a `chain`)
     /// answers the prompt; an approved host is tunnelled, a denied one gets a
-    /// 403. For `run` and `shell`, a non-empty map activates the proxy even
-    /// with an empty allowlist, provided `network.block` is false or omitted
-    /// and `--block-net` is absent. The empty allowlist then requires approval
-    /// rather than allowing all hosts. Both hard-block forms conflict with
+    /// 403. For `run`, `shell`, and standalone `proxy`, a non-empty map
+    /// activates the proxy even with an empty allowlist, provided
+    /// `network.block` is false or omitted and `--block-net` is absent. The
+    /// empty allowlist then requires approval rather than allowing all hosts. Both hard-block forms conflict with
     /// configured approval backends and are rejected; approvals cannot lift
     /// a block. `--allow-net` clears these profile approval settings. Explicit host denies and metadata /
     /// link-local SSRF protection cannot be overridden by approval.
@@ -2358,10 +2581,11 @@ pub struct LinuxConfig {
 
 /// Opt-in Linux namespace isolation (NEP-0004).
 ///
-/// Every field defaults off and is permanently opt-in. Fields merge by logical
-/// OR across profile layers and the CLI, like `network.block`: any layer can
-/// turn a namespace on, and no layer can turn one off.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Every field defaults off and is permanently opt-in. Boolean fields merge by
+/// logical OR across profile layers and the CLI, like `network.block`: any
+/// layer can turn a namespace on, and no layer can turn one off.
+/// `extra_masks` merges by deduplicated append, so no layer can remove a mask.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinuxIsolateConfig {
     /// New user + network namespace containing only loopback. Egress is
@@ -2378,16 +2602,32 @@ pub struct LinuxIsolateConfig {
     /// New UTS namespace (hostname and domain name).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub uts: bool,
+    /// New mount namespace with nono's default masks over host IPC endpoints
+    /// (`$XDG_RUNTIME_DIR`, the D-Bus system bus, container runtime sockets)
+    /// and a private, per-session `/tmp`. Granted paths are re-bound through
+    /// the masks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mounts: bool,
+    /// Additional paths to mask. Additive only: no layer can remove a default
+    /// or inherited mask. Requires `mounts`. Paths support variable expansion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_masks: Vec<String>,
 }
 
 impl LinuxIsolateConfig {
     /// Whether no namespace is requested.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        !self.network && !self.loopback && !self.ipc && !self.uts
+        !self.network
+            && !self.loopback
+            && !self.ipc
+            && !self.uts
+            && !self.mounts
+            && self.extra_masks.is_empty()
     }
 
-    /// OR-merge: the result requests every namespace either side requests.
+    /// OR-merge: the result requests every namespace either side requests,
+    /// and every mask either side lists.
     #[must_use]
     pub fn merge(self, other: Self) -> Self {
         Self {
@@ -2395,6 +2635,8 @@ impl LinuxIsolateConfig {
             loopback: self.loopback || other.loopback,
             ipc: self.ipc || other.ipc,
             uts: self.uts || other.uts,
+            mounts: self.mounts || other.mounts,
+            extra_masks: dedup_append(&self.extra_masks, &other.extra_masks),
         }
     }
 
@@ -2407,6 +2649,7 @@ impl LinuxIsolateConfig {
             (self.loopback, "loopback"),
             (self.ipc, "ipc"),
             (self.uts, "uts"),
+            (self.mounts, "mounts"),
         ]
         .into_iter()
         .filter_map(|(on, label)| on.then_some(label))
@@ -2445,6 +2688,10 @@ pub struct WorkdirConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
+    /// Authenticate named IPC callers against the owning nono session.
+    /// Opt-in; requires SO_PEERPIDFD on Linux (kernel 6.5+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_socket_auth: Option<bool>,
     /// Signal isolation mode. Controls whether the sandboxed process can signal
     /// other processes. When `None`, inherits from the base profile during merge
     /// (defaults to `Isolated` if no base sets it).
@@ -2506,6 +2753,179 @@ pub struct RollbackConfig {
     /// Matched against the filename using standard glob syntax.
     #[serde(default)]
     pub exclude_globs: Vec<String>,
+}
+
+/// Whether session recordings capture what is typed into the session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionRecordingInput {
+    On,
+    Off,
+}
+
+/// Session terminal recording (NEP-0010 §7).
+///
+/// Every field can only raise recording when profiles are merged: a child
+/// profile can turn recording on, make it required, capture input, raise the
+/// size limit or add a destination, but never undo what a base profile set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRecordingConfig {
+    /// Record the session's terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Stop the session rather than run it unrecorded. Implies `enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// Capture input (`on`) or only mark that input happened (`off`).
+    /// Defaults to `on` for terminal sessions and `off` for pipe sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<SessionRecordingInput>,
+    /// Uncompressed size at which the recording stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Extra copy of the finished recording, plus a chunk manifest, written
+    /// outside the sandbox. Relative paths resolve against the launch
+    /// directory. Implies `enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Upload chunks to a receiver as they close. Implies `enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<SessionRecordingDelivery>,
+}
+
+/// Where and how recording chunks are delivered (NEP-0010 §6.1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRecordingDelivery {
+    /// `platform`: the platform this host is enrolled with.
+    pub receiver: String,
+    /// Fail the session when chunks cannot be delivered by session end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// How long session end waits for undelivered chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_secs: Option<u64>,
+}
+
+/// The only receiver supported so far.
+pub const RECORDING_RECEIVER_PLATFORM: &str = "platform";
+/// Upper bound for `delivery.flush_timeout_secs`.
+pub const RECORDING_MAX_FLUSH_TIMEOUT_SECS: u64 = 600;
+
+impl SessionRecordingDelivery {
+    fn merge(base: Option<Self>, child: Option<Self>) -> Option<Self> {
+        match (base, child) {
+            (None, None) => None,
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            // The base receiver stays; the child can make it required or
+            // wait longer, never less.
+            (Some(base), Some(child)) => Some(Self {
+                receiver: base.receiver,
+                required: if base.required == Some(true) || child.required == Some(true) {
+                    Some(true)
+                } else {
+                    child.required.or(base.required)
+                },
+                flush_timeout_secs: match (base.flush_timeout_secs, child.flush_timeout_secs) {
+                    (Some(base), Some(child)) => Some(base.max(child)),
+                    (base, child) => child.or(base),
+                },
+            }),
+        }
+    }
+}
+
+impl SessionRecordingConfig {
+    /// Whether this block turns recording on.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled == Some(true)
+            || self.required == Some(true)
+            || self.file.is_some()
+            || self.delivery.is_some()
+    }
+
+    /// Merge a child block onto a base block. Settings can only be raised.
+    pub fn merge(base: Option<Self>, child: Option<Self>) -> Option<Self> {
+        let (base, child) = match (base, child) {
+            (None, None) => return None,
+            (Some(only), None) | (None, Some(only)) => return Some(only),
+            (Some(base), Some(child)) => (base, child),
+        };
+        let raise = |base: Option<bool>, child: Option<bool>| {
+            if base == Some(true) || child == Some(true) {
+                Some(true)
+            } else {
+                child.or(base)
+            }
+        };
+        let input = match (base.input, child.input) {
+            (Some(SessionRecordingInput::On), _) | (_, Some(SessionRecordingInput::On)) => {
+                Some(SessionRecordingInput::On)
+            }
+            (base, child) => child.or(base),
+        };
+        Some(Self {
+            enabled: raise(base.enabled, child.enabled),
+            required: raise(base.required, child.required),
+            input,
+            max_bytes: match (base.max_bytes, child.max_bytes) {
+                (Some(base), Some(child)) => Some(base.max(child)),
+                (base, child) => child.or(base),
+            },
+            // A base profile's destination cannot be replaced.
+            file: base.file.or(child.file),
+            delivery: SessionRecordingDelivery::merge(base.delivery, child.delivery),
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let invalid = |reason: &str| {
+            Err(NonoError::ProfileParse(format!(
+                "invalid session_recording: {reason}"
+            )))
+        };
+        if self.enabled == Some(false) && self.required == Some(true) {
+            return invalid("`required: true` cannot be combined with `enabled: false`");
+        }
+        if self.enabled == Some(false) && self.file.is_some() {
+            return invalid("`file` cannot be combined with `enabled: false`");
+        }
+        if self.max_bytes == Some(0) {
+            return invalid("`max_bytes` must be greater than zero");
+        }
+        if self
+            .file
+            .as_deref()
+            .is_some_and(|file| file.trim().is_empty())
+        {
+            return invalid("`file` must not be empty");
+        }
+        if let Some(delivery) = self.delivery.as_ref() {
+            if self.enabled == Some(false) {
+                return invalid("`delivery` cannot be combined with `enabled: false`");
+            }
+            if delivery.receiver != RECORDING_RECEIVER_PLATFORM {
+                return invalid(
+                    "`delivery.receiver` must be \"platform\" (the platform this host is enrolled with)",
+                );
+            }
+            if delivery
+                .flush_timeout_secs
+                .is_some_and(|secs| secs == 0 || secs > RECORDING_MAX_FLUSH_TIMEOUT_SECS)
+            {
+                return invalid("`delivery.flush_timeout_secs` must be between 1 and 600");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_profile_session_recording(profile: &Profile) -> Result<()> {
+    match profile.session_recording.as_ref() {
+        Some(recording) => recording.validate(),
+        None => Ok(()),
+    }
 }
 
 /// Controls which environment variables are passed to the sandboxed process.
@@ -2684,6 +3104,9 @@ pub struct Profile {
     pub session_hooks: SessionHooks,
     #[serde(default)]
     pub rollback: RollbackConfig,
+    /// Session terminal recording (NEP-0010). `None` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_recording: Option<SessionRecordingConfig>,
     /// Supervisor-delegated URL opening (e.g., for OAuth2 login flows).
     /// When `None` (absent from JSON), inherits from the base profile.
     /// When `Some`, replaces the base profile's config entirely, allowing
@@ -2845,6 +3268,8 @@ struct ProfileDeserialize {
     #[serde(default)]
     rollback: RollbackConfig,
     #[serde(default)]
+    session_recording: Option<SessionRecordingConfig>,
+    #[serde(default)]
     open_urls: Option<OpenUrlConfig>,
     #[serde(default)]
     allow_launch_services: Option<bool>,
@@ -2887,6 +3312,7 @@ impl From<ProfileDeserialize> for Profile {
             hooks: raw.hooks,
             session_hooks: raw.session_hooks,
             rollback: raw.rollback,
+            session_recording: raw.session_recording,
             open_urls: raw.open_urls,
             allow_launch_services: raw.allow_launch_services,
             allow_gpu: raw.allow_gpu,
@@ -3244,9 +3670,36 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
     parse_profile_file(path)
 }
 
+pub(crate) fn validate_delivered_profile(profile: &Profile) -> Result<()> {
+    if profile.session_hooks.before.is_some()
+        || profile.session_hooks.after.is_some()
+        || !profile.hooks.hooks.is_empty()
+    {
+        return Err(NonoError::ProfileParse(
+            "delivered policies cannot contain host or session hooks".into(),
+        ));
+    }
+    if let Some(overrides) = &profile.platform_overrides {
+        for item in [&overrides.macos, &overrides.linux, &overrides.windows]
+            .into_iter()
+            .flatten()
+        {
+            validate_delivered_profile(&item.0)?;
+        }
+    }
+    Ok(())
+}
+
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
+pub(crate) fn finalize_profile(profile: Profile) -> Result<Profile> {
+    finalize_profile_with_policy(profile, &crate::policy::load_embedded_policy()?)
+}
+
 #[allow(deprecated)]
-pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
+pub(crate) fn finalize_profile_with_policy(
+    mut profile: Profile,
+    policy: &crate::policy::Policy,
+) -> Result<Profile> {
     profile = apply_platform_overrides(profile)?;
     // apply_platform_overrides merges platform-specific custom_credentials,
     // env_credentials, and environment.set_vars into the profile, so those
@@ -3262,8 +3715,9 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     }
     validate_profile_env_var_patterns(&profile)?;
     validate_profile_network_denial_audit(&profile)?;
+    validate_profile_session_recording(&profile)?;
     validate_profile_domain_patterns(&profile)?;
-    merge_implicit_default_groups(&mut profile)?;
+    merge_implicit_default_groups(&mut profile, policy)?;
     // Re-run after extends/platform overrides: base and child profiles can
     // independently add no_proxy and allow_domain entries that only conflict
     // once the final effective profile has been assembled.
@@ -3309,13 +3763,19 @@ pub(crate) fn resolve_and_finalize_profile(profile: Profile) -> Result<Profile> 
 ///
 /// The built-in `default` profile is now the canonical source of implicit
 /// groups. The `default` profile itself does not inherit any additional groups.
-fn implicit_default_groups(profile: &Profile) -> Result<Vec<String>> {
+fn implicit_default_groups(
+    profile: &Profile,
+    policy: &crate::policy::Policy,
+) -> Result<Vec<String>> {
     if profile.meta.name == "default" {
         return Ok(Vec::new());
     }
 
-    let default = crate::policy::get_policy_profile("default")?
+    let default = policy
+        .profiles
+        .get("default")
         .ok_or_else(|| NonoError::ProfileNotFound("default".to_string()))?;
+    let default = finalize_profile_with_policy(default.to_raw_profile(), policy)?;
     Ok(default.groups.include)
 }
 
@@ -3329,12 +3789,14 @@ fn implicit_default_groups(profile: &Profile) -> Result<Vec<String>> {
 ///
 /// This means exclusions win even if the same group is also added explicitly in
 /// `groups.include`.
-fn merge_implicit_default_groups(profile: &mut Profile) -> Result<()> {
-    let policy = crate::policy::load_embedded_policy()?;
+fn merge_implicit_default_groups(
+    profile: &mut Profile,
+    policy: &crate::policy::Policy,
+) -> Result<()> {
     let exclusions = &profile.groups.exclude;
-    crate::policy::validate_group_exclusions(&policy, exclusions)?;
+    crate::policy::validate_group_exclusions(policy, exclusions)?;
 
-    let mut merged = implicit_default_groups(profile)?;
+    let mut merged = implicit_default_groups(profile, policy)?;
     // Append profile-specific groups (avoiding duplicates)
     let mut seen: std::collections::HashSet<String> = merged.iter().cloned().collect();
     for g in &profile.groups.include {
@@ -3406,6 +3868,7 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     }
     validate_profile_env_var_patterns(&profile)?;
     validate_profile_network_denial_audit(&profile)?;
+    validate_profile_session_recording(&profile)?;
     validate_profile_domain_patterns(&profile)?;
 
     validate_command_policies(
@@ -3489,6 +3952,27 @@ fn resolve_extends(
     context_dir: Option<&Path>,
     source_file: Option<&Path>,
 ) -> Result<Profile> {
+    resolve_extends_with(
+        child,
+        visited,
+        depth,
+        context_dir,
+        source_file,
+        &mut load_base_profile_raw,
+    )
+}
+
+fn resolve_extends_with<F>(
+    child: Profile,
+    visited: &mut Vec<String>,
+    depth: usize,
+    context_dir: Option<&Path>,
+    source_file: Option<&Path>,
+    loader: &mut F,
+) -> Result<Profile>
+where
+    F: FnMut(&str, Option<&Path>, Option<&Path>) -> Result<ResolvedBase>,
+{
     let base_names = match child.extends {
         Some(ref names) => names.clone(),
         None => return Ok(child),
@@ -3515,20 +3999,25 @@ fn resolve_extends(
 
         visited.push(base_name.clone());
 
-        let resolved = load_base_profile_raw(base_name, context_dir, source_file)?;
+        let resolved = loader(base_name, context_dir, source_file)?;
         let resolved_base = match resolved {
-            ResolvedBase::Sibling(base, source_path) => resolve_extends(
+            ResolvedBase::Sibling(base, source_path) => resolve_extends_with(
                 base,
                 visited,
                 depth + 1,
                 source_path.parent(),
                 Some(&source_path),
+                loader,
             )?,
-            ResolvedBase::Global(base) => resolve_extends(base, visited, depth + 1, None, None)?,
+            ResolvedBase::Global(base) => {
+                resolve_extends_with(base, visited, depth + 1, None, None, loader)?
+            }
         };
         // Pop to restore the stack to the pre-base state. On the error path
         // above (? propagation), visited is abandoned so the missing pop is harmless.
         visited.pop();
+        let mut resolved_base = resolved_base;
+        drop_inherited_recording_file(&mut resolved_base);
 
         accumulated_base = Some(match accumulated_base {
             Some(acc) => merge_profiles(acc, resolved_base),
@@ -3622,6 +4111,40 @@ fn load_base_profile_raw(
     )))
 }
 
+/// `session_recording.file` makes the unsandboxed supervisor create a file
+/// on the host, so it is honoured only from the profile selected for the
+/// session, which `sandbox_prepare` further limits to user-authored profiles.
+/// A base reached through `extends` may be a package or built-in profile,
+/// so its destination, including any in its `platform_overrides`, is
+/// dropped before it is merged. Recording that the destination turned on
+/// stays on.
+fn drop_inherited_recording_file(base: &mut Profile) {
+    fn strip(recording: Option<&mut SessionRecordingConfig>) {
+        if let Some(recording) = recording
+            && recording.file.is_some()
+        {
+            let enabled = recording.is_enabled();
+            recording.file = None;
+            if enabled {
+                recording.enabled = Some(true);
+            }
+        }
+    }
+    strip(base.session_recording.as_mut());
+    if let Some(overrides) = base.platform_overrides.as_mut() {
+        for platform in [
+            overrides.macos.as_mut(),
+            overrides.linux.as_mut(),
+            overrides.windows.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            strip(platform.0.session_recording.as_mut());
+        }
+    }
+}
+
 /// Merge a resolved base profile with a child profile.
 ///
 /// The child's values take precedence for scalar fields. Collection fields
@@ -3693,6 +4216,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         ),
         meta: child.meta,
         security: SecurityConfig {
+            session_socket_auth: child
+                .security
+                .session_socket_auth
+                .or(base.security.session_socket_auth),
             signal_mode: child.security.signal_mode.or(base.security.signal_mode),
             process_info_mode: child
                 .security
@@ -3837,7 +4364,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .or(base.linux.af_unix_mediation),
             sandbox_policy: child.linux.sandbox_policy.or(base.linux.sandbox_policy),
             // OR-merge: an extending profile can add isolation, never remove it.
-            isolate: base.linux.isolate.merge(child.linux.isolate),
+            isolate: base.linux.isolate.clone().merge(child.linux.isolate),
         },
         diagnostics: DiagnosticsConfig {
             redaction: RedactionConfig {
@@ -3949,6 +4476,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &child.rollback.exclude_globs,
             ),
         },
+        session_recording: SessionRecordingConfig::merge(
+            base.session_recording,
+            child.session_recording,
+        ),
         open_urls: match child.open_urls {
             Some(child_urls) => Some(child_urls),
             None => base.open_urls,
@@ -3993,27 +4524,79 @@ pub(crate) fn dedup_append<T: Eq + std::hash::Hash + Clone>(base: &[T], child: &
     result
 }
 
-/// Merge `allow_domain` entries from base and child profiles.
+/// Merge `allow_domain` entries from base and child profiles, or any list in
+/// which a domain may appear more than once (a profile plus `--allow-domain`).
 ///
-/// For the same domain, endpoint rules are **appended** (child rules added to base).
-/// A plain entry upgraded with endpoints from the other side becomes `WithEndpoints`.
-/// Order: base domains first, then child-only domains.
+/// For the same domain, endpoint rules are **appended** (later rules added to
+/// earlier ones). A plain entry upgraded with endpoints from the other side
+/// becomes `WithEndpoints`. Once either side has an `endpoint_policy`, the
+/// `endpoints` allow-lists join its `allow` rules, and an `endpoints` list
+/// stands for an explicit `default: deny`. A later explicit `default` replaces
+/// an earlier one; an omitted `default` inherits.
+/// Order: first-seen domain order.
+///
+/// An entry that sets both `endpoints` and `endpoint_policy` is invalid and is
+/// kept as written, unmerged, so `partition_allow_domain` still rejects it.
 pub(crate) fn merge_allow_domain(
     base: &[AllowDomainEntry],
     child: &[AllowDomainEntry],
 ) -> Vec<AllowDomainEntry> {
+    let mut invalid: Vec<AllowDomainEntry> = Vec::new();
     let mut domains: Vec<String> = Vec::new();
     let mut rules: HashMap<String, Vec<nono_proxy::config::EndpointRule>> = HashMap::new();
+    let mut policies: HashMap<String, AllowDomainEndpointPolicy> = HashMap::new();
 
     for entry in base.iter().chain(child.iter()) {
-        let (domain, endpoints) = match entry {
-            AllowDomainEntry::Plain(d) => (d.clone(), &[][..]),
-            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
-                (domain.clone(), endpoints.as_slice())
+        let (domain, endpoints, policy) = match entry {
+            AllowDomainEntry::Plain(d) => (d.clone(), &[][..], None),
+            AllowDomainEntry::WithEndpoints {
+                domain,
+                endpoints,
+                endpoint_policy,
+            } => {
+                if !endpoints.is_empty() && endpoint_policy.is_some() {
+                    invalid.push(entry.clone());
+                    continue;
+                }
+                (
+                    domain.clone(),
+                    endpoints.as_slice(),
+                    endpoint_policy.as_ref(),
+                )
             }
         };
         if !domains.contains(&domain) {
             domains.push(domain.clone());
+        }
+        if let Some(policy) = policy {
+            match policies.entry(domain.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut merged) => {
+                    let merged = merged.get_mut();
+                    if policy.default.is_some() {
+                        merged.default = policy.default.clone();
+                    }
+                    merged.deny.extend_from_slice(&policy.deny);
+                    merged.approve.extend_from_slice(&policy.approve);
+                    merged.allow.extend_from_slice(&policy.allow);
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    // An earlier `endpoints` allow-list already denied
+                    // everything else; the policy inherits that default.
+                    let mut policy = policy.clone();
+                    if policy.default.is_none()
+                        && rules.get(&domain).is_some_and(|rules| !rules.is_empty())
+                    {
+                        policy.default = Some(nono_proxy::config::EndpointPolicyDefault::default());
+                    }
+                    slot.insert(policy);
+                }
+            }
+        } else if !endpoints.is_empty()
+            && let Some(merged) = policies.get_mut(&domain)
+        {
+            // A later `endpoints` allow-list denies everything it does not
+            // list, as it would on its own.
+            merged.default = Some(nono_proxy::config::EndpointPolicyDefault::default());
         }
         rules
             .entry(domain)
@@ -4021,17 +4604,39 @@ pub(crate) fn merge_allow_domain(
             .extend_from_slice(endpoints);
     }
 
-    domains
+    let mut merged: Vec<AllowDomainEntry> = domains
         .into_iter()
         .map(|domain| {
             let endpoints = rules.remove(&domain).unwrap_or_default();
-            if endpoints.is_empty() {
+            if let Some(mut policy) = policies.remove(&domain) {
+                policy.allow.extend(endpoints.into_iter().map(|rule| {
+                    nono_proxy::config::EndpointPolicyRule {
+                        method: rule.method,
+                        path: rule.path,
+                        backend: None,
+                        reason: None,
+                        timeout_secs: None,
+                        operations: None,
+                    }
+                }));
+                AllowDomainEntry::WithEndpoints {
+                    domain,
+                    endpoints: Vec::new(),
+                    endpoint_policy: Some(policy),
+                }
+            } else if endpoints.is_empty() {
                 AllowDomainEntry::Plain(domain)
             } else {
-                AllowDomainEntry::WithEndpoints { domain, endpoints }
+                AllowDomainEntry::WithEndpoints {
+                    domain,
+                    endpoints,
+                    endpoint_policy: None,
+                }
             }
         })
-        .collect()
+        .collect();
+    merged.extend(invalid);
+    merged
 }
 
 /// Get the path to a user profile (default `.json` extension, used for writes).
@@ -5486,7 +6091,11 @@ mod tests {
             ..Default::default()
         };
 
-        merge_implicit_default_groups(&mut profile).expect("merge should succeed");
+        merge_implicit_default_groups(
+            &mut profile,
+            &crate::policy::load_embedded_policy().expect("policy"),
+        )
+        .expect("merge should succeed");
 
         // Should contain base groups
         assert!(
@@ -5533,7 +6142,11 @@ mod tests {
             ..Default::default()
         };
 
-        merge_implicit_default_groups(&mut profile).expect("merge should succeed");
+        merge_implicit_default_groups(
+            &mut profile,
+            &crate::policy::load_embedded_policy().expect("policy"),
+        )
+        .expect("merge should succeed");
 
         assert!(
             !profile
@@ -5648,6 +6261,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -5657,6 +6271,57 @@ mod tests {
             spiffe: None,
             rate_limit: None,
         }
+    }
+
+    #[test]
+    fn test_validate_phantom_format() {
+        let with = |fmt: &str| CustomCredentialDef {
+            phantom_format: Some(fmt.to_string()),
+            ..header_cred_builder()
+        };
+        assert!(validate_custom_credential("t", &with("ghp_{}")).is_ok());
+        for bad in ["{}", "Bearer {}", "a/{}", "nono_{}", "noplaceholder"] {
+            assert!(
+                validate_custom_credential("t", &with(bad)).is_err(),
+                "{bad}"
+            );
+        }
+
+        // Requires a session-phantom credential source.
+        let mut no_source = with("ghp_{}");
+        no_source.credential_key = None;
+        no_source.redeem_phantoms = vec!["x".to_string()];
+        assert!(validate_custom_credential("t", &no_source).is_err());
+
+        // Reserved env vars, explicit or derived from the credential key.
+        for name in ["NONO_PROXY_TOKEN", "HTTPS_PROXY", "OPENAI_BASE_URL"] {
+            let mut c = with("ghp_{}");
+            c.env_var = Some(name.to_string());
+            assert!(validate_custom_credential("t", &c).is_err(), "{name}");
+        }
+        let mut derived = with("ghp_{}");
+        derived.credential_key = Some("https_proxy".to_string());
+        assert!(validate_custom_credential("t", &derived).is_err());
+
+        // A URI credential key cannot derive an env var name.
+        let mut uri = with("ghp_{}");
+        uri.credential_key = Some("op://v/i/f".to_string());
+        assert!(validate_custom_credential("t", &uri).is_err());
+        uri.env_var = Some("GH_TOKEN".to_string());
+        assert!(validate_custom_credential("t", &uri).is_ok());
+    }
+
+    #[test]
+    fn test_phantom_format_deserializes_and_rejects_unknown_format_key() {
+        let ok: CustomCredentialDef = serde_json::from_str(
+            r#"{"upstream":"https://a.example.com","credential_key":"k","phantom_format":"ghp_{}"}"#,
+        )
+        .unwrap();
+        assert_eq!(ok.phantom_format.as_deref(), Some("ghp_{}"));
+        let err = serde_json::from_str::<CustomCredentialDef>(
+            r#"{"upstream":"https://a.example.com","credential_key":"k","format":"ghp_{}"}"#,
+        );
+        assert!(err.is_err());
     }
 
     #[test]
@@ -5955,6 +6620,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6001,6 +6667,56 @@ mod tests {
         let err = validate_custom_credential("test", &cred)
             .expect_err("redeem_phantoms + aws_auth must be rejected");
         assert!(err.to_string().contains("redeem_phantoms"));
+    }
+
+    fn ops_policy(ops: &[&str]) -> nono_proxy::config::EndpointPolicyConfig {
+        nono_proxy::config::EndpointPolicyConfig {
+            allow: vec![nono_proxy::config::EndpointPolicyRule {
+                method: "POST".to_string(),
+                path: "/".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+                operations: Some(ops.iter().map(|s| s.to_string()).collect()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_operations_requires_aws_auth() {
+        let mut cred = header_cred_builder();
+        cred.endpoint_policy = Some(ops_policy(&["Describe*"]));
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("operations without aws_auth must be rejected");
+        assert!(err.to_string().contains("aws_auth"));
+
+        cred.credential_key = None;
+        cred.aws_auth = Some(nono_proxy::config::AwsAuthConfig::default());
+        validate_custom_credential("test", &cred).expect("operations with aws_auth is valid");
+    }
+
+    #[test]
+    fn test_validate_operations_allowed_on_aws_upstream_without_aws_auth() {
+        let mut cred = header_cred_builder();
+        cred.upstream = "https://ssm.us-east-1.amazonaws.com".to_string();
+        cred.endpoint_policy = Some(ops_policy(&["Describe*"]));
+        validate_custom_credential("test", &cred)
+            .expect("operations on an AWS upstream are valid without aws_auth");
+    }
+
+    #[test]
+    fn test_validate_operations_rejects_bad_patterns() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.aws_auth = Some(nono_proxy::config::AwsAuthConfig::default());
+        for bad in [vec![], vec!["Get[A]"], vec!["a.b"], vec!["{A,B}"]] {
+            cred.endpoint_policy = Some(ops_policy(&bad));
+            assert!(
+                validate_custom_credential("test", &cred).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -6071,6 +6787,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6098,6 +6815,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6127,6 +6845,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6156,6 +6875,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6183,6 +6903,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6212,6 +6933,7 @@ mod tests {
             query_param_name: Some("key".to_string()),
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6239,6 +6961,7 @@ mod tests {
             query_param_name: None, // Missing required field
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6268,6 +6991,7 @@ mod tests {
             query_param_name: Some("".to_string()), // Empty
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6297,6 +7021,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6505,6 +7230,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6884,6 +7610,7 @@ mod tests {
                 exclude_patterns: vec!["node_modules".to_string()],
                 exclude_globs: vec!["*.pyc".to_string()],
             },
+            session_recording: None,
             open_urls: Some(OpenUrlConfig {
                 allow_origins: vec!["https://base.example.com".to_string()],
                 allow_localhost: false,
@@ -6977,6 +7704,7 @@ mod tests {
                 exclude_patterns: vec![],
                 exclude_globs: vec![],
             },
+            session_recording: None,
             open_urls: Some(OpenUrlConfig {
                 allow_origins: vec!["https://child.example.com".to_string()],
                 allow_localhost: true,
@@ -7067,13 +7795,34 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_rejects_unimplemented_isolate_fields() {
-        // Phase 2 mount masking is not implemented; accepting the field would
-        // let a profile believe it is masked when it is not.
+    fn test_profile_rejects_unknown_isolate_fields() {
+        // An unknown field must not let a profile believe it is isolated.
         let result = serde_json::from_str::<Profile>(
-            r#"{"meta":{"name":"iso"},"linux":{"isolate":{"mounts":true}}}"#,
+            r#"{"meta":{"name":"iso"},"linux":{"isolate":{"pid":true}}}"#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_profile_parses_and_merges_isolate_mounts() {
+        let base: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"base"},"linux":{"isolate":{"mounts":true,"extra_masks":["/opt/a.sock","/opt/b.sock"]}}}"#,
+        )
+        .expect("parse");
+        assert!(base.linux.isolate.mounts);
+        #[cfg(target_os = "linux")]
+        assert_eq!(base.linux.isolate.labels(), vec!["mounts"]);
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"linux":{"isolate":{"mounts":false,"extra_masks":["/opt/b.sock","/opt/c.sock"]}}}"#,
+        )
+        .expect("parse");
+        let merged = merge_profiles(base, child);
+        assert!(merged.linux.isolate.mounts, "child cannot drop mounts");
+        assert_eq!(
+            merged.linux.isolate.extra_masks,
+            vec!["/opt/a.sock", "/opt/b.sock", "/opt/c.sock"],
+            "extra_masks is a deduplicated append; no layer removes a mask"
+        );
     }
 
     #[test]
@@ -7459,6 +8208,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -7486,6 +8236,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -7650,6 +8401,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -7677,6 +8429,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -9196,7 +9949,9 @@ mod tests {
             AllowDomainEntry::Plain("api.openai.com".to_string())
         );
         match &profile.network.allow_domain[1] {
-            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+            AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } => {
                 assert_eq!(domain, "api.github.com");
                 assert_eq!(endpoints.len(), 2);
                 assert_eq!(endpoints[0].method, "GET");
@@ -9212,6 +9967,7 @@ mod tests {
     fn test_merge_allow_domain_appends_endpoints_for_same_domain() {
         let base = vec![AllowDomainEntry::WithEndpoints {
             domain: "api.github.com".to_string(),
+            endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
                 path: "/repos/my-org/**".to_string(),
@@ -9219,6 +9975,7 @@ mod tests {
         }];
         let child = vec![AllowDomainEntry::WithEndpoints {
             domain: "api.github.com".to_string(),
+            endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "POST".to_string(),
                 path: "/repos/my-org/*/issues".to_string(),
@@ -9229,7 +9986,9 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         match &merged[0] {
-            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+            AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } => {
                 assert_eq!(domain, "api.github.com");
                 assert_eq!(endpoints.len(), 2);
                 assert_eq!(endpoints[0].method, "GET");
@@ -9244,6 +10003,7 @@ mod tests {
         let base = vec![AllowDomainEntry::Plain("api.github.com".to_string())];
         let child = vec![AllowDomainEntry::WithEndpoints {
             domain: "api.github.com".to_string(),
+            endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
                 path: "/repos/**".to_string(),
@@ -9254,7 +10014,9 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         match &merged[0] {
-            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+            AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } => {
                 assert_eq!(domain, "api.github.com");
                 assert_eq!(endpoints.len(), 1);
             }
@@ -9263,10 +10025,225 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_allow_domain_appends_endpoint_policy_rules() {
+        let base: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }],
+                "approve": [{ "method": "*", "path": "/*/*/**" }]
+            } }]"#,
+        )
+        .unwrap();
+        let child: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[
+                { "domain": "github.com", "endpoint_policy": {
+                    "allow": [{ "method": "GET", "path": "/login" }],
+                    "default": { "decision": "deny" }
+                } },
+                { "domain": "github.com", "endpoints": [{ "method": "GET", "path": "/favicon.ico" }] }
+            ]"#,
+        )
+        .unwrap();
+
+        let merged = merge_allow_domain(&base, &child);
+
+        assert_eq!(merged.len(), 1);
+        match &merged[0] {
+            AllowDomainEntry::WithEndpoints {
+                endpoints,
+                endpoint_policy: Some(policy),
+                ..
+            } => {
+                assert!(endpoints.is_empty());
+                assert_eq!(policy.deny.len(), 1, "base deny rules must survive");
+                assert_eq!(policy.approve.len(), 1);
+                let allowed: Vec<&str> = policy.allow.iter().map(|r| r.path.as_str()).collect();
+                assert_eq!(allowed, vec!["/login", "/favicon.ico"]);
+            }
+            other => panic!("expected an endpoint_policy entry, got {other:?}"),
+        }
+    }
+
+    fn merged_policy(merged: &[AllowDomainEntry]) -> nono_proxy::config::EndpointPolicyConfig {
+        match merged {
+            [
+                AllowDomainEntry::WithEndpoints {
+                    endpoint_policy: Some(policy),
+                    ..
+                },
+            ] => policy.to_proxy(),
+            other => panic!("expected one endpoint_policy entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_merge_allow_domain_omitted_child_default_inherits() {
+        use nono_proxy::config::EndpointPolicyDecision;
+        let base: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "default": { "decision": "approve" }
+            } }]"#,
+        )
+        .unwrap();
+        let child: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "allow": [{ "method": "GET", "path": "/login" }]
+            } }]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            merged_policy(&merge_allow_domain(&base, &child))
+                .default
+                .decision,
+            EndpointPolicyDecision::Approve,
+            "a child without default must keep the base's"
+        );
+
+        let explicit: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "default": { "decision": "deny" }
+            } }]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            merged_policy(&merge_allow_domain(&base, &explicit))
+                .default
+                .decision,
+            EndpointPolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn test_merge_allow_domain_endpoints_keep_their_default_deny() {
+        use nono_proxy::config::EndpointPolicyDecision;
+        let endpoints: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoints": [{ "method": "*", "path": "/acme/**" }] }]"#,
+        )
+        .unwrap();
+        // A policy that leaves `default` out must not turn the allow-list into
+        // allow-everything, in either order.
+        let policy: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }]
+            } }]"#,
+        )
+        .unwrap();
+        for merged in [
+            merge_allow_domain(&endpoints, &policy),
+            merge_allow_domain(&policy, &endpoints),
+        ] {
+            let merged = merged_policy(&merged);
+            assert_eq!(merged.default.decision, EndpointPolicyDecision::Deny);
+            assert_eq!(merged.allow.len(), 1);
+            assert_eq!(merged.deny.len(), 1);
+        }
+
+        // A later allow-list re-imposes default deny over an earlier allow.
+        let open: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "default": { "decision": "allow" }
+            } }]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            merged_policy(&merge_allow_domain(&open, &endpoints))
+                .default
+                .decision,
+            EndpointPolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn test_merge_allow_domain_keeps_entries_with_both_fields_for_rejection() {
+        let base: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "approve": [{ "method": "*", "path": "/**" }]
+            } }]"#,
+        )
+        .unwrap();
+        let invalid: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[{
+                "domain": "github.com",
+                "endpoints": [{ "method": "*", "path": "/acme/**" }],
+                "endpoint_policy": { "allow": [{ "method": "*", "path": "/**" }] }
+            }]"#,
+        )
+        .unwrap();
+        let merged = merge_allow_domain(&base, &invalid);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[1], invalid[0],
+            "the invalid entry must survive as written"
+        );
+    }
+
+    #[test]
+    fn test_allow_domain_policy_entry_serializes_without_empty_endpoints() {
+        let entry: AllowDomainEntry = serde_json::from_str(
+            r#"{ "domain": "github.com", "endpoint_policy": { "approve": [{ "method": "*", "path": "/**" }] } }"#,
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&entry).unwrap();
+        assert!(encoded.get("endpoints").is_none(), "{encoded}");
+        assert!(encoded["endpoint_policy"].get("default").is_none());
+        let decoded: AllowDomainEntry = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    fn profile_with_allow_domain(entry: &str) -> Profile {
+        let mut profile = Profile::default();
+        profile.network.allow_domain = vec![serde_json::from_str(entry).unwrap()];
+        profile
+    }
+
+    #[test]
+    fn test_allow_domain_operations_require_aws_domain() {
+        let ops = r#""endpoint_policy": { "allow": [{ "method": "POST", "path": "/", "operations": ["Describe*"] }] } }"#;
+        for domain in ["ssm.us-east-1.amazonaws.com", "*.amazonaws.com"] {
+            let profile = profile_with_allow_domain(&format!(r#"{{ "domain": "{domain}", {ops}"#));
+            validate_profile_domain_patterns(&profile).unwrap_or_else(|e| panic!("{domain}: {e}"));
+        }
+        for domain in ["api.github.com", "evilamazonaws.com"] {
+            let profile = profile_with_allow_domain(&format!(r#"{{ "domain": "{domain}", {ops}"#));
+            let err = validate_profile_domain_patterns(&profile)
+                .expect_err("operations on a non-AWS domain must be rejected");
+            assert!(err.to_string().contains("AWS upstream"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_allow_domain_operations_reject_bad_patterns() {
+        let profile = profile_with_allow_domain(
+            r#"{ "domain": "ssm.us-east-1.amazonaws.com", "endpoint_policy": { "deny": [{ "method": "POST", "path": "/", "operations": ["Delete[a]"] }] } }"#,
+        );
+        let err = validate_profile_domain_patterns(&profile)
+            .expect_err("operation patterns outside the charset must be rejected");
+        assert!(
+            err.to_string().contains("ssm.us-east-1.amazonaws.com"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_allow_domain_entry_rejects_unknown_keys() {
+        let err = serde_json::from_str::<AllowDomainEntry>(
+            r#"{ "domain": "github.com", "endpoint_polcy": { "approve": [] } }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no other keys"), "{err}");
+        assert!(
+            serde_json::from_str::<AllowDomainEntry>(
+                r#"{ "domain": "github.com", "endpoint_policy": { "deafult": {} } }"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_merge_allow_domain_preserves_distinct_domains() {
         let base = vec![AllowDomainEntry::Plain("api.openai.com".to_string())];
         let child = vec![AllowDomainEntry::WithEndpoints {
             domain: "api.github.com".to_string(),
+            endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
                 path: "/repos/**".to_string(),
@@ -9352,6 +10329,30 @@ mod tests {
         std::fs::write(&path, json).expect("write profile");
         let profile = load_profile_from_path(&path).expect("parse profile");
         assert!(profile.security.process_info_mode.is_none());
+    }
+
+    #[test]
+    fn session_socket_auth_defaults_off_and_inherits_explicit_settings() {
+        let unset: Profile = serde_json::from_value(serde_json::json!({})).expect("profile");
+        assert_eq!(unset.security.session_socket_auth, None);
+        let mut base = base_profile();
+        base.security.session_socket_auth = Some(true);
+        let merged = merge_profiles(base.clone(), unset);
+        assert_eq!(merged.security.session_socket_auth, Some(true));
+        let disabled: Profile = serde_json::from_value(serde_json::json!({
+            "security": {"session_socket_auth": false}
+        }))
+        .expect("disabled profile");
+        assert_eq!(
+            merge_profiles(base, disabled).security.session_socket_auth,
+            Some(false)
+        );
+        assert!(
+            serde_json::from_value::<Profile>(serde_json::json!({
+                "security": {"session_socket_auth": "true"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -9898,6 +10899,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -9928,6 +10930,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -9961,6 +10964,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -9994,6 +10998,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -10059,6 +11064,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -10553,6 +11559,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            phantom_format: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -11352,6 +12359,7 @@ mod tests {
             auth: None,
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: None,
             }),
@@ -11363,6 +12371,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -11380,10 +12389,42 @@ mod tests {
     }
 
     #[test]
+    fn test_aws_auth_wildcard_region_upstream() {
+        let aws = |region: Option<&str>, service: Option<&str>| {
+            Some(nono_proxy::config::AwsAuthConfig {
+                region: region.map(str::to_string),
+                service: service.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        let cred = |upstream: &str, region, service| CustomCredentialDef {
+            upstream: upstream.to_string(),
+            aws_auth: aws(region, service),
+            ..aws_auth_cred_builder()
+        };
+        let ok = cred("https://eks.*.amazonaws.com", None, Some("eks"));
+        assert!(validate_custom_credential("eks", &ok).is_ok());
+
+        for (upstream, region) in [
+            ("https://eks.*.amazonaws.com", Some("us-east-1")),
+            ("https://*.s3.*.amazonaws.com", Some("us-east-1")),
+            ("https://eks.*.amazonaws.eu", None),
+            ("https://*.amazonaws.com", None),
+        ] {
+            let bad = cred(upstream, region, Some("eks"));
+            assert!(
+                validate_custom_credential("eks", &bad).is_err(),
+                "{upstream} {region:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_aws_auth_all_fields_valid() {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some("my-aws-profile".to_string()),
+                profiles: None,
                 region: Some("us-east-1".to_string()),
                 service: Some("bedrock".to_string()),
             }),
@@ -11468,11 +12509,70 @@ mod tests {
         );
     }
 
+    fn aws_profiles(pairs: &[(&str, &str)]) -> Option<std::collections::BTreeMap<String, String>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_accepted() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profiles: aws_profiles(&[
+                    ("NONOPROFILE0DEVRO01", "dev-ro"),
+                    ("NONOPROFILE0STGRO01", "staging-ro"),
+                ]),
+                ..Default::default()
+            }),
+            ..aws_auth_cred_builder()
+        };
+        assert!(validate_custom_credential("aws-sts", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_aws_auth_profile_and_profiles_together_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: Some("dev-ro".to_string()),
+                profiles: aws_profiles(&[("NONOPROFILE0DEVRO01", "dev-ro")]),
+                ..Default::default()
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let msg = validate_custom_credential("aws-sts", &cred)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("profile") && msg.contains("profiles"), "{msg}");
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_malformed_key_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profiles: aws_profiles(&[("dev", "dev-ro")]),
+                ..Default::default()
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let msg = validate_custom_credential("aws-sts", &cred)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("aws-sts") && msg.contains("access key ID"),
+            "{msg}"
+        );
+    }
+
     #[test]
     fn test_aws_auth_empty_profile_rejected() {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some(String::new()),
+                profiles: None,
                 region: None,
                 service: None,
             }),
@@ -11493,6 +12593,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: Some(String::new()),
                 service: None,
             }),
@@ -11513,6 +12614,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: Some(String::new()),
             }),
@@ -11533,6 +12635,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: Some("us east-1".to_string()),
                 service: None,
             }),
@@ -11553,6 +12656,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: Some("bed rock".to_string()),
             }),
@@ -11598,6 +12702,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some("my profile".to_string()),
+                profiles: None,
                 region: None,
                 service: None,
             }),
@@ -11618,6 +12723,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some("my\tprofile".to_string()),
+                profiles: None,
                 region: None,
                 service: None,
             }),
@@ -11638,6 +12744,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some("MyCompany-Prod".to_string()),
+                profiles: None,
                 region: None,
                 service: None,
             }),
@@ -11653,6 +12760,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: Some("US-EAST-1".to_string()),
                 service: None,
             }),
@@ -11673,6 +12781,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: Some("Us-East-1".to_string()),
                 service: None,
             }),
@@ -11695,6 +12804,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: Some("Bedrock".to_string()),
             }),
@@ -11715,6 +12825,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: Some("S3".to_string()),
             }),
@@ -11735,6 +12846,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: None,
                 service: Some("workers-ai".to_string()),
             }),
@@ -11748,6 +12860,7 @@ mod tests {
         let cred = CustomCredentialDef {
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: None,
+                profiles: None,
                 region: Some("ap-southeast-2".to_string()),
                 service: Some("execute-api".to_string()),
             }),
@@ -12281,5 +13394,207 @@ mod tests {
                 .is_some_and(|u| u.allow_origins.contains(&"https://example.com".to_string())),
             "child override's own field must still apply"
         );
+    }
+
+    fn recording(json: serde_json::Value) -> SessionRecordingConfig {
+        serde_json::from_value(json).expect("valid session_recording block")
+    }
+
+    #[test]
+    fn session_recording_merge_can_only_raise() {
+        let base = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "enabled": true,
+                "required": true,
+                "input": "on",
+                "max_bytes": 4096,
+                "file": "/artifacts/base.cast",
+            }))),
+            ..Default::default()
+        };
+        let child = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "enabled": false,
+                "required": false,
+                "input": "off",
+                "max_bytes": 1024,
+                "file": "/artifacts/child.cast",
+            }))),
+            ..Default::default()
+        };
+        let merged = merge_profiles(base, child)
+            .session_recording
+            .expect("recording block kept");
+        assert_eq!(merged.enabled, Some(true));
+        assert_eq!(merged.required, Some(true));
+        assert_eq!(merged.input, Some(SessionRecordingInput::On));
+        assert_eq!(merged.max_bytes, Some(4096));
+        assert_eq!(merged.file.as_deref(), Some("/artifacts/base.cast"));
+    }
+
+    #[test]
+    fn inherited_recording_file_destinations_are_dropped() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("packaged.json"),
+            r#"{
+                "meta": { "name": "packaged" },
+                "extends": "default",
+                "session_recording": { "file": "/etc/cron.d/recording.cast" },
+                "platform_overrides": {
+                    "linux": { "session_recording": { "file": "/etc/linux.cast" } },
+                    "macos": { "session_recording": { "file": "/etc/macos.cast" } }
+                }
+            }"#,
+        )
+        .expect("write base");
+        let child_path = dir.path().join("local.json");
+        std::fs::write(
+            &child_path,
+            r#"{ "meta": { "name": "local" }, "extends": "packaged" }"#,
+        )
+        .expect("write child");
+        let recording = load_profile_from_path(&child_path)
+            .expect("load profile")
+            .session_recording
+            .expect("recording block kept");
+        assert_eq!(recording.file, None);
+        // The base turned recording on through its destination; it stays on.
+        assert!(recording.is_enabled());
+
+        // The selected profile's own destination is kept.
+        std::fs::write(
+            &child_path,
+            r#"{
+                "meta": { "name": "local" },
+                "extends": "packaged",
+                "session_recording": { "file": "/home/me/session.cast" }
+            }"#,
+        )
+        .expect("rewrite child");
+        let recording = load_profile_from_path(&child_path)
+            .expect("load profile")
+            .session_recording
+            .expect("recording block kept");
+        assert_eq!(recording.file.as_deref(), Some("/home/me/session.cast"));
+    }
+
+    #[test]
+    fn session_recording_child_can_turn_recording_on() {
+        let base = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "enabled": false,
+                "input": "off",
+            }))),
+            ..Default::default()
+        };
+        let child = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "required": true,
+                "max_bytes": 8192,
+                "file": "out.cast",
+            }))),
+            ..Default::default()
+        };
+        let merged = merge_profiles(base, child)
+            .session_recording
+            .expect("recording block kept");
+        assert!(merged.is_enabled());
+        assert_eq!(merged.required, Some(true));
+        assert_eq!(merged.input, Some(SessionRecordingInput::Off));
+        assert_eq!(merged.max_bytes, Some(8192));
+        assert_eq!(merged.file.as_deref(), Some("out.cast"));
+
+        let inherited = merge_profiles(
+            Profile {
+                session_recording: Some(recording(serde_json::json!({ "enabled": true }))),
+                ..Default::default()
+            },
+            Profile::default(),
+        );
+        assert!(inherited.session_recording.is_some_and(|r| r.is_enabled()));
+    }
+
+    #[test]
+    fn session_recording_rejects_unknown_and_later_phase_fields() {
+        for field in ["retention_days", "live", "bogus"] {
+            let json = format!(r#"{{ "session_recording": {{ "{field}": 1 }} }}"#);
+            assert!(
+                serde_json::from_str::<Profile>(&json).is_err(),
+                "session_recording.{field} must be rejected"
+            );
+        }
+        assert!(
+            serde_json::from_str::<Profile>(r#"{ "session_recording": { "input": "maybe" } }"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn session_recording_delivery_can_only_be_raised() {
+        let base = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "delivery": { "receiver": "platform", "required": true, "flush_timeout_secs": 30 }
+            }))),
+            ..Default::default()
+        };
+        let child = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "delivery": { "receiver": "platform", "required": false, "flush_timeout_secs": 5 }
+            }))),
+            ..Default::default()
+        };
+        let merged = merge_profiles(base, child)
+            .session_recording
+            .expect("recording block kept");
+        assert!(merged.is_enabled());
+        let delivery = merged.delivery.expect("delivery kept");
+        assert_eq!(delivery.required, Some(true));
+        assert_eq!(delivery.flush_timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn session_recording_validation_rejects_contradictions() {
+        for block in [
+            serde_json::json!({ "enabled": false, "required": true }),
+            serde_json::json!({ "enabled": false, "file": "x.cast" }),
+            serde_json::json!({ "max_bytes": 0 }),
+            serde_json::json!({ "file": "  " }),
+            serde_json::json!({ "delivery": { "receiver": "https://receiver.example" } }),
+            serde_json::json!({ "delivery": { "receiver": "platform", "flush_timeout_secs": 0 } }),
+            serde_json::json!({ "enabled": false, "delivery": { "receiver": "platform" } }),
+        ] {
+            let profile = Profile {
+                session_recording: Some(recording(block.clone())),
+                ..Default::default()
+            };
+            assert!(
+                validate_profile_session_recording(&profile).is_err(),
+                "{block} must be rejected"
+            );
+        }
+        let ok = Profile {
+            session_recording: Some(recording(serde_json::json!({
+                "required": true,
+                "input": "off",
+                "max_bytes": 1,
+                "file": "x.cast",
+            }))),
+            ..Default::default()
+        };
+        assert!(validate_profile_session_recording(&ok).is_ok());
+    }
+
+    #[test]
+    fn session_recording_is_validated_when_a_profile_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("recorded.json");
+        std::fs::write(
+            &path,
+            r#"{ "meta": { "name": "recorded" }, "session_recording": { "max_bytes": 0 } }"#,
+        )
+        .expect("write profile");
+        let err = load_profile_from_path(&path).expect_err("max_bytes 0 is invalid");
+        assert!(err.to_string().contains("session_recording"), "{err}");
     }
 }

@@ -15,6 +15,7 @@ use crate::config::{
     SpiffeAuthConfig,
 };
 use crate::error::{ProxyError, Result};
+use crate::token::PhantomTemplate;
 use nono::undo::{NetworkAuditAuthMechanism, NetworkAuditInjectionMode};
 use rustls::pki_types::pem::PemObject;
 use std::collections::HashMap;
@@ -82,6 +83,14 @@ pub struct LoadedRoute {
     /// Retained even when credential loading fails.
     pub requires_http1: bool,
 
+    /// `true` if the route signs requests with AWS SigV4 (`aws_auth`). Only
+    /// these routes may use `operations` in their endpoint policy.
+    pub aws_auth: bool,
+
+    /// Wildcard-region shape of an `aws_auth` upstream.
+    /// `Some` means the SigV4 region is derived from each request's host.
+    pub aws_wildcard: Option<crate::aws::endpoints::AwsUpstreamPattern>,
+
     /// Audit auth mechanism implied by the managed credential configuration.
     /// Kept even if credential material failed to load so fail-closed denial
     /// events can describe what auth shape the route expected.
@@ -103,6 +112,29 @@ pub struct LoadedRoute {
     pub rate_limiter: Option<std::sync::Arc<crate::rate_limit::RouteRateLimiter>>,
     /// See [`crate::config::RouteConfig::redeem_phantoms`].
     pub redeem_phantoms: Vec<String>,
+    /// Parsed [`crate::config::RouteConfig::phantom_format`].
+    pub phantom_template: Option<PhantomTemplate>,
+}
+
+impl LoadedRoute {
+    /// `true` if requests on this route must have their AWS operation
+    /// resolved before policy evaluation: `aws_auth` routes, and routes whose
+    /// policy has `operations` rules (load validation allows those only on
+    /// `aws_auth` routes and AWS upstreams).
+    #[must_use]
+    pub fn resolves_aws_operation(&self) -> bool {
+        self.aws_auth || self.endpoint_policy.has_operation_rules()
+    }
+
+    /// The phantom value a client must present on this route: the session token
+    /// wrapped in the route's template, or the bare token when none is set.
+    #[must_use]
+    pub fn expected_phantom(&self, session_token: &Zeroizing<String>) -> Zeroizing<String> {
+        match &self.phantom_template {
+            Some(t) => Zeroizing::new(t.render(session_token.as_str())),
+            None => session_token.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -116,6 +148,7 @@ impl std::fmt::Debug for LoadedRoute {
             .field("has_custom_tls_ca", &self.tls_connector.is_some())
             .field("requires_intercept", &self.requires_intercept)
             .field("requires_http1", &self.requires_http1)
+            .field("aws_auth", &self.aws_auth)
             .field(
                 "requires_managed_credential",
                 &self.requires_managed_credential,
@@ -123,7 +156,8 @@ impl std::fmt::Debug for LoadedRoute {
             .field("managed_auth_mechanism", &self.managed_auth_mechanism)
             .field("managed_injection_mode", &self.managed_injection_mode)
             .field("has_rate_limiter", &self.rate_limiter.is_some())
-            .field("redeem_phantoms", &self.redeem_phantoms);
+            .field("redeem_phantoms", &self.redeem_phantoms)
+            .field("phantom_template", &self.phantom_template);
         let managed_auth_type = self.managed_auth.as_ref().map(|a| match a.as_ref() {
             crate::auth::ManagedUpstreamAuth::SpiffeJwt(_) => "spiffe_jwt",
         });
@@ -209,12 +243,41 @@ impl RouteStore {
     /// does a regex match, not a glob compile. Routes with a `tls_ca` field
     /// get a per-route TLS connector built from the custom CA certificate.
     pub async fn load(routes: &[RouteConfig]) -> Result<Self> {
+        Self::load_with_registry(routes, None).await
+    }
+
+    /// Like [`Self::load`], additionally registering every SPIFFE JWT-SVID the
+    /// proxy injects on a route in `secret_registry` (NEP-0010 §3.1). `None`
+    /// behaves exactly like `load`.
+    pub async fn load_with_registry(
+        routes: &[RouteConfig],
+        secret_registry: Option<&crate::secret_registry::SecretRegistry>,
+    ) -> Result<Self> {
         let mut loaded = HashMap::new();
 
         let base_root_store = build_base_root_store();
 
+        // Two different routes under one prefix would leave only the last one
+        // loaded, silently dropping the other's endpoint policy. Identical
+        // repeats are harmless and skipped.
+        let mut seen: HashMap<String, serde_json::Value> = HashMap::new();
+
         for route in routes {
             let normalized_prefix = route.prefix.trim_matches('/').to_string();
+            let fingerprint = serde_json::to_value(route)
+                .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
+            match seen.get(&normalized_prefix) {
+                Some(existing) if *existing == fingerprint => continue,
+                Some(_) => {
+                    return Err(ProxyError::Config(format!(
+                        "route '{}' is configured more than once with different settings",
+                        normalized_prefix
+                    )));
+                }
+                None => {
+                    seen.insert(normalized_prefix.clone(), fingerprint);
+                }
+            }
 
             debug!(
                 "Loading route '{}' -> {}",
@@ -228,6 +291,13 @@ impl RouteStore {
                 &route.endpoint_rules,
             )
             .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
+            if endpoint_policy.has_operation_rules() {
+                crate::aws::endpoints::validate_operations_upstream(
+                    &route.upstream,
+                    route.aws_auth.is_some(),
+                )
+                .map_err(|e| ProxyError::Config(format!("route '{}': {e}", normalized_prefix)))?;
+            }
             let upgrade_rules = CompiledUpgradeRules::compile(&route.upgrades)
                 .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
 
@@ -295,6 +365,38 @@ impl RouteStore {
                 )));
             }
 
+            // A session phantom is only validated on routes that inject a
+            // credential; elsewhere the field would be silently ignored.
+            let phantom_template = match route.phantom_format.as_deref() {
+                None => None,
+                Some(fmt) => {
+                    if route.credential_key.is_none() && route.oauth2.is_none() {
+                        return Err(ProxyError::Config(format!(
+                            "route '{}': `phantom_format` requires `credential_key` or `oauth2` (not valid with `aws_auth`, `spiffe`, or `redeem_phantoms` alone)",
+                            normalized_prefix
+                        )));
+                    }
+                    Some(PhantomTemplate::parse_route(fmt).map_err(|e| {
+                        ProxyError::Config(format!("route '{}': {e}", normalized_prefix))
+                    })?)
+                }
+            };
+
+            // A multi-profile route selects its identity from the agent's
+            // access key ID; reject maps that could never match, and a
+            // `profile` that would otherwise be silently ignored.
+            if let Some(profiles) = route.aws_auth.as_ref().and_then(|a| a.profiles.as_ref()) {
+                if route.aws_auth.as_ref().is_some_and(|a| a.profile.is_some()) {
+                    return Err(ProxyError::Config(format!(
+                        "route '{}': `aws_auth.profile` and `aws_auth.profiles` are mutually exclusive",
+                        normalized_prefix
+                    )));
+                }
+                crate::config::validate_aws_auth_profiles(profiles).map_err(|e| {
+                    ProxyError::Config(format!("route '{}': {}", normalized_prefix, e))
+                })?;
+            }
+
             // Connect to the SPIRE Workload API for SPIFFE routes. This blocks
             // startup (fail-closed) if the socket is unreachable within the
             // initial_sync_timeout configured on the source builder.
@@ -322,6 +424,12 @@ impl RouteStore {
                     .map_err(|e| {
                         ProxyError::Config(format!("route '{}': {e}", normalized_prefix))
                     })?;
+                    let src = match secret_registry {
+                        Some(registry) => {
+                            src.with_secret_registry(registry.clone(), &normalized_prefix)
+                        }
+                        None => src,
+                    };
                     Some(Arc::new(crate::auth::ManagedUpstreamAuth::SpiffeJwt(
                         Arc::new(src),
                     )))
@@ -337,6 +445,17 @@ impl RouteStore {
                 || !route.redeem_phantoms.is_empty()
                 || !endpoint_policy.allows_all_without_l7()
                 || !upgrade_rules.is_empty();
+            let aws_wildcard = match &route.aws_auth {
+                Some(aws_auth) => {
+                    crate::aws::endpoints::validate_aws_upstream(&route.upstream, aws_auth)
+                        .map_err(|e| {
+                            ProxyError::Config(format!("route '{}': {e}", normalized_prefix))
+                        })?
+                }
+                None => None,
+            };
+            // Operations are resolved only on the HTTP/1.1 path.
+            let requires_http1 = route.aws_auth.is_some() || endpoint_policy.has_operation_rules();
             let managed_auth_mechanism = auth_mechanism_for_route(route);
             let managed_injection_mode = injection_mode_for_route(route);
 
@@ -362,12 +481,15 @@ impl RouteStore {
                     tls_config_key,
                     requires_intercept,
                     requires_managed_credential,
-                    requires_http1: route.aws_auth.is_some(),
+                    requires_http1,
+                    aws_auth: route.aws_auth.is_some(),
+                    aws_wildcard,
                     managed_auth_mechanism,
                     managed_injection_mode,
                     managed_auth,
                     rate_limiter,
                     redeem_phantoms: route.redeem_phantoms.clone(),
+                    phantom_template,
                 },
             );
         }
@@ -444,6 +566,52 @@ impl RouteStore {
                     .upstream_host_port
                     .as_ref()
                     .is_some_and(|hp| host_port_matches(hp, &normalised))
+            })
+            .map(|(prefix, route)| (prefix.as_str(), route))
+            .collect();
+        matches.sort_by_key(|(prefix, _)| *prefix);
+        matches
+    }
+
+    /// Return all routes whose endpoint policy can constrain a plain-HTTP
+    /// forward-proxy request to `host:port`.
+    ///
+    /// The absolute-form forward path (`handle_forward_http`) sees
+    /// `http://host:port/…` targets. A route is a candidate when its upstream
+    /// host matches (wildcard-aware, same grammar as the host filter) and
+    /// either its upstream port equals the request port, or the request uses
+    /// the plain-HTTP default port 80 and the route is the port-443 `https`
+    /// upstream of the same host: `allow_domain` entries with endpoints (and
+    /// URL-form `--allow-domain 'https://host/path'`) always compile to
+    /// `https` upstreams, so without that alias every `http://` request would
+    /// bypass the rules entirely (issue #2174). Loopback routes keep their
+    /// explicit port (often an `http://` upstream on a non-default port), so
+    /// different local services on the same host never gate each other.
+    #[must_use]
+    pub fn lookup_forward_endpoint_candidates(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Vec<(&str, &LoadedRoute)> {
+        let normalised_host = match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
+            Ok(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
+            Err(_) => nono::net_filter::HostFilter::normalize_authority_host(host),
+        };
+        let request_port = port.to_string();
+        let mut matches: Vec<_> = self
+            .routes
+            .iter()
+            .filter(|(_, route)| {
+                route
+                    .upstream_host_port
+                    .as_ref()
+                    .and_then(|hp| hp.rsplit_once(':'))
+                    .is_some_and(|(pattern_host, pattern_port)| {
+                        nono::net_filter::host_pattern_matches(pattern_host, &normalised_host)
+                            && (pattern_port == request_port
+                                || (port == 80 && pattern_port == "443"))
+                    })
             })
             .map(|(prefix, route)| (prefix.as_str(), route))
             .collect();
@@ -955,6 +1123,61 @@ fn build_tls_connector_with_ca(ca_path: &str) -> Result<tokio_rustls::TlsConnect
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    fn phantom_route(phantom_format: Option<&str>, credential_key: Option<&str>) -> RouteConfig {
+        RouteConfig {
+            prefix: "github".to_string(),
+            upstream: "https://api.github.com".to_string(),
+            credential_key: credential_key.map(str::to_string),
+            phantom_format: phantom_format.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_phantom_format_loads_and_renders() {
+        let store = RouteStore::load(&[phantom_route(Some("ghp_{}"), Some("env://GH"))])
+            .await
+            .unwrap();
+        let route = store.get("github").unwrap();
+        let token = Zeroizing::new("t".repeat(64));
+        assert_eq!(
+            route.expected_phantom(&token).as_str(),
+            format!("ghp_{}", "t".repeat(64))
+        );
+        let dbg = format!("{route:?}");
+        assert!(!dbg.contains(&"t".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn test_no_phantom_format_expects_bare_token() {
+        let store = RouteStore::load(&[phantom_route(None, Some("env://GH"))])
+            .await
+            .unwrap();
+        let token = Zeroizing::new("tok".to_string());
+        assert_eq!(
+            store
+                .get("github")
+                .unwrap()
+                .expected_phantom(&token)
+                .as_str(),
+            "tok"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_phantom_format_rejects_bad_template_and_credentialless_route() {
+        assert!(
+            RouteStore::load(&[phantom_route(Some("Bearer {}"), Some("env://GH"))])
+                .await
+                .is_err()
+        );
+        assert!(
+            RouteStore::load(&[phantom_route(Some("ghp_{}"), None)])
+                .await
+                .is_err()
+        );
+    }
     use super::*;
     use crate::config::EndpointRule;
 
@@ -982,6 +1205,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![
                 EndpointRule {
                     method: "POST".to_string(),
@@ -1036,6 +1260,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1068,6 +1293,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1083,6 +1309,76 @@ mod tests {
         let store = RouteStore::load(&routes).await.unwrap();
         assert!(store.is_route_upstream("api.openai.com:443"));
         assert!(!store.is_route_upstream("github.com:443"));
+    }
+
+    /// Candidates for the plain-HTTP forward path (issue #2174): exact-port
+    /// matches always apply; port-80 requests also see the port-443 `https`
+    /// upstream of the same host; other ports on the same host do not gate
+    /// each other (loopback services on distinct ports stay independent).
+    #[tokio::test]
+    async fn test_forward_endpoint_candidates() {
+        fn route(prefix: &str, upstream: &str) -> RouteConfig {
+            RouteConfig {
+                redeem_phantoms: Vec::new(),
+                prefix: prefix.to_string(),
+                upstream: upstream.to_string(),
+                credential_key: None,
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                phantom_format: None,
+                endpoint_rules: vec![EndpointRule {
+                    method: "GET".to_string(),
+                    path: "/get".to_string(),
+                }],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+                upgrades: vec![],
+                rate_limit: None,
+            }
+        }
+
+        let routes = vec![
+            route("api", "https://api.example.com"),
+            route("local", "http://127.0.0.1:3000"),
+            route("wild", "https://*.example.com"),
+        ];
+        let store = RouteStore::load(&routes).await.unwrap();
+
+        let prefixes = |host: &str, port: u16| -> Vec<String> {
+            store
+                .lookup_forward_endpoint_candidates(host, port)
+                .into_iter()
+                .map(|(prefix, _)| prefix.to_string())
+                .collect()
+        };
+
+        // Exact upstream port match.
+        assert_eq!(prefixes("api.example.com", 443), vec!["api", "wild"]);
+        // Plain-HTTP default port 80 sees the https (443) upstream of the
+        // same host — the issue #2174 bypass.
+        assert_eq!(prefixes("api.example.com", 80), vec!["api", "wild"]);
+        // Wildcard route upstreams match subdomains.
+        assert_eq!(prefixes("other.example.com", 80), vec!["wild"]);
+        // Unrelated hosts never match.
+        assert!(prefixes("example.org", 80).is_empty());
+        // Other ports on the same host don't gate each other (loopback
+        // services on distinct ports stay independent).
+        assert!(prefixes("api.example.com", 8080).is_empty());
+        // Loopback route keeps its explicit port.
+        assert_eq!(prefixes("127.0.0.1", 3000), vec!["local"]);
+        assert!(prefixes("127.0.0.1", 80).is_empty());
+        assert!(prefixes("127.0.0.1", 9999).is_empty());
     }
 
     #[tokio::test]
@@ -1101,6 +1397,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1125,6 +1422,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1212,6 +1510,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1258,6 +1557,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1334,6 +1634,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aws_auth_profiles_misconfiguration_rejected_by_route_store() {
+        // The library validates aws_auth.profiles itself: a direct consumer of
+        // nono-proxy must not get a silently-ignored `profile` or an
+        // unmatchable map.
+        for aws_auth in [
+            serde_json::json!({
+                "profile": "dev-ro",
+                "profiles": {"NONOPROFILE0DEVRO01": "dev-ro"}
+            }),
+            serde_json::json!({ "profiles": {} }),
+            serde_json::json!({ "profiles": {"nonoprofile0devro01": "dev-ro"} }),
+        ] {
+            let route: RouteConfig = serde_json::from_value(serde_json::json!({
+                "prefix": "sts",
+                "upstream": "https://sts.us-east-1.amazonaws.com",
+                "aws_auth": aws_auth,
+            }))
+            .unwrap();
+            let err = RouteStore::load(&[route]).await.err();
+            assert!(
+                matches!(err, Some(ProxyError::Config(ref m)) if m.contains("profiles")),
+                "{aws_auth}: expected config error, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn http1_required_for_all_matching_aws_routes() {
         let aws: RouteConfig = serde_json::from_value(serde_json::json!({
             "prefix": "z-aws",
@@ -1377,6 +1704,7 @@ mod tests {
     fn test_loaded_route_debug() {
         let route = LoadedRoute {
             redeem_phantoms: Vec::new(),
+            phantom_template: None,
             upstream: "https://api.openai.com".to_string(),
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
@@ -1388,6 +1716,8 @@ mod tests {
             requires_intercept: false,
             requires_managed_credential: false,
             requires_http1: false,
+            aws_auth: false,
+            aws_wildcard: None,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
@@ -1417,6 +1747,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1458,6 +1789,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: Some("INTERNAL_API_TOKEN".to_string()),
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1504,6 +1836,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![EndpointRule {
                 method: "GET".to_string(),
                 path: "/v1/items".to_string(),
@@ -1543,6 +1876,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1576,6 +1910,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1614,6 +1949,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1630,10 +1966,91 @@ mod tests {
         assert!(err.to_string().contains("redeem_phantoms"));
     }
 
+    fn operations_route(aws: bool) -> RouteConfig {
+        RouteConfig {
+            aws_auth: aws.then(crate::config::AwsAuthConfig::default),
+            prefix: "ssm".to_string(),
+            upstream: "https://ssm.us-east-1.amazonaws.com".to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            phantom_format: None,
+            endpoint_rules: vec![],
+            endpoint_policy: Some(crate::config::EndpointPolicyConfig {
+                allow: vec![crate::config::EndpointPolicyRule {
+                    method: "POST".to_string(),
+                    path: "/".to_string(),
+                    backend: None,
+                    reason: None,
+                    timeout_secs: None,
+                    operations: Some(vec!["Describe*".to_string()]),
+                }],
+                ..Default::default()
+            }),
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            spiffe: None,
+            rate_limit: None,
+            upgrades: vec![],
+            redeem_phantoms: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_operations_load_on_credential_free_aws_route() {
+        let store = RouteStore::load(&[operations_route(false)]).await.unwrap();
+        let (_, route) = store
+            .lookup_by_upstream("ssm.us-east-1.amazonaws.com:443")
+            .unwrap();
+        assert!(!route.aws_auth);
+        assert!(!route.requires_managed_credential);
+        assert!(route.resolves_aws_operation());
+        assert!(store.requires_http1("ssm.us-east-1.amazonaws.com:443"));
+    }
+
+    #[tokio::test]
+    async fn test_operations_rejected_on_non_aws_upstream() {
+        let mut route = operations_route(false);
+        route.upstream = "https://evilamazonaws.com".to_string();
+        let err = RouteStore::load(&[route])
+            .await
+            .expect_err("operations on a non-AWS upstream must be rejected");
+        assert!(err.to_string().contains("AWS upstream"));
+    }
+
+    #[tokio::test]
+    async fn test_route_without_operations_does_not_resolve_them() {
+        let mut route = operations_route(false);
+        route.endpoint_policy = None;
+        let store = RouteStore::load(&[route]).await.unwrap();
+        let (_, route) = store
+            .lookup_by_upstream("ssm.us-east-1.amazonaws.com:443")
+            .unwrap();
+        assert!(!route.resolves_aws_operation());
+    }
+
+    #[tokio::test]
+    async fn test_operations_loads_with_aws_auth() {
+        let store = RouteStore::load(&[operations_route(true)]).await.unwrap();
+        let (_, route) = store
+            .lookup_by_upstream("ssm.us-east-1.amazonaws.com:443")
+            .unwrap();
+        assert!(route.aws_auth);
+    }
+
     #[tokio::test]
     async fn test_missing_managed_credential_policy() {
         let managed = LoadedRoute {
             redeem_phantoms: Vec::new(),
+            phantom_template: None,
             upstream: "https://api.openai.com".to_string(),
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
@@ -1645,6 +2062,8 @@ mod tests {
             requires_intercept: true,
             requires_managed_credential: true,
             requires_http1: false,
+            aws_auth: false,
+            aws_wildcard: None,
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
             managed_auth: None,
@@ -1658,6 +2077,7 @@ mod tests {
 
         let l7_only = LoadedRoute {
             redeem_phantoms: Vec::new(),
+            phantom_template: None,
             upstream: "https://internal.example.com".to_string(),
             upstream_host_port: Some("internal.example.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
@@ -1669,6 +2089,8 @@ mod tests {
             requires_intercept: true,
             requires_managed_credential: false,
             requires_http1: false,
+            aws_auth: false,
+            aws_wildcard: None,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
@@ -1692,6 +2114,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -1712,6 +2135,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_rejects_conflicting_duplicate_prefixes() {
+        let route = |path: &str| RouteConfig {
+            prefix: "_ep_github.com".to_string(),
+            upstream: "https://github.com".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "*".to_string(),
+                path: path.to_string(),
+            }],
+            ..RouteConfig::default()
+        };
+        assert!(
+            RouteStore::load(&[route("/a/**"), route("/a/**")])
+                .await
+                .is_ok()
+        );
+        let err = RouteStore::load(&[route("/a/**"), route("/b/**")])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[tokio::test]
     async fn test_lookup_all_by_upstream_returns_multiple_routes() {
         let routes = vec![
             RouteConfig {
@@ -1727,6 +2172,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("GH_TOKEN_A".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "*".to_string(),
                     path: "/org-a/**".to_string(),
@@ -1754,6 +2200,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("GH_TOKEN_B".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "*".to_string(),
                     path: "/org-b/**".to_string(),
@@ -1835,6 +2282,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some(env.to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "*".to_string(),
                     path: path.to_string(),
@@ -2252,6 +2700,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -2286,5 +2735,72 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         .unwrap();
         let store = RouteStore::load(&[route]).await.unwrap();
         assert!(store.get("chat").unwrap().requires_intercept);
+    }
+
+    fn wildcard_aws_route(upstream: &str, region: Option<&str>) -> RouteConfig {
+        serde_json::from_value(serde_json::json!({
+            "prefix": "eks",
+            "upstream": upstream,
+            "aws_auth": {"region": region, "service": "eks"},
+            "endpoint_rules": [{"method": "GET", "path": "/clusters"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn load_accepts_wildcard_region_aws_route() {
+        let store = RouteStore::load(&[wildcard_aws_route("https://eks.*.amazonaws.com", None)])
+            .await
+            .unwrap();
+        assert!(store.requires_http1("eks.us-west-2.amazonaws.com:443"));
+        assert!(!store.requires_http1("eks.us-west-2.amazonaws.com:8443"));
+        assert!(!store.requires_http1("a.eks.us-west-2.amazonaws.com:443"));
+        let route = store
+            .lookup_all_by_upstream("eks.us-west-2.amazonaws.com:443")
+            .into_iter()
+            .next()
+            .unwrap()
+            .1;
+        assert_eq!(
+            route.aws_wildcard.as_ref().map(|p| p.service_label()),
+            Some("eks")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_rejects_malformed_wildcard_aws_routes() {
+        for (upstream, region) in [
+            ("https://eks.*.amazonaws.com", Some("us-east-1")),
+            ("https://*.s3.*.amazonaws.com", Some("us-east-1")),
+            ("https://*.s3.*.amazonaws.com.cn", Some("cn-north-1")),
+            ("https://eks.*.amazonaws.eu", None),
+            ("https://*.amazonaws.com", None),
+        ] {
+            let err = RouteStore::load(&[wildcard_aws_route(upstream, region)])
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{upstream} {region:?} should be rejected"));
+            assert!(matches!(err, ProxyError::Config(_)), "{err:?}");
+        }
+    }
+
+    /// A wildcard route and a concrete route for the same service both match,
+    /// so selection stays ambiguous (fail closed) rather than picking one.
+    #[tokio::test]
+    async fn wildcard_and_concrete_aws_routes_are_ambiguous() {
+        let mut concrete = wildcard_aws_route("https://eks.us-east-1.amazonaws.com", None);
+        concrete.prefix = "eks-east".to_string();
+        let store = RouteStore::load(&[
+            wildcard_aws_route("https://eks.*.amazonaws.com", None),
+            concrete,
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .lookup_all_by_upstream("eks.us-east-1.amazonaws.com:443")
+                .len(),
+            2
+        );
     }
 }

@@ -20,12 +20,17 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
 
     fs::write(
         &profile,
-        r#"{
-            "filesystem": {
-                "allow": ["$WORKDIR"],
-                "deny": ["$WORKDIR/blocked.txt"]
-            }
-        }"#,
+        format!(
+            r#"{{
+                "filesystem": {{
+                    "allow": ["$WORKDIR"],
+                    "read_file": ["{nono}"],
+                    "deny": ["$WORKDIR/blocked.txt"]
+                }}
+            }}"#,
+            // macOS scopes exec to the read set, so the sandboxed binary must be readable.
+            nono = env!("CARGO_BIN_EXE_nono")
+        ),
     )
     .expect("write profile");
 

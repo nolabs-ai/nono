@@ -124,7 +124,7 @@ impl TerminalApproval {
                 reason,
                 ..
             } => {
-                prompt_line!("[nono] The sandboxed process is requesting network access:");
+                prompt_line!("[nono] A connection through the nono proxy needs approval:");
                 prompt_line!("[nono]   Host:     {}", sanitize_for_terminal(host));
                 prompt_line!("[nono]   Port:     {port}");
                 prompt_line!("[nono]   Protocol: {protocol}");
@@ -159,19 +159,44 @@ impl TerminalApproval {
                     prompt_line!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
+            ApprovalRequest::UnixSocket {
+                path, op, reason, ..
+            } => {
+                prompt_line!("[nono] The sandboxed process is requesting unix socket access:");
+                prompt_line!(
+                    "[nono]   Socket: {}",
+                    sanitize_for_terminal(&path.display().to_string())
+                );
+                prompt_line!("[nono]   Op:     {op}");
+                if let Some(r) = reason {
+                    prompt_line!("[nono]   Reason: {}", sanitize_for_terminal(r));
+                }
+            }
             ApprovalRequest::Endpoint {
                 route_id,
+                credential_route,
                 upstream,
                 method,
                 path,
                 rule_label,
+                operation,
                 reason,
                 ..
             } => {
                 prompt_line!("[nono] Proxy endpoint access requires approval:");
                 prompt_line!("[nono]   Route:   {}", sanitize_for_terminal(route_id));
+                prompt_line!(
+                    "[nono]   Credential: {}",
+                    credential_route
+                        .as_deref()
+                        .map(sanitize_for_terminal)
+                        .unwrap_or_else(|| "none".to_string())
+                );
                 prompt_line!("[nono]   Method:  {}", sanitize_for_terminal(method));
                 prompt_line!("[nono]   Path:    {}", sanitize_for_terminal(path));
+                for line in endpoint_operation_lines(operation.as_deref()) {
+                    prompt_line!("{line}");
+                }
                 prompt_line!("[nono]   Upstream: {}", sanitize_for_terminal(upstream));
                 prompt_line!("[nono]   Rule:    {}", sanitize_for_terminal(rule_label));
                 if let Some(r) = reason {
@@ -181,10 +206,16 @@ impl TerminalApproval {
         }
         prompt_line!("[nono]");
 
-        // Network prompts offer session-scoped choices so an "always" answer
-        // suppresses re-prompting for the rest of the session. Every other
-        // request type keeps the one-shot [y/N] prompt.
-        let is_network = matches!(request, ApprovalRequest::Network { .. });
+        // Network, unix socket, and endpoint prompts offer session-scoped
+        // choices so an "always" answer suppresses re-prompting for the rest
+        // of the session (for endpoints, within the rule scope shown). Every
+        // other request type keeps the one-shot [y/N] prompt.
+        let is_network = matches!(
+            request,
+            ApprovalRequest::Network { .. }
+                | ApprovalRequest::UnixSocket { .. }
+                | ApprovalRequest::Endpoint { .. }
+        );
         let prompt = if is_network {
             prompt_line!("[nono]   1) Allow once");
             prompt_line!("[nono]   2) Always allow (this session)");
@@ -238,6 +269,103 @@ impl TerminalApproval {
     }
 }
 
+/// Tell the user that a non-interactive approval backend (a webhook or the
+/// platform) is deciding `request`, so a stalled agent is not a mystery.
+///
+/// Best effort: returns false without printing when an interactive prompt
+/// currently holds the terminal, so the notice never lands inside another
+/// request's prompt. The caller pairs a true return with
+/// [`announce_backend_decision`].
+pub(crate) fn announce_backend_query(
+    backend: &str,
+    request: &ApprovalRequest,
+    timeout: Duration,
+) -> bool {
+    let Ok(_guard) = APPROVAL_PROMPT_LOCK.try_lock() else {
+        return false;
+    };
+    prompt_line!();
+    for line in backend_query_lines(backend, request, timeout) {
+        prompt_line!("{line}");
+    }
+    true
+}
+
+/// Report the outcome of a query announced with [`announce_backend_query`].
+pub(crate) fn announce_backend_decision(backend: &str, decision: &Result<ApprovalDecision>) {
+    let Ok(_guard) = APPROVAL_PROMPT_LOCK.try_lock() else {
+        return;
+    };
+    prompt_line!("{}", backend_decision_line(backend, decision));
+}
+
+fn backend_query_lines(backend: &str, request: &ApprovalRequest, timeout: Duration) -> [String; 2] {
+    [
+        format!(
+            "[nono] Waiting for approval backend '{}' (up to {}s)...",
+            sanitize_for_terminal(backend),
+            timeout.as_secs()
+        ),
+        format!("[nono]   Request: {}", request_summary(request)),
+    ]
+}
+
+fn backend_decision_line(backend: &str, decision: &Result<ApprovalDecision>) -> String {
+    let backend = sanitize_for_terminal(backend);
+    match decision {
+        Ok(ApprovalDecision::Granted) => {
+            format!("[nono] Approval backend '{backend}' granted the request.")
+        }
+        Ok(ApprovalDecision::GrantedForSession) => {
+            format!("[nono] Approval backend '{backend}' granted the request for this session.")
+        }
+        Ok(ApprovalDecision::Denied { reason }) => format!(
+            "[nono] Approval backend '{backend}' denied the request: {}",
+            sanitize_for_terminal(reason)
+        ),
+        Ok(ApprovalDecision::DeniedForSession) => {
+            format!("[nono] Approval backend '{backend}' denied the request for this session.")
+        }
+        Ok(ApprovalDecision::Timeout) => {
+            format!("[nono] Approval backend '{backend}' timed out; access denied.")
+        }
+        Err(_) => format!("[nono] Approval backend '{backend}' failed; access denied."),
+    }
+}
+
+/// One-line, terminal-safe description of what `request` asks for. Omits
+/// free-text reasons and endpoint paths (which may carry query strings).
+fn request_summary(request: &ApprovalRequest) -> String {
+    match request {
+        ApprovalRequest::Capability { path, access, .. } => format!(
+            "{} access to {}",
+            format_access_mode(access),
+            sanitize_for_terminal(&path.display().to_string())
+        ),
+        ApprovalRequest::Network { host, port, .. } => {
+            format!("connection to {}:{port}", sanitize_for_terminal(host))
+        }
+        ApprovalRequest::Command { command, .. } => {
+            format!("launch of {}", sanitize_for_terminal(command))
+        }
+        ApprovalRequest::UnixSocket { path, op, .. } => format!(
+            "unix socket {op} on {}",
+            sanitize_for_terminal(&path.display().to_string())
+        ),
+        ApprovalRequest::Endpoint {
+            method,
+            upstream,
+            route_id,
+            ..
+        } => format!(
+            "{} {} (route {})",
+            sanitize_for_terminal(method),
+            sanitize_for_terminal(upstream),
+            sanitize_for_terminal(route_id)
+        ),
+    }
+}
+
 fn acquire_prompt_slot(lock: &Mutex<()>, deadline: Instant) -> Result<Option<MutexGuard<'_, ()>>> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -271,6 +399,21 @@ fn is_affirmative_response(response: &str) -> bool {
 /// - DCS (ESC P), APC (ESC _), PM (ESC ^), SOS (ESC X): all consume through ST
 ///
 /// All control characters (0x00-0x1F, 0x7F) are replaced with space.
+/// Prompt lines for the AWS operation of an endpoint approval request.
+fn endpoint_operation_lines(operation: Option<&str>) -> Vec<String> {
+    let Some(op) = operation else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!("[nono]   Operation: {}", sanitize_for_terminal(op))];
+    if op == nono_proxy::config::UNKNOWN_OPERATION {
+        lines.push(
+            "[nono]   (could not be determined; approving allows an unidentified AWS call)"
+                .to_string(),
+        );
+    }
+    lines
+}
+
 pub(crate) fn sanitize_for_terminal(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -324,9 +467,116 @@ fn format_access_mode(access: &AccessMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn operation_lines_cover_absent_named_unknown_and_hostile() {
+        assert!(endpoint_operation_lines(None).is_empty());
+        assert_eq!(
+            endpoint_operation_lines(Some("TerminateInstances")),
+            vec!["[nono]   Operation: TerminateInstances".to_string()]
+        );
+        let unknown = endpoint_operation_lines(Some("Unknown"));
+        assert_eq!(unknown.len(), 2);
+        assert!(unknown[1].contains("could not be determined"));
+        let hostile = endpoint_operation_lines(Some("Op\x1b[31m\nFake"));
+        assert!(
+            hostile
+                .iter()
+                .all(|l| !l.contains('\x1b') && l.lines().count() == 1)
+        );
+    }
+
     use super::*;
     use nono::{AccessMode, ApprovalRequest};
     use std::io::IsTerminal;
+
+    /// Serializes tests that reach `TerminalApproval::prompt`: they share the
+    /// process-wide `APPROVAL_PROMPT_LOCK`, and one test asserts it is free.
+    static PROMPT_TESTS: Mutex<()> = Mutex::new(());
+
+    fn prompt_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        PROMPT_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn backend_query_notice_names_backend_timeout_and_request() {
+        let lines = backend_query_lines("platform", &network_request(), Duration::from_secs(60));
+        assert_eq!(
+            lines[0],
+            "[nono] Waiting for approval backend 'platform' (up to 60s)..."
+        );
+        assert_eq!(
+            lines[1],
+            "[nono]   Request: connection to api.example.com:443"
+        );
+
+        let cases = [
+            (capability_request(), "read+write access to /tmp/test"),
+            (command_request(), "launch of git"),
+            (
+                unix_socket_request(),
+                "unix socket connect on /tmp/test.sock",
+            ),
+            (
+                endpoint_request(),
+                "POST https://api.internal.example (route internal-api)",
+            ),
+        ];
+        for (request, expected) in cases {
+            assert_eq!(request_summary(&request), expected);
+        }
+    }
+
+    #[test]
+    fn backend_notices_strip_terminal_escapes() {
+        let hostile = ApprovalRequest::Network {
+            request_id: "net-002".to_string(),
+            host: "evil\x1b]0;pwned\x07.example\n[nono] Access granted.".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+            resolved_ips: Vec::new(),
+            reason: None,
+            child_pid: 42,
+            session_id: "sess-001".to_string(),
+        };
+        let lines = backend_query_lines("hook\x1b[2J", &hostile, Duration::from_secs(5));
+        let denied = backend_decision_line(
+            "hook",
+            &Ok(ApprovalDecision::Denied {
+                reason: "no\x1b[31m\nway".to_string(),
+            }),
+        );
+        for line in lines.iter().chain(std::iter::once(&denied)) {
+            assert!(!line.contains('\x1b') && !line.contains('\x07') && !line.contains('\n'));
+        }
+    }
+
+    #[test]
+    fn backend_decision_line_covers_every_outcome() {
+        let line = |d| backend_decision_line("b", &d);
+        assert!(line(Ok(ApprovalDecision::Granted)).ends_with("granted the request."));
+        assert!(line(Ok(ApprovalDecision::GrantedForSession)).contains("for this session"));
+        assert!(line(Ok(ApprovalDecision::DeniedForSession)).contains("denied"));
+        assert!(line(Ok(ApprovalDecision::Timeout)).contains("timed out"));
+        assert!(
+            line(Err(NonoError::SandboxInit("secret detail".to_string())))
+                .ends_with("failed; access denied."),
+            "errors are summarized, not echoed"
+        );
+    }
+
+    #[test]
+    fn backend_query_notice_yields_to_an_active_prompt() {
+        let _guard = prompt_test_guard();
+        let held = APPROVAL_PROMPT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(!announce_backend_query(
+            "platform",
+            &network_request(),
+            Duration::from_secs(1)
+        ));
+        drop(held);
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -371,11 +621,24 @@ mod tests {
         ApprovalRequest::Endpoint {
             request_id: "endpoint-001".to_string(),
             route_id: "internal-api".to_string(),
+            credential_route: None,
             upstream: "https://api.internal.example".to_string(),
             method: "POST".to_string(),
             path: "/v1/tasks/1/comments".to_string(),
             rule_label: "endpoint_policy.approve[POST /v1/tasks/*/comments]".to_string(),
+            operation: None,
             reason: Some("comment write".to_string()),
+            child_pid: 42,
+            session_id: "sess-001".to_string(),
+        }
+    }
+
+    fn unix_socket_request() -> ApprovalRequest {
+        ApprovalRequest::UnixSocket {
+            request_id: "unix-001".to_string(),
+            path: "/tmp/test.sock".into(),
+            op: nono::UnixSocketOp::Connect,
+            reason: None,
             child_pid: 42,
             session_id: "sess-001".to_string(),
         }
@@ -413,6 +676,7 @@ mod tests {
 
     #[test]
     fn timed_out_terminal_attempt_finishes_before_another_prompt_starts() {
+        let _serial = prompt_test_guard();
         use crate::terminal_prompt::read_consent_line_from;
         use nix::pty::{OpenptyResult, openpty};
         use std::sync::mpsc;
@@ -471,7 +735,7 @@ mod tests {
         assert!(matches!(second, ApprovalDecision::Timeout));
     }
 
-    // ── non-TTY auto-deny (all three variants) ────────────────────────────────
+    // ── non-TTY auto-deny ────────────────────────────────────────────────────
     //
     // When stderr is not a terminal (e.g. in CI or when redirected), the
     // backend must return Denied for every request type without attempting to
@@ -480,6 +744,7 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_capability_request() {
+        let _serial = prompt_test_guard();
         if std::io::stderr().is_terminal() {
             return;
         }
@@ -495,6 +760,7 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_network_request() {
+        let _serial = prompt_test_guard();
         if std::io::stderr().is_terminal() {
             return;
         }
@@ -507,6 +773,7 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_command_request() {
+        let _serial = prompt_test_guard();
         if std::io::stderr().is_terminal() {
             return;
         }
@@ -519,6 +786,7 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_endpoint_request() {
+        let _serial = prompt_test_guard();
         if std::io::stderr().is_terminal() {
             return;
         }
@@ -529,10 +797,93 @@ mod tests {
         assert!(decision.is_denied());
     }
 
+    #[test]
+    fn non_tty_auto_denies_unix_socket_request() {
+        let _serial = prompt_test_guard();
+        if std::io::stderr().is_terminal() {
+            return;
+        }
+        assert!(
+            TerminalApproval
+                .request_approval(&unix_socket_request())
+                .expect("no error")
+                .is_denied()
+        );
+    }
+
+    #[test]
+    fn endpoint_prompt_supports_session_answers() {
+        let _serial = prompt_test_guard();
+        for (input, expected) in [
+            ("1", ApprovalDecision::Granted),
+            ("2", ApprovalDecision::GrantedForSession),
+            ("4", ApprovalDecision::DeniedForSession),
+        ] {
+            let decision = TerminalApproval::prompt(
+                &endpoint_request(),
+                Instant::now() + Duration::from_secs(5),
+                |prompt, _| {
+                    assert!(prompt.contains("1-4"));
+                    Ok(Some(input.to_string()))
+                },
+            )
+            .expect("prompt");
+            assert_eq!(
+                std::mem::discriminant(&decision),
+                std::mem::discriminant(&expected)
+            );
+        }
+        assert!(
+            TerminalApproval::prompt(
+                &endpoint_request(),
+                Instant::now() + Duration::from_secs(5),
+                |_, _| Ok(Some(String::new())),
+            )
+            .expect("prompt")
+            .is_denied()
+        );
+    }
+
+    #[test]
+    fn unix_socket_prompt_supports_once_session_and_default_denial() {
+        let _serial = prompt_test_guard();
+        for (input, expected) in [
+            ("1", ApprovalDecision::Granted),
+            ("2", ApprovalDecision::GrantedForSession),
+            ("4", ApprovalDecision::DeniedForSession),
+        ] {
+            let decision = TerminalApproval::prompt(
+                &unix_socket_request(),
+                Instant::now() + Duration::from_secs(5),
+                |prompt, _| {
+                    assert!(prompt.contains("1-4"));
+                    Ok(Some(input.to_string()))
+                },
+            )
+            .expect("prompt");
+            assert_eq!(
+                std::mem::discriminant(&decision),
+                std::mem::discriminant(&expected)
+            );
+        }
+        for input in ["", "3", "invalid"] {
+            assert!(
+                TerminalApproval::prompt(
+                    &unix_socket_request(),
+                    Instant::now() + Duration::from_secs(5),
+                    |_, _| Ok(Some(input.to_string())),
+                )
+                .expect("prompt")
+                .is_denied()
+            );
+        }
+    }
+
     // ── auto-deny reason is populated ─────────────────────────────────────────
 
     #[test]
     fn non_tty_denial_carries_reason() {
+        let _serial = prompt_test_guard();
         if std::io::stderr().is_terminal() {
             return;
         }

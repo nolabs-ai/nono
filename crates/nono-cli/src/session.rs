@@ -22,6 +22,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 /// Session state persisted to `$XDG_STATE_HOME/nono/sessions/{session_id}.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) policy: Option<crate::platform_policy::PolicySession>,
     pub session_id: String,
     pub name: Option<String>,
     pub supervisor_pid: u32,
@@ -37,6 +39,24 @@ pub struct SessionRecord {
     pub workdir: PathBuf,
     pub network: String,
     pub rollback_session: Option<String>,
+    /// Set once the session's terminal recording has started (NEP-0010), so
+    /// launchers and attaching clients can show the recording notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<SessionRecordingState>,
+}
+
+/// Recording facts published in the session file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRecordingState {
+    /// Whether typed input is recorded.
+    pub input: bool,
+    pub required: bool,
+    /// Extra copies being written (`file` sink).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<PathBuf>,
+    /// Chunks are uploaded to the platform.
+    #[serde(default)]
+    pub delivered: bool,
 }
 
 /// Session lifecycle status.
@@ -88,6 +108,14 @@ impl SessionGuard {
         self.record.child_pid = pid;
         if let Err(e) = update_session_file(&self.path, &self.record) {
             warn!("Failed to update session file with child PID: {}", e);
+        }
+    }
+
+    /// Record that terminal recording is on for this session.
+    pub fn set_recording(&mut self, recording: SessionRecordingState) {
+        self.record.recording = Some(recording);
+        if let Err(e) = update_session_file(&self.path, &self.record) {
+            warn!("Failed to update session file with recording state: {}", e);
         }
     }
 
@@ -1015,6 +1043,7 @@ mod tests {
     #[test]
     fn test_session_record_roundtrip() {
         let record = SessionRecord {
+            policy: None,
             session_id: "a3f7c2".to_string(),
             name: Some("test".to_string()),
             supervisor_pid: 1234,
@@ -1029,6 +1058,7 @@ mod tests {
             workdir: PathBuf::from("/home/user/project"),
             network: "allowed".to_string(),
             rollback_session: None,
+            recording: None,
         };
 
         let json = serde_json::to_string(&record).expect("serialize");
@@ -1055,6 +1085,7 @@ mod tests {
         let path = dir.path().join("test.json");
 
         let record = SessionRecord {
+            policy: None,
             session_id: "abc123".to_string(),
             name: None,
             supervisor_pid: 100,
@@ -1069,6 +1100,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             network: "blocked".to_string(),
             rollback_session: None,
+            recording: None,
         };
 
         write_session_file(&path, &record).expect("write");
@@ -1086,6 +1118,7 @@ mod tests {
         let path = dir.path().join("update.json");
 
         let mut record = SessionRecord {
+            policy: None,
             session_id: "def456".to_string(),
             name: None,
             supervisor_pid: 200,
@@ -1100,6 +1133,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             network: "allowed".to_string(),
             rollback_session: None,
+            recording: None,
         };
 
         write_session_file(&path, &record).expect("write");
@@ -1133,6 +1167,7 @@ mod tests {
         // We can't easily test SessionGuard::new because it uses sessions_dir().
         // Instead, test the update_session_file + load roundtrip that Drop uses.
         let mut record = SessionRecord {
+            policy: None,
             session_id: "guard1".to_string(),
             name: None,
             supervisor_pid: 300,
@@ -1147,6 +1182,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             network: "allowed".to_string(),
             rollback_session: None,
+            recording: None,
         };
 
         let file_path = path.join("guard1.json");
@@ -1169,6 +1205,7 @@ mod tests {
         make_private_dir(dir.path());
         let path = dir.path().join("guard-exit.json");
         let record = SessionRecord {
+            policy: None,
             session_id: "guard-exit".to_string(),
             name: None,
             supervisor_pid: 300,
@@ -1183,6 +1220,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             network: "blocked".to_string(),
             rollback_session: None,
+            recording: None,
         };
         write_session_file(&path, &record).expect("write initial session");
         let mut guard = SessionGuard {
@@ -1244,6 +1282,7 @@ mod tests {
         std::fs::create_dir_all(&sessions_path).expect("mkdir");
 
         let record = SessionRecord {
+            policy: None,
             session_id: "aabbcc".to_string(),
             name: None,
             supervisor_pid: 400,
@@ -1258,6 +1297,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             network: "allowed".to_string(),
             rollback_session: None,
+            recording: None,
         };
 
         write_session_file(&sessions_path.join("aabbcc.json"), &record).expect("write");

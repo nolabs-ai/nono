@@ -526,7 +526,8 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     }
 
     // Allow specific process operations needed for execution
-    profile.push_str("(allow process-exec*)\n");
+    // process-exec* is scoped to the read set below: a binary that can be
+    // exec'd but not read cannot load its own image and dies obscurely.
     profile.push_str("(allow process-fork)\n");
 
     // Process info: allow self-inspection and same-sandbox inspection for both
@@ -674,6 +675,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             AccessMode::Read | AccessMode::ReadWrite => {
                 for filter in path_filters_for_cap(cap)? {
                     profile.push_str(&format!("(allow file-read* ({}))\n", filter));
+                    profile.push_str(&format!("(allow process-exec* ({}))\n", filter));
                 }
             }
             AccessMode::Write => {
@@ -691,6 +693,10 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push_str("(allow file-read* (extension \"com.apple.app-sandbox.read\"))\n");
         profile.push_str("(allow file-read* (extension \"com.apple.app-sandbox.read-write\"))\n");
         profile.push_str("(allow file-write* (extension \"com.apple.app-sandbox.read-write\"))\n");
+        // Exec follows read for dynamic grants, same as static grants.
+        profile.push_str("(allow process-exec* (extension \"com.apple.app-sandbox.read\"))\n");
+        profile
+            .push_str("(allow process-exec* (extension \"com.apple.app-sandbox.read-write\"))\n");
     }
 
     // Add write rules for all capabilities with Write or ReadWrite access.
@@ -1097,6 +1103,56 @@ mod tests {
         assert!(profile.contains("(allow file-read* (subpath \"/test\"))"));
         assert!(profile.contains("(allow file-write* (subpath \"/test\"))"));
         assert!(profile.contains("(allow file-map-executable (subpath \"/test\"))"));
+    }
+
+    #[test]
+    fn test_generate_profile_scopes_exec_to_read_set() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/readable"),
+            resolved: PathBuf::from("/readable"),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/rw-file"),
+            resolved: PathBuf::from("/rw-file"),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/write-only"),
+            resolved: PathBuf::from("/write-only"),
+            access: AccessMode::Write,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(!profile.contains("(allow process-exec*)\n"));
+        assert!(profile.contains("(allow process-exec* (subpath \"/readable\"))"));
+        assert!(profile.contains("(allow process-exec* (literal \"/rw-file\"))"));
+        assert!(!profile.contains("process-exec* (subpath \"/write-only\")"));
+    }
+
+    #[test]
+    fn test_generate_profile_exec_covers_original_and_resolved() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/tmp"),
+            resolved: PathBuf::from("/private/tmp"),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow process-exec* (subpath \"/tmp\"))"));
+        assert!(profile.contains("(allow process-exec* (subpath \"/private/tmp\"))"));
     }
 
     #[test]
@@ -1553,6 +1609,74 @@ mod tests {
             profile
                 .contains("(allow file-write* (extension \"com.apple.app-sandbox.read-write\"))")
         );
+    }
+
+    #[test]
+    fn test_generate_profile_extensions_allow_exec() {
+        let caps = CapabilitySet::new().enable_extensions();
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(
+            profile.contains("(allow process-exec* (extension \"com.apple.app-sandbox.read\"))")
+        );
+        assert!(
+            profile
+                .contains("(allow process-exec* (extension \"com.apple.app-sandbox.read-write\"))")
+        );
+    }
+
+    /// Applies a real sandbox in a forked child: an ungranted binary can be
+    /// exec'd only after its extension token is consumed.
+    #[test]
+    fn test_extension_token_allows_exec_of_ungranted_binary() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("echo-copy");
+        std::fs::copy("/bin/echo", &bin).unwrap();
+        let signed = Command::new("codesign")
+            .args(["-f", "-s", "-"])
+            .arg(&bin)
+            .output()
+            .unwrap();
+        assert!(signed.status.success());
+        let bin = bin.canonicalize().unwrap();
+        let token = extension_issue_file(&bin, AccessMode::Read).unwrap();
+
+        let run = |consume: bool| {
+            let mut caps = CapabilitySet::new().enable_extensions();
+            for p in [
+                "/usr",
+                "/bin",
+                "/System",
+                "/Library",
+                "/private/var/db",
+                "/dev",
+            ] {
+                caps.add_fs(FsCapability::new_dir(p, AccessMode::Read).unwrap());
+            }
+            let token = token.clone();
+            let mut cmd = Command::new(&bin);
+            cmd.arg("ext-exec-ok");
+            // SAFETY: the closure runs between fork and exec in the child and
+            // only applies the sandbox and consumes the token.
+            unsafe {
+                cmd.pre_exec(move || {
+                    apply(&caps).map_err(|e| std::io::Error::other(e.to_string()))?;
+                    if consume {
+                        extension_consume(&token)
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    }
+                    Ok(())
+                });
+            }
+            cmd.output()
+        };
+
+        assert!(run(false).is_err(), "exec must be denied without a token");
+        let out = run(true).expect("exec must succeed with a consumed token");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("ext-exec-ok"));
     }
 
     #[test]

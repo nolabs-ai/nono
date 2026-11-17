@@ -527,6 +527,7 @@ struct PendingCwdAccessRequest {
 
 /// Result of sandbox preparation.
 pub(crate) struct PreparedSandbox {
+    pub(crate) policy_session: Option<crate::platform_policy::PolicySession>,
     pub(crate) caps: CapabilitySet,
     /// Resolved filesystem deny paths (groups + profile `filesystem.deny`).
     /// Threaded to command mediation so a mediated command's live cwd can be
@@ -534,6 +535,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) deny_paths: Vec<PathBuf>,
     pub(crate) secrets: Vec<nono::LoadedSecret>,
     pub(crate) profile_display_name: Option<String>,
+    pub(crate) session_socket_auth: bool,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Command binaries already resolved while validating `command_policies`.
     /// Reused by the command-mediation plan build so every controlled binary is
@@ -548,6 +550,8 @@ pub(crate) struct PreparedSandbox {
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
+    /// `session_recording` from the profile (NEP-0010).
+    pub(crate) session_recording: Option<profile::SessionRecordingConfig>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
     pub(crate) deny_domain: Vec<String>,
@@ -747,6 +751,7 @@ fn finalize_prepared_sandbox(
     args: &SandboxArgs,
     silent: bool,
 ) -> Result<PreparedSandbox> {
+    crate::session_auth::validate_support(prepared.session_socket_auth)?;
     // Attach resource limits from CLI flags. The manifest path already set caps via
     // `CapabilitySet::try_from`, and flags conflict with `--config`, so this only
     // runs on the flag path. Enforcement is later, in the supervised runtime; here
@@ -796,7 +801,7 @@ fn finalize_prepared_sandbox(
     #[cfg(target_os = "linux")]
     output::print_landlock_scope_policy(&prepared.caps, args.verbose, silent);
     #[cfg(target_os = "linux")]
-    output::print_isolation(prepared.isolate, silent);
+    output::print_isolation(&prepared.isolate, silent);
 
     if !Sandbox::is_supported() {
         return Err(NonoError::SandboxInit(Sandbox::support_info().details));
@@ -1558,10 +1563,15 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
 
         return finalize_prepared_sandbox(
             PreparedSandbox {
+                policy_session: crate::platform_policy::with_effective_profile(
+                    args.policy_session.as_ref(),
+                    Some(&manifest),
+                )?,
                 caps,
                 deny_paths: Vec::new(),
                 secrets: Vec::new(),
                 profile_display_name: None,
+                session_socket_auth: false,
                 command_policies: None,
                 resolved_command_binaries: None,
                 approval_backends: std::collections::BTreeMap::new(),
@@ -1569,6 +1579,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 session_hooks: profile::SessionHooks::default(),
                 rollback_exclude_patterns,
                 rollback_exclude_globs,
+                session_recording: None,
                 network_profile: None,
                 allow_domain,
                 deny_domain: Vec::new(),
@@ -1641,6 +1652,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         workdir_access: profile_workdir_access,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
+        session_recording: profile_session_recording,
         network_profile: profile_network_profile,
         allow_domain: profile_allow_domain,
         deny_domain: profile_deny_domain,
@@ -1685,6 +1697,15 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             command_policies.as_mut(),
             silent,
         );
+    }
+    // `session_recording.file` makes the supervisor create a file outside the
+    // sandbox, so it follows the same trust boundary. Recording itself stays
+    // on; only the extra destination is dropped.
+    let mut profile_session_recording = profile_session_recording;
+    if let (Some(profile_name), Some(recording)) =
+        (args.profile.as_deref(), profile_session_recording.as_mut())
+    {
+        crate::terminal_capture::settings::drop_untrusted_file(profile_name, recording, silent);
     }
 
     let session_hooks = loaded_profile
@@ -1968,13 +1989,22 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .map(|profile| profile.credential_capture.clone())
         .unwrap_or_default();
     let loaded_secrets = load_env_credentials(args, &profile_secrets, silent, &caps)?;
+    let session_socket_auth = loaded_profile
+        .as_ref()
+        .and_then(|profile| profile.security.session_socket_auth)
+        .unwrap_or(false);
 
     finalize_prepared_sandbox(
         PreparedSandbox {
+            policy_session: crate::platform_policy::with_effective_profile(
+                args.policy_session.as_ref(),
+                loaded_profile.as_ref(),
+            )?,
             caps,
             deny_paths: prepared_deny_paths,
             secrets: loaded_secrets,
             profile_display_name,
+            session_socket_auth,
             command_policies,
             resolved_command_binaries: profile_resolved_command_binaries,
             approval_backends: profile_approval_backends,
@@ -1982,6 +2012,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             session_hooks,
             rollback_exclude_patterns: profile_rollback_patterns,
             rollback_exclude_globs: profile_rollback_globs,
+            session_recording: profile_session_recording,
             network_profile: profile_network_profile,
             allow_domain: profile_allow_domain,
             deny_domain: profile_deny_domain,
@@ -3031,10 +3062,12 @@ mod tests {
 
     fn empty_prepared() -> PreparedSandbox {
         PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::default(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
+            session_socket_auth: false,
             command_policies: None,
             resolved_command_binaries: None,
             approval_backends: std::collections::BTreeMap::new(),
@@ -3042,6 +3075,7 @@ mod tests {
             session_hooks: profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            session_recording: None,
             network_profile: None,
             allow_domain: Vec::new(),
             deny_domain: Vec::new(),

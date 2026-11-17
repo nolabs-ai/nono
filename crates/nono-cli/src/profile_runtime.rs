@@ -29,6 +29,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) workdir_access: Option<profile::WorkdirAccess>,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
+    pub(crate) session_recording: Option<profile::SessionRecordingConfig>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
     pub(crate) deny_domain: Vec<String>,
@@ -688,7 +689,10 @@ fn prepare_profile_with_options(
         }
     }
 
-    let (loaded_profile, resolved_command_binaries) = if let Some(ref profile_name) = args.profile {
+    let (loaded_profile, resolved_command_binaries) = if let Some(profile) = &args.managed_profile {
+        let binaries = validate_command_policy_runtime_support(&profile.profile)?;
+        (Some(profile.profile.clone()), binaries)
+    } else if let Some(ref profile_name) = args.profile {
         // Missing fully-qualified package profiles may offer to install the
         // exact registry package from every normal loading call site.
         let profile = profile::load_profile_with_extends(profile_name, &args.extends)?;
@@ -837,7 +841,7 @@ fn prepare_profile_with_options(
         #[cfg(target_os = "linux")]
         isolate: loaded_profile
             .as_ref()
-            .map(|profile| profile.linux.isolate)
+            .map(|profile| profile.linux.isolate.clone())
             .unwrap_or_default(),
         workdir_access: loaded_profile
             .as_ref()
@@ -850,6 +854,9 @@ fn prepare_profile_with_options(
             .as_ref()
             .map(|profile| profile.rollback.exclude_globs.clone())
             .unwrap_or_default(),
+        session_recording: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.session_recording.clone()),
         network_profile: loaded_profile.as_ref().and_then(|profile| {
             profile
                 .network

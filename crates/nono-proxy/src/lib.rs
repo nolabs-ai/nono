@@ -26,6 +26,7 @@ pub mod config;
 pub mod connect;
 pub mod credential;
 pub mod diagnostic;
+pub(crate) mod endpoint_approval;
 pub mod error;
 pub mod external;
 pub mod filter;
@@ -38,10 +39,12 @@ pub mod pool;
 pub mod rate_limit;
 pub mod reverse;
 pub mod route;
+pub mod secret_registry;
 pub mod server;
 pub mod spiffe;
 pub mod tls_intercept;
 pub mod token;
+pub(crate) mod upstream_socket;
 
 #[cfg(test)]
 pub mod test_env;
@@ -50,5 +53,6 @@ pub use config::ProxyConfig;
 pub use credential::{CredentialLoadOutcome, CredentialStore};
 pub use diagnostic::{ProxyDiagnostic, ProxyDiagnosticCode, ProxyDiagnosticSeverity};
 pub use error::{ProxyError, Result};
+pub use secret_registry::{RegisteredSecret, SecretRegistry};
 pub use server::{ProxyHandle, start};
 pub use token::NonceResolver;

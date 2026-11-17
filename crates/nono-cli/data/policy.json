@@ -151,6 +151,7 @@
           "/sbin",
           "/usr/bin",
           "/usr/sbin",
+          "/usr/libexec",
           "/usr/local/bin",
           "/usr/lib",
           "/usr/local/lib",
@@ -419,7 +420,8 @@
           "/etc/mise",
           "~/.local/bin/mise",
           "~/.config/mise",
-          "~/.local/share/mise"
+          "~/.local/share/mise",
+          "~/.tool-versions"
         ]
       }
     },

@@ -29,6 +29,9 @@ pub struct SpiffeJwtSource {
     pub inject_header: String,
     pub credential_format: Option<String>,
     pub svid_hint: Option<SpiffeId>,
+    /// Session secret registry and the non-secret name each fetched
+    /// JWT-SVID is registered under (NEP-0010 §3.1).
+    secret_registry: Option<(crate::secret_registry::SecretRegistry, String)>,
 }
 
 impl std::fmt::Debug for SpiffeJwtSource {
@@ -73,7 +76,21 @@ impl SpiffeJwtSource {
             inject_header,
             credential_format,
             svid_hint,
+            secret_registry: None,
         })
+    }
+
+    /// Register every JWT-SVID this source fetches in `registry` under `name`,
+    /// so tokens injected into upstream requests can be redacted from
+    /// terminal recordings.
+    #[must_use]
+    pub fn with_secret_registry(
+        mut self,
+        registry: crate::secret_registry::SecretRegistry,
+        name: &str,
+    ) -> Self {
+        self.secret_registry = Some((registry, name.to_string()));
+        self
     }
 
     /// Returns `(token, spiffe_id)` for the requested audience.
@@ -112,6 +129,9 @@ impl SpiffeJwtSource {
         }
 
         let spiffe_id = svid.spiffe_id().to_string();
+        if let Some((registry, name)) = &self.secret_registry {
+            registry.register(name, svid.token());
+        }
         Ok((Zeroizing::new(svid.token().to_string()), spiffe_id))
     }
 }

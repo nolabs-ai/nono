@@ -336,7 +336,12 @@ impl OAuthCaptureStore {
                 continue;
             }
             let (key, visible) = mint_response_phantom(&endpoint.provider, field, real)?;
-            self.store_phantom(&key, real.as_bytes(), &endpoint.admitted_consumers)?;
+            self.store_phantom(
+                &endpoint.provider,
+                &key,
+                real.as_bytes(),
+                &endpoint.admitted_consumers,
+            )?;
             *value = Value::String(visible);
             changed = true;
             rewritten_fields += 1;
@@ -480,7 +485,12 @@ impl OAuthCaptureStore {
                     serialized.append_pair(name, value);
                 }
                 Slot::Phantom { key, visible } => {
-                    self.store_phantom(key, value.as_bytes(), &endpoint.admitted_consumers)?;
+                    self.store_phantom(
+                        &endpoint.provider,
+                        key,
+                        value.as_bytes(),
+                        &endpoint.admitted_consumers,
+                    )?;
                     serialized.append_pair(name, visible);
                 }
             }

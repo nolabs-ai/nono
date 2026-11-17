@@ -31,7 +31,6 @@ A nono-generated Seatbelt profile follows this structure:
 (deny default)
 
 ; Process operations (narrowed - no blanket process*)
-(allow process-exec*)                    ; Execute programs
 (allow process-fork)                     ; Fork child processes
 (allow process-info* (target self))      ; Self-inspection (dyld, code signing)
 (deny process-info* (target others))     ; Block inspecting other processes
@@ -48,11 +47,11 @@ A nono-generated Seatbelt profile follows this structure:
 ; Root directory access for path resolution
 (allow file-read* (literal "/"))
 
-; Executable mapping (required for dyld)
-(allow file-map-executable)
-
-; System paths from security-lists.toml
+; System paths from security-lists.toml. Each readable path also gets
+; exec and executable-mapping rules (required for dyld).
 (allow file-read* (subpath "/System/Library"))
+(allow process-exec* (subpath "/System/Library"))
+(allow file-map-executable (subpath "/System/Library"))
 (allow file-read* (subpath "/usr/lib"))
 (allow file-read* (subpath "/private/var/db/dyld"))
 ; ... more system paths
@@ -100,7 +99,7 @@ nono allows read access to system paths required for running executables. These 
 | Locale | `/usr/share/zoneinfo`, `/usr/share/locale` | Timezone and locale data |
 | System | `/var`, `/private/var`, `/System/Volumes` | System paths and APFS volumes |
 
-The `file-map-executable` permission is also granted globally, which is required for `dyld` to map executables and shared libraries into memory.
+`process-exec*` and `file-map-executable` are granted per readable path, not globally. `file-map-executable` is required for `dyld` to map executables and shared libraries into memory. On macOS you can only run what you can read: executing a binary outside the read set fails immediately with `Operation not permitted`. Fix it with `--read-file <canonical path>`; `nono why --path <path> --op read` shows whether a path is granted. This matches Linux, where Landlock read access includes execute.
 
 ## Sensitive Paths
 

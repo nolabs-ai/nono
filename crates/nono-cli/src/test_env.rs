@@ -16,25 +16,41 @@ pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Restores a set of environment variables when dropped.
 pub struct EnvVarGuard {
-    original: Vec<(&'static str, Option<String>)>,
+    original: Vec<(String, Option<String>)>,
 }
 
 #[allow(clippy::disallowed_methods)] // This IS the safe wrapper around env var mutation.
 impl EnvVarGuard {
     /// Set multiple env vars, capturing originals for restore on drop.
     #[must_use]
-    pub fn set_all(vars: &[(&'static str, &str)]) -> Self {
-        let original = vars
-            .iter()
-            .map(|(key, _)| (*key, std::env::var(key).ok()))
-            .collect::<Vec<_>>();
+    pub fn set_all(vars: &[(&str, &str)]) -> Self {
+        let guard = Self::snapshot(vars.iter().map(|(key, _)| *key));
 
         for (key, value) in vars {
             // SAFETY: all callers hold ENV_LOCK, preventing concurrent env mutation.
             unsafe { std::env::set_var(key, value) };
         }
 
-        Self { original }
+        guard
+    }
+
+    /// Remove variables for a test, restoring their original values on drop.
+    #[must_use]
+    pub fn unset_all(keys: &[&str]) -> Self {
+        let guard = Self::snapshot(keys.iter().copied());
+        for key in keys {
+            // SAFETY: callers hold ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+        }
+        guard
+    }
+
+    fn snapshot<'a>(keys: impl Iterator<Item = &'a str>) -> Self {
+        Self {
+            original: keys
+                .map(|key| (key.to_string(), std::env::var(key).ok()))
+                .collect(),
+        }
     }
 
     /// Remove an env var mid-test (e.g. to test fallback behaviour).

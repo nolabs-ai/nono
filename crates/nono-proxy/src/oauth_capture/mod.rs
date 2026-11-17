@@ -14,6 +14,7 @@ use self::endpoint::{LoadedOAuthEndpoint, load_endpoint, provider_consumer};
 use self::persist::{load_persisted_tokens, persist_tokens};
 use crate::config::OAuthCaptureConfig;
 use crate::error::{ProxyError, Result};
+use crate::secret_registry::SecretRegistry;
 use crate::token::{NonceResolver, PHANTOM_BODY_HEX_LEN, PhantomTemplate, rewrite_first_phantom};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -45,6 +46,9 @@ pub struct OAuthCaptureStore {
     /// Distinct visible-phantom templates declared across all endpoints, used
     /// to recognise and replace templated phantoms on egress.
     templates: Vec<PhantomTemplate>,
+    /// Session secret registry. Real tokens are registered when captured and
+    /// when resolved for injection (NEP-0010 §3.1).
+    secret_registry: Option<SecretRegistry>,
 }
 
 const MAX_PERSISTED_PHANTOMS: usize = 4096;
@@ -109,7 +113,23 @@ impl OAuthCaptureStore {
             phantoms: Mutex::new(phantoms),
             persist_path,
             templates,
+            secret_registry: None,
         })
+    }
+
+    /// Register real tokens in `registry` as they are captured from token
+    /// responses or resolved from phantoms (including phantoms persisted by
+    /// earlier sessions) so they can be redacted from terminal recordings.
+    pub fn set_secret_registry(&mut self, registry: Option<SecretRegistry>) {
+        self.secret_registry = registry;
+    }
+
+    fn register_real(&self, name: &str, real: &[u8]) {
+        if let Some(registry) = &self.secret_registry
+            && let Ok(real) = std::str::from_utf8(real)
+        {
+            registry.register(name, real);
+        }
     }
 
     pub fn empty() -> Self {
@@ -179,10 +199,12 @@ impl OAuthCaptureStore {
     /// sees and later resents), admitting it for `admitted_consumers`.
     pub(super) fn store_phantom(
         &self,
+        provider: &str,
         phantom: &str,
         real: &[u8],
         admitted_consumers: &HashSet<String>,
     ) -> Result<()> {
+        self.register_real(&format!("oauth_capture:{provider}"), real);
         let token = StoredOAuthToken {
             real: Zeroizing::new(real.to_vec()),
             admitted_consumers: admitted_consumers.clone(),
@@ -242,6 +264,7 @@ impl NonceResolver for OAuthCaptureStore {
         if !token.admitted_consumers.contains(consumer) {
             return None;
         }
+        self.register_real(&format!("oauth_capture:{consumer}"), &token.real);
         debug!(
             consumer = %consumer,
             phantom = %phantom_fingerprint(nonce),
@@ -366,6 +389,67 @@ mod tests {
             store.resolve(access, "proxy.other").is_none(),
             "unadmitted consumers must not resolve"
         );
+    }
+
+    #[test]
+    fn captured_and_resolved_real_tokens_are_registered() {
+        let mut store = store();
+        let registry = SecretRegistry::new();
+        store.set_secret_registry(Some(registry.clone()));
+        let endpoint = store.lookup("auth.openai.com:443", "/oauth/token").unwrap();
+        let _rewritten = store
+            .rewrite_response_body(
+                endpoint,
+                &[],
+                br#"{"access_token":"real-access-registry","refresh_token":"real-refresh-registry"}"#,
+            )
+            .unwrap();
+        let entries: Vec<(String, String)> = registry
+            .snapshot()
+            .1
+            .into_iter()
+            .map(|e| (e.name, e.value.to_string()))
+            .collect();
+        assert!(entries.contains(&(
+            "oauth_capture:codex".to_string(),
+            "real-access-registry".to_string()
+        )));
+        assert!(entries.contains(&(
+            "oauth_capture:codex".to_string(),
+            "real-refresh-registry".to_string()
+        )));
+        assert!(
+            !entries.iter().any(|(_, v)| v.starts_with("nono_")),
+            "phantoms are not registered"
+        );
+
+        // A phantom whose real value was never captured in this process (as
+        // when persisted by an earlier session) is registered on resolution.
+        let phantom = generate_phantom().unwrap();
+        store.phantoms.lock().unwrap().insert(
+            phantom.clone(),
+            StoredOAuthToken {
+                real: Zeroizing::new(b"persisted-real-token".to_vec()),
+                admitted_consumers: endpoint.admitted_consumers.clone(),
+                created_at_secs: now_secs(),
+            },
+        );
+        assert!(store.resolve(&phantom, "proxy.openai_oauth").is_some());
+        assert!(registry.snapshot().1.iter().any(|e| {
+            e.name == "oauth_capture:proxy.openai_oauth"
+                && e.value.as_str() == "persisted-real-token"
+        }));
+    }
+
+    #[test]
+    fn capture_store_without_registry_is_unchanged() {
+        let store = store();
+        let endpoint = store.lookup("auth.openai.com:443", "/oauth/token").unwrap();
+        let rewritten = store
+            .rewrite_response_body(endpoint, &[], br#"{"access_token":"real-access"}"#)
+            .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert!(json["access_token"].as_str().unwrap().starts_with("nono_"));
     }
 
     #[test]
@@ -618,6 +702,7 @@ mod tests {
         let phantom = generate_phantom().unwrap();
         store
             .store_phantom(
+                "codex",
                 &phantom,
                 b"real refresh/value",
                 &endpoint.admitted_consumers,

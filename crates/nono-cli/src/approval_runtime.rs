@@ -1,5 +1,6 @@
 use crate::command_policy::{
     ApprovalBackendConfig, ApprovalBackendType, ApprovalChainMode, CommandPoliciesConfig,
+    WebhookTarget, parse_webhook_target,
 };
 use crate::terminal_approval::{TERMINAL_APPROVAL_TIMEOUT, TerminalApproval};
 use nono::{ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result};
@@ -10,20 +11,39 @@ use std::time::{Duration, Instant};
 
 const WEBHOOK_RESPONSE_LIMIT_BYTES: u64 = 64 * 1024;
 
+#[cfg(unix)]
+#[path = "approval_unix_transport.rs"]
+mod unix_transport;
+
+/// Build the endpoint-approval registry for a session's proxy. Requests routed
+/// through it carry `session_id`, so a backend can attribute them to the
+/// sandbox session rather than to the proxy.
+///
+/// `command_policies` backends answer endpoint `approve` decisions when the
+/// profile declares them. Otherwise `network_fallback` (the profile's
+/// `network.approval_backends` and default) does, so a credential endpoint
+/// policy on `network.custom_credentials` can ask without a command policy,
+/// which nono only accepts when it names a command.
 pub(crate) fn build_proxy_approval_registry(
     config: Option<&CommandPoliciesConfig>,
+    network_fallback: Option<(&BTreeMap<String, ApprovalBackendConfig>, Option<String>)>,
+    session_id: &str,
 ) -> Result<Option<nono_proxy::approval::ApprovalBackendRegistry>> {
-    let Some(config) = config else {
-        return Ok(None);
+    let (backends, default_backend) = match config {
+        Some(config) if !config.approval_backends.is_empty() => (
+            &config.approval_backends,
+            config.approval_defaults.backend.clone(),
+        ),
+        _ => match network_fallback {
+            Some((backends, default_backend)) if !backends.is_empty() => {
+                (backends, default_backend)
+            }
+            _ => return Ok(None),
+        },
     };
-    if config.approval_backends.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(build_approval_registry_from(
-        &config.approval_backends,
-        config.approval_defaults.backend.clone(),
-    )?))
+    Ok(Some(
+        build_approval_registry_from(backends, default_backend)?.with_session_id(session_id),
+    ))
 }
 
 pub(crate) fn build_approval_registry(
@@ -67,6 +87,79 @@ pub(crate) fn resolve_supervised_approval_backend(
     let registry = build_approval_registry_from(backends, default_backend_name)?;
     let (_name, backend) = registry.resolve(None)?;
     Ok(Some(backend))
+}
+
+/// Whether the backend `name` is the terminal prompt or a chain that can
+/// reach it. Used to warn when there is no terminal to prompt on.
+pub(crate) fn backend_reaches_terminal(
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
+    name: &str,
+) -> bool {
+    let mut pending = vec![name];
+    let mut seen = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        match backends.get(current) {
+            Some(backend) if backend.backend_type == ApprovalBackendType::Terminal => {
+                return true;
+            }
+            Some(backend) => pending.extend(backend.backends.iter().map(String::as_str)),
+            None => {}
+        }
+    }
+    false
+}
+
+/// Every `unix://` webhook socket configured in `backend_maps`, as
+/// `(backend name, socket path)`. Malformed URLs are skipped here; profile
+/// validation and the backend builder reject them.
+pub(crate) fn approval_socket_paths<'a>(
+    backend_maps: impl IntoIterator<Item = &'a BTreeMap<String, ApprovalBackendConfig>>,
+) -> Vec<(String, std::path::PathBuf)> {
+    let mut sockets = Vec::new();
+    for backends in backend_maps {
+        for (name, backend) in backends {
+            if backend.backend_type != ApprovalBackendType::Webhook {
+                continue;
+            }
+            if let Some(Ok(WebhookTarget::Unix { socket })) =
+                backend.url.as_deref().map(parse_webhook_target)
+            {
+                sockets.push((name.clone(), socket));
+            }
+        }
+    }
+    sockets
+}
+
+/// Refuse to launch when the sandboxed child could stand in for a `unix://`
+/// approval helper: by writing to the socket or any directory above it
+/// (replacing or recreating the socket), or by holding a grant to bind it.
+/// An impostor socket would answer every approval itself.
+///
+/// `sockets` comes from [`approval_socket_paths`]. The same check applies to
+/// the agent's sandbox at launch and to each mediated command's sandbox.
+pub(crate) fn reject_child_replaceable_approval_sockets(
+    caps: &nono::CapabilitySet,
+    sockets: &[(String, std::path::PathBuf)],
+) -> Result<()> {
+    for (name, socket) in sockets {
+        let canonical = nono::try_canonicalize(socket);
+        let bindable = [socket, &canonical]
+            .into_iter()
+            .any(|path| caps.unix_socket_allowed(path, nono::UnixSocketOp::Bind));
+        if bindable || nono::path_writable_by(socket, caps) {
+            return Err(NonoError::ConfigParse(format!(
+                "approval backend '{name}' uses unix socket {} but the sandbox could {} it; \
+                 move the socket to a directory the sandbox cannot write to",
+                socket.display(),
+                if bindable { "bind" } else { "replace" },
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn build_approval_backends_from(
@@ -161,6 +254,9 @@ const PLATFORM_APPROVALS_PATH: &str = "/api/v1/approvals";
 /// Pause between polls when the server answers `pending` immediately instead
 /// of holding the request open.
 const PLATFORM_POLL_BACKOFF: Duration = Duration::from_millis(250);
+/// Longest a webhook query waits for the PTY relay to pause so it can print a
+/// status notice. Past this the notice is skipped.
+const BACKEND_NOTICE_PAUSE_WAIT: Duration = Duration::from_secs(1);
 /// Header carrying the client's remaining patience so the server-side hold and
 /// deadline match this backend's `timeout_secs`.
 const HEADER_TIMEOUT_SECS: &str = "X-Nono-Timeout-Secs";
@@ -214,6 +310,10 @@ struct HttpReply {
 /// that host answer `granted`. A 3xx therefore surfaces as a non-2xx status
 /// and is treated as a denial.
 fn build_agent(timeout: Duration) -> ureq::Agent {
+    agent_config(timeout).new_agent()
+}
+
+fn agent_config(timeout: Duration) -> ureq::config::Config {
     let tls_config = ureq::tls::TlsConfig::builder()
         .root_certs(ureq::tls::RootCerts::PlatformVerifier)
         .build();
@@ -223,7 +323,26 @@ fn build_agent(timeout: Duration) -> ureq::Agent {
         .max_redirects_will_error(false)
         .tls_config(tls_config)
         .build()
-        .new_agent()
+}
+
+/// Request URL for a `unix://` webhook. The connector dials the socket and
+/// ignores the host, so this only fixes the request line and `Host` header.
+const UNIX_WEBHOOK_REQUEST_URL: &str = "http://localhost/";
+
+/// Agent and request URL for a webhook target.
+fn agent_for_target(target: WebhookTarget, timeout: Duration) -> Result<(ureq::Agent, String)> {
+    match target {
+        WebhookTarget::Http(url) => Ok((build_agent(timeout), url)),
+        #[cfg(unix)]
+        WebhookTarget::Unix { socket } => Ok((
+            unix_transport::build_agent(agent_config(timeout), socket),
+            UNIX_WEBHOOK_REQUEST_URL.to_string(),
+        )),
+        #[cfg(not(unix))]
+        WebhookTarget::Unix { .. } => Err(NonoError::ConfigParse(
+            "unix socket approval webhooks are not supported on this platform".to_string(),
+        )),
+    }
 }
 
 impl WebhookApproval {
@@ -249,13 +368,23 @@ impl WebhookApproval {
                 )));
             }
         };
-        if platform.is_some() && !crate::command_policy::is_platform_grade_url(&url) {
-            return Err(NonoError::ConfigParse(format!(
-                "approval backend '{name}' with auth platform must use an https URL (plain http is allowed only for loopback)"
-            )));
+        let target = parse_webhook_target(&url).map_err(|reason| {
+            NonoError::ConfigParse(format!("approval backend '{name}' {reason}"))
+        })?;
+        if platform.is_some() {
+            if matches!(target, WebhookTarget::Unix { .. }) {
+                return Err(NonoError::ConfigParse(format!(
+                    "approval backend '{name}' with auth platform cannot use a unix socket url"
+                )));
+            }
+            if !crate::command_policy::is_platform_grade_url(&url) {
+                return Err(NonoError::ConfigParse(format!(
+                    "approval backend '{name}' with auth platform must use an https URL (plain http is allowed only for loopback)"
+                )));
+            }
         }
         let timeout = Duration::from_secs(config.timeout_secs.unwrap_or(60));
-        let http = build_agent(timeout);
+        let (http, url) = agent_for_target(target, timeout)?;
         Ok(Self {
             name: name.to_string(),
             url,
@@ -326,22 +455,46 @@ impl WebhookApproval {
             })
     }
 
+    /// Print a status notice for the user, pausing the PTY relay only for
+    /// the print itself so the agent's terminal stays live while the backend
+    /// decides. Waiting for the pause is bounded by [`BACKEND_NOTICE_PAUSE_WAIT`]
+    /// and the caller's deadline. Completion notices get their own deadline.
+    /// Returns whether the notice was shown. Never affects the decision.
+    fn show_notice(deadline: Instant, print: impl FnOnce() -> bool) -> bool {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let deadline = now
+            .checked_add(BACKEND_NOTICE_PAUSE_WAIT)
+            .unwrap_or(now)
+            .min(deadline);
+        crate::relay_prompt_gate::run_with_relay_paused(deadline, print).unwrap_or(false)
+    }
+
     /// Unsigned contract: one blocking POST, the response body is the
     /// decision. Any approval endpoint that does not verify enrolled
     /// identities speaks this (`docs/protocols/approval-webhook-v1.md`).
+    /// The request gets only what is left of this backend's timeout, both as
+    /// its HTTP timeout and as the server hold hint.
     fn request_unsigned(&self, body: &[u8], started: Instant) -> Result<ApprovalDecision> {
+        let remaining = self.timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(ApprovalDecision::Timeout);
+        }
         let mut response = self
             .http
             .post(&self.url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(Some(remaining))
             .build()
             .header("Content-Type", "application/json")
             .header(
                 "User-Agent",
                 &format!("nono-cli/{}", env!("CARGO_PKG_VERSION")),
             )
-            .header(HEADER_TIMEOUT_SECS, &self.timeout.as_secs().to_string())
+            .header(HEADER_TIMEOUT_SECS, &remaining.as_secs().max(1).to_string())
             .send(body)
             .map_err(|e| {
                 NonoError::SandboxInit(format!("approval webhook '{}' failed: {e}", self.name))
@@ -547,7 +700,11 @@ impl ApprovalBackend for WebhookApproval {
             ))
         })?;
         let started = Instant::now();
-        match &self.platform {
+        let deadline = started.checked_add(self.timeout).unwrap_or(started);
+        let announced = Self::show_notice(deadline, || {
+            crate::terminal_approval::announce_backend_query(&self.name, request, self.timeout)
+        });
+        let decision = match &self.platform {
             None => self.request_unsigned(&body, started),
             Some(state) => self.drive_platform_approval(
                 request.request_id(),
@@ -555,7 +712,16 @@ impl ApprovalBackend for WebhookApproval {
                 started,
                 |step, remaining| self.send_platform(state, step, remaining),
             ),
+        };
+        if announced {
+            let now = Instant::now();
+            let deadline = now.checked_add(BACKEND_NOTICE_PAUSE_WAIT).unwrap_or(now);
+            Self::show_notice(deadline, || {
+                crate::terminal_approval::announce_backend_decision(&self.name, &decision);
+                true
+            });
         }
+        decision
     }
 
     fn backend_name(&self) -> &str {
@@ -707,6 +873,110 @@ mod tests {
     use super::*;
     use sha2::Digest as _;
 
+    fn webhook_backends(url: &str) -> BTreeMap<String, ApprovalBackendConfig> {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "dialog".to_string(),
+            ApprovalBackendConfig {
+                backend_type: ApprovalBackendType::Webhook,
+                url: Some(url.to_string()),
+                timeout_secs: None,
+                mode: None,
+                backends: Vec::new(),
+                auth: None,
+            },
+        );
+        backends
+    }
+
+    #[test]
+    fn backend_reaches_terminal_follows_chains() {
+        let mut backends = webhook_backends("unix:///run/helper/approval.sock");
+        let backend = |backend_type, children: &[&str]| ApprovalBackendConfig {
+            backend_type,
+            url: None,
+            timeout_secs: None,
+            mode: (backend_type == ApprovalBackendType::Chain).then_some(ApprovalChainMode::Any),
+            backends: children.iter().map(|c| c.to_string()).collect(),
+            auth: None,
+        };
+        backends.insert(
+            "prompt".to_string(),
+            backend(ApprovalBackendType::Terminal, &[]),
+        );
+        backends.insert(
+            "either".to_string(),
+            backend(ApprovalBackendType::Chain, &["dialog", "prompt"]),
+        );
+        backends.insert(
+            "remote".to_string(),
+            backend(ApprovalBackendType::Chain, &["dialog"]),
+        );
+        assert!(backend_reaches_terminal(&backends, "prompt"));
+        assert!(backend_reaches_terminal(&backends, "either"));
+        assert!(!backend_reaches_terminal(&backends, "dialog"));
+        assert!(!backend_reaches_terminal(&backends, "remote"));
+    }
+
+    #[test]
+    fn approval_socket_paths_collects_unix_webhooks_only() {
+        let unix = webhook_backends("unix:///run/helper/approval.sock");
+        let http = webhook_backends("http://127.0.0.1:9000/hook");
+        assert_eq!(
+            approval_socket_paths([&unix, &http]),
+            vec![(
+                "dialog".to_string(),
+                std::path::PathBuf::from("/run/helper/approval.sock")
+            )]
+        );
+    }
+
+    #[test]
+    fn approval_socket_check_refuses_sockets_the_sandbox_could_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("helper").join("s");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let socket = socket_dir.join("approval.sock");
+        let backends = webhook_backends(&format!("unix://{}", socket.display()));
+        let sockets = approval_socket_paths([&backends]);
+        let check = |caps: &nono::CapabilitySet| {
+            reject_child_replaceable_approval_sockets(caps, &sockets)
+                .err()
+                .map(|e| e.to_string())
+        };
+
+        // Read-only access to the helper's directory is fine.
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_fs(nono::FsCapability::new_dir(dir.path(), nono::AccessMode::Read).unwrap());
+        assert_eq!(check(&caps), None);
+
+        // Write access to the socket's directory, or any directory above it,
+        // would let the sandbox put its own socket in the helper's place.
+        for writable in [socket_dir.as_path(), dir.path()] {
+            let mut caps = nono::CapabilitySet::new();
+            caps.add_fs(nono::FsCapability::new_dir(writable, nono::AccessMode::Write).unwrap());
+            let err = check(&caps).unwrap_or_default();
+            assert!(err.contains("'dialog'") && err.contains("replace"), "{err}");
+        }
+
+        // So would a grant to bind the socket path itself.
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_unix_socket(
+            nono::UnixSocketCapability::new_file(&socket, nono::UnixSocketMode::ConnectBind)
+                .unwrap(),
+        );
+        let err = check(&caps).unwrap_or_default();
+        assert!(err.contains("bind"), "{err}");
+
+        // Connecting to the socket is what the helper is for; that's allowed.
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_unix_socket(
+            nono::UnixSocketCapability::new_dir(&socket_dir, nono::UnixSocketMode::Connect)
+                .unwrap(),
+        );
+        assert_eq!(check(&caps), None);
+    }
+
     struct StaticBackend {
         name: &'static str,
         decision: ApprovalDecision,
@@ -726,10 +996,12 @@ mod tests {
         ApprovalRequest::Endpoint {
             request_id: "req-1".to_string(),
             route_id: "internal-api".to_string(),
+            credential_route: None,
             upstream: "https://api.internal.example".to_string(),
             method: "POST".to_string(),
             path: "/v1/tasks/1/comments".to_string(),
             rule_label: "endpoint_policy.approve[POST /v1/tasks/*/comments]".to_string(),
+            operation: None,
             reason: None,
             child_pid: 0,
             session_id: "proxy".to_string(),
@@ -976,6 +1248,51 @@ mod tests {
         assert!(chain.request_approval(&request()).unwrap().is_granted());
     }
 
+    fn webhook(url: &str) -> ApprovalBackendConfig {
+        ApprovalBackendConfig {
+            backend_type: ApprovalBackendType::Webhook,
+            url: Some(url.to_string()),
+            timeout_secs: Some(5),
+            mode: None,
+            backends: Vec::new(),
+            auth: None,
+        }
+    }
+
+    #[test]
+    fn endpoint_registry_prefers_command_policies_then_network_backends() {
+        let network = BTreeMap::from([("net".to_string(), webhook("https://net.example"))]);
+        let fallback = Some((&network, Some("net".to_string())));
+
+        let registry = build_proxy_approval_registry(None, fallback.clone(), "sess-1")
+            .unwrap()
+            .expect("network backends answer endpoint approvals without command policies");
+        let (name, _) = registry.resolve(None).unwrap();
+        assert_eq!(name, "net");
+        assert_eq!(registry.session_id(), "sess-1");
+
+        let mut commands = CommandPoliciesConfig::default();
+        commands
+            .approval_backends
+            .insert("cmd".to_string(), webhook("https://cmd.example"));
+        commands.approval_defaults.backend = Some("cmd".to_string());
+        let registry = build_proxy_approval_registry(Some(&commands), fallback, "sess-1")
+            .unwrap()
+            .expect("command policy backends");
+        assert_eq!(registry.resolve(None).unwrap().0, "cmd");
+
+        assert!(
+            build_proxy_approval_registry(None, None, "sess-1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            build_proxy_approval_registry(None, Some((&BTreeMap::new(), None)), "sess-1")
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn supervised_backend_resolves_configured_webhook() {
         let mut backends = BTreeMap::new();
@@ -1106,6 +1423,43 @@ mod tests {
             http: ureq::Agent::new_with_defaults(),
             platform: None,
             poll_backoff: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn unsigned_webhook_times_out_without_sending_once_budget_is_spent() {
+        // The URL is unreachable; returning Timeout proves no request was made.
+        let backend = test_webhook(Duration::from_secs(1));
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now);
+        assert!(matches!(
+            backend.request_unsigned(b"{}", started).unwrap(),
+            ApprovalDecision::Timeout
+        ));
+        // An initial notice cannot consume time after the query deadline.
+        assert!(!WebhookApproval::show_notice(started, || panic!(
+            "notice must be skipped"
+        )));
+    }
+
+    #[test]
+    fn completion_notices_have_a_fresh_deadline_after_the_query_expires() {
+        let backend = test_webhook(Duration::from_secs(1));
+        let started = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+        let timeout = backend.request_unsigned(b"{}", started).unwrap();
+        for decision in [
+            timeout,
+            ApprovalDecision::Granted,
+            ApprovalDecision::DeniedForSession,
+        ] {
+            let now = Instant::now();
+            let deadline = now.checked_add(BACKEND_NOTICE_PAUSE_WAIT).unwrap();
+            assert!(WebhookApproval::show_notice(deadline, || {
+                assert!(started.elapsed() >= backend.timeout);
+                crate::terminal_approval::announce_backend_decision("test", &Ok(decision));
+                true
+            }));
         }
     }
 

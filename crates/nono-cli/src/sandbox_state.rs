@@ -63,6 +63,24 @@ pub struct SandboxState {
     /// nono builds; `#[serde(default)]` keeps those loadable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimits>,
+    /// Effective Linux namespace isolation (NEP-0004). Absent when no
+    /// isolation was requested, and in states written by older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<IsolationState>,
+}
+
+/// Linux namespace isolation in effect for a sandbox (NEP-0004).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolationState {
+    /// Requested namespaces, as `--isolate` names them (`net`, `mounts`, ...).
+    pub namespaces: Vec<String>,
+    /// Host paths hidden by the mount mask, as the applied plan masks them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub masked_paths: Vec<PathBuf>,
+    /// Host paths bound back over the masks, as the applied plan re-binds
+    /// them. Everything beneath a re-bound directory is reachable again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rebound_paths: Vec<PathBuf>,
 }
 
 /// Enforcement applied to pathname AF_UNIX operations for a running sandbox.
@@ -110,6 +128,53 @@ pub struct DomainEndpointState {
     pub domain: String,
     /// Allowed method+path rules (default-deny when non-empty)
     pub endpoints: Vec<EndpointRuleState>,
+    /// The entry's `endpoint_policy` as the proxy enforces it. `endpoints`
+    /// then lists only its `allow` rules, for display; `nono why` evaluates
+    /// this policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_policy: Option<nono_proxy::config::EndpointPolicyConfig>,
+}
+
+impl DomainEndpointState {
+    /// Endpoint state for an `allow_domain` entry, or `None` when the entry
+    /// does not restrict endpoints.
+    pub fn from_allow_domain(entry: &crate::profile::AllowDomainEntry) -> Option<Self> {
+        if !entry.has_endpoint_restrictions() {
+            return None;
+        }
+        let crate::profile::AllowDomainEntry::WithEndpoints {
+            domain,
+            endpoints,
+            endpoint_policy,
+        } = entry
+        else {
+            return None;
+        };
+        let rules: Vec<EndpointRuleState> = match endpoint_policy {
+            Some(policy) => policy
+                .allow
+                .iter()
+                .map(|r| EndpointRuleState {
+                    method: r.method.clone(),
+                    path: r.path.clone(),
+                })
+                .collect(),
+            None => endpoints
+                .iter()
+                .map(|r| EndpointRuleState {
+                    method: r.method.clone(),
+                    path: r.path.clone(),
+                })
+                .collect(),
+        };
+        Some(Self {
+            domain: domain.clone(),
+            endpoints: rules,
+            endpoint_policy: endpoint_policy
+                .as_ref()
+                .map(crate::profile::AllowDomainEndpointPolicy::to_proxy),
+        })
+    }
 }
 
 /// Serializable endpoint rule
@@ -228,6 +293,7 @@ impl SandboxState {
             denied_domains: denied_domains.to_vec(),
             domain_endpoints: domain_endpoints.to_vec(),
             resource_limits: caps.resource_limits().copied(),
+            isolation: None,
         }
     }
 
@@ -289,14 +355,39 @@ impl SandboxState {
         Ok(caps)
     }
 
-    /// Write sandbox state to a file with secure permissions
+    /// Write sandbox state to a new file; see [`create_file`](Self::create_file).
+    #[cfg(test)]
+    pub fn write_to_file(&self, path: &std::path::Path) -> Result<()> {
+        self.create_file(path).map(drop)
+    }
+
+    /// Replace the contents of a state file created by
+    /// [`create_file`](Self::create_file), through its open handle, so the
+    /// path is never re-resolved.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn rewrite(&self, file: &mut std::fs::File, path: &std::path::Path) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let json = serde_json::to_string_pretty(self).map_err(|e| {
+            NonoError::ConfigParse(format!("Failed to serialize sandbox state: {}", e))
+        })?;
+        let io = |source| NonoError::ConfigWrite {
+            path: path.to_path_buf(),
+            source,
+        };
+        file.set_len(0).map_err(io)?;
+        file.seek(SeekFrom::Start(0)).map_err(io)?;
+        file.write_all(json.as_bytes()).map_err(io)
+    }
+
+    /// Write sandbox state to a new file with secure permissions and return
+    /// its open handle.
     ///
     /// # Security
     /// This function implements multiple defenses against temp file attacks:
     /// - Uses `create_new(true)` to fail if file exists (prevents symlink attacks)
     /// - Sets `mode(0o600)` for owner-only read/write permissions (Unix)
-    /// - Atomic write operation (no TOCTOU window)
-    pub fn write_to_file(&self, path: &std::path::Path) -> Result<()> {
+    /// - Later updates go through the returned handle, never the path
+    pub fn create_file(&self, path: &std::path::Path) -> Result<std::fs::File> {
         let json = serde_json::to_string_pretty(self).map_err(|e| {
             NonoError::ConfigParse(format!("Failed to serialize sandbox state: {}", e))
         })?;
@@ -329,7 +420,7 @@ impl SandboxState {
                 source: e,
             })?;
 
-        Ok(())
+        Ok(file)
     }
 }
 
@@ -1071,6 +1162,7 @@ mod tests {
             }],
             unix_sockets: vec![],
             pathname_socket_enforcement: None,
+            isolation: None,
             net_blocked: false,
             allowed_commands: vec![],
             blocked_commands: vec![],
@@ -1394,9 +1486,11 @@ mod cap_file_validation_tests {
         let path = write_cap_file(file_dir.path());
         let path_str = path.to_str().expect("utf8 path").to_string();
 
-        // Point $TMPDIR at a *different* existing directory.
-        let other_dir = tempfile::tempdir_in("/tmp").expect("other tempdir");
-        let other = other_dir.path().to_str().expect("utf8 other");
+        // Point $TMPDIR at a *different* existing directory. Kept, not
+        // deleted: tests running in parallel may create temp dirs under it
+        // while it is set, and deleting it would make those fail.
+        let other_dir = tempfile::tempdir_in("/tmp").expect("other tempdir").keep();
+        let other = other_dir.to_str().expect("utf8 other");
         let _env = EnvVarGuard::set_all(&[("TMPDIR", other)]);
 
         // The cap file's canonical path is not under the overridden $TMPDIR, but
@@ -1568,5 +1662,50 @@ mod cap_file_validation_tests {
         // the field to None via #[serde(default)] — the back-compat guarantee.
         let reloaded: SandboxState = serde_json::from_str(&json).expect("loads");
         assert!(reloaded.resource_limits.is_none());
+    }
+
+    #[test]
+    fn domain_endpoint_state_from_allow_domain_entries() {
+        use crate::profile::AllowDomainEntry;
+        let entries: Vec<AllowDomainEntry> = serde_json::from_str(
+            r#"[
+                "plain.example.com",
+                { "domain": "object.example.com" },
+                { "domain": "rules.example.com", "endpoints": [{ "method": "GET", "path": "/v1/**" }] },
+                { "domain": "policy.example.com", "endpoint_policy": {
+                    "approve": [{ "method": "*", "path": "/**" }],
+                    "allow": [{ "method": "GET", "path": "/health" }]
+                } },
+                { "domain": "open.example.com", "endpoint_policy": { "default": { "decision": "allow" } } }
+            ]"#,
+        )
+        .expect("entries");
+        let states: Vec<DomainEndpointState> = entries
+            .iter()
+            .filter_map(DomainEndpointState::from_allow_domain)
+            .collect();
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].domain, "rules.example.com");
+        assert!(states[0].endpoint_policy.is_none());
+        assert_eq!(states[1].domain, "policy.example.com");
+        let policy = states[1].endpoint_policy.as_ref().expect("policy");
+        assert_eq!(policy.approve.len(), 1);
+        assert_eq!(
+            policy.default.decision,
+            nono_proxy::config::EndpointPolicyDecision::Deny
+        );
+        assert_eq!(states[1].endpoints.len(), 1);
+        assert_eq!(states[1].endpoints[0].path, "/health");
+
+        // Entries without a policy keep the existing state-file shape.
+        let encoded = serde_json::to_value(&states[0]).expect("encode");
+        assert!(encoded.get("endpoint_policy").is_none());
+        let decoded: DomainEndpointState = serde_json::from_value(serde_json::json!({
+            "domain": "old.example.com",
+            "endpoints": []
+        }))
+        .expect("old state files still load");
+        assert!(decoded.endpoint_policy.is_none());
     }
 }

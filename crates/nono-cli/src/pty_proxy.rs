@@ -216,8 +216,63 @@ fn enabled_control_char(termios: &Termios, index: SpecialCharacterIndices) -> Op
     (byte != libc::_POSIX_VDISABLE).then_some(byte)
 }
 
+/// Collects terminal notifications the screen model sees (NEP-0010 §2.1).
+#[derive(Default)]
+struct NotificationCallbacks {
+    pending: Vec<crate::terminal_capture::events::NotificationKind>,
+}
+
+impl vt100::Callbacks for NotificationCallbacks {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.pending
+            .push(crate::terminal_capture::events::NotificationKind::Bell);
+    }
+
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        use crate::terminal_capture::events::NotificationKind;
+        match params {
+            // OSC 9;4 is a progress report, not a notification.
+            [b"9", second, ..] if *second != b"4" => self.pending.push(NotificationKind::Osc9),
+            [b"9"] => self.pending.push(NotificationKind::Osc9),
+            [b"777", b"notify", ..] => self.pending.push(NotificationKind::Osc777),
+            _ => {}
+        }
+    }
+}
+
 struct ScreenState {
-    parser: vt100::Parser,
+    parser: vt100::Parser<NotificationCallbacks>,
+}
+
+/// Executable of a process group's leader, or `None` when it cannot be
+/// resolved. Never guessed (NEP-0010 §2.2).
+fn foreground_executable(pgid: i32) -> Option<String> {
+    if pgid <= 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pgid}/exe"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: `buf` is a valid writable buffer of the length passed, and
+        // `proc_pidpath` writes at most that many bytes.
+        let len =
+            unsafe { libc::proc_pidpath(pgid, buf.as_mut_ptr().cast::<libc::c_void>(), 4096) };
+        if len <= 0 {
+            return None;
+        }
+        buf.truncate(usize::try_from(len).ok()?);
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 fn nonzero_screen_dimension(value: usize) -> NonZeroU16 {
@@ -228,10 +283,11 @@ fn nonzero_screen_dimension(value: usize) -> NonZeroU16 {
 impl ScreenState {
     fn new(rows: usize, cols: usize) -> Self {
         Self {
-            parser: vt100::Parser::new(
+            parser: vt100::Parser::new_with_callbacks(
                 nonzero_screen_dimension(rows),
                 nonzero_screen_dimension(cols),
                 VT_SCROLLBACK_ROWS,
+                NotificationCallbacks::default(),
             ),
         }
     }
@@ -249,6 +305,10 @@ impl ScreenState {
 
     fn render(&self) -> Vec<u8> {
         self.parser.screen().state_formatted().into_bytes()
+    }
+
+    fn take_notifications(&mut self) -> Vec<crate::terminal_capture::events::NotificationKind> {
+        std::mem::take(&mut self.parser.callbacks_mut().pending)
     }
 
     fn render_plaintext(&self) -> String {
@@ -305,6 +365,14 @@ pub struct PtyProxy {
     /// A quit byte, recorded and forwarded on exactly the same terms as
     /// `interrupt_requested`.
     quit_requested: Option<Pid>,
+    /// Session terminal capture (NEP-0010), when recording is on.
+    capture: Option<crate::terminal_capture::TerminalCapture>,
+    /// Label for input from the current client: `local` or `attach:<n>`.
+    client_label: String,
+    /// Number of socket clients accepted, for `attach:<n>` labels.
+    attach_count: u64,
+    /// Set once a required recording failure has asked to stop the session.
+    capture_stop_requested: bool,
 }
 
 /// Open a PTY pair, inheriting the current terminal's window size.
@@ -371,7 +439,7 @@ pub unsafe fn setup_child_pty(slave_fd: RawFd) {
 }
 
 /// Get the current terminal window size, if available.
-fn get_terminal_winsize() -> Option<Winsize> {
+pub(crate) fn get_terminal_winsize() -> Option<Winsize> {
     let mut ws: Winsize = unsafe { std::mem::zeroed() };
     // SAFETY: ioctl with TIOCGWINSZ reads window size into ws
     let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
@@ -436,6 +504,10 @@ impl PtyProxy {
             suspension_requested: false,
             interrupt_requested: None,
             quit_requested: None,
+            capture: None,
+            client_label: "local".to_string(),
+            attach_count: 0,
+            capture_stop_requested: false,
         })
     }
 
@@ -451,6 +523,11 @@ impl PtyProxy {
             } else {
                 "socket"
             });
+            if let Some(capture) = self.capture.as_mut() {
+                capture.lifecycle(crate::terminal_capture::events::Lifecycle::ClientDetached {
+                    client: self.client_label.clone(),
+                });
+            }
             if client.is_terminal() {
                 detached_terminal = true;
                 self.restore_terminal();
@@ -696,6 +773,13 @@ impl PtyProxy {
                 let socket = unsafe { OwnedFd::from_raw_fd(socket_fd) };
                 self.client = Some(AttachedClient::socket(socket));
                 self.resize_notifier = Some(supervisor_resize);
+                self.attach_count = self.attach_count.saturating_add(1);
+                self.client_label = format!("attach:{}", self.attach_count);
+                if let Some(capture) = self.capture.as_mut() {
+                    capture.lifecycle(crate::terminal_capture::events::Lifecycle::ClientAttached {
+                        client: self.client_label.clone(),
+                    });
+                }
                 self.persist_attachment_state(crate::session::SessionAttachment::Attached);
                 info!(
                     "PTY proxy attached socket client for session {}",
@@ -908,6 +992,7 @@ impl PtyProxy {
         };
 
         let forwarded = self.filter_client_input(&buf[..n]);
+        self.capture_input(&forwarded);
         if !forwarded.is_empty()
             && let Err(err) = write_all_fd(self.master.as_raw_fd(), &forwarded)
         {
@@ -1089,7 +1174,87 @@ impl PtyProxy {
         }
         self.screen
             .resize(target_rows as usize, target_cols as usize);
+        if let Some(capture) = self.capture.as_mut() {
+            capture.resize(target_cols, target_rows);
+        }
         true
+    }
+
+    /// Install session terminal capture. Records the initial client.
+    pub(crate) fn set_capture(&mut self, mut capture: crate::terminal_capture::TerminalCapture) {
+        if self.client.is_some() {
+            capture.lifecycle(crate::terminal_capture::events::Lifecycle::ClientAttached {
+                client: self.client_label.clone(),
+            });
+        }
+        self.capture = Some(capture);
+        self.sample_foreground();
+    }
+
+    /// Record a supervisor lifecycle event, when capture is on.
+    pub(crate) fn capture_lifecycle(&mut self, event: crate::terminal_capture::events::Lifecycle) {
+        if let Some(capture) = self.capture.as_mut() {
+            capture.lifecycle(event);
+        }
+    }
+
+    /// Periodic capture housekeeping from the supervisor loop.
+    ///
+    /// Returns the reason the first time a required recording destination
+    /// fails, so the caller can stop the session.
+    pub(crate) fn service_capture(&mut self) -> Option<String> {
+        let capture = self.capture.as_mut()?;
+        if capture.wants_foreground_sample() {
+            self.sample_foreground();
+        }
+        let reason = self.capture.as_mut()?.tick()?;
+        if self.capture_stop_requested {
+            return None;
+        }
+        self.capture_stop_requested = true;
+        Some(reason)
+    }
+
+    /// Finish capture: record the exit and close the last chunk.
+    pub(crate) fn finish_capture(
+        &mut self,
+        status: String,
+    ) -> Option<crate::terminal_capture::CaptureSummary> {
+        self.capture.take().map(|capture| capture.finish(status))
+    }
+
+    fn capture_input(&mut self, bytes: &[u8]) {
+        if self.capture.is_none() || bytes.is_empty() {
+            return;
+        }
+        // Read the slave's mode before recording the batch, so password-mode
+        // input (ICANON on, ECHO off) is never captured (NEP-0010 §3.2).
+        // If the mode cannot be read, assume password mode: fail closed.
+        let mode = nix::sys::termios::tcgetattr(&self.master).ok().map(|t| {
+            (
+                t.local_flags
+                    .contains(nix::sys::termios::LocalFlags::ICANON),
+                t.local_flags.contains(nix::sys::termios::LocalFlags::ECHO),
+            )
+        });
+        let label = self.client_label.clone();
+        if let Some(capture) = self.capture.as_mut() {
+            let (icanon, echo) = mode.unwrap_or((true, false));
+            capture.observe_mode(icanon, echo);
+            capture.input(&label, bytes);
+        }
+        self.sample_foreground();
+    }
+
+    fn sample_foreground(&mut self) {
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        let Ok(pgid) = nix::unistd::tcgetpgrp(&self.master) else {
+            return;
+        };
+        let raw = pgid.as_raw();
+        capture.foreground(raw, foreground_executable(raw));
     }
 
     fn persist_attachment_state(&self, attachment: crate::session::SessionAttachment) {
@@ -1107,7 +1272,25 @@ impl PtyProxy {
         }
 
         let first_output = self.scrollback.is_empty();
+        if self.capture.is_some() {
+            // Local SIGWINCH resizes the master directly from a signal
+            // handler; pick the new size up here so it precedes the output
+            // drawn at that size.
+            let size = current_winsize(self.master.as_raw_fd());
+            if let Some(capture) = self.capture.as_mut() {
+                if let Some(size) = size {
+                    capture.resize(size.ws_col, size.ws_row);
+                }
+                capture.output(crate::terminal_capture::events::OutputStream::Pty, bytes);
+            }
+        }
         self.screen.apply_bytes(bytes);
+        let notifications = self.screen.take_notifications();
+        if let Some(capture) = self.capture.as_mut() {
+            for kind in notifications {
+                capture.notification(kind);
+            }
+        }
 
         if bytes.len() >= SCROLLBACK_LIMIT_BYTES {
             self.scrollback.clear();
@@ -1391,7 +1574,16 @@ impl PtyProxy {
                     );
                 }
             }
-            EnhancedKeyMatch::Invalid => self.flush_pending_detach_escape(forwarded),
+            EnhancedKeyMatch::Invalid => {
+                if self.detach_sequence[..self.pending_detach_match_len]
+                    .iter()
+                    .any(|&key| is_enhanced_key_echo(&self.pending_detach_escape, key))
+                {
+                    self.pending_detach_escape.clear();
+                } else {
+                    self.flush_pending_detach_escape(forwarded);
+                }
+            }
         }
 
         true
@@ -1440,25 +1632,14 @@ pub(crate) fn match_enhanced_key_sequence(bytes: &[u8], expected_key: u8) -> Enh
     };
 
     if last == b'u' {
-        if body.is_empty()
-            || !body
-                .iter()
-                .all(|b| b.is_ascii_digit() || matches!(b, b';' | b':'))
+        let Some(report) = parse_csi_u_key_report(body) else {
+            return EnhancedKeyMatch::Invalid;
+        };
+        // Only a press advances a detach match. Repeat and release reports
+        // (kitty "report event types") are handled by is_enhanced_key_echo.
+        return if report.event_type == KITTY_EVENT_PRESS
+            && enhanced_key_matches(expected_key, report.codepoint, report.modifiers)
         {
-            return EnhancedKeyMatch::Invalid;
-        }
-        let mut fields = body.split(|b| matches!(b, b';' | b':'));
-        let Some(first_field) = fields.next() else {
-            return EnhancedKeyMatch::Invalid;
-        };
-        if first_field.is_empty() {
-            return EnhancedKeyMatch::Invalid;
-        }
-        let Some(codepoint) = parse_ascii_u32(first_field) else {
-            return EnhancedKeyMatch::Invalid;
-        };
-        let modifiers = fields.find_map(parse_ascii_u32).unwrap_or(1);
-        return if enhanced_key_matches(expected_key, codepoint, modifiers) {
             EnhancedKeyMatch::Matched
         } else {
             EnhancedKeyMatch::Invalid
@@ -1495,6 +1676,75 @@ pub(crate) fn match_enhanced_key_sequence(bytes: &[u8], expected_key: u8) -> Enh
     }
 
     EnhancedKeyMatch::Invalid
+}
+
+/// Returns true when `bytes` is a complete kitty CSI-u repeat or release
+/// report for `key`.
+///
+/// Applications that enable kitty event reporting (e.g. pi pushes flags 7)
+/// make the terminal send `\x1b[93;5:3u` after the `\x1b[93;5u` press of
+/// Ctrl-]. Detach matchers use this to swallow those reports for keys already
+/// matched instead of letting them reset a partial detach sequence.
+pub(crate) fn is_enhanced_key_echo(bytes: &[u8], key: u8) -> bool {
+    let Some(body) = bytes
+        .strip_prefix(b"\x1b[")
+        .and_then(|rest| rest.strip_suffix(b"u"))
+    else {
+        return false;
+    };
+    parse_csi_u_key_report(body).is_some_and(|report| {
+        report.event_type != KITTY_EVENT_PRESS
+            && enhanced_key_matches(key, report.codepoint, report.modifiers)
+    })
+}
+
+const KITTY_EVENT_PRESS: u32 = 1;
+/// Caps Lock and Num Lock bits of a kitty modifier mask; they do not change
+/// which key was pressed.
+const KITTY_LOCK_MODIFIER_BITS: u32 = 64 | 128;
+
+struct CsiUKeyReport {
+    codepoint: u32,
+    modifiers: u32,
+    event_type: u32,
+}
+
+/// Parse the body of `CSI key[:shifted[:base]] [; modifiers[:event] [; text]] u`.
+fn parse_csi_u_key_report(body: &[u8]) -> Option<CsiUKeyReport> {
+    if body.is_empty()
+        || !body
+            .iter()
+            .all(|b| b.is_ascii_digit() || matches!(b, b';' | b':'))
+    {
+        return None;
+    }
+    let mut fields = body.split(|b| *b == b';');
+    let codepoint = parse_ascii_u32(fields.next()?.split(|b| *b == b':').next()?)?;
+
+    let (modifiers, event_type) = match fields.next() {
+        None => (1, KITTY_EVENT_PRESS),
+        Some(field) => {
+            let mut parts = field.split(|b| *b == b':');
+            let modifiers = match parts.next() {
+                Some(m) if !m.is_empty() => parse_ascii_u32(m)?,
+                _ => 1,
+            };
+            let event_type = match parts.next() {
+                Some(e) if !e.is_empty() => parse_ascii_u32(e)?,
+                _ => KITTY_EVENT_PRESS,
+            };
+            (modifiers, event_type)
+        }
+    };
+    let modifiers = modifiers
+        .checked_sub(1)
+        .map(|bits| (bits & !KITTY_LOCK_MODIFIER_BITS).saturating_add(1))?;
+
+    Some(CsiUKeyReport {
+        codepoint,
+        modifiers,
+        event_type,
+    })
 }
 
 fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
@@ -1660,6 +1910,13 @@ fn select_attach_replay_bytes(
     } else {
         body
     }
+}
+
+/// Window size of a freshly opened PTY, as `(cols, rows)`.
+pub(crate) fn pty_pair_size(pair: &PtyPair) -> Option<(u16, u16)> {
+    current_winsize(pair.master.as_raw_fd())
+        .filter(|w| w.ws_col > 0 && w.ws_row > 0)
+        .map(|w| (w.ws_col, w.ws_row))
 }
 
 fn current_winsize(fd: RawFd) -> Option<Winsize> {
@@ -2797,6 +3054,26 @@ fn run_attach_loop(
 #[cfg(test)]
 mod tests {
     use super::remote_terminal_restore_escape;
+
+    #[test]
+    fn screen_model_reports_terminal_notifications() {
+        use crate::terminal_capture::events::NotificationKind;
+        let mut screen = ScreenState::new(24, 80);
+        screen.apply_bytes(b"done\x07");
+        screen.apply_bytes(b"\x1b]9;build finished\x07");
+        screen.apply_bytes(b"\x1b]9;4;1;50\x07");
+        screen.apply_bytes(b"\x1b]777;notify;title;body\x1b\\");
+        screen.apply_bytes(b"\x1b]0;window title\x07");
+        assert_eq!(
+            screen.take_notifications(),
+            vec![
+                NotificationKind::Bell,
+                NotificationKind::Osc9,
+                NotificationKind::Osc777
+            ]
+        );
+        assert!(screen.take_notifications().is_empty());
+    }
     use super::{
         ATTACH_HANDSHAKE_MAGIC, ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE,
         AltScreenTracker, AttachedClient, CprReplyParse, DEFAULT_DETACH_SEQUENCE,
@@ -2961,6 +3238,10 @@ mod tests {
             saved_termios: None,
             scrollback: VecDeque::new(),
             screen: ScreenState::new(24, 80),
+            capture: None,
+            client_label: "local".to_string(),
+            attach_count: 0,
+            capture_stop_requested: false,
             detach_sequence: sequence.to_vec(),
             pending_detach_match_len: 0,
             pending_detach_escape: Vec::new(),
@@ -3041,7 +3322,7 @@ mod tests {
             nonzero_screen_dimension(30),
             30,
         );
-        parser.process(b"$ nono connect\r\nconnected\r\ndetach keys\r\n");
+        parser.process(b"$ nono remote connect\r\nconnected\r\ndetach keys\r\n");
         // Reproduce a saved cursor above the connection banner. Restoring only
         // the alternate buffer would put the next prompt over that banner.
         parser.process(b"\x1b[H");
@@ -3053,7 +3334,7 @@ mod tests {
         parser.process(b"Detached\r\n$ ");
         assert_eq!(parser.screen().contents(), "Detached\n$ ");
         parser.screen_mut().set_scrollback(6);
-        assert!(parser.screen().contents().contains("$ nono connect"));
+        assert!(parser.screen().contents().contains("$ nono remote connect"));
         assert!(parser.screen().contents().contains("connected"));
         assert!(parser.screen().contents().contains("detach keys"));
     }
@@ -3481,6 +3762,38 @@ mod tests {
         let forwarded = proxy.filter_client_input(b"\x1b[93;5u\x1b[100;1u");
         assert!(forwarded.is_empty());
         assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_detaches_with_kitty_event_type_reports() {
+        // pi pushes kitty flags 7, so Ctrl-] arrives as a press then a release
+        // (and repeats when held). These must not reset the partial match.
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5u");
+        assert!(forwarded.is_empty());
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5:2u\x1b[93;5:3u");
+        assert!(forwarded.is_empty());
+        assert_eq!(proxy.pending_detach_match_len, 1);
+        let forwarded = proxy.filter_client_input(b"d");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_detaches_with_explicit_press_alternate_keys_and_locks() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        // Alternate base-layout key, Caps Lock (bit 64) and explicit press.
+        let forwarded = proxy.filter_client_input(b"\x1b[93::93;69:1u\x1b[100;1:1u");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_does_not_match_detach_on_release_only() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5:3ud");
+        assert_eq!(forwarded, b"\x1b[93;5:3ud");
+        assert!(!proxy.take_detach_request());
     }
 
     #[test]

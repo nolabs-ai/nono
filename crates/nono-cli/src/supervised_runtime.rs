@@ -25,6 +25,7 @@ struct SessionRuntimeState {
 }
 
 pub(crate) struct SupervisedRuntimeContext<'a> {
+    pub(crate) session_socket_auth: bool,
     pub(crate) config: &'a exec_strategy::ExecConfig<'a>,
     pub(crate) caps: &'a CapabilitySet,
     /// Resolved deny paths; the supervisor never grants beneath them.
@@ -46,6 +47,12 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     #[cfg(target_os = "linux")]
     pub(crate) network_denial_audit: crate::profile::NetworkDenialAuditLimits,
     pub(crate) silent: bool,
+    /// Credential values resolved for this session, for terminal-recording
+    /// redaction (NEP-0010 §3.1). Shared with the proxies, which keep adding
+    /// refreshed and captured values while the session runs.
+    pub(crate) secret_registry: nono_proxy::SecretRegistry,
+    /// Session terminal recording settings (NEP-0010), when recording is on.
+    pub(crate) session_recording: Option<crate::terminal_capture::RecordingSettings>,
 }
 
 fn build_supervisor_session_id(audit_state: Option<&AuditState>) -> String {
@@ -107,6 +114,7 @@ fn create_session_runtime_state(
         })
         .unwrap_or_else(session::generate_session_id);
     let session_record = session::SessionRecord {
+        policy: session.policy.clone(),
         session_id: short_session_id.clone(),
         name: Some(
             session
@@ -134,6 +142,7 @@ fn create_session_runtime_state(
             nono::NetworkMode::ProxyOnly { port, .. } => format!("proxy (localhost:{port})"),
         },
         rollback_session: audit_state.map(|state| state.session_id.clone()),
+        recording: None,
     };
     let session_guard = Some(session::SessionGuard::new(session_record)?);
     let pty_pair = if should_open_supervised_pty(
@@ -214,6 +223,7 @@ fn should_open_supervised_pty(
 
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
     let SupervisedRuntimeContext {
+        session_socket_auth,
         config,
         caps,
         deny_paths,
@@ -230,6 +240,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         #[cfg(target_os = "linux")]
         network_denial_audit,
         silent,
+        secret_registry,
+        session_recording,
     } = ctx;
 
     output::print_applying_sandbox(silent);
@@ -239,6 +251,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         rollback.destination.as_ref(),
         session.session_id.as_deref(),
     )?;
+    if let Some(state) = &audit_state {
+        crate::audit_client::capture_profile(&state.session_dir, config.profile_save_base)?;
+    }
     warn_if_rollback_flags_ignored(rollback, silent);
 
     // Create the session guard (writes session file) and PTY pair BEFORE
@@ -291,6 +306,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             .lock()
             .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
         recorder.record_session_started(started.clone(), command.to_vec())?;
+        if let Some(policy) = &session.policy {
+            recorder.record_extension_event("platform_policy", policy)?;
+        }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(tool_sandbox_runtime) = config.tool_sandbox_runtime {
             #[cfg(target_os = "linux")]
@@ -345,6 +363,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     let supervisor_session_id = build_supervisor_session_id(audit_state.as_ref());
     let supervisor_deny_paths = exec_strategy::supervisor_deny_paths(deny_paths);
     let supervisor_cfg = exec_strategy::SupervisorConfig {
+        session_socket_auth,
         protected_roots: protected_roots.as_paths(),
         deny_paths: &supervisor_deny_paths,
         approval_backend,
@@ -428,6 +447,35 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     #[cfg(not(target_os = "linux"))]
     let resource_procs_fd: Option<std::os::fd::RawFd> = None;
 
+    let terminal_capture = match session_recording.as_ref() {
+        Some(settings) => crate::terminal_capture::start_for_session(
+            crate::terminal_capture::SessionCaptureContext {
+                settings,
+                session_id: &short_session_id,
+                audit: audit_state.as_ref().zip(audit_recorder.as_ref()).map(
+                    |(state, recorder)| {
+                        (
+                            state.session_id.as_str(),
+                            state.session_dir.as_path(),
+                            recorder,
+                        )
+                    },
+                ),
+                pty_size: pty_pair.as_ref().map(pty_proxy::pty_pair_size),
+                registry: &secret_registry,
+            },
+        )?,
+        None => None,
+    };
+    if let (Some(capture), Some(guard)) = (terminal_capture.as_ref(), session_guard.as_mut()) {
+        guard.set_recording(session::SessionRecordingState {
+            input: capture.input_mode() == crate::terminal_capture::InputCapture::On,
+            required: capture.is_required(),
+            files: capture.files().to_vec(),
+            delivered: capture.delivering(),
+        });
+    }
+
     let exit_code = {
         // Runs in the parent the instant the child is forked, with the child's pid;
         // records it on the session. The cgroup attach is the child's own job (see
@@ -479,6 +527,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             Some(&mut on_fork),
             pty_pair,
             Some(&short_session_id),
+            terminal_capture,
             resource_procs_fd,
             on_exit_diag,
         )?

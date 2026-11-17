@@ -218,6 +218,13 @@ pub struct ProxyConfig {
     /// `nono proxy` command, which has no sandboxed child.
     #[serde(default, skip)]
     pub outer_caps: Option<nono::CapabilitySet>,
+
+    /// Session secret registry (NEP-0010 §3.1). When set, the proxy registers
+    /// every credential value it loads, refreshes, or captures so the
+    /// supervisor can redact it from terminal recordings. `None` leaves
+    /// behaviour unchanged. Skipped during (de)serialisation.
+    #[serde(default, skip)]
+    pub secret_registry: Option<crate::secret_registry::SecretRegistry>,
 }
 
 /// Pre-generated CA key material for cross-session CA reuse.
@@ -281,6 +288,7 @@ impl Default for ProxyConfig {
             enable_h2: false,
             enable_network_audit: default_enable_network_audit(),
             outer_caps: None,
+            secret_registry: None,
         }
     }
 }
@@ -735,6 +743,14 @@ fn normalise_no_proxy_host(host: &str) -> String {
     lower.parse::<IpAddr>().map_or(lower, |ip| ip.to_string())
 }
 
+/// Prefix marking a synthetic endpoint-authorization route created by the CLI
+/// (`partition_allow_domain`) for an `allow_domain` entry with `endpoints`.
+/// The route gates requests to the domain's endpoints and carries no
+/// credential. Shared between the creation site (`nono-cli`) and the match
+/// site (`credential_env_vars` in `server.rs`) so renaming one cannot
+/// silently reintroduce the vars this prefix suppresses (see #2286).
+pub const ENDPOINT_ROUTE_PREFIX: &str = "_ep_";
+
 /// Configuration for a reverse proxy credential route.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteConfig {
@@ -807,6 +823,14 @@ pub struct RouteConfig {
     /// otherwise produce a nonsensical env var name.
     #[serde(default)]
     pub env_var: Option<String>,
+
+    /// Template for the phantom token placed in `env_var`, with `{}` replaced by
+    /// the session token (e.g. `ghp_{}`), for clients that reject tokens lacking a
+    /// known prefix. When set, the route accepts only the rendered value, not the
+    /// bare token. A compatibility shim, not a per-route secret. Independent of
+    /// `credential_format`, which shapes the outbound real credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phantom_format: Option<String>,
 
     /// Optional L7 endpoint rules for method+path filtering.
     ///
@@ -1061,6 +1085,10 @@ pub struct EndpointPolicyRule {
     pub reason: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// AWS operation-name globs (`aws_auth` routes only). `Unknown` is the
+    /// literal name used when the operation cannot be determined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Vec<String>>,
 }
 
 /// Explicit L7 endpoint policy for a route.
@@ -1075,6 +1103,50 @@ pub struct EndpointPolicyConfig {
     pub approve: Vec<EndpointPolicyRule>,
     #[serde(default)]
     pub allow: Vec<EndpointPolicyRule>,
+}
+
+impl EndpointPolicyConfig {
+    /// The policy a legacy `endpoint_rules` allow-list stands for: allow the
+    /// listed rules and deny everything else, or allow everything when the
+    /// list is empty.
+    #[must_use]
+    pub fn from_legacy_rules(rules: &[EndpointRule]) -> Self {
+        let allow = rules
+            .iter()
+            .map(|rule| EndpointPolicyRule {
+                method: rule.method.clone(),
+                path: rule.path.clone(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+                operations: None,
+            })
+            .collect::<Vec<_>>();
+        let default = if allow.is_empty() {
+            EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            }
+        } else {
+            EndpointPolicyDefault::default()
+        };
+        Self {
+            default,
+            deny: Vec::new(),
+            approve: Vec::new(),
+            allow,
+        }
+    }
+
+    /// `true` when the policy does not require L7 visibility.
+    #[must_use]
+    pub fn allows_all_without_l7(&self) -> bool {
+        self.deny.is_empty()
+            && self.approve.is_empty()
+            && self.allow.is_empty()
+            && self.default.decision == EndpointPolicyDecision::Allow
+    }
 }
 
 /// Pre-compiled endpoint rules for the request hot path.
@@ -1107,7 +1179,35 @@ struct CompiledPolicyRule {
     backend: Option<String>,
     reason: Option<String>,
     timeout_secs: Option<u64>,
+    operations: Option<globset::GlobSet>,
+    operations_src: Vec<String>,
 }
+
+impl CompiledPolicyRule {
+    fn label(&self) -> String {
+        format!("{} {}{}", self.method, self.path, self.operations_suffix())
+    }
+
+    fn operations_suffix(&self) -> String {
+        if self.operations_src.is_empty() {
+            String::new()
+        } else {
+            format!(" ops={}", self.operations_src.join(","))
+        }
+    }
+}
+
+/// Request attributes evaluated by [`CompiledEndpointPolicy::evaluate_request`].
+#[derive(Debug, Clone, Copy)]
+pub struct EndpointRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    /// Resolved AWS operation name. `None` is evaluated as `Unknown`.
+    pub operation: Option<&'a str>,
+}
+
+/// Operation name used when the AWS operation cannot be determined.
+pub const UNKNOWN_OPERATION: &str = "Unknown";
 
 /// Result of evaluating a compiled endpoint policy.
 #[derive(Debug)]
@@ -1198,7 +1298,7 @@ impl CompiledEndpointRules {
     pub fn compile(rules: &[EndpointRule]) -> Result<Self, String> {
         let mut compiled = Vec::with_capacity(rules.len());
         for rule in rules {
-            let glob = GlobBuilder::new(&rule.path)
+            let glob = GlobBuilder::new(normalize_rule_path(&rule.path))
                 .literal_separator(true)
                 .build()
                 .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
@@ -1245,35 +1345,12 @@ impl CompiledEndpointPolicy {
             return Self::compile_explicit(policy);
         }
 
-        let allow = legacy_rules
-            .iter()
-            .map(|rule| EndpointPolicyRule {
-                method: rule.method.clone(),
-                path: rule.path.clone(),
-                backend: None,
-                reason: None,
-                timeout_secs: None,
-            })
-            .collect::<Vec<_>>();
-        let default = if allow.is_empty() {
-            EndpointPolicyDefault {
-                decision: EndpointPolicyDecision::Allow,
-                backend: None,
-                timeout_secs: None,
-            }
-        } else {
-            EndpointPolicyDefault::default()
-        };
-        Self::compile_explicit(&EndpointPolicyConfig {
-            default,
-            deny: Vec::new(),
-            approve: Vec::new(),
-            allow,
-        })
-        .map(|mut compiled| {
-            compiled.explicit = false;
-            compiled
-        })
+        Self::compile_explicit(&EndpointPolicyConfig::from_legacy_rules(legacy_rules)).map(
+            |mut compiled| {
+                compiled.explicit = false;
+                compiled
+            },
+        )
     }
 
     fn compile_explicit(policy: &EndpointPolicyConfig) -> Result<Self, String> {
@@ -1306,6 +1383,49 @@ impl CompiledEndpointPolicy {
     /// policy constrains endpoints at all.
     #[must_use]
     pub fn evaluate<'a>(&'a self, method: &str, path: &str) -> EndpointPolicyOutcome<'a> {
+        self.evaluate_request(&EndpointRequest {
+            method,
+            path,
+            operation: None,
+        })
+    }
+
+    /// `true` when any rule constrains the AWS operation name.
+    #[must_use]
+    pub fn has_operation_rules(&self) -> bool {
+        self.deny
+            .iter()
+            .chain(&self.approve)
+            .chain(&self.allow)
+            .any(|r| r.operations.is_some())
+    }
+
+    /// `true` when a deny or approve rule with `operations` matches the
+    /// `Unknown` operation for some method and path.
+    #[must_use]
+    pub fn restrictive_rule_matches_unknown(&self) -> bool {
+        self.deny.iter().chain(&self.approve).any(|r| {
+            r.operations
+                .as_ref()
+                .is_some_and(|set| set.is_match(UNKNOWN_OPERATION))
+        })
+    }
+
+    /// `true` when the default decision is allow.
+    #[must_use]
+    pub fn default_allows(&self) -> bool {
+        self.default.decision == EndpointPolicyDecision::Allow
+    }
+
+    /// Evaluate a request using deny, approve, allow, default precedence.
+    #[must_use]
+    pub fn evaluate_request<'a>(&'a self, req: &EndpointRequest<'_>) -> EndpointPolicyOutcome<'a> {
+        let EndpointRequest {
+            method,
+            path,
+            operation,
+        } = *req;
+        let operation = operation.unwrap_or(UNKNOWN_OPERATION);
         if !self.allows_all_without_l7() && path_is_ambiguous(path) {
             return EndpointPolicyOutcome::Deny {
                 reason: Some(
@@ -1317,23 +1437,28 @@ impl CompiledEndpointPolicy {
             };
         }
         let normalized = normalize_path(path);
-        if let Some(rule) = first_policy_match(&self.deny, method, &normalized) {
+        if let Some(rule) = first_policy_match(&self.deny, method, &normalized, operation) {
             return EndpointPolicyOutcome::Deny {
                 reason: rule.reason.as_deref(),
-                rule_label: format!("endpoint_policy.deny[{} {}]", rule.method, rule.path),
+                rule_label: format!("endpoint_policy.deny[{}]", rule.label()),
             };
         }
-        if let Some(rule) = first_policy_match(&self.approve, method, &normalized) {
+        if let Some(rule) = first_policy_match(&self.approve, method, &normalized, operation) {
             return EndpointPolicyOutcome::Approve {
                 backend: rule.backend.as_deref(),
                 reason: rule.reason.as_deref(),
                 timeout_secs: rule.timeout_secs,
-                rule_label: format!("endpoint_policy.approve[{} {}]", rule.method, rule.path),
+                rule_label: format!(
+                    "endpoint_policy.approve[{} {}{}]",
+                    approval_scope_method(method),
+                    approval_scope_path(&rule.path, &normalized),
+                    rule.operations_suffix()
+                ),
             };
         }
-        if let Some(rule) = first_policy_match(&self.allow, method, &normalized) {
+        if let Some(rule) = first_policy_match(&self.allow, method, &normalized, operation) {
             return EndpointPolicyOutcome::Allow {
-                rule_label: format!("endpoint_policy.allow[{} {}]", rule.method, rule.path),
+                rule_label: format!("endpoint_policy.allow[{}]", rule.label()),
             };
         }
 
@@ -1345,11 +1470,17 @@ impl CompiledEndpointPolicy {
                 reason: None,
                 rule_label: "endpoint_policy.default".to_string(),
             },
+            // The default has no pattern to scope by, so an answer covers only
+            // the exact method and path that reached it.
             EndpointPolicyDecision::Approve => EndpointPolicyOutcome::Approve {
                 backend: self.default.backend.as_deref(),
                 reason: None,
                 timeout_secs: self.default.timeout_secs,
-                rule_label: "endpoint_policy.default".to_string(),
+                rule_label: format!(
+                    "endpoint_policy.default[{} {}]",
+                    approval_scope_method(method),
+                    escape_glob(&normalized)
+                ),
             },
         }
     }
@@ -1358,10 +1489,14 @@ impl CompiledEndpointPolicy {
 fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPolicyRule>, String> {
     let mut compiled = Vec::with_capacity(rules.len());
     for rule in rules {
-        let glob = GlobBuilder::new(&rule.path)
+        let glob = GlobBuilder::new(normalize_rule_path(&rule.path))
             .literal_separator(true)
             .build()
             .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
+        let (operations, operations_src) = match &rule.operations {
+            Some(ops) => (Some(compile_operation_globs(ops)?), ops.clone()),
+            None => (None, Vec::new()),
+        };
         compiled.push(CompiledPolicyRule {
             method: rule.method.clone(),
             path: rule.path.clone(),
@@ -1369,19 +1504,155 @@ fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPoli
             backend: rule.backend.clone(),
             reason: rule.reason.clone(),
             timeout_secs: rule.timeout_secs,
+            operations,
+            operations_src,
         });
     }
     Ok(compiled)
+}
+
+/// The request method as it appears in an approval scope. Scopes always name
+/// the request's method, never a rule's `*`, so a session answer for `GET`
+/// does not cover `POST`.
+fn approval_scope_method(method: &str) -> String {
+    method.to_ascii_uppercase()
+}
+
+/// The part of an `approve` rule that one session answer covers: the rule
+/// `pattern` with every wildcard segment before the first `**` replaced by the
+/// request segment it matched. The first `**` and everything after it stay as
+/// written, so `/*/*/**` on `/torvalds/linux/info/refs` yields
+/// `/torvalds/linux/**`.
+///
+/// The result is both the approval `rule_label` shown to the backend and the
+/// session-cache key, so it must never cover more than the rule matched. When
+/// the pattern segments cannot be aligned with the request segments (a brace
+/// spanning `/`, or any class, which may match `/`), the whole normalized
+/// request path is the scope.
+/// Filled-in values have glob metacharacters escaped so a request segment
+/// named `*` cannot read as a wildcard.
+fn approval_scope_path(pattern: &str, normalized_path: &str) -> String {
+    let mut request_segments = normalized_path.split('/').skip(1);
+    let mut scoped = Vec::new();
+    let mut pattern_segments = pattern.split('/');
+    if pattern_segments.next() != Some("") {
+        return escape_glob(normalized_path);
+    }
+    while let Some(segment) = pattern_segments.next() {
+        if segment == "**" {
+            scoped.push(segment.to_string());
+            scoped.extend(pattern_segments.map(str::to_string));
+            return format!("/{}", scoped.join("/"));
+        }
+        // A class can match `/` even with `literal_separator` (`[!x]`,
+        // `[.-0]`), so a segment holding one may span request segments.
+        if !segment_is_balanced(segment) || segment.contains('[') {
+            return escape_glob(normalized_path);
+        }
+        let Some(value) = request_segments.next() else {
+            return escape_glob(normalized_path);
+        };
+        if segment.contains(GLOB_METACHARACTERS) {
+            scoped.push(escape_glob(value));
+        } else {
+            scoped.push(segment.to_string());
+        }
+    }
+    format!("/{}", scoped.join("/"))
+}
+
+const GLOB_METACHARACTERS: [char; 7] = ['*', '?', '[', ']', '{', '}', '\\'];
+
+fn segment_is_balanced(segment: &str) -> bool {
+    let mut braces = 0usize;
+    let mut brackets = 0usize;
+    for ch in segment.chars() {
+        match ch {
+            '{' => braces = braces.saturating_add(1),
+            '}' => match braces.checked_sub(1) {
+                Some(depth) => braces = depth,
+                None => return false,
+            },
+            '[' => brackets = brackets.saturating_add(1),
+            ']' => match brackets.checked_sub(1) {
+                Some(depth) => brackets = depth,
+                None => return false,
+            },
+            _ => {}
+        }
+    }
+    braces == 0 && brackets == 0
+}
+
+fn escape_glob(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if GLOB_METACHARACTERS.contains(&ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// Validate and compile `operations` patterns: non-empty list of 1-256 byte
+/// patterns over `[A-Za-z0-9_*?]` (no classes, alternation or separators).
+pub fn compile_operation_globs(patterns: &[String]) -> Result<globset::GlobSet, String> {
+    if patterns.is_empty() {
+        return Err("endpoint policy 'operations' must not be empty".to_string());
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for p in patterns {
+        validate_operation_pattern(p)?;
+        let glob = GlobBuilder::new(p)
+            .literal_separator(false)
+            .build()
+            .map_err(|e| format!("invalid operation pattern '{}': {}", p, e))?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("invalid operations: {}", e))
+}
+
+/// `true` when the patterns are valid and match the `Unknown` operation.
+#[must_use]
+pub fn operations_match_unknown(patterns: &[String]) -> bool {
+    compile_operation_globs(patterns).is_ok_and(|set| set.is_match(UNKNOWN_OPERATION))
+}
+
+/// Check a single `operations` pattern against the allowed charset.
+pub fn validate_operation_pattern(p: &str) -> Result<(), String> {
+    if p.is_empty() || p.len() > 256 {
+        return Err(format!(
+            "operation pattern must be 1-256 bytes (got {} bytes)",
+            p.len()
+        ));
+    }
+    if !p
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'*' | b'?'))
+    {
+        return Err(format!(
+            "operation pattern '{}' may only contain [A-Za-z0-9_*?]",
+            p
+        ));
+    }
+    Ok(())
 }
 
 fn first_policy_match<'a>(
     rules: &'a [CompiledPolicyRule],
     method: &str,
     normalized_path: &str,
+    operation: &str,
 ) -> Option<&'a CompiledPolicyRule> {
     rules.iter().find(|r| {
         (r.method == "*" || r.method.eq_ignore_ascii_case(method))
             && r.matcher.is_match(normalized_path)
+            && r.operations
+                .as_ref()
+                .is_none_or(|set| set.is_match(operation))
     })
 }
 
@@ -1418,13 +1689,32 @@ fn endpoint_allowed(rules: &[EndpointRule], method: &str, path: &str) -> bool {
     let normalized = normalize_path(path);
     rules.iter().any(|r| {
         (r.method == "*" || r.method.eq_ignore_ascii_case(method))
-            && GlobBuilder::new(&r.path)
+            && GlobBuilder::new(normalize_rule_path(&r.path))
                 .literal_separator(true)
                 .build()
                 .ok()
                 .map(|g| g.compile_matcher())
                 .is_some_and(|m| m.is_match(&normalized))
     })
+}
+
+/// Normalize an endpoint rule path pattern so it lines up with request
+/// paths after [`normalize_path`], which strips the trailing slash.
+///
+/// Without this, a rule such as `/3322/` could never match a request for
+/// `/3322/` (normalized to `/3322`), so allow rules silently failed and deny
+/// or approve rules never fired. Only trailing slashes are removed (root `/`
+/// is preserved); the rule matches exactly what the slash-less form matches,
+/// so this never broadens a grant. The pattern is otherwise left untouched
+/// because it is a glob, not a request path.
+#[must_use]
+pub fn normalize_rule_path(pattern: &str) -> &str {
+    let trimmed = pattern.trim_end_matches('/');
+    if trimmed.is_empty() && !pattern.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
 }
 
 /// Normalize a URL path for matching: percent-decode, strip query string,
@@ -1609,6 +1899,50 @@ pub enum ClientAssertionConfig {
     },
 }
 
+/// Validate an `aws_auth.profiles` map.
+///
+/// Shared by every config surface that accepts `aws_auth` so the rules cannot
+/// drift. Requires at least one entry; each key must look like an AWS access
+/// key ID (16-128 uppercase letters or digits) so it can match the `Credential=`
+/// scope of a SigV4 header; each value follows the `profile` rules (non-empty,
+/// no whitespace); and no profile may appear twice.
+///
+/// # Errors
+///
+/// Returns a message describing the first invalid entry.
+pub fn validate_aws_auth_profiles(
+    profiles: &std::collections::BTreeMap<String, String>,
+) -> std::result::Result<(), String> {
+    if profiles.is_empty() {
+        return Err(
+            "aws_auth.profiles must map at least one placeholder access key ID \
+                    to a profile; omit the field to sign with a single profile"
+                .to_string(),
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (access_key_id, profile) in profiles {
+        if !crate::aws::sign::is_access_key_id(access_key_id) {
+            return Err(format!(
+                "aws_auth.profiles key '{access_key_id}' is not a valid access key ID \
+                 (16-128 uppercase letters or digits)"
+            ));
+        }
+        if profile.is_empty() || profile.contains(char::is_whitespace) {
+            return Err(format!(
+                "aws_auth.profiles entry '{access_key_id}' must map to a non-empty \
+                 profile name with no whitespace"
+            ));
+        }
+        if !seen.insert(profile.as_str()) {
+            return Err(format!(
+                "aws_auth.profiles maps more than one access key ID to profile '{profile}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// AWS SigV4 signing configuration for a credential route.
 ///
 /// When present on a route, the proxy will sign outbound requests using AWS
@@ -1627,10 +1961,22 @@ pub struct AwsAuthConfig {
     #[serde(default)]
     pub profile: Option<String>,
 
+    /// Operator-approved signing profiles, keyed by placeholder access key ID.
+    ///
+    /// When set, each request picks its signing profile by the access key ID
+    /// in the `Credential=` scope of its own `Authorization` header: the child
+    /// holds one placeholder key per allowed profile, and the proxy signs with
+    /// the mapped host profile. A request whose key ID is missing or unlisted
+    /// is rejected with 403. Mutually exclusive with `profile`.
+    #[serde(default)]
+    pub profiles: Option<std::collections::BTreeMap<String, String>>,
+
     /// Explicit SigV4 signing region (e.g., `"us-east-1"`).
     /// If omitted, auto-detected from the upstream URL.
     /// Must be non-empty and lowercase if provided (SigV4 credential scope
     /// requires lowercase region codes).
+    /// Must be omitted when the upstream is `https://{service}.*.amazonaws.com`;
+    /// the region is then taken from each request's host.
     #[serde(default)]
     pub region: Option<String>,
 
@@ -2062,6 +2408,7 @@ mod tests {
                 backend: None,
                 reason: Some("blocked".to_string()),
                 timeout_secs: None,
+                operations: None,
             }],
             approve: vec![EndpointPolicyRule {
                 method: "POST".to_string(),
@@ -2069,6 +2416,7 @@ mod tests {
                 backend: Some("terminal".to_string()),
                 reason: None,
                 timeout_secs: Some(5),
+                operations: None,
             }],
             allow: vec![EndpointPolicyRule {
                 method: "POST".to_string(),
@@ -2076,6 +2424,7 @@ mod tests {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
         };
         let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
@@ -2101,6 +2450,7 @@ mod tests {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
             ..EndpointPolicyConfig::default()
         };
@@ -2173,6 +2523,7 @@ mod tests {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
             ..EndpointPolicyConfig::default()
         };
@@ -2242,6 +2593,7 @@ mod tests {
                 backend: Some("terminal".to_string()),
                 reason: Some("sensitive endpoint".to_string()),
                 timeout_secs: Some(10),
+                operations: None,
             }],
             ..EndpointPolicyConfig::default()
         };
@@ -2256,6 +2608,203 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn op_rule(method: &str, path: &str, ops: &[&str]) -> EndpointPolicyRule {
+        EndpointPolicyRule {
+            method: method.to_string(),
+            path: path.to_string(),
+            backend: None,
+            reason: None,
+            timeout_secs: None,
+            operations: Some(ops.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    fn eval_op<'a>(
+        policy: &'a CompiledEndpointPolicy,
+        operation: Option<&str>,
+    ) -> EndpointPolicyOutcome<'a> {
+        policy.evaluate_request(&EndpointRequest {
+            method: "POST",
+            path: "/",
+            operation,
+        })
+    }
+
+    #[test]
+    fn test_operations_rule_requires_method_path_and_operation() {
+        let policy = EndpointPolicyConfig {
+            allow: vec![op_rule("POST", "/", &["Describe*", "GetParameter"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        assert!(matches!(
+            eval_op(&compiled, Some("DescribeInstances")),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            eval_op(&compiled, Some("GetParameter")),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            eval_op(&compiled, Some("TerminateInstances")),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        // Method and path must still match.
+        assert!(matches!(
+            compiled.evaluate_request(&EndpointRequest {
+                method: "GET",
+                path: "/",
+                operation: Some("DescribeInstances"),
+            }),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_operations_match_is_case_sensitive() {
+        let policy = EndpointPolicyConfig {
+            allow: vec![op_rule("POST", "/", &["Describe*"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        assert!(matches!(
+            eval_op(&compiled, Some("describeinstances")),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_operations_unknown_is_matchable() {
+        let allow_only = EndpointPolicyConfig {
+            allow: vec![op_rule("POST", "/", &["Describe*"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&allow_only), &[]).unwrap();
+        assert!(matches!(
+            eval_op(&compiled, None),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            eval_op(&compiled, Some("Unknown")),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+
+        let star = EndpointPolicyConfig {
+            allow: vec![op_rule("POST", "/", &["*"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&star), &[]).unwrap();
+        assert!(matches!(
+            eval_op(&compiled, None),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn test_operations_precedence_and_labels() {
+        let policy = EndpointPolicyConfig {
+            default: EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            },
+            deny: vec![op_rule("POST", "/", &["Delete*", "Put*"])],
+            allow: vec![op_rule("POST", "/", &["*"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        match eval_op(&compiled, Some("DeleteParameter")) {
+            EndpointPolicyOutcome::Deny { rule_label, .. } => {
+                assert_eq!(rule_label, "endpoint_policy.deny[POST / ops=Delete*,Put*]");
+            }
+            other => panic!("expected deny, got {other:?}"),
+        }
+        assert!(matches!(
+            eval_op(&compiled, Some("GetParameter")),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(compiled.has_operation_rules());
+        assert!(!compiled.restrictive_rule_matches_unknown());
+    }
+
+    #[test]
+    fn test_restrictive_rule_matches_unknown_detection() {
+        for (ops, expected) in [
+            (vec!["Unknown"], true),
+            (vec!["*"], true),
+            (vec!["U*"], true),
+            (vec!["Delete*"], false),
+        ] {
+            let policy = EndpointPolicyConfig {
+                deny: vec![op_rule("POST", "/", &ops)],
+                ..EndpointPolicyConfig::default()
+            };
+            let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+            assert_eq!(
+                compiled.restrictive_rule_matches_unknown(),
+                expected,
+                "{ops:?}"
+            );
+        }
+        // Allow rules never count as restricting `Unknown`.
+        let policy = EndpointPolicyConfig {
+            allow: vec![op_rule("POST", "/", &["*"])],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        assert!(!compiled.restrictive_rule_matches_unknown());
+    }
+
+    #[test]
+    fn test_operations_rules_without_operations_unchanged() {
+        let policy = EndpointPolicyConfig {
+            allow: vec![EndpointPolicyRule {
+                method: "POST".to_string(),
+                path: "/".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+                operations: None,
+            }],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        assert!(!compiled.has_operation_rules());
+        assert!(matches!(
+            eval_op(&compiled, Some("Anything")),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("POST", "/"),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn test_operations_compile_rejects_invalid_patterns() {
+        for ops in [
+            vec![],
+            vec![""],
+            vec!["Get[A]"],
+            vec!["a.b"],
+            vec!["a/b"],
+            vec!["{A,B}"],
+            vec!["Gét"],
+            vec!["a b"],
+        ] {
+            let policy = EndpointPolicyConfig {
+                allow: vec![op_rule("POST", "/", &ops)],
+                ..EndpointPolicyConfig::default()
+            };
+            assert!(
+                CompiledEndpointPolicy::compile(Some(&policy), &[]).is_err(),
+                "{ops:?} should be rejected"
+            );
+        }
+        let too_long = "a".repeat(257);
+        assert!(compile_operation_globs(&[too_long]).is_err());
     }
 
     #[test]
@@ -2490,6 +3039,7 @@ mod tests {
     fn test_aws_auth_config_all_fields_roundtrip() {
         let original = AwsAuthConfig {
             profile: Some("my-aws-profile".to_string()),
+            profiles: None,
             region: Some("us-east-1".to_string()),
             service: Some("bedrock".to_string()),
         };
@@ -2498,6 +3048,78 @@ mod tests {
         assert_eq!(deserialized.profile.as_deref(), Some("my-aws-profile"));
         assert_eq!(deserialized.region.as_deref(), Some("us-east-1"));
         assert_eq!(deserialized.service.as_deref(), Some("bedrock"));
+    }
+
+    #[test]
+    fn test_aws_auth_config_profiles_deserializes() {
+        let json = r#"{"profiles": {"NONOPROFILE0DEVRO01": "dev-ro", "NONOPROFILE0STGRO01": "staging-ro"}}"#;
+        let aws: AwsAuthConfig = serde_json::from_str(json).unwrap();
+        assert!(aws.profile.is_none());
+        let profiles = aws.profiles.unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            profiles.get("NONOPROFILE0DEVRO01").map(String::as_str),
+            Some("dev-ro")
+        );
+        assert_eq!(
+            profiles.get("NONOPROFILE0STGRO01").map(String::as_str),
+            Some("staging-ro")
+        );
+    }
+
+    fn profiles_of(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_validation_accepts_well_formed_map() {
+        let profiles = profiles_of(&[
+            ("NONOPROFILE0DEVRO01", "dev-ro"),
+            ("NONOPROFILE0STGRO01", "staging-ro"),
+        ]);
+        assert_eq!(validate_aws_auth_profiles(&profiles), Ok(()));
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_validation_rejects_empty_map() {
+        let err = validate_aws_auth_profiles(&profiles_of(&[])).unwrap_err();
+        assert!(err.contains("at least one"), "{err}");
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_validation_rejects_malformed_access_key_id() {
+        for key in ["short", "nonoprofile0devro01", "NONO-PROFILE-DEVRO01", ""] {
+            let err = validate_aws_auth_profiles(&profiles_of(&[(key, "dev-ro")])).unwrap_err();
+            assert!(err.contains("access key ID"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_validation_rejects_bad_profile_name() {
+        for profile in ["", "dev ro"] {
+            let err = validate_aws_auth_profiles(&profiles_of(&[("NONOPROFILE0DEVRO01", profile)]))
+                .unwrap_err();
+            assert!(err.contains("profile"), "{profile:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_aws_auth_profiles_validation_rejects_duplicate_profile() {
+        let err = validate_aws_auth_profiles(&profiles_of(&[
+            ("NONOPROFILE0DEVRO01", "dev-ro"),
+            ("NONOPROFILE0DEVRO02", "dev-ro"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("dev-ro"), "{err}");
+    }
+
+    #[test]
+    fn test_aws_auth_config_profiles_absent_is_none() {
+        let aws: AwsAuthConfig = serde_json::from_str(r#"{"profile": "dev"}"#).unwrap();
+        assert!(aws.profiles.is_none());
     }
 
     #[test]
@@ -2627,6 +3249,63 @@ mod tests {
     }
 
     #[test]
+    fn normalize_rule_path_strips_trailing_slash() {
+        assert_eq!(normalize_rule_path("/3322/"), "/3322");
+        assert_eq!(normalize_rule_path("/3322"), "/3322");
+        assert_eq!(normalize_rule_path("/api/**/"), "/api/**");
+        assert_eq!(normalize_rule_path("/a//"), "/a");
+        assert_eq!(normalize_rule_path("/"), "/");
+        assert_eq!(normalize_rule_path("//"), "/");
+    }
+
+    #[test]
+    fn endpoint_rules_with_trailing_slash_match_request() {
+        let compiled = CompiledEndpointRules::compile(&[EndpointRule {
+            method: "GET".to_string(),
+            path: "/3322/".to_string(),
+        }])
+        .unwrap();
+        assert!(compiled.is_allowed("GET", "/3322/"));
+        assert!(compiled.is_allowed("GET", "/3322"));
+        assert!(!compiled.is_allowed("GET", "/3322/extra"));
+        assert!(!compiled.is_allowed("GET", "/3323/"));
+    }
+
+    #[test]
+    fn endpoint_policy_deny_with_trailing_slash_fires() {
+        let policy = EndpointPolicyConfig {
+            default: EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            },
+            deny: vec![EndpointPolicyRule {
+                method: "*".to_string(),
+                path: "/admin/".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+                operations: None,
+            }],
+            approve: Vec::new(),
+            allow: Vec::new(),
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+        assert!(matches!(
+            compiled.evaluate("GET", "/admin/"),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("GET", "/admin"),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("GET", "/other"),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+    }
+
+    #[test]
     fn normalize_path_collapses_dot_segments() {
         assert_eq!(normalize_path("/a/../b"), "/b");
         assert_eq!(normalize_path("/a/./b"), "/a/b");
@@ -2660,5 +3339,113 @@ mod tests {
         // the raw form elsewhere (GHSA-8r33-hr9m-69wh).
         assert!(!compiled.matches("/backend-api/%2e%2e/backend-api/codex/responses"));
         assert!(!compiled.matches("/backend-api/codex/responses;v=1"));
+    }
+
+    #[test]
+    fn approval_scope_fills_wildcards_before_the_first_double_star() {
+        let cases = [
+            ("/*/*/**", "/torvalds/linux/info/refs", "/torvalds/linux/**"),
+            (
+                "/*/*/**",
+                "/torvalds/linux/git-upload-pack",
+                "/torvalds/linux/**",
+            ),
+            ("/**", "/torvalds/linux/info/refs", "/**"),
+            (
+                "/repos/*/issues",
+                "/repos/acme/issues",
+                "/repos/acme/issues",
+            ),
+            ("/v*/items/**", "/v2/items/1", "/v2/items/**"),
+            ("/**/admin/*", "/a/admin/b", "/**/admin/*"),
+            ("/", "/", "/"),
+        ];
+        for (pattern, path, expected) in cases {
+            assert_eq!(
+                approval_scope_path(pattern, path),
+                expected,
+                "{pattern} on {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_scope_escapes_values_and_falls_back_to_the_full_path() {
+        assert_eq!(approval_scope_path("/*/**", "/*/x"), "/\\*/**");
+        // A brace spanning `/` cannot be aligned with request segments.
+        assert_eq!(approval_scope_path("/{a/b,c}/**", "/a/b/x"), "/a/b/x");
+        assert_eq!(approval_scope_path("relative/*", "/a/b"), "/a/b");
+        // A class can match `/`, so its segment cannot be aligned either.
+        assert_eq!(approval_scope_path("/a[!x]b/**", "/a/b/c/d"), "/a/b/c/d");
+    }
+
+    #[test]
+    fn default_approve_label_covers_the_exact_request_only() {
+        let policy = CompiledEndpointPolicy::compile(
+            Some(&EndpointPolicyConfig {
+                default: EndpointPolicyDefault {
+                    decision: EndpointPolicyDecision::Approve,
+                    backend: None,
+                    timeout_secs: None,
+                },
+                ..EndpointPolicyConfig::default()
+            }),
+            &[],
+        )
+        .unwrap();
+        let label = |method: &str, path: &str| match policy.evaluate(method, path) {
+            EndpointPolicyOutcome::Approve { rule_label, .. } => rule_label,
+            other => panic!("expected approve, got {other:?}"),
+        };
+        assert_eq!(
+            label("post", "/v1/comments?x=1"),
+            "endpoint_policy.default[POST /v1/comments]"
+        );
+        assert_ne!(
+            label("POST", "/v1/comments"),
+            label("DELETE", "/v1/comments")
+        );
+        assert_ne!(label("POST", "/v1/comments"), label("POST", "/v1/other"));
+        assert_eq!(label("GET", "/a*b"), "endpoint_policy.default[GET /a\\*b]");
+    }
+
+    #[test]
+    fn policy_config_shares_the_l7_predicate_and_legacy_conversion() {
+        assert!(EndpointPolicyConfig::from_legacy_rules(&[]).allows_all_without_l7());
+        let legacy = EndpointPolicyConfig::from_legacy_rules(&[EndpointRule {
+            method: "GET".to_string(),
+            path: "/a/**".to_string(),
+        }]);
+        assert!(!legacy.allows_all_without_l7());
+        assert_eq!(legacy.default.decision, EndpointPolicyDecision::Deny);
+        assert_eq!(legacy.allow.len(), 1);
+    }
+
+    #[test]
+    fn approve_rule_label_shows_the_scope() {
+        let policy = CompiledEndpointPolicy::compile(
+            Some(&EndpointPolicyConfig {
+                approve: vec![EndpointPolicyRule {
+                    method: "*".to_string(),
+                    path: "/*/*/**".to_string(),
+                    backend: None,
+                    reason: None,
+                    timeout_secs: None,
+                    operations: None,
+                }],
+                ..EndpointPolicyConfig::default()
+            }),
+            &[],
+        )
+        .unwrap();
+        match policy.evaluate("GET", "/torvalds/linux/info/refs?service=git-upload-pack") {
+            EndpointPolicyOutcome::Approve { rule_label, .. } => {
+                assert_eq!(
+                    rule_label,
+                    "endpoint_policy.approve[GET /torvalds/linux/**]"
+                );
+            }
+            other => panic!("expected approve, got {other:?}"),
+        }
     }
 }

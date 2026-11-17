@@ -992,6 +992,9 @@ pub struct EndpointRuleConfig {
     pub reason: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// AWS operation-name globs; valid only on `aws_auth` credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2028,11 +2031,16 @@ fn validate_sandbox(
         if let CommandCredentialGrantConfig::Policy(grant) = credential
             && let Some(endpoint_policy) = &grant.endpoint_policy
         {
+            let aws_auth = config
+                .credentials
+                .get(grant.name.as_str())
+                .is_some_and(|c| c.aws_auth.is_some());
             validate_endpoint_policy(
                 command_name,
                 caller,
                 grant.name.as_str(),
                 endpoint_policy,
+                aws_auth,
                 config,
                 report,
             );
@@ -2276,7 +2284,20 @@ fn validate_approval_backend(
                     format!("approval backend '{name}' type webhook must define url"),
                 );
             }
-            if platform_auth && !url.is_empty() && !is_platform_grade_url(url) {
+            let target = parse_webhook_target(url);
+            if let Err(reason) = &target {
+                report.error(
+                    "invalid_approval_backend",
+                    format!("approval backend '{name}' {reason}"),
+                );
+            } else if platform_auth && matches!(target, Ok(WebhookTarget::Unix { .. })) {
+                report.error(
+                    "invalid_approval_backend",
+                    format!(
+                        "approval backend '{name}' with auth platform cannot use a unix socket url"
+                    ),
+                );
+            } else if platform_auth && !url.is_empty() && !is_platform_grade_url(url) {
                 report.error(
                     "invalid_approval_backend",
                     format!(
@@ -2556,6 +2577,7 @@ fn validate_endpoint_policy(
     caller: &str,
     credential_name: &str,
     policy: &EndpointPolicyConfig,
+    aws_auth: bool,
     config: &CommandPoliciesConfig,
     report: &mut CommandPolicyValidationReport,
 ) {
@@ -2567,6 +2589,33 @@ fn validate_endpoint_policy(
         config,
         report,
     );
+    let has_operations = [&policy.deny, &policy.approve, &policy.allow]
+        .iter()
+        .any(|rules| rules.iter().any(|r| r.operations.is_some()));
+    let unknown_restricted = [&policy.deny, &policy.approve].iter().any(|rules| {
+        rules
+            .iter()
+            .filter_map(|r| r.operations.as_ref())
+            .any(|ops| nono_proxy::config::operations_match_unknown(ops))
+    });
+    if aws_auth
+        && has_operations
+        && !unknown_restricted
+        && matches!(
+            policy.default,
+            PolicyDecisionConfig::Decision(PolicyDecision::Allow)
+        )
+    {
+        report.warning(
+            "endpoint_policy_unknown_operation_allowed",
+            format!(
+                "command '{command_name}' from.{caller} credential '{credential_name}' uses \
+                 default: allow with operations rules but nothing denies or approves the \
+                 'Unknown' operation; requests whose operation cannot be determined will be \
+                 allowed. Prefer default: deny with allow rules."
+            ),
+        );
+    }
     for (bucket, rules) in [
         ("deny", policy.deny.as_slice()),
         ("approve", policy.approve.as_slice()),
@@ -2587,8 +2636,84 @@ fn validate_endpoint_policy(
             if rule.method.contains('\0') || rule.path.contains('\0') {
                 report.error("invalid_endpoint_policy", format!("{label} contains NUL"));
             }
+            if let Some(operations) = &rule.operations {
+                if !aws_auth {
+                    report.error(
+                        "invalid_endpoint_policy",
+                        format!("{label} sets operations, which requires an aws_auth credential"),
+                    );
+                }
+                if let Err(err) = nono_proxy::config::compile_operation_globs(operations) {
+                    report.error("invalid_endpoint_policy", format!("{label}: {err}"));
+                }
+            }
         }
     }
+}
+
+/// Where an approval webhook is delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WebhookTarget {
+    /// An `http(s)://` URL, passed to the HTTP client as is.
+    Http(String),
+    /// `unix:///abs/path.sock`: HTTP/1.1 `POST /` over a Unix stream socket.
+    Unix { socket: std::path::PathBuf },
+}
+
+const UNIX_WEBHOOK_PREFIX: &str = "unix://";
+/// Longest socket path `sockaddr_un.sun_path` holds, leaving room for the NUL.
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
+
+/// Classify a webhook `url`. Anything that names the `unix:` scheme (in any
+/// case) must be exactly `unix://` followed by an absolute socket path, so a
+/// typo can never fall through to the HTTP client as a different endpoint.
+/// The path takes no host, query, or fragment; `.` and repeated `/` are
+/// normalized away and `..` is rejected.
+pub(crate) fn parse_webhook_target(value: &str) -> std::result::Result<WebhookTarget, String> {
+    if !value
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"unix:"))
+    {
+        return Ok(WebhookTarget::Http(value.to_string()));
+    }
+    let Some(raw_path) = value.strip_prefix(UNIX_WEBHOOK_PREFIX) else {
+        return Err("unix socket url must start with 'unix://'".to_string());
+    };
+    if raw_path.is_empty() {
+        return Err("unix socket url must name a socket path".to_string());
+    }
+    if !raw_path.starts_with('/') {
+        return Err(
+            "unix socket url must use an absolute path with no host (unix:///path/to.sock)"
+                .to_string(),
+        );
+    }
+    if raw_path.contains(['\0', '?', '#']) {
+        return Err("unix socket url path cannot contain NUL, '?', or '#'".to_string());
+    }
+    let mut socket = std::path::PathBuf::from("/");
+    for component in Path::new(raw_path).components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => socket.push(part),
+            std::path::Component::ParentDir => {
+                return Err("unix socket url path cannot contain '..'".to_string());
+            }
+            std::path::Component::Prefix(_) => {
+                return Err("unix socket url path is not a Unix path".to_string());
+            }
+        }
+    }
+    if socket.parent().is_none() {
+        return Err("unix socket url must name a socket path".to_string());
+    }
+    if socket.as_os_str().len() > MAX_UNIX_SOCKET_PATH_BYTES {
+        return Err(format!(
+            "unix socket url path is longer than {MAX_UNIX_SOCKET_PATH_BYTES} bytes"
+        ));
+    }
+    Ok(WebhookTarget::Unix { socket })
 }
 
 /// Signed platform requests carry an enrolled identity; they never travel over
@@ -2798,6 +2923,14 @@ fn validate_credential(
             // Replicate the session-level validate_aws_auth checks so malformed
             // profile/region/service values don't propagate to the signing path.
             if let Some(ref aws) = credential.aws_auth {
+                if let Some(ref upstream) = credential.upstream
+                    && let Err(e) = nono_proxy::aws::endpoints::validate_aws_upstream(upstream, aws)
+                {
+                    report.error(
+                        "invalid_credential",
+                        format!("proxy credential '{name}': {e}"),
+                    );
+                }
                 if let Some(ref profile) = aws.profile
                     && (profile.is_empty() || profile.contains(char::is_whitespace))
                 {
@@ -2808,6 +2941,23 @@ fn validate_credential(
                              with no whitespace; omit the field to use the default chain"
                         ),
                     );
+                }
+                if let Some(ref profiles) = aws.profiles {
+                    if aws.profile.is_some() {
+                        report.error(
+                            "invalid_credential",
+                            format!(
+                                "proxy credential '{name}' cannot set both aws_auth.profile \
+                                 and aws_auth.profiles; list every allowed profile in profiles"
+                            ),
+                        );
+                    }
+                    if let Err(e) = nono_proxy::config::validate_aws_auth_profiles(profiles) {
+                        report.error(
+                            "invalid_credential",
+                            format!("proxy credential '{name}': {e}"),
+                        );
+                    }
                 }
                 if let Some(ref region) = aws.region
                     && (region.is_empty()
@@ -6382,6 +6532,73 @@ mod tests {
     }
 
     #[test]
+    fn parse_webhook_target_classifies_and_normalizes_unix_urls() {
+        assert_eq!(
+            parse_webhook_target("https://approval.example/hook"),
+            Ok(WebhookTarget::Http(
+                "https://approval.example/hook".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_webhook_target("unix:///run/helper//./s/approval.sock"),
+            Ok(WebhookTarget::Unix {
+                socket: PathBuf::from("/run/helper/s/approval.sock")
+            })
+        );
+
+        let too_long = format!("unix:///{}", "a".repeat(MAX_UNIX_SOCKET_PATH_BYTES));
+        for (url, expected) in [
+            ("unix://", "must name a socket path"),
+            ("unix:///", "must name a socket path"),
+            (
+                "unix://host/run/approval.sock",
+                "absolute path with no host",
+            ),
+            ("unix://run/approval.sock", "absolute path with no host"),
+            ("unix:/run/approval.sock", "must start with 'unix://'"),
+            ("UNIX:///run/approval.sock", "must start with 'unix://'"),
+            ("unix:///run/../approval.sock", "cannot contain '..'"),
+            ("unix:///run/approval.sock#/approvals", "cannot contain"),
+            ("unix:///run/approval.sock?x=1", "cannot contain"),
+            (too_long.as_str(), "longer than"),
+        ] {
+            match parse_webhook_target(url) {
+                Ok(target) => panic!("{url} must be rejected, got {target:?}"),
+                Err(err) => assert!(err.contains(expected), "{url}: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn security_approval_backends_unix_socket_url_matrix() {
+        let validate = |url: &str, auth: Option<ApprovalBackendAuth>| {
+            let mut backends = BTreeMap::new();
+            backends.insert(
+                "dialog".to_string(),
+                ApprovalBackendConfig {
+                    url: Some(url.to_string()),
+                    auth,
+                    ..security_backend(ApprovalBackendType::Webhook)
+                },
+            );
+            validate_security_approval_backends(&backends, None)
+                .err()
+                .map(|e| e.to_string())
+        };
+
+        assert_eq!(validate("unix:///run/helper/approval.sock", None), None);
+        let err = validate("unix://relative.sock", None).unwrap_or_default();
+        assert!(err.contains("absolute path"), "{err}");
+        // The platform contract signs requests for an https origin only.
+        let err = validate(
+            "unix:///run/helper/approval.sock",
+            Some(ApprovalBackendAuth::Platform),
+        )
+        .unwrap_or_default();
+        assert!(err.contains("cannot use a unix socket url"), "{err}");
+    }
+
+    #[test]
     fn approval_backend_auth_parses_from_profile_json() {
         let parsed: ApprovalBackendConfig =
             serde_json::from_str(r#"{"type":"webhook","auth":"platform","timeout_secs":90}"#)
@@ -6528,6 +6745,7 @@ mod tests {
                                         backend: None,
                                         reason: None,
                                         timeout_secs: Some(0),
+                                        operations: None,
                                     }],
                                     ..Default::default()
                                 }),
@@ -6563,6 +6781,141 @@ mod tests {
             timeout_errors, 5,
             "expected timeout validation on defaults, backend, invocation, endpoint, and intercept"
         );
+    }
+
+    fn config_with_operations_grant(ops: Vec<String>) -> CommandPoliciesConfig {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.sandbox = None;
+            git.from.insert(
+                "session".to_string(),
+                CommandFromConfig::Edge(Box::new(CommandEdgeConfig {
+                    sandbox: CommandSandboxConfig {
+                        credentials: vec![CommandCredentialGrantConfig::Policy(
+                            CommandCredentialGrantPolicyConfig {
+                                name: "github-api".to_string(),
+                                endpoint_policy: Some(EndpointPolicyConfig {
+                                    allow: vec![EndpointRuleConfig {
+                                        method: "POST".to_string(),
+                                        path: "/".to_string(),
+                                        backend: None,
+                                        reason: None,
+                                        timeout_secs: None,
+                                        operations: Some(ops),
+                                    }],
+                                    ..Default::default()
+                                }),
+                            },
+                        )],
+                        ..Default::default()
+                    },
+                    invocation_policy: None,
+                })),
+            );
+        }
+        config
+    }
+
+    fn endpoint_policy_errors(config: &CommandPoliciesConfig) -> Vec<String> {
+        validate_command_policies(Some(config), CommandPolicyValidationScope::Syntax)
+            .errors
+            .into_iter()
+            .filter(|finding| finding.code == "invalid_endpoint_policy")
+            .map(|finding| finding.message)
+            .collect()
+    }
+
+    #[test]
+    fn validate_default_allow_without_unknown_restriction_warns() {
+        let aws_credential = || CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://ssm.us-east-1.amazonaws.com".to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+            ..Default::default()
+        };
+        let warns = |config: &CommandPoliciesConfig| {
+            validate_command_policies(Some(config), CommandPolicyValidationScope::Syntax)
+                .warnings
+                .iter()
+                .any(|w| w.code == "endpoint_policy_unknown_operation_allowed")
+        };
+        let set_policy = |config: &mut CommandPoliciesConfig, deny_ops: Option<&str>| {
+            let Some(git) = config.commands.get_mut("git") else {
+                panic!("git command");
+            };
+            let Some(CommandFromConfig::Edge(edge)) = git.from.get_mut("session") else {
+                panic!("session edge");
+            };
+            let Some(CommandCredentialGrantConfig::Policy(grant)) =
+                edge.sandbox.credentials.first_mut()
+            else {
+                panic!("policy grant");
+            };
+            let Some(policy) = grant.endpoint_policy.as_mut() else {
+                panic!("endpoint policy");
+            };
+            policy.default = PolicyDecisionConfig::Decision(PolicyDecision::Allow);
+            policy.deny = deny_ops
+                .map(|op| {
+                    vec![EndpointRuleConfig {
+                        method: "POST".to_string(),
+                        path: "/".to_string(),
+                        backend: None,
+                        reason: None,
+                        timeout_secs: None,
+                        operations: Some(vec![op.to_string()]),
+                    }]
+                })
+                .unwrap_or_default();
+        };
+
+        let mut config = config_with_operations_grant(vec!["Describe*".to_string()]);
+        config
+            .credentials
+            .insert("github-api".to_string(), aws_credential());
+        set_policy(&mut config, None);
+        assert!(warns(&config), "default allow + allow-only ops must warn");
+        set_policy(&mut config, Some("Delete*"));
+        assert!(warns(&config), "deny not covering Unknown must warn");
+        set_policy(&mut config, Some("*"));
+        assert!(!warns(&config), "deny matching Unknown must not warn");
+    }
+
+    #[test]
+    fn validate_operations_requires_aws_auth_credential() {
+        let config = config_with_operations_grant(vec!["Describe*".to_string()]);
+        let errors = endpoint_policy_errors(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("aws_auth")),
+            "operations on a non-aws_auth credential must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_operations_accepts_aws_auth_credential_and_checks_patterns() {
+        let mut config = config_with_operations_grant(vec!["Describe*".to_string()]);
+        config.credentials.insert(
+            "github-api".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://ssm.us-east-1.amazonaws.com".to_string()),
+                aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+                ..Default::default()
+            },
+        );
+        assert!(endpoint_policy_errors(&config).is_empty());
+
+        let mut config = config_with_operations_grant(vec!["Get[A]".to_string()]);
+        config.credentials.insert(
+            "github-api".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://ssm.us-east-1.amazonaws.com".to_string()),
+                aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+                ..Default::default()
+            },
+        );
+        assert!(!endpoint_policy_errors(&config).is_empty());
     }
 
     #[test]
@@ -6796,6 +7149,7 @@ mod tests {
             upstream: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
             aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                 profile: Some("production".to_string()),
+                profiles: None,
                 region: Some("us-east-1".to_string()),
                 service: Some("bedrock".to_string()),
             }),
@@ -6804,6 +7158,97 @@ mod tests {
         assert!(
             validate_one(&cred).errors.is_empty(),
             "well-formed proxy aws_auth should validate"
+        );
+    }
+
+    #[test]
+    fn proxy_credential_wildcard_region_upstream_validated() {
+        let cred = |upstream: &str, region: Option<&str>| CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some(upstream.to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                region: region.map(str::to_string),
+                service: Some("eks".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred("https://eks.*.amazonaws.com", None))
+                .errors
+                .is_empty()
+        );
+        for (upstream, region) in [
+            ("https://eks.*.amazonaws.com", Some("us-east-1")),
+            ("https://*.s3.*.amazonaws.com", Some("us-east-1")),
+            ("https://eks.*.amazonaws.eu", None),
+        ] {
+            assert!(
+                !validate_one(&cred(upstream, region)).errors.is_empty(),
+                "{upstream} {region:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_credential_with_aws_auth_profiles_accepted() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://sts.us-east-1.amazonaws.com".to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profiles: Some(
+                    [("NONOPROFILE0DEVRO01".to_string(), "dev-ro".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred).errors.is_empty(),
+            "well-formed aws_auth.profiles should validate"
+        );
+    }
+
+    #[test]
+    fn proxy_credential_with_aws_auth_profile_and_profiles_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://sts.us-east-1.amazonaws.com".to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: Some("dev-ro".to_string()),
+                profiles: Some(
+                    [("NONOPROFILE0DEVRO01".to_string(), "dev-ro".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let errors = validate_one(&cred).errors;
+        assert!(
+            errors.iter().any(|e| e.message.contains("profiles")),
+            "expected profile/profiles exclusivity error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_credential_with_empty_aws_auth_profiles_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://sts.us-east-1.amazonaws.com".to_string()),
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profiles: Some(std::collections::BTreeMap::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let errors = validate_one(&cred).errors;
+        assert!(
+            errors.iter().any(|e| e.message.contains("at least one")),
+            "expected empty profiles error, got {errors:?}"
         );
     }
 

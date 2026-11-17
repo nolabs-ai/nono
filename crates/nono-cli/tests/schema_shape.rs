@@ -113,6 +113,7 @@ fn test_schema_top_level_profile_matches_rust_model() {
             "hooks",
             "session_hooks",
             "rollback",
+            "session_recording",
             "open_urls",
             "allow_launch_services",
             "allow_gpu",
@@ -483,6 +484,7 @@ fn test_schema_custom_credential_def_matches_rust_model() {
             "query_param_name",
             "proxy",
             "env_var",
+            "phantom_format",
             "endpoint_rules",
             "endpoint_policy",
             "tls_ca",
@@ -520,6 +522,31 @@ fn test_schema_validates_custom_credential_with_spiffe_and_endpoint_policy() {
     validator
         .validate(&profile)
         .expect("custom credential with spiffe and endpoint_policy should validate");
+}
+
+#[test]
+fn test_schema_validates_custom_credential_phantom_format() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = |fmt: &str| {
+        json!({
+            "network": { "custom_credentials": { "github": {
+                "upstream": "https://api.github.com",
+                "credential_key": "cmd://github",
+                "env_var": "GH_TOKEN",
+                "phantom_format": fmt
+            } } }
+        })
+    };
+
+    assert!(validator.is_valid(&profile("ghp_{}")));
+    assert!(validator.is_valid(&profile("pre-{}-post")));
+    for bad in ["{}", "Bearer {}", "a/{}", "no placeholder", "a{}{}"] {
+        assert!(
+            !validator.is_valid(&profile(bad)),
+            "{bad} should be rejected"
+        );
+    }
 }
 
 #[test]
@@ -650,6 +677,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "argv_prepend",
             "credentials",
             "environment",
+            "exec_paths",
             "fs_read",
             "fs_read_file",
             "fs_write",
@@ -672,7 +700,14 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
     assert_schema_properties(
         &schema,
         "EndpointRuleConfig",
-        &["backend", "method", "path", "reason", "timeout_secs"],
+        &[
+            "backend",
+            "method",
+            "operations",
+            "path",
+            "reason",
+            "timeout_secs",
+        ],
     );
     assert_schema_properties(
         &schema,
@@ -721,6 +756,8 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
         &[
             "allow_all",
             "allow_domain",
+            "open_port",
+            "open_port_range",
             "tcp_bind_ports",
             "tcp_connect_ports",
         ],
@@ -1092,6 +1129,7 @@ fn test_schema_security_config_matches_rust_model() {
         &schema,
         "SecurityConfig",
         &[
+            "session_socket_auth",
             "signal_mode",
             "process_info_mode",
             "ipc_mode",
@@ -1119,7 +1157,7 @@ fn test_schema_linux_isolate_config_matches_rust_model() {
     assert_schema_properties(
         &schema,
         "LinuxIsolateConfig",
-        &["network", "loopback", "ipc", "uts"],
+        &["network", "loopback", "ipc", "uts", "mounts", "extra_masks"],
     );
 }
 
@@ -1131,10 +1169,15 @@ fn test_schema_validates_linux_isolate() {
     validator
         .validate(&profile)
         .unwrap_or_else(|e| panic!("linux.isolate should validate: {e}"));
-    // Phase 2 fields are not accepted until they are implemented, so a
-    // profile cannot believe it is mount-masked when it is not.
-    let phase_two = json!({ "linux": { "isolate": { "mounts": true } } });
-    assert!(validator.validate(&phase_two).is_err());
+    let phase_two =
+        json!({ "linux": { "isolate": { "mounts": true, "extra_masks": ["/opt/agent.sock"] } } });
+    validator
+        .validate(&phase_two)
+        .unwrap_or_else(|e| panic!("linux.isolate.mounts should validate: {e}"));
+    // Unknown fields stay rejected, so a profile cannot believe it is
+    // isolated by a field nono does not implement.
+    let unknown = json!({ "linux": { "isolate": { "pid": true } } });
+    assert!(validator.validate(&unknown).is_err());
 }
 
 #[test]
@@ -1153,6 +1196,23 @@ fn test_schema_validates_linux_sandbox_policy() {
 fn test_schema_workdir_config_matches_rust_model() {
     let schema = load_schema();
     assert_schema_properties(&schema, "WorkdirConfig", &["access"]);
+}
+
+#[test]
+fn test_schema_session_recording_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "SessionRecordingConfig",
+        &[
+            "enabled",
+            "required",
+            "input",
+            "max_bytes",
+            "file",
+            "delivery",
+        ],
+    );
 }
 
 #[test]
@@ -1442,4 +1502,96 @@ fn test_schema_validates_profile_authoring_guide_environment_example() {
     validator
         .validate(&profile)
         .expect("profile-authoring-guide.md environment example should validate");
+}
+
+#[test]
+fn test_schema_allow_domain_endpoint_policy_excludes_endpoints() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let with_policy = json!({
+        "network": {
+            "allow_domain": [{
+                "domain": "github.com",
+                "endpoint_policy": {
+                    "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }],
+                    "approve": [{ "method": "*", "path": "/*/*/**", "reason": "outside the org" }],
+                    "default": { "decision": "deny" }
+                }
+            }]
+        }
+    });
+    assert!(validator.validate(&with_policy).is_ok());
+
+    let with_both = json!({
+        "network": {
+            "allow_domain": [{
+                "domain": "github.com",
+                "endpoints": [{ "method": "GET", "path": "/my-org/**" }],
+                "endpoint_policy": { "approve": [{ "method": "*", "path": "/**" }] }
+            }]
+        }
+    });
+    assert!(
+        validator.validate(&with_both).is_err(),
+        "endpoints and endpoint_policy are mutually exclusive"
+    );
+}
+
+#[test]
+fn test_schema_validates_aws_auth_profiles_map() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": { "custom_credentials": { "aws-sts": {
+            "upstream": "https://sts.us-east-1.amazonaws.com",
+            "aws_auth": {
+                "profiles": {
+                    "NONOPROFILE0DEVRO01": "dev-ro",
+                    "NONOPROFILE0STGRO01": "staging-ro"
+                }
+            }
+        } } }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("aws_auth.profiles map should validate");
+}
+
+#[test]
+fn test_schema_rejects_aws_auth_profile_with_profiles() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": { "custom_credentials": { "aws-sts": {
+            "upstream": "https://sts.us-east-1.amazonaws.com",
+            "aws_auth": {
+                "profile": "dev-ro",
+                "profiles": { "NONOPROFILE0DEVRO01": "dev-ro" }
+            }
+        } } }
+    });
+
+    assert!(
+        validator.validate(&profile).is_err(),
+        "aws_auth.profile and aws_auth.profiles must be mutually exclusive"
+    );
+}
+
+#[test]
+fn test_schema_rejects_aws_auth_profiles_bad_key() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    for profiles in [json!({}), json!({ "dev": "dev-ro" })] {
+        let profile = json!({
+            "network": { "custom_credentials": { "aws-sts": {
+                "upstream": "https://sts.us-east-1.amazonaws.com",
+                "aws_auth": { "profiles": profiles }
+            } } }
+        });
+        assert!(
+            validator.validate(&profile).is_err(),
+            "aws_auth.profiles {profiles} should be rejected"
+        );
+    }
 }

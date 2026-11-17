@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 const STYLES: Styles = Styles::plain().header(Style::new().bold());
+const COMMAND_HELP: &str = "{about}\n\n\x1b[1mUSAGE\x1b[0m\n  {usage}\n\n{all-args}\n{after-help}";
 
 /// nono - The opposite of YOLO
 ///
@@ -41,14 +42,18 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   stop       Stop a running sandbox session
   detach     Detach from an interactive runtime session
   attach     Attach to a detached runtime session
-  connect    Connect this terminal to a session hosted by nono-console
   logs       View runtime session event logs
   inspect    Show detailed runtime session state
+  replay     Play a session's terminal recording back
+  transcript Print a session's terminal recording as text
   session    Manage runtime session storage
   rollback   Manage rollback sessions (browse, restore, cleanup)
-  audit      View audit trail of sandboxed commands
-  platform   Enroll with and inspect an audit control plane
   trust      Manage file trust and attestation
+
+\x1b[1mPLATFORM & AUDIT\x1b[0m
+  platform   Manage sign-in, tenants, and device enrollment
+  remote     Launch, list, and connect to remote sessions
+  audit      Inspect local audit evidence and delivery
 
 \x1b[1mPACKS\x1b[0m
   pull       Install a signed nono pack from the registry
@@ -131,15 +136,11 @@ pub enum Commands {
 
 \x1b[1mUSAGE\x1b[0m
   nono run [flags] <program>...
-  nono run --remote --agent <agent> [--workspace <name-or-id>] [prompt]
 
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono run --allow . claude                    # Read/write current dir, run claude
-  nono run --remote --agent claude             # Choose a workspace and attach
-  nono run --remote --agent claude --workspace my-project --detached
-                                               # Launch remotely without attaching
   nono run --profile nolabs-ai/claude claude        # Use a profile
   nono run --profile nolabs-ai/claude --allow-domain api.openai.com claude
                                                # Restrict outbound access to listed domains
@@ -275,7 +276,7 @@ pub enum Commands {
 ")]
     Audit(AuditArgs),
 
-    /// Enroll with and inspect an audit control plane
+    /// Manage sign-in, tenants, and device enrollment
     #[command(subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
     #[command(help_template = "\
 {about}
@@ -286,11 +287,19 @@ pub enum Commands {
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono platform enroll --url https://nono.example.com --token \"$TOKEN\"
+  nono platform login --url https://nono.example.com
+  nono platform tenant use acme
   nono platform status
   nono platform status --json
 ")]
     Platform(PlatformArgs),
+
+    /// Launch, list, and connect to remote sessions
+    #[command(help_template = COMMAND_HELP, subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
+    #[command(
+        after_help = "EXAMPLES:\n  nono remote run --agent claude --workspace project\n  nono remote list\n  nono remote connect"
+    )]
+    Remote(RemoteArgs),
 
     /// Manage file trust and attestation
     #[command(subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
@@ -314,7 +323,7 @@ pub enum Commands {
 ")]
     Trust(TrustArgs),
 
-    /// List local or remote sandboxed sessions
+    /// List local sandboxed sessions
     #[command(help_template = "\
 {about}
 
@@ -329,12 +338,6 @@ pub enum Commands {
 
     # Show all sessions (including exited)
     nono ps --all
-
-    # Show sessions hosted by the enrolled tenant's nono-console
-    nono ps --remote
-
-    # Show all remote sessions as JSON
-    nono ps --remote --all --json
 
     # JSON output
     nono ps --json
@@ -413,32 +416,6 @@ IN-BAND DETACH:
     )]
     Attach(AttachArgs),
 
-    /// Connect this terminal to a session hosted by nono-console
-    #[command(
-        help_template = "\
-{about}
-
-\x1b[1mUSAGE\x1b[0m
-  nono connect [session|url] [flags]
-
-{all-args}
-{after-help}",
-        after_help = "EXAMPLES:
-    # Discover the enrolled tenant's console, list live sessions, then choose one
-    nono connect
-
-    # Attach directly by global session ID
-    nono connect local:host:abc123
-
-    # Escape hatch: use a complete WebSocket attach URL
-    nono connect wss://console.example.com/api/v1/sessions/local:host:abc123/terminal
-
-SESSION PICKER:
-    Use Up/Down or j/k to move, Enter to connect, and q or Esc to cancel.
-"
-    )]
-    Connect(ConnectArgs),
-
     /// View event log for a session
     #[command(help_template = "\
 {about}
@@ -483,6 +460,46 @@ SESSION PICKER:
     nono inspect --json a3f7c2
 ")]
     Inspect(InspectArgs),
+
+    /// Play a session's terminal recording back
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono replay [flags] <session>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Replay a recorded session
+    nono replay a3f7c2
+
+    # Twice as fast, with pauses capped at 2 seconds
+    nono replay --speed 2 --idle-limit 2 a3f7c2
+
+    # Start 90 seconds in, or at the first suspend
+    nono replay --from 1:30 a3f7c2
+    nono replay --from suspended a3f7c2
+")]
+    Replay(ReplayArgs),
+
+    /// Print a session's terminal recording as readable text
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono transcript [flags] <session>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Readable text
+    nono transcript a3f7c2
+
+    # Structured entries
+    nono transcript --format json a3f7c2
+")]
+    Transcript(TranscriptArgs),
 
     /// Manage runtime session storage
     #[command(subcommand_help_heading = "COMMANDS")]
@@ -967,7 +984,7 @@ pub struct ProfileShowArgs {
     /// Show raw paths before expansion (e.g., $HOME instead of /Users/luke)
     #[arg(long)]
     pub raw: bool,
-    /// Output format: 'profile' (default) or 'manifest' (capability manifest JSON)
+    /// Output format: profile, manifest, or portable (self-contained policy sources)
     #[arg(long, value_enum, value_name = "FORMAT")]
     pub format: Option<ProfileShowFormat>,
 }
@@ -976,6 +993,8 @@ pub struct ProfileShowArgs {
 pub enum ProfileShowFormat {
     Profile,
     Manifest,
+    /// Self-contained profile sources with dependencies and device predicates preserved.
+    Portable,
 }
 
 #[derive(Parser, Debug)]
@@ -1042,6 +1061,12 @@ pub struct ProfileGroupsArgs {
 
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SandboxArgs {
+    #[arg(skip)]
+    pub(crate) policy_inputs: crate::platform_policy::inputs::PolicyInputs,
+    #[arg(skip)]
+    pub(crate) managed_profile: Option<crate::profile::bundle::ManagedProfile>,
+    #[arg(skip)]
+    pub(crate) policy_session: Option<crate::platform_policy::PolicySession>,
     // ── Filesystem ───────────────────────────────────────────────────────
     /// Allow read+write access to a directory (recursive)
     #[arg(
@@ -1351,9 +1376,12 @@ pub struct SandboxArgs {
 
     /// Run the command in new Linux namespaces (opt-in, NEP-0004).
     ///
-    /// Comma-separated list of: net, loopback, ipc, uts. Always adds a user
-    /// namespace. `loopback` (requires `net`) allows TCP bind/connect on any
-    /// port of the namespace's own loopback, for local dev servers and tests.
+    /// Comma-separated list of: net, loopback, ipc, uts, mounts. Always adds a
+    /// user namespace. `loopback` (requires `net`) allows TCP bind/connect on
+    /// any port of the namespace's own loopback, for local dev servers and
+    /// tests. `mounts` masks host IPC endpoints ($XDG_RUNTIME_DIR, the D-Bus
+    /// system bus, container runtime sockets) and gives the session a private
+    /// /tmp; granted paths stay reachable through the masks.
     /// `net` leaves only loopback; egress is possible only through the session
     /// proxy, so it requires --block-net or a proxied network policy and cannot
     /// be combined with direct-access grants (--open-port, --listen-port,
@@ -1651,6 +1679,8 @@ pub struct ProxyArgs {
 
 #[derive(Parser, Debug, Clone, Default)]
 pub struct WrapSandboxArgs {
+    #[arg(skip)]
+    pub(crate) policy_inputs: crate::platform_policy::inputs::PolicyInputs,
     // ── Filesystem ───────────────────────────────────────────────────────
     /// Allow read+write access to a directory (recursive)
     #[arg(
@@ -1872,6 +1902,8 @@ pub enum IsolateNamespace {
     Ipc,
     /// UTS namespace.
     Uts,
+    /// Mount namespace masking host IPC endpoints, with a private /tmp.
+    Mounts,
 }
 
 #[cfg(target_os = "linux")]
@@ -1884,6 +1916,8 @@ impl SandboxArgs {
             loopback: has(IsolateNamespace::Loopback),
             ipc: has(IsolateNamespace::Ipc),
             uts: has(IsolateNamespace::Uts),
+            mounts: has(IsolateNamespace::Mounts),
+            extra_masks: Vec::new(),
         }
     }
 }
@@ -1891,6 +1925,9 @@ impl SandboxArgs {
 impl From<WrapSandboxArgs> for SandboxArgs {
     fn from(args: WrapSandboxArgs) -> Self {
         Self {
+            policy_inputs: args.policy_inputs,
+            managed_profile: None,
+            policy_session: None,
             allow: args.allow,
             read: args.read,
             write: args.write,
@@ -1954,9 +1991,6 @@ impl From<WrapSandboxArgs> for SandboxArgs {
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct RunArgs {
-    #[command(flatten)]
-    pub remote_options: RemoteRunArgs,
-
     #[command(flatten)]
     pub sandbox: SandboxArgs,
 
@@ -2069,7 +2103,15 @@ pub struct RunArgs {
     /// Disable the audit trail for this session
     #[arg(
         long,
-        conflicts_with_all = ["audit_integrity", "no_audit_integrity", "rollback"],
+        conflicts_with_all = [
+            "audit_integrity",
+            "no_audit_integrity",
+            "rollback",
+            "record",
+            "record_required",
+            "record_file",
+            "deliver_to",
+        ],
         help_heading = "OPTIONS"
     )]
     pub no_audit: bool,
@@ -2119,6 +2161,9 @@ pub struct RunArgs {
     )]
     pub capability_elevation: bool,
 
+    #[command(flatten)]
+    pub recording: RecordingArgs,
+
     /// Command to run inside the sandbox (optional if profile specifies `binary`)
     #[arg(hide = true)]
     pub command: Vec<OsString>,
@@ -2128,33 +2173,71 @@ pub struct RunArgs {
     pub help: Option<bool>,
 }
 
-#[derive(clap::Args, Debug, Default)]
-pub struct RemoteRunArgs {
-    /// Launch a persistent agent in a remote workspace and attach this terminal
-    #[arg(long, requires = "agent", help_heading = "REMOTE")]
-    pub remote: bool,
-    /// Server-managed agent to launch (for example claude)
-    #[arg(long, requires = "remote", help_heading = "REMOTE")]
-    pub agent: Option<String>,
+#[derive(Parser, Debug)]
+#[command(trailing_var_arg = true)]
+#[command(disable_help_flag = true)]
+pub struct RemoteLaunchArgs {
+    /// Server-managed agent to launch
+    #[arg(long)]
+    pub agent: String,
     /// Remote workspace name or ID; prompts when omitted in a terminal
-    #[arg(long, requires = "remote", help_heading = "REMOTE")]
+    #[arg(long)]
     pub workspace: Option<String>,
-    /// Platform origin; defaults to the enrolled platform
-    #[arg(long = "platform-url", requires = "remote", help_heading = "REMOTE")]
+    /// Tenant for this command; overrides NONO_TENANT and the saved choice
+    #[arg(long)]
+    pub tenant: Option<String>,
+    /// Platform origin; defaults to the signed-in platform
+    #[arg(long)]
     pub platform_url: Option<String>,
-    /// Console origin; defaults to enrolled console discovery
-    #[arg(long, requires = "remote", help_heading = "REMOTE")]
+    /// Console origin; defaults to the signed-in tenant's console
+    #[arg(long)]
     pub console: Option<String>,
-    /// Protected Run API personal access token file (or NONO_RUN_TOKEN)
-    #[arg(long = "run-token-file", requires = "remote", help_heading = "REMOTE")]
+    /// Runs API token file; normally human CLI sign-in is used
+    #[arg(long)]
     pub run_token_file: Option<PathBuf>,
-    /// Console token file override; normally browser authorization is automatic
-    #[arg(
-        long = "connect-token-file",
-        requires = "remote",
-        help_heading = "REMOTE"
-    )]
+    /// Console token file; normally human CLI sign-in is used
+    #[arg(long)]
     pub connect_token_file: Option<PathBuf>,
+    /// Launch without attaching this terminal
+    #[arg(long, alias = "detach")]
+    pub detached: bool,
+    /// Initial instruction for the remote agent
+    pub command: Vec<OsString>,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct RemoteArgs {
+    #[command(subcommand)]
+    pub command: RemoteCommands,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RemoteCommands {
+    /// Launch an agent in a remote workspace and attach
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
+    #[command(
+        after_help = "EXAMPLES:\n  nono remote run --agent claude --workspace project\n  nono remote run --tenant acme --agent claude --detached 'Review the project'"
+    )]
+    Run(RemoteLaunchArgs),
+    /// List remote sessions in the selected tenant
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
+    #[command(
+        after_help = "EXAMPLES:\n  nono remote list\n  nono remote list --all --json\n  nono remote list --tenant personal"
+    )]
+    List(RemoteListArgs),
+    /// Choose a remote session or connect directly
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
+    #[command(
+        after_help = "EXAMPLES:\n  nono remote connect\n  nono remote connect --tenant acme local:host:abc123"
+    )]
+    Connect(ConnectArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -2181,9 +2264,57 @@ pub struct ShellArgs {
     )]
     pub startup_timeout_secs: Option<u64>,
 
+    #[command(flatten)]
+    pub recording: RecordingArgs,
+
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
+}
+
+/// Session terminal recording (NEP-0010). These flags can only raise what
+/// the profile sets: they never turn recording off.
+#[derive(clap::Args, Debug, Default, Clone)]
+pub struct RecordingArgs {
+    /// Record the session's terminal into the audit log
+    #[arg(
+        long,
+        env = "NONO_RECORD",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::SetTrue,
+        help_heading = "RECORDING"
+    )]
+    pub record: bool,
+
+    /// Stop the session rather than run it unrecorded (implies --record)
+    #[arg(
+        long,
+        env = "NONO_RECORD_REQUIRED",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::SetTrue,
+        help_heading = "RECORDING"
+    )]
+    pub record_required: bool,
+
+    /// Also write the finished recording, and a chunk manifest beside it, to
+    /// this new file (implies --record)
+    #[arg(
+        long,
+        value_name = "PATH",
+        env = "NONO_RECORD_FILE",
+        help_heading = "RECORDING"
+    )]
+    pub record_file: Option<PathBuf>,
+
+    /// Upload the recording as it is made (implies --record). RECEIVER is
+    /// `platform`, the platform this host is enrolled with
+    #[arg(
+        long,
+        value_name = "RECEIVER",
+        env = "NONO_DELIVER_TO",
+        help_heading = "RECORDING"
+    )]
+    pub deliver_to: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -2615,12 +2746,95 @@ pub struct PlatformArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum PlatformCommands {
+    /// Authenticate, select a tenant, and enroll this installation
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
+    #[command(
+        after_help = "EXAMPLES:\n  nono platform login\n  nono platform login --url https://nono.example.com --tenant acme\n  nono platform login --no-enroll"
+    )]
+    Login(LoginArgs),
+    /// Revoke the human CLI sign-in; keep device enrollment
+    #[command(help_template = COMMAND_HELP)]
+    #[command(after_help = "EXAMPLES:\n  nono platform logout")]
+    Logout(LogoutArgs),
+    /// List tenants or change the saved tenant
+    #[command(help_template = COMMAND_HELP, subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
+    #[command(
+        after_help = "EXAMPLES:\n  nono platform tenant list\n  nono platform tenant use acme --no-enroll"
+    )]
+    Tenant(TenantArgs),
+    /// Replace a revoked device enrollment after fresh authorization
+    #[command(name = "re-enroll", help_template = COMMAND_HELP, next_help_heading = "OPTIONS", mut_arg("no_enroll", |arg| arg.hide(true)))]
+    #[command(
+        after_help = "EXAMPLES:\n  nono platform re-enroll\n  nono platform re-enroll --tenant acme"
+    )]
+    ReEnroll(LoginArgs),
+
     /// Exchange a one-time token for an audit-only enrolled identity
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
+    #[command(
+        after_help = "EXAMPLES:\n  nono platform enroll --url https://nono.example.com --token <token>\n  nono platform enroll --url https://nono.example.com --token <token> --workload"
+    )]
     Enroll(PlatformEnrollArgs),
-    /// Show the locally enrolled platform identity
+    /// Show the saved CLI context and local audit enrollment
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
+    #[command(after_help = "EXAMPLES:\n  nono platform status\n  nono platform status --json")]
     Status(PlatformStatusArgs),
     /// Remove the local platform enrollment
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
+    #[command(
+        after_help = "EXAMPLES:\n  nono platform unenroll\n  nono platform unenroll --delete-key"
+    )]
     Unenroll(PlatformUnenrollArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct TenantArgs {
+    #[command(subcommand)]
+    pub command: TenantCommands,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TenantCommands {
+    /// List accessible tenants and mark the saved default
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
+    #[command(
+        after_help = "EXAMPLES:\n  nono platform tenant list\n  nono platform tenant list --json"
+    )]
+    List(TenantListArgs),
+    /// Save the default tenant and ensure enrollment unless opted out
+    #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
+    #[command(
+        after_help = "EXAMPLES:\n  nono platform tenant use acme\n  nono platform tenant use personal --no-enroll"
+    )]
+    Use(TenantUseArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct TenantListArgs {
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct TenantUseArgs {
+    /// Tenant name, slug, ID, or personal
+    pub tenant: String,
+    /// Skip creating an enrollment; retain an existing matching registration
+    #[arg(long, env = "NONO_NO_ENROLL", value_parser = clap::builder::BoolishValueParser::new())]
+    pub no_enroll: bool,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
 }
 
 #[derive(Parser, Debug)]
@@ -2653,7 +2867,55 @@ pub struct PlatformEnrollArgs {
 
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
+pub struct LoginArgs {
+    /// Platform origin for a self-hosted platform; defaults to the platform
+    /// you last signed in to, else https://app.nolabs.ai
+    #[arg(long, env = "NONO_PLATFORM_URL")]
+    pub url: Option<String>,
+
+    /// Tenant to work in (name, slug, ID, or personal); switches without a browser
+    /// when already signed in. Remote commands can override this choice for one command
+    #[arg(long)]
+    pub tenant: Option<String>,
+
+    /// Sign in without enrolling this device; existing enrollment is retained
+    #[arg(long, env = "NONO_NO_ENROLL", value_parser = clap::builder::BoolishValueParser::new())]
+    pub no_enroll: bool,
+
+    /// Replace a revoked enrollment with a new device key after fresh sign-in
+    #[arg(skip)]
+    pub re_enroll: bool,
+
+    /// Sign in through a local browser and a loopback redirect
+    #[arg(long, conflicts_with = "device_code")]
+    pub browser: bool,
+
+    /// Sign in with a user code on any device (for SSH sessions and containers)
+    #[arg(long)]
+    pub device_code: bool,
+
+    /// Print the sign-in URL instead of opening a browser
+    #[arg(long)]
+    pub no_open: bool,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct LogoutArgs {
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
 pub struct PlatformStatusArgs {
+    /// Fetch and verify the current platform policy assignment
+    #[arg(long)]
+    pub refresh: bool,
     /// Print status as JSON
     #[arg(long)]
     pub json: bool,
@@ -2796,25 +3058,35 @@ pub enum SessionCommands {
 
 #[derive(Parser, Debug)]
 pub struct PsArgs {
-    /// List sessions hosted by the enrolled tenant's nono-console
-    #[arg(long)]
-    pub remote: bool,
-
-    /// nono-console origin override (valid only with --remote)
-    #[arg(long, requires = "remote")]
-    pub console: Option<String>,
-
-    /// Explicit console token-file override (valid only with --remote)
-    #[arg(long, value_name = "PATH", requires = "remote")]
-    pub token_file: Option<PathBuf>,
-
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+    /// Include exited local sessions
+    #[arg(long)]
+    pub all: bool,
+}
 
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct RemoteListArgs {
+    /// Tenant for this command; overrides NONO_TENANT and the saved choice
+    #[arg(long)]
+    pub tenant: Option<String>,
+    /// nono-console origin override
+    #[arg(long)]
+    pub console: Option<String>,
+    /// Explicit console token-file override
+    #[arg(long, value_name = "PATH")]
+    pub token_file: Option<PathBuf>,
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
     /// Include exited sessions
     #[arg(long)]
     pub all: bool,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
 }
 
 #[derive(Parser, Debug)]
@@ -2848,11 +3120,16 @@ pub struct AttachArgs {
 }
 
 #[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
 pub struct ConnectArgs {
     /// Session name/global ID, or a complete ws(s) terminal URL
     pub target: Option<String>,
 
-    /// nono-console origin; defaults to signed discovery from device enrollment
+    /// Tenant for this command; overrides NONO_TENANT and the saved choice
+    #[arg(long)]
+    pub tenant: Option<String>,
+
+    /// Console origin; defaults to the signed-in tenant's console
     #[arg(long, env = "NONO_CONSOLE_URL")]
     pub console: Option<String>,
 
@@ -2863,6 +3140,9 @@ pub struct ConnectArgs {
     /// Spectate without sending terminal input (reserved until console fan-out lands)
     #[arg(long)]
     pub read_only: bool,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
 }
 
 #[derive(Parser, Debug)]
@@ -2881,6 +3161,53 @@ pub struct LogsArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct ReplayArgs {
+    /// Session ID, prefix or name
+    pub session: String,
+
+    /// Playback speed multiplier
+    #[arg(long, value_name = "N", default_value_t = 1.0, value_parser = parse_positive_f64)]
+    pub speed: f64,
+
+    /// Cap pauses at this many seconds
+    #[arg(long, value_name = "SECS", value_parser = parse_positive_f64)]
+    pub idle_limit: Option<f64>,
+
+    /// Start at a time (SECS, MM:SS or HH:MM:SS) or at the first marker with
+    /// this name (for example suspended, resumed, resize)
+    #[arg(long, value_name = "TIME|MARKER")]
+    pub from: Option<String>,
+}
+
+fn parse_positive_f64(value: &str) -> std::result::Result<f64, String> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a number"))?;
+    if parsed.is_finite() && parsed > 0.0 {
+        Ok(parsed)
+    } else {
+        Err(format!("`{value}` must be greater than zero"))
+    }
+}
+
+/// Output format for `nono transcript`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum TranscriptFormat {
+    Text,
+    Json,
+}
+
+#[derive(Parser, Debug)]
+pub struct TranscriptArgs {
+    /// Session ID, prefix or name
+    pub session: String,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t = TranscriptFormat::Text)]
+    pub format: TranscriptFormat,
 }
 
 #[derive(Parser, Debug)]
@@ -3611,6 +3938,80 @@ mod tests {
                 _ => panic!("Expected Restore subcommand"),
             },
             _ => panic!("Expected Rollback command"),
+        }
+    }
+
+    #[test]
+    fn test_run_and_shell_recording_flags_parse() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--record",
+            "--record-required",
+            "--record-file",
+            "artifacts/session.cast",
+            "--",
+            "true",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.recording.record);
+                assert!(args.recording.record_required);
+                assert_eq!(
+                    args.recording.record_file,
+                    Some(PathBuf::from("artifacts/session.cast"))
+                );
+            }
+            _ => panic!("Expected Run command"),
+        }
+        let cli = Cli::parse_from(["nono", "shell", "--record-required"]);
+        match cli.command {
+            Commands::Shell(args) => assert!(args.recording.record_required),
+            _ => panic!("Expected Shell command"),
+        }
+    }
+
+    #[test]
+    fn test_recording_flags_conflict_with_no_audit() {
+        for flag in ["--record", "--record-required"] {
+            assert!(
+                Cli::try_parse_from(["nono", "run", flag, "--no-audit", "--", "true"]).is_err(),
+                "{flag} with --no-audit must be rejected"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "nono",
+                "run",
+                "--record-file",
+                "x.cast",
+                "--no-audit",
+                "--",
+                "true"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_recording_flags_read_environment() {
+        let _env_lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("NONO_RECORD", "1"),
+            ("NONO_RECORD_REQUIRED", "true"),
+            ("NONO_RECORD_FILE", "/artifacts/session.cast"),
+        ]);
+        let cli = Cli::parse_from(["nono", "run", "--", "true"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.recording.record);
+                assert!(args.recording.record_required);
+                assert_eq!(
+                    args.recording.record_file,
+                    Some(PathBuf::from("/artifacts/session.cast"))
+                );
+            }
+            _ => panic!("Expected Run command"),
         }
     }
 
@@ -4539,11 +4940,11 @@ mod tests {
     }
 
     #[test]
-    fn test_ps_remote_flags_parse() {
+    fn test_remote_list_flags_parse() {
         let cli = Cli::try_parse_from([
             "nono",
-            "ps",
-            "--remote",
+            "remote",
+            "list",
             "--all",
             "--json",
             "--console",
@@ -4552,10 +4953,13 @@ mod tests {
             "/tmp/console-token",
         ])
         .expect("ps remote flags must parse");
-        let Commands::Ps(args) = cli.command else {
+        let Commands::Remote(RemoteArgs {
+            command: RemoteCommands::List(args),
+            ..
+        }) = cli.command
+        else {
             panic!("expected Commands::Ps");
         };
-        assert!(args.remote);
         assert!(args.all);
         assert!(args.json);
         assert_eq!(args.console.as_deref(), Some("https://console.example.com"));
@@ -4724,6 +5128,104 @@ mod tests {
         panic!("expected Commands::Profile(Validate(..))");
     }
 
+    #[test]
+    fn platform_and_remote_commands_have_one_canonical_path() {
+        for args in [
+            vec!["platform", "login", "--no-enroll"],
+            vec!["platform", "logout"],
+            vec!["platform", "status", "--json"],
+            vec!["platform", "tenant", "list", "--json"],
+            vec!["platform", "tenant", "use", "acme", "--no-enroll"],
+            vec!["platform", "re-enroll", "--tenant", "personal"],
+            vec![
+                "remote",
+                "run",
+                "--agent",
+                "claude",
+                "--workspace",
+                "project",
+                "--tenant",
+                "acme",
+                "--detached",
+            ],
+            vec!["remote", "list", "--tenant", "acme", "--json"],
+            vec![
+                "remote",
+                "connect",
+                "--tenant",
+                "personal",
+                "local:host:abc",
+            ],
+        ] {
+            let mut command = vec!["nono"];
+            command.extend(args);
+            assert!(Cli::try_parse_from(&command).is_ok(), "{command:?}");
+        }
+        for args in [
+            vec!["login"],
+            vec!["logout"],
+            vec!["connect"],
+            vec!["ps", "--remote"],
+            vec!["run", "--remote", "--agent", "claude"],
+            vec!["platform", "login", "--re-enroll"],
+            vec!["platform", "tenant", "use"],
+            vec!["remote", "run"],
+            vec!["remote", "run", "--agent", "claude", "--allow", "/tmp"],
+        ] {
+            let mut command = vec!["nono"];
+            command.extend(args);
+            assert!(Cli::try_parse_from(&command).is_err(), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn platform_and_remote_help_uses_consistent_sections() {
+        fn check(command: &clap::Command) {
+            let mut command = command.clone();
+            let help = command.render_help().to_string();
+            for section in ["USAGE", "EXAMPLES"] {
+                assert!(help.contains(section), "{}: {help}", command.get_name());
+            }
+            for child in command.get_subcommands() {
+                check(child);
+            }
+        }
+        let root = Cli::command();
+        for name in ["platform", "remote"] {
+            check(root.find_subcommand(name).expect("group"));
+        }
+    }
+
+    #[test]
+    fn nested_platform_and_remote_help_is_available_from_the_cli() {
+        for path in [
+            vec!["platform", "login"],
+            vec!["platform", "logout"],
+            vec!["platform", "tenant"],
+            vec!["platform", "tenant", "list"],
+            vec!["platform", "tenant", "use"],
+            vec!["platform", "enroll"],
+            vec!["platform", "unenroll"],
+            vec!["platform", "re-enroll"],
+            vec!["platform", "status"],
+            vec!["remote"],
+            vec!["remote", "run"],
+            vec!["remote", "list"],
+            vec!["remote", "connect"],
+        ] {
+            let mut args = vec!["nono"];
+            args.extend(path);
+            args.push("--help");
+            let error = Cli::try_parse_from(&args).expect_err("help exits parsing");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "{args:?}: {error}"
+            );
+            assert!(!error.to_string().contains("Options:"), "{error}");
+        }
+    }
+
     /// All subcommand names that must appear in the root help template.
     /// If you add a new command to the `Commands` enum, add it here too.
     const ALL_SUBCOMMANDS: &[&str] = &[
@@ -4737,13 +5239,15 @@ mod tests {
         "stop",
         "detach",
         "attach",
-        "connect",
         "logs",
         "inspect",
+        "replay",
+        "transcript",
         "session",
         "rollback",
         "audit",
         "platform",
+        "remote",
         "trust",
         "policy",
         "profile",

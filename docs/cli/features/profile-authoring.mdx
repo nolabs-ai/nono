@@ -64,6 +64,7 @@ A few fields have their own specific rules:
 | `network.credentials` | Leave it out to inherit. Set it to `[]` to explicitly disable inherited credentials. Otherwise your list is combined with the base. |
 | `network.network_profile` | Leave it out to inherit. Set it to `null` to explicitly clear the inherited proxy profile. |
 | `hooks`, `env_credentials`, `environment.set_vars` | Merged as key-value maps. Your keys win over the base on any conflict. |
+| `session_recording` | Can only be raised. You can turn recording on, make it required, record input, raise `max_bytes`, or set `file` when the base has none, but not undo what a base set. See [Session Recording](/cli/features/session-recording). |
 
 ### Extending multiple profiles
 
@@ -370,6 +371,9 @@ The `security` section controls process-level isolation knobs that are not files
 | `signal_mode` | `isolated`, `allow_same_sandbox`, `allow_all` | Controls which processes the sandboxed command may signal. On Linux V6, restricted modes use Landlock signal scoping when available. |
 | `process_info_mode` | `isolated`, `allow_same_sandbox`, `allow_all` | Controls visibility of other process metadata. |
 | `ipc_mode` | `shared_memory_only`, `full` | Controls IPC compatibility. On Linux V6, `shared_memory_only` requests abstract UNIX socket scoping; `full` leaves abstract UNIX sockets unscoped for runtimes that require broader IPC compatibility. |
+| `session_socket_auth` | `true`, `false` (default) | Authenticate callers of named session IPC sockets using kernel peer identity and verified ancestry or protected tool lineage. Requires Linux 6.5+ on Linux; also supported on macOS. Startup fails if the required kernel feature is unavailable. |
+
+With `session_socket_auth` enabled, browser helpers must stay alive until authentication completes. Credential-capture browser helpers must retain their ancestry; untracked daemonized helpers are rejected. The option does not change URL or command policies. Regardless of its value, named URL listeners use kernel-derived caller PIDs and the receiving session's ID for attribution. See the [session socket security model](/cli/internals/security-model#from-outside-an-external-attacker) for details.
 
 Use `nono why --scope` to inspect the effective scope policy for a profile:
 

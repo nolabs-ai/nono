@@ -110,6 +110,23 @@ pub fn writable_path_dirs(path_value: &str, outer_caps: &CapabilitySet) -> Vec<P
     writable
 }
 
+/// Return whether the sandbox could create, replace, or redirect `path`.
+///
+/// This is `true` when a write grant covers `path`, any of its directories, or
+/// any symlink hop on the way to it, including a symlink at an intermediate
+/// directory that a writable parent would let the sandbox retarget. A path
+/// that can't be proven safe (relative, containing NUL, a symlink cycle, or
+/// too deep to resolve) is reported as writable.
+#[must_use]
+pub fn path_writable_by(path: &Path, caps: &CapabilitySet) -> bool {
+    if path.is_relative() || path.as_os_str().as_encoded_bytes().contains(&0) {
+        return true;
+    }
+    path.ancestors()
+        .filter(|ancestor| ancestor.parent().is_some())
+        .any(|ancestor| !matches!(walk_chain(ancestor, caps), Some(false)))
+}
+
 fn filter_path(path_value: &str, mut keep: impl FnMut(&Path) -> bool) -> String {
     let kept: Vec<PathBuf> = std::env::split_paths(path_value)
         .filter(|entry| keep(entry))
@@ -148,8 +165,17 @@ fn is_entry_safe(entry: &Path, outer_caps: &CapabilitySet) -> bool {
 /// `Some(false)` if the chain resolved cleanly with nothing writable, or
 /// `None` if it could not be resolved (broken loop or too many hops).
 fn walk_chain(path: &Path, outer_caps: &CapabilitySet) -> Option<bool> {
+    let mut remaining_hops = MAX_SYMLINK_HOPS;
+    walk_chain_with_budget(path, outer_caps, &mut remaining_hops)
+}
+
+fn walk_chain_with_budget(
+    path: &Path,
+    outer_caps: &CapabilitySet,
+    remaining_hops: &mut u32,
+) -> Option<bool> {
     let mut current = path.to_path_buf();
-    for _ in 0..MAX_SYMLINK_HOPS {
+    loop {
         let parent = current.parent()?;
         let canonical_parent = try_canonicalize(parent);
         let canonical_current = match current.file_name() {
@@ -164,12 +190,23 @@ fn walk_chain(path: &Path, outer_caps: &CapabilitySet) -> Option<bool> {
 
         match std::fs::symlink_metadata(&current) {
             Ok(meta) if meta.file_type().is_symlink() => {
+                *remaining_hops = remaining_hops.checked_sub(1)?;
                 let target = std::fs::read_link(&current).ok()?;
                 current = if target.is_absolute() {
                     target
                 } else {
-                    parent.join(target)
+                    canonical_parent.join(target)
                 };
+                // A target can introduce replaceable directory components that
+                // canonicalizing its parent would otherwise hide. Share the hop
+                // budget so cycles through those components still fail closed.
+                for ancestor in current.ancestors().skip(1) {
+                    if ancestor.parent().is_some()
+                        && walk_chain_with_budget(ancestor, outer_caps, remaining_hops)?
+                    {
+                        return Some(true);
+                    }
+                }
             }
             // Real file/directory, or doesn't exist yet: nothing further to
             // follow. The ancestor grant check above already covers the
@@ -177,7 +214,6 @@ fn walk_chain(path: &Path, outer_caps: &CapabilitySet) -> Option<bool> {
             _ => return Some(false),
         }
     }
-    None
 }
 
 fn grants_write(caps: &CapabilitySet, path: &Path) -> bool {
@@ -729,5 +765,98 @@ mod tests {
         let mut perms = std::fs::metadata(path).expect("metadata").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(path, perms).expect("chmod");
+    }
+
+    #[test]
+    fn path_writable_by_rejects_writable_parent_or_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_dir = dir.path().join("helper").join("s");
+        std::fs::create_dir_all(&socket_dir).expect("mkdir");
+        let socket = socket_dir.join("approval.sock");
+        assert!(path_writable_by(&socket, &caps_with_write(&socket_dir)));
+        assert!(path_writable_by(&socket, &caps_with_write(dir.path())));
+        assert!(!path_writable_by(&socket, &caps_with_read(dir.path())));
+        assert!(!path_writable_by(&socket, &CapabilitySet::new()));
+    }
+
+    #[test]
+    fn path_writable_by_rejects_missing_path_under_writable_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("not-created").join("approval.sock");
+        assert!(path_writable_by(&socket, &caps_with_write(dir.path())));
+        assert!(!path_writable_by(&socket, &caps_with_read(dir.path())));
+    }
+
+    #[test]
+    fn path_writable_by_rejects_relative_paths() {
+        assert!(path_writable_by(
+            Path::new("helper/approval.sock"),
+            &CapabilitySet::new()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_writable_by_rejects_symlinked_directory_into_writable_area() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writable = dir.path().join("writable");
+        std::fs::create_dir_all(&writable).expect("mkdir writable");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&writable, &link).expect("symlink");
+        assert!(path_writable_by(
+            &link.join("approval.sock"),
+            &caps_with_write(&writable)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_writable_by_rejects_retargetable_intermediate_symlink() {
+        // `outer/link -> safe`: `safe` is read-only, but `outer` is writable,
+        // so the sandbox could point `link` somewhere it controls.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let safe = dir.path().join("safe");
+        let outer = dir.path().join("outer");
+        std::fs::create_dir_all(&safe).expect("mkdir safe");
+        std::fs::create_dir_all(&outer).expect("mkdir outer");
+        let link = outer.join("link");
+        std::os::unix::fs::symlink(&safe, &link).expect("symlink");
+        let socket = link.join("approval.sock");
+        assert!(path_writable_by(&socket, &caps_with_write(&outer)));
+        assert!(!path_writable_by(&socket, &caps_with_read(dir.path())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_writable_by_checks_ancestors_introduced_by_symlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let safe = dir.path().join("safe");
+        let work = dir.path().join("work");
+        let trusted = dir.path().join("trusted");
+        for path in [&safe, &work, &trusted] {
+            std::fs::create_dir(path).expect("mkdir");
+        }
+        std::os::unix::fs::symlink(&trusted, work.join("hop")).expect("symlink hop");
+        for target in [
+            work.join("hop/approval.sock"),
+            PathBuf::from("../work/hop/approval.sock"),
+        ] {
+            let socket = safe.join("approval.sock");
+            std::os::unix::fs::symlink(target, &socket).expect("symlink socket");
+            assert!(path_writable_by(&socket, &caps_with_write(&work)));
+            assert!(!path_writable_by(&socket, &caps_with_read(dir.path())));
+            std::fs::remove_file(socket).expect("remove socket link");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_writable_by_rejects_cycle_in_introduced_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hop = dir.path().join("hop");
+        let socket = dir.path().join("approval.sock");
+        std::os::unix::fs::symlink("hop", &hop).expect("symlink cycle");
+        std::os::unix::fs::symlink("hop/approval.sock", &socket).expect("symlink socket");
+        assert!(path_writable_by(&socket, &CapabilitySet::new()));
     }
 }

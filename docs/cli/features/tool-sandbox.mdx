@@ -61,7 +61,7 @@ Each entry under `approval_backends` is one of:
 | `type` | Fields | Use |
 |---|---|---|
 | `terminal` | `timeout_secs` | Prompt the operator in the terminal. |
-| `webhook` | `url`, `auth`, `timeout_secs` | Ask an HTTP endpoint. Omit `auth` for a plain endpoint that answers the `POST` with the decision. Set `auth: "platform"` to sign every request with this client's enrollment key and follow the submit-and-poll exchange; `url` may then be omitted and defaults to the enrolled platform's approval route. Both variants are specified in `docs/protocols/approval-webhook-v1.md`. |
+| `webhook` | `url`, `auth`, `timeout_secs` | Ask an HTTP endpoint, or a local helper on a Unix socket with `url: "unix:///abs/path.sock"` (launch is refused if the agent or the command's sandbox could replace the socket). Omit `auth` for a plain endpoint that answers the `POST` with the decision. Set `auth: "platform"` to sign every request with this client's enrollment key and follow the submit-and-poll exchange; `url` may then be omitted and defaults to the enrolled platform's approval route. Both variants are specified in `docs/protocols/approval-webhook-v1.md`. |
 | `chain` | `mode` (`all` or `any`), `backends` | Combine other backends. |
 
 Terminal approval has a total `timeout_secs` budget of 600 seconds by default,
@@ -769,12 +769,21 @@ only the command sandbox: `aws_auth.profile` is still resolved by the host super
 For an SSO profile, run `aws sso login --profile <name>` outside the sandbox first.
 Do not grant the command sandbox access to `~/.aws`.
 
+To let the command switch between several host profiles, set `aws_auth.profiles`
+instead of `aws_auth.profile`. Point `AWS_CONFIG_FILE` at a host-written file with
+one placeholder profile per entry instead of `/dev/null`, and drop the
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` placeholders: clients prefer them over
+the selected profile, so `AWS_PROFILE` would not switch identities. See
+[Multiple profiles](/cli/features/credential-injection#multiple-profiles).
+
 `aws_auth` is valid only on `proxy` credentials and cannot be combined with
 `credential_key` or `source`. As with every command-scoped proxy credential, each
 grant must include an `endpoint_policy`. See
 [AWS SigV4 Signing](/cli/features/credential-injection#aws-sigv4-signing) for the
 profile, region, service, and credential-resolution behavior shared with
-session-level routes.
+session-level routes. A single route can cover every commercial region with a
+`https://{service}.*.amazonaws.com` upstream; see
+[wildcard-region endpoints](/cli/features/credential-injection#region-pinned-and-wildcard-region-endpoints).
 
 ### Shaping an ambient credential's phantom
 

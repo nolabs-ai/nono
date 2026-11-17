@@ -7,7 +7,7 @@
 //! [`ApprovalRequest`] is the generalised form consumed by [`crate::supervisor::ApprovalBackend`].
 //! It covers file capability, network, and command-policy launch requests.
 
-use crate::capability::AccessMode;
+use crate::capability::{AccessMode, UnixSocketOp};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -83,6 +83,12 @@ pub enum ApprovalRequest {
         request_id: String,
         /// Stable configured route identifier, e.g. `"github-api"`
         route_id: String,
+        /// Credential route that will inject a credential into the approved
+        /// request, or `None` when the request is forwarded without one.
+        /// Equals `route_id` when the approval comes from a credential
+        /// route's own policy.
+        #[serde(default)]
+        credential_route: Option<String>,
         /// Upstream URL for the route, without credentials
         upstream: String,
         /// HTTP method being requested
@@ -91,6 +97,10 @@ pub enum ApprovalRequest {
         path: String,
         /// The endpoint policy rule/default that triggered approval
         rule_label: String,
+        /// AWS operation name for `aws_auth` routes (`"Unknown"` when it
+        /// could not be determined); `None` for other routes.
+        #[serde(default)]
+        operation: Option<String>,
         /// Human-readable reason
         reason: Option<String>,
         /// PID of the requesting child process, if known
@@ -117,6 +127,22 @@ pub enum ApprovalRequest {
         /// Session identifier
         session_id: String,
     },
+    /// A pathname unix socket `connect` or `bind` outside the granted socket
+    /// set (Linux seccomp-notify, `linux.af_unix_mediation: pathname`).
+    UnixSocket {
+        /// Unique identifier for this request
+        request_id: String,
+        /// Canonical socket path
+        path: PathBuf,
+        /// `connect` or `bind`; datagram sends are never escalated
+        op: UnixSocketOp,
+        /// Human-readable reason
+        reason: Option<String>,
+        /// PID of the requesting child process
+        child_pid: u32,
+        /// Session identifier
+        session_id: String,
+    },
 }
 
 impl ApprovalRequest {
@@ -127,7 +153,8 @@ impl ApprovalRequest {
             ApprovalRequest::Capability { request_id, .. }
             | ApprovalRequest::Network { request_id, .. }
             | ApprovalRequest::Endpoint { request_id, .. }
-            | ApprovalRequest::Command { request_id, .. } => request_id,
+            | ApprovalRequest::Command { request_id, .. }
+            | ApprovalRequest::UnixSocket { request_id, .. } => request_id,
         }
     }
 
@@ -138,7 +165,8 @@ impl ApprovalRequest {
             ApprovalRequest::Capability { session_id, .. }
             | ApprovalRequest::Network { session_id, .. }
             | ApprovalRequest::Endpoint { session_id, .. }
-            | ApprovalRequest::Command { session_id, .. } => session_id,
+            | ApprovalRequest::Command { session_id, .. }
+            | ApprovalRequest::UnixSocket { session_id, .. } => session_id,
         }
     }
 }
@@ -171,9 +199,10 @@ pub enum ApprovalDecision {
     /// approvals this explicitly permits local reuse without consulting the
     /// backend again; each connection still undergoes its own address checks.
     ///
-    /// Callers that do not implement session caching (e.g. the L7 endpoint
-    /// approval path) MUST treat this exactly as [`ApprovalDecision::Granted`];
-    /// see [`ApprovalDecision::without_session_scope`].
+    /// Callers that do not implement session caching (e.g. L7 endpoint
+    /// approvals for credential routes) MUST treat this exactly as
+    /// [`ApprovalDecision::Granted`]; see
+    /// [`ApprovalDecision::without_session_scope`].
     GrantedForSession,
     /// Access was denied with a reason.
     Denied {
@@ -212,10 +241,13 @@ impl ApprovalDecision {
 
     /// Collapse the session-scoped variants to their one-shot equivalents.
     ///
-    /// Session caching is only implemented on the network CONNECT path, which
-    /// keys decisions by `(host, port)`. Every other approval consumer treats a
-    /// decision as a single yes/no; calling this keeps those `match` sites total
-    /// and fail-secure without teaching them about session persistence.
+    /// Session caching is implemented on the network CONNECT path, keyed by
+    /// `(host, port)`, and for `allow_domain` endpoint approvals, keyed by the
+    /// approval scope. An endpoint scope includes the AWS operation so a grant
+    /// for one operation cannot satisfy another. Every other approval consumer
+    /// treats a decision as a single yes/no; calling this keeps those `match`
+    /// sites total and fail-secure without teaching them about session
+    /// persistence.
     #[must_use]
     pub fn without_session_scope(self) -> Self {
         match self {

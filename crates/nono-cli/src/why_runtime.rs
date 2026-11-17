@@ -15,6 +15,10 @@ struct WhyContext {
     denied_domains: Vec<String>,
     domain_endpoints: Vec<sandbox_state::DomainEndpointState>,
     command_policies: Option<CommandPoliciesConfig>,
+    /// Host paths hidden by the Linux mount mask (`linux.isolate.mounts`).
+    masked_paths: Vec<std::path::PathBuf>,
+    /// Host paths the mount mask plan binds back over the masks.
+    rebound_paths: Vec<std::path::PathBuf>,
 }
 
 /// Resolve the proxy domain allowlist from a profile's network config.
@@ -95,23 +99,7 @@ fn resolve_domain_endpoints(profile: &profile::Profile) -> Vec<sandbox_state::Do
         .network
         .allow_domain
         .iter()
-        .filter_map(|e| match e {
-            profile::AllowDomainEntry::WithEndpoints { domain, endpoints }
-                if !endpoints.is_empty() =>
-            {
-                Some(sandbox_state::DomainEndpointState {
-                    domain: domain.clone(),
-                    endpoints: endpoints
-                        .iter()
-                        .map(|r| sandbox_state::EndpointRuleState {
-                            method: r.method.clone(),
-                            path: r.path.clone(),
-                        })
-                        .collect(),
-                })
-            }
-            _ => None,
-        })
+        .filter_map(sandbox_state::DomainEndpointState::from_allow_domain)
         .collect()
 }
 
@@ -189,6 +177,16 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             Some(state) => {
                 let domain_endpoints = state.domain_endpoints.clone();
                 let pathname_socket_enforcement = state.pathname_socket_enforcement;
+                let (masked_paths, rebound_paths) = state
+                    .isolation
+                    .as_ref()
+                    .map(|isolation| {
+                        (
+                            isolation.masked_paths.clone(),
+                            isolation.rebound_paths.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
                 WhyContext {
                     caps: state.to_caps()?,
                     deny_policy: policy::EffectiveDenyPolicy::from_applied_bypasses(
@@ -200,6 +198,8 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
                     denied_domains: state.denied_domains.clone(),
                     domain_endpoints,
                     command_policies: None,
+                    masked_paths,
+                    rebound_paths,
                 }
             }
             None => {
@@ -246,6 +246,21 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         if prepared.needs_unlink_overrides {
             policy::apply_unlink_overrides(&mut caps);
         }
+        // The same plan a launch would build from these grants, so a grant
+        // that re-binds a path through a mask is answered as reachable.
+        #[cfg(target_os = "linux")]
+        let (masked_paths, rebound_paths) = if profile.linux.isolate.mounts {
+            let workdir = nono::try_canonicalize(&workdir);
+            crate::isolation::mount_view(&crate::isolation::plan_mount_mask(
+                &profile.linux.isolate,
+                &caps,
+                &workdir,
+            )?)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (masked_paths, rebound_paths) = (Vec::new(), Vec::new());
         WhyContext {
             caps,
             deny_policy: policy::EffectiveDenyPolicy::from_applied_bypasses(
@@ -257,6 +272,8 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             denied_domains,
             domain_endpoints,
             command_policies,
+            masked_paths,
+            rebound_paths,
         }
     } else {
         let sandbox_args = sandbox_args_from_why(&args);
@@ -277,6 +294,8 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             denied_domains: merge_cli_deny_domains(Vec::new(), &args.deny_proxy)?,
             domain_endpoints: vec![],
             command_policies: None,
+            masked_paths: Vec::new(),
+            rebound_paths: Vec::new(),
         }
     };
 
@@ -330,13 +349,16 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             .deny_policy
             .matching_deny_for_access(path, deny_access)
             .is_some();
-        query_ext::query_unix_socket(
-            path,
-            op,
-            &ctx.caps,
-            ctx.pathname_socket_enforcement,
-            denied_by_filesystem_policy,
-        )
+        match query_ext::query_masked_unix_socket(path, &ctx.masked_paths, &ctx.rebound_paths) {
+            Some(masked) => masked,
+            None => query_ext::query_unix_socket(
+                path,
+                op,
+                &ctx.caps,
+                ctx.pathname_socket_enforcement,
+                denied_by_filesystem_policy,
+            ),
+        }
     } else if let Some(ref host) = args.host {
         query_network(
             host,

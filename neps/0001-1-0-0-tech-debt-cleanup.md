@@ -3,8 +3,9 @@ nep: 0001
 title: Pre-1.0.0 tech debt, deprecation, and API-freeze cleanup
 authors:
   - Aleksy Siek
-status: proposed
+status: accepted
 created: 2026-08-31
+breaking: true
 superseded-by:
 ---
 
@@ -22,20 +23,39 @@ a pile of decisions we already know are wrong.
 The guiding rule for this NEP is that 1.0.0 is a clean slate. Anything
 marked deprecated, legacy, or `remove_by="indefinite"` gets removed. A
 tag of "indefinite" was never really a decision, it just meant nobody
-had scheduled one yet (see `crates/nono/src/trust/types.rs:48` for an
-example of the marker convention). 1.0.0 is the point where that gets
+had scheduled one yet. 1.0.0 is the point where that gets
 resolved by removing the thing, not by deferring it again. If
 something genuinely needs to stay, that has to be an explicit,
 argued-for exception written into this NEP's discussion, not the
 default outcome.
 
+## Implementation status
+
+Partially implemented as of 2026-11-02:
+
+- Legacy aliases, `deprecated_schema.rs` and `deprecated_policy.rs` were
+  removed in [#1826](https://github.com/nolabs-ai/nono/pull/1826).
+- Deprecated diagnostic, trust-policy and credential APIs were removed in
+  [#1871](https://github.com/nolabs-ai/nono/pull/1871); legacy Claude hook
+  cleanup was removed in [#1973](https://github.com/nolabs-ai/nono/pull/1973).
+- The stale AGENTS.md capability claims are gone. Main `apply_auto`
+  entrypoints have `#[must_use]`; other apply helpers still need review.
+- Remaining: keystore policy placement, public API review, socket-state
+  typing and compatibility, command-blocking removal, dead-code cleanup,
+  hidden-command review and the `endpoint_rules` decision.
+
+The inventory below records the original 0.74.0 audit; counts and line
+references are historical. Recheck callers before removing API:
+`nono-proxy` now uses `scrub_value`, and `CapabilityRequest` is still part
+of the library's supervisor message types.
+
 ## Motivation
 
-The project is currently at 0.74.0. A number of deprecations across
-`nono`, `nono-cli`, and `nono-proxy` are already marked "removed in
+At the time of the 0.74.0 audit, a number of deprecations across
+`nono`, `nono-cli`, and `nono-proxy` were already marked "removed in
 1.0.0" in code comments and `#[deprecated(since = ...)]` attributes
 (for example `crates/nono/src/diagnostic/codes.rs:72`), but they
-haven't actually been removed yet. Others were never formally marked
+had not been removed. Others were never formally marked
 deprecated but are clearly meant to be temporary: aliases, fields
 commented "legacy," and compat shims tagged `remove_by="indefinite"`.
 
@@ -120,15 +140,14 @@ NEP. Nothing here requires bundling everything into one change.
    a different concern from general command policy") to survive
    review.
 
-3. **Remove public API in `nono` that has no known caller.** None of
-   these are referenced anywhere else in the workspace:
+3. **Review public API identified as unused by the original audit.**
+   Revalidate these candidates against current workspace and downstream use:
    - `CapabilityRequest` in `crates/nono/src/supervisor/types.rs:21`
    - `SessionObservationInput` in
      `crates/nono/src/diagnostic/observation.rs:14`
    - `scrub_value`, `scrub_env_name`, `scrub_env_value`, `scrub_argv`,
      `scrub_header` in `crates/nono/src/scrub.rs:213,233,249,273,329`,
-     which are thin wrappers around the `..._with_policy` versions and
-     have no callers of their own
+     which are thin wrappers around the `..._with_policy` versions
    Public-and-unused doesn't carry forward into a frozen 1.0.0 API by
    default. If one of these turns out to be part of a documented
    contract for some downstream consumer, that should be called out
@@ -197,9 +216,9 @@ NEP. Nothing here requires bundling everything into one change.
    `crates/nono-cli/src/profile/mod.rs`, and
    `crates/nono-cli/src/profile_cmd.rs`.
 
-4. **Resolve all 15 `#[allow(dead_code)]` sites in `nono-cli`.**
-   AGENTS.md says this attribute shouldn't exist in the codebase.
-   Sites: `crates/nono-cli/src/setup.rs:14`,
+4. **Review `#[allow(dead_code)]` sites in `nono-cli`.**
+   The original audit identified 15 sites; refresh this inventory before
+   cleanup. Sites: `crates/nono-cli/src/setup.rs:14`,
    `crates/nono-cli/src/policy.rs:21,32,34,41`,
    `crates/nono-cli/src/test_env.rs:9`,
    `crates/nono-cli/src/network_policy.rs:20,32,34,41`,

@@ -3,8 +3,9 @@ nep: 0003
 title: Move macOS keychain authorisation to `nono-cli`
 authors:
   - Kurtis Charnock
-status: accepted
+status: implemented
 created: 2026-09-23
+breaking: true
 superseded-by:
 ---
 
@@ -16,6 +17,20 @@ Move the decision about whether a sandboxed process may reach the macOS
 keychain out of the `nono` library and into `nono-cli` and make that decision
 require an explicit `filesystem.bypass_protection` entry when a deny group
 covers the keychain.
+
+## Implementation status
+
+Implemented in [#2019](https://github.com/nolabs-ai/nono/pull/2019) and
+shipped in v0.79.0, including shared deny-policy evaluation and regression
+tests. The design and security considerations below record that decision.
+
+Later, [#2093](https://github.com/nolabs-ai/nono/pull/2093) added explicit
+command-scoped `keychain_access` grants. These authorise a mediated child
+while leaving the agent denied. The original restriction still applies to
+ordinary command filesystem grants; the explicit delegation is a separately
+reviewed extension. Current usage is documented in
+[Tool Sandbox](../docs/cli/features/tool-sandbox.mdx) and
+[Claude Code](../docs/cli/clients/claude.mdx).
 
 ## Motivation
 
@@ -55,7 +70,7 @@ launcher has to forward specifically to keep that inference working.
 
 ### Non-Goals
 
-- No changes to the Landlock/Linux implementation..
+- No changes to the Landlock/Linux implementation.
 - No change to which paths `deny_keychains_macos` covers.
 
 ## Proposal
@@ -188,6 +203,6 @@ launcher has to forward specifically to keep that inference working.
 
 ## Open Questions
 
-- Does the same bug class apply on Linux?.
+- Does the same bug class apply on Linux?
 - How is the version skew between a released CLI and the `nolabs-ai/claude`
   registry pack handled?

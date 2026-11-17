@@ -988,14 +988,17 @@ impl<'a> DiagnosticFormatter<'a> {
             Some(c) => c,
             None => return true, // no context, assume readable
         };
-        let binary_path = &cmd.resolved_path;
+        // Compare canonical paths so symlinks and /tmp vs /private/tmp aliases
+        // do not produce a wrong verdict. `starts_with` is component-based.
+        let binary_path = canonical_or_self(&cmd.resolved_path);
         for cap in self.caps.fs_capabilities() {
             if cap.access == AccessMode::Read || cap.access == AccessMode::ReadWrite {
+                let cap_path = canonical_or_self(&cap.resolved);
                 if cap.is_file {
-                    if *binary_path == cap.resolved {
+                    if binary_path == cap_path {
                         return true;
                     }
-                } else if binary_path.starts_with(&cap.resolved) {
+                } else if binary_path.starts_with(&cap_path) {
                     return true;
                 }
             }
@@ -1009,14 +1012,15 @@ impl<'a> DiagnosticFormatter<'a> {
             Some(c) => c,
             None => return true,
         };
-        let binary_dir = match cmd.resolved_path.parent() {
+        let resolved = canonical_or_self(&cmd.resolved_path);
+        let binary_dir = match resolved.parent() {
             Some(d) => d,
             None => return false,
         };
         for cap in self.caps.fs_capabilities() {
             if !cap.is_file
                 && (cap.access == AccessMode::Read || cap.access == AccessMode::ReadWrite)
-                && binary_dir.starts_with(&cap.resolved)
+                && binary_dir.starts_with(canonical_or_self(&cap.resolved))
             {
                 return true;
             }
@@ -1069,6 +1073,13 @@ impl<'a> DiagnosticFormatter<'a> {
                             );
                             lines.push(format!("[nono]   nono run --read {} ...", parent_path,));
                         }
+                        // Exec requires read; a file grant is the narrowest fix.
+                        let canonical = canonical_or_self(&cmd.resolved_path).display().to_string();
+                        lines.push("[nono] Or, for just this binary:".to_string());
+                        lines.push(format!(
+                            "[nono]   nono run --read-file {} ...",
+                            sanitize_for_diagnostic(&canonical)
+                        ));
                     } else if !self.is_binary_dir_readable() {
                         // Binary itself is allowed but its directory isn't
                         // (unlikely but possible with file-level grants)
@@ -1139,6 +1150,18 @@ impl<'a> DiagnosticFormatter<'a> {
                         "[nono] may be blocking execution of binaries in that directory."
                             .to_string(),
                     );
+                    if !self.is_binary_path_readable() {
+                        // On macOS, exec is only allowed for paths in the read set.
+                        let canonical = canonical_or_self(&cmd.resolved_path).display().to_string();
+                        lines.push("[nono]".to_string());
+                        lines.push(
+                            "[nono] The binary is not in the sandbox read set. Fix:".to_string(),
+                        );
+                        lines.push(format!(
+                            "[nono]   nono run --read-file {} ...",
+                            sanitize_for_diagnostic(&canonical)
+                        ));
+                    }
                 } else {
                     lines.push(
                         "[nono] The command was found but could not be executed.".to_string(),
@@ -1928,6 +1951,23 @@ impl<'a> DiagnosticFormatter<'a> {
         diagnostics: &[NonoDiagnostic],
     ) {
         const MAX_INLINE_LIST: usize = 10;
+        const MAX_REASON_CHARS: usize = 256;
+        use crate::terminal_approval::sanitize_for_terminal;
+
+        let mut groups = std::collections::BTreeMap::<_, usize>::new();
+        for diagnostic in ipc_diagnostics {
+            if let Some(NonoDiagnosticDetail::IpcDenial {
+                operation,
+                target,
+                ipc_reason,
+            }) = &diagnostic.detail
+            {
+                let count = groups
+                    .entry((operation.as_str(), target.as_str(), ipc_reason.as_str()))
+                    .or_default();
+                *count = count.saturating_add(1);
+            }
+        }
 
         let total = ipc_diagnostics.len();
         let plural_s = if total == 1 { "" } else { "s" };
@@ -1935,19 +1975,28 @@ impl<'a> DiagnosticFormatter<'a> {
             "[nono] IPC denial: {} Unix socket operation{} blocked.",
             total, plural_s
         ));
-        for (idx, diagnostic) in ipc_diagnostics.iter().enumerate() {
+        for (idx, ((operation, target, reason), count)) in groups.iter().enumerate() {
             if idx >= MAX_INLINE_LIST {
-                lines.push(format!("[nono]   ... and {} more", total - idx));
+                lines.push(format!(
+                    "[nono]   ... and {} more distinct denials",
+                    groups.len() - idx
+                ));
                 break;
             }
-            if let Some(NonoDiagnosticDetail::IpcDenial {
-                operation,
-                target,
-                ipc_reason,
-            }) = &diagnostic.detail
-            {
-                lines.push(format!("[nono]   {operation} {target} ({ipc_reason})"));
-            }
+            let reason = crate::command_display::truncate_chars(
+                &sanitize_for_terminal(reason),
+                MAX_REASON_CHARS,
+            );
+            let attempts = if *count > 1 {
+                format!("; {count} attempts")
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "[nono]   {} {} ({reason}{attempts})",
+                sanitize_for_terminal(operation),
+                sanitize_for_terminal(target)
+            ));
         }
 
         let flags =
@@ -2882,6 +2931,11 @@ fn shell_quote(s: &str) -> String {
     quoted
 }
 
+/// Canonicalize for comparison, falling back to the path as given.
+fn canonical_or_self(path: &std::path::Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3718,6 +3772,8 @@ mod tests {
             denial_category: Some(category),
             endpoint_policy_action: None,
             endpoint_policy_rule: None,
+            endpoint_operation: None,
+            endpoint_protocol: None,
             approval_backend: None,
             credential_capture_action: None,
             credential_capture_name: None,
@@ -4546,6 +4602,98 @@ mod tests {
         // Policy-blocked paths cannot be fixed with a path flag.
         assert!(!output.contains("Fix flags: --read /etc/shadow"));
         assert!(!output.contains("--allow <path>"));
+    }
+
+    #[test]
+    fn test_ipc_summary_groups_by_target_operation_and_reason() {
+        let caps = make_test_caps();
+        let ipc_denials: Vec<_> = [
+            ("/bus", "connect", "approval timed out"),
+            ("/bus", "connect", "approval timed out"),
+            ("/bus", "connect", "approval denied for this session"),
+            ("/bus", "bind", "approval timed out"),
+            ("/other", "connect", "approval timed out"),
+        ]
+        .into_iter()
+        .map(|(target, operation, reason)| {
+            nono::IpcDenialRecord::new(target.into(), operation.into(), reason.into(), None)
+        })
+        .collect();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_ipc_denials(&ipc_denials);
+        let report = formatter.build_session_report(0);
+        assert_eq!(report.ipc_denials.len(), 5);
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| matches!(
+                    diagnostic.detail,
+                    Some(NonoDiagnosticDetail::IpcDenial { .. })
+                ))
+                .count(),
+            5
+        );
+        let output = formatter.with_session_report(&report).format_footer(0);
+
+        assert!(output.contains("IPC denial: 5 Unix socket operations blocked."));
+        assert_eq!(
+            output
+                .matches("connect /bus (approval timed out; 2 attempts)")
+                .count(),
+            1
+        );
+        assert!(output.contains("connect /bus (approval denied for this session)"));
+        assert!(output.contains("bind /bus (approval timed out)"));
+        assert!(output.contains("connect /other (approval timed out)"));
+    }
+
+    #[test]
+    fn test_ipc_summary_limits_distinct_denials() {
+        let caps = make_test_caps();
+        let ipc_denials: Vec<_> = (0..12)
+            .flat_map(|index| {
+                let denial = nono::IpcDenialRecord::new(
+                    format!("/socket-{index:02}"),
+                    "connect".into(),
+                    "approval timed out".into(),
+                    None,
+                );
+                [denial.clone(), denial]
+            })
+            .collect();
+        let output = format_footer_with_session_report(
+            DiagnosticFormatter::new(&caps)
+                .with_mode(DiagnosticMode::Supervised)
+                .with_ipc_denials(&ipc_denials),
+            0,
+        );
+        assert!(output.contains("IPC denial: 24 Unix socket operations blocked."));
+        assert_eq!(output.matches("2 attempts").count(), 10);
+        assert!(output.contains("... and 2 more distinct denials"));
+        assert!(!output.contains("/socket-10"));
+    }
+
+    #[test]
+    fn test_ipc_summary_sanitizes_and_bounds_backend_reasons() {
+        let caps = make_test_caps();
+        let ipc_denials = [nono::IpcDenialRecord::new(
+            "/bus\x1b]0;spoof\x07".into(),
+            "connect\x1b[31m".into(),
+            format!("approval denied: \x1b[2K\r\n{}", "界".repeat(5000)),
+            None,
+        )];
+        let output = format_footer_with_session_report(
+            DiagnosticFormatter::new(&caps)
+                .with_mode(DiagnosticMode::Supervised)
+                .with_ipc_denials(&ipc_denials),
+            0,
+        );
+        assert!(output.contains("connect /bus (approval denied:"));
+        assert!(!output.contains("spoof"));
+        assert!(!output.contains('\x1b'));
+        assert!(output.chars().count() < 700);
     }
 
     #[test]

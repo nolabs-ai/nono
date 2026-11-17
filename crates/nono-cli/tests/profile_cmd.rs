@@ -342,3 +342,82 @@ fn test_guide_outputs_markdown() {
         "guide should show command-policy diagnostic query"
     );
 }
+
+#[test]
+fn portable_export_includes_bases_and_preserves_device_predicates() {
+    let dir = tempfile::tempdir().expect("fixture");
+    std::fs::write(
+        dir.path().join("base.json"),
+        r#"{
+        "meta":{"name":"base"},"filesystem":{"read":["$HOME/shared", {"path":"$HOME/linux-conditional", "when":"linux"}, {"path":"$HOME/mac-conditional", "when":"macos"}]},
+        "platform_overrides":{
+            "macos":{"filesystem":{"read":["$HOME/mac-only"]}},
+            "linux":{"filesystem":{"read":["$HOME/linux-only"]}}
+        }
+    }"#,
+    )
+    .expect("base");
+    let path = dir.path().join("managed.json");
+    std::fs::write(
+        &path,
+        r#"{"meta":{"name":"managed"},"extends":"base","filesystem":{"read":["$WORKDIR"]}}"#,
+    )
+    .expect("leaf");
+    let output = nono_bin()
+        .args(["profile", "show"])
+        .arg(&path)
+        .args(["--format", "portable"])
+        .output()
+        .expect("export");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exported: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("portable JSON");
+    assert!(!exported["profiles"].as_object().expect("bases").is_empty());
+    assert_eq!(
+        exported["profiles"]["profile-0"]["filesystem"]["read"][1]["path"],
+        "$HOME/linux-conditional"
+    );
+    assert_eq!(
+        exported["profiles"]["profile-0"]["filesystem"]["read"][2]["path"],
+        "$HOME/mac-conditional"
+    );
+    assert_eq!(
+        exported["profiles"]["profile-0"]["filesystem"]["read"][0],
+        "$HOME/shared"
+    );
+    assert_eq!(
+        exported["root"]["filesystem"]["read"],
+        serde_json::json!(["$WORKDIR"])
+    );
+    assert_eq!(
+        exported["profiles"]["profile-0"]["platform_overrides"]["macos"]["filesystem"]["read"][0],
+        "$HOME/mac-only"
+    );
+    assert_eq!(
+        exported["profiles"]["profile-0"]["platform_overrides"]["linux"]["filesystem"]["read"][0],
+        "$HOME/linux-only"
+    );
+}
+
+#[test]
+fn portable_export_rejects_host_hooks_before_delivery() {
+    let dir = tempfile::tempdir().expect("fixture");
+    let path = dir.path().join("managed.json");
+    std::fs::write(
+        &path,
+        r#"{"meta":{"name":"managed"},"hooks":{"claude":{"command":"untrusted-helper"}}}"#,
+    )
+    .expect("profile");
+    let output = nono_bin()
+        .args(["profile", "show"])
+        .arg(&path)
+        .args(["--format", "portable"])
+        .output()
+        .expect("export");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}

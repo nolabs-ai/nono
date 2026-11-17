@@ -1,6 +1,6 @@
 ---
 title: Namespace Isolation (Linux)
-description: Opt-in user, network, IPC, and UTS namespaces that structurally remove local IPC and direct-network escape paths
+description: Opt-in user, network, IPC, UTS, and mount namespaces that structurally remove local IPC and direct-network escape paths
 ---
 
 Namespace isolation is an opt-in Linux layer that runs the sandboxed command inside new kernel namespaces, on top of the normal Landlock and seccomp sandbox. It is off by default and must be explicitly enabled with the `--isolate` flag or the corresponding profile settings.
@@ -14,6 +14,9 @@ nono run --isolate net --allow-domain api.openai.com --allow-cwd -- my-agent
 
 # Same, and let the agent run local servers and tests on its own loopback
 nono run --isolate net,loopback --allow-domain api.openai.com --allow-cwd -- my-agent
+
+# Hide D-Bus, the systemd user manager and container sockets; private /tmp
+nono run --isolate net,mounts --allow-domain api.openai.com --allow-cwd -- my-agent
 ```
 
 Or in a profile:
@@ -36,16 +39,80 @@ Every request also creates a **user namespace**. It maps your own uid and gid to
 | Network | `network` / `net` | A fresh network stack containing only loopback. Host abstract Unix sockets (`@/tmp/.X11-unix/X0`, `@dbus-*`, and so on), host netlink, and every direct IP protocol (TCP, UDP, ICMP, raw) are unreachable, on every kernel version. |
 | IPC | `ipc` | SysV shared memory, semaphores, message queues, and POSIX message queues are not shared with the host. |
 | UTS | `uts` | Hostname changes inside the sandbox do not affect the host. |
+| Mount | `mounts` | Host IPC endpoints such as the D-Bus session bus and `docker.sock` are masked, and the sandbox gets a private `/tmp`. See [Mount masks](#mount-masks). |
 
 Network isolation closes some of the same classes as Landlock's scoping and network rules, but it does so on every kernel nono supports. Landlock abstract-socket scoping needs ABI V6 (Linux 6.12), and Landlock network rules cover TCP only.
 
 <Note>
   Pathname Unix sockets (such as `/run/user/1000/bus` or
   `/var/run/docker.sock`) use filesystem paths as addresses, but they are not
-  part of the IP network namespace. Use
+  part of the IP network namespace. Use `mounts` to hide them (see
+  [Mount masks](#mount-masks)), or
   [`linux.af_unix_mediation`](/cli/internals/landlock#pathname-unix-socket-mediation)
-  to control them.
+  to mediate them.
 </Note>
+
+## Mount masks
+
+Below Landlock ABI 9, Landlock does not govern `connect(2)` to a pathname Unix socket. A sandboxed command that can name `/run/user/1000/bus` can reach the D-Bus session bus, or the systemd user manager, and ask it to start processes outside the sandbox. The same applies to `docker.sock` and other daemons that accept local connections. `mounts` hides these endpoints instead of mediating each `connect`:
+
+```bash
+nono run --isolate mounts --allow-cwd -- my-agent
+```
+
+```json
+{ "linux": { "isolate": { "mounts": true } } }
+```
+
+The command runs in a new mount namespace in which nono covers:
+
+| Path | Mask |
+|---|---|
+| `/run/user/<uid>`, and `$XDG_RUNTIME_DIR` when it is a directory you own | Empty tmpfs (16 MiB). Hides the D-Bus session bus, the systemd user manager, Wayland, PipeWire, rootless Podman, keyring and agent sockets. |
+| `/tmp` | Empty tmpfs private to the session. It also hides `/tmp/.X11-unix` and `ssh-agent` sockets under `/tmp`. |
+| `/run/dbus` | Empty tmpfs (D-Bus system bus). |
+| `/run/docker`, `/run/containerd`, `/run/k3s`, `/run/crio`, `/run/podman`, `/run/libvirt`, `/run/pcscd` | Empty tmpfs (1 MiB). Container and VM managers, and smart cards and hardware tokens. Masking the directory also hides sockets the daemon creates after launch. |
+| `/run/docker.sock`, `/var/run/docker.sock`, `/var/lib/incus/unix.socket`, `/var/lib/lxd/unix.socket`, `/var/snap/lxd/common/lxd/unix.socket`, `/run/snapd.socket`, `/run/systemd/private` | Replaced by an inert, read-only node that cannot be connected to. |
+
+The rest of the filesystem is untouched; this is a mask over your machine, not a container root. A path that does not exist on the host, or that your user cannot reach, is not masked because the command could not reach it either. `$XDG_RUNTIME_DIR` comes from the environment, so nono masks it only when it names a directory you own; `/run/user/<uid>` is masked either way.
+
+**Grants stay reachable.** Every path the profile grants beneath a mask, including `unix_socket` grants, is bound back into place over the mask. To let an agent use one socket in your runtime directory, grant that socket:
+
+```bash
+nono run --isolate mounts --allow-unix-socket "$XDG_RUNTIME_DIR/my-agent.sock" -- my-agent
+```
+
+A grant of a whole masked directory does not re-expose it. A `/tmp` grant (included in nono's default write groups) applies to the session's private `/tmp`, and a grant of `$XDG_RUNTIME_DIR` applies to the empty tmpfs that covers it. Grant individual paths beneath the mask instead.
+
+<Warning>
+  Any filesystem grant beneath a mask is re-bound, not only `unix_socket`
+  grants. A read-only grant of a directory under a mask makes every socket in
+  that directory connectable, because Landlock below ABI 9 does not govern
+  `connect(2)`. The same applies when `$TMPDIR` points at a subdirectory of
+  `/tmp` and the profile grants `$TMPDIR`. Grant the narrowest path you need.
+</Warning>
+
+If the working directory lies under a mask and the profile does not grant it, nono refuses to start: that directory does not exist inside the sandbox. Grant it with `--allow-cwd` or the profile's `workdir` access, or start from another directory.
+
+**Extra masks.** `linux.isolate.extra_masks` adds paths to mask, with the usual variable expansion. It is additive: no profile layer or pack can remove a default or inherited mask.
+
+```json
+{ "linux": { "isolate": { "mounts": true, "extra_masks": ["$HOME/.corp/agent.sock"] } } }
+```
+
+The masks cannot be removed from inside the sandbox. The command holds no capabilities, Landlock forbids mount changes, and the kernel locks the masks in any namespace the command creates itself. Nested user and mount namespaces (for example, `unshare -Um` in a build tool) still work.
+
+**The host can remove a mask.** A mask is a mount on a host path. When a host process deletes or replaces that path, the kernel detaches the mask in every namespace. Restarting a daemon or its socket unit, or upgrading its package, does this to its socket. Logging out and back in does the same to `/run/user/<uid>`. nono watches the sandbox's mount table for the whole session. If a mask disappears, or a new mount covers one, nono kills every process in the sandbox and reports which mask was lost:
+
+```
+[nono] the host removed the mount mask over /run/docker.sock (the path was deleted, replaced or unmounted). The sandbox was terminated so that host endpoint stays unreachable.
+```
+
+The watch reacts to the kernel's mount-change notification. That fires when the old socket is removed, which is normally before a restarted daemon creates its new one; a daemon that atomically renames a new socket over the old one leaves a window of a few milliseconds. Directory masks over a daemon's own directory (`/run/containerd`, `/run/podman`, ...) are not affected by socket restarts at all.
+
+`nono why --unix-socket <path>` reports when a socket is hidden by the mask. Inside a sandbox, `nono why --self` reports the masks that sandbox applied.
+
+`mounts` cannot be combined with `security.capability_elevation`: approved paths are opened by the supervisor outside the sandbox's mount namespace and would bypass the masks.
 
 ## Local servers on loopback
 
@@ -89,7 +156,7 @@ Because the namespace has no other way out, the following combinations produce *
 
 ## Merging and precedence
 
-`linux.isolate` fields merge by logical OR across `extends`, packs, and the CLI. Any layer can turn a namespace on, and no layer can turn one off. `--isolate` adds to a profile's isolation; it cannot remove it.
+`linux.isolate` fields merge by logical OR across `extends`, packs, and the CLI. Any layer can turn a namespace on, and no layer can turn one off. `--isolate` adds to a profile's isolation; it cannot remove it. `extra_masks` lists merge by deduplicated append.
 
 ## Host requirements and failure
 
@@ -112,6 +179,7 @@ Some common causes include:
   Adjust the path to where your `nono` binary is installed, then run `sudo apparmor_parser -r /etc/apparmor.d/nono`. This lets any local user obtain an unprivileged user namespace through nono, the same trade Ubuntu makes for its bubblewrap profile.
 - **Containers.** Docker's and Kubernetes' default seccomp profiles block `unshare`. See [Externally provisioned namespaces](#externally-provisioned-namespaces).
 - **Hardened kernels** with `kernel.unprivileged_userns_clone = 0` or `user.max_user_namespaces = 0`.
+- **Mount restrictions.** With `mounts`, a security module (AppArmor or SELinux mount rules) or a seccomp filter that blocks the mount API (`fsopen`, `fsmount`, `move_mount`) refuses the mask. The error names the path and step that failed.
 
 ## Externally provisioned namespaces
 
@@ -124,4 +192,6 @@ Where unprivileged user namespaces cannot be enabled, create the namespace outsi
 - **Supplementary groups** appear as `nobody` inside the namespace, because only your primary uid and gid are mapped. The kernel still applies your real groups for file access.
 - **Kernel attack surface.** Unprivileged user namespaces expose more kernel code to the sandboxed process. See the [security model](/cli/internals/security-model#opt-in-namespace-isolation-linux).
 - **`loopback` is Linux-only.** On macOS a profile that relies on it for a local server still needs `network.listen_port`.
-- **Not yet available:** a mount namespace that masks `$XDG_RUNTIME_DIR`, D-Bus, and container sockets, plus a per-session `/tmp`; a SOCKS5 route for non-HTTP TCP; and reverse forwarding for listen ports. These are planned under NEP-0004.
+- **Masks are fixed at launch.** A socket created under an unmasked path after the session starts is not masked, and a granted path that does not exist at launch cannot be re-bound. A host change that removes a mask ends the session (see above). The watch stops when the sandboxed command exits, so a background process that outlives the command is no longer protected by it.
+- **`mounts` hides GUI and agent sockets.** X11, Wayland and `ssh-agent` sockets under masked paths are unreachable unless granted.
+- **Not yet available:** a SOCKS5 route for non-HTTP TCP, and reverse forwarding for listen ports. These are planned under NEP-0004.

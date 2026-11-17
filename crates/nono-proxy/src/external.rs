@@ -43,6 +43,7 @@ pub async fn connect_via_proxy(
             proxy_addr, e
         ))
     })?;
+    crate::upstream_socket::set_liveness(&proxy_stream);
 
     let mut connect_req = format!(
         "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n",

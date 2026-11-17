@@ -317,6 +317,11 @@ pub struct ExecConfig<'a> {
     /// Landlock and seccomp apply. Partial application is fatal.
     #[cfg(target_os = "linux")]
     pub namespaces: Option<nono::NamespaceSpec>,
+    /// Mount masks applied in the child's new mount namespace, after the id
+    /// maps are written and before Landlock. Present exactly when
+    /// `namespaces` requests a mount namespace.
+    #[cfg(target_os = "linux")]
+    pub mount_mask: Option<&'a nono::PreparedMountMask>,
     /// Allow-list of environment variable names. When set, only variables
     /// matching a glob pattern (e.g. `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -355,6 +360,7 @@ pub struct StartupTimeoutConfig<'a> {
 /// `NONO_SUPERVISOR_PATH`). The parent runs an IPC event loop that handles
 /// capability expansion requests and URL open delegations.
 pub struct SupervisorConfig<'a> {
+    pub session_socket_auth: bool,
     /// Protected nono state roots that must never be granted dynamically.
     pub protected_roots: &'a [std::path::PathBuf],
     /// The session's resolved deny paths (deny groups and profile
@@ -576,6 +582,9 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     on_fork: Option<&mut dyn FnMut(u32)>,
     pty_pair: Option<crate::pty_proxy::PtyPair>,
     pty_session_id: Option<&str>,
+    // Session terminal capture (NEP-0010), started before fork so a required
+    // recording that cannot start never runs the agent.
+    terminal_capture: Option<crate::terminal_capture::TerminalCapture>,
     // Write fd of the resource cgroup's `cgroup.procs`. The forked child attaches
     // itself through it before sandboxing or exec'ing. None off Linux.
     resource_procs_fd: Option<std::os::fd::RawFd>,
@@ -1366,7 +1375,27 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     attach_initial_client,
                     detach_sequence,
                 ) {
-                    Ok(proxy) => Some(proxy),
+                    Ok(mut proxy) => {
+                        if let Some(mut capture) = terminal_capture {
+                            // The recorder's threads start only now, in the
+                            // parent: the fork above needs a single-threaded
+                            // process (ThreadingContext::Strict).
+                            match capture.activate() {
+                                Ok(()) => proxy.set_capture(capture),
+                                Err(e) if capture.is_required() => {
+                                    let _ = signal::kill(child, Signal::SIGKILL);
+                                    let _ = waitpid(child, None);
+                                    return Err(NonoError::SandboxInit(format!(
+                                        "required session recording cannot start: {e}"
+                                    )));
+                                }
+                                Err(e) => eprintln!(
+                                    "[nono] Warning: session recording is off for this session: {e}"
+                                ),
+                            }
+                        }
+                        Some(proxy)
+                    }
                     Err(e) => {
                         let _ = signal::kill(child, Signal::SIGKILL);
                         let _ = waitpid(child, None);
@@ -1498,6 +1527,25 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 }
             }
 
+            // Mount masks are mounts on host dentries; the host removing or
+            // replacing one detaches the mask. Watch for that for the whole
+            // session and terminate the sandbox rather than let it reach the
+            // new host endpoint.
+            #[cfg(target_os = "linux")]
+            let _mount_watch = match clone_bootstrap
+                .as_mut()
+                .and_then(|bootstrap| bootstrap.mount_watch.take())
+                .map(spawn_mount_watch)
+                .transpose()
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let _ = signal::kill(child, Signal::SIGKILL);
+                    let _ = waitpid(child, None);
+                    return Err(error);
+                }
+            };
+
             // Set up signal forwarding.
             setup_signal_forwarding(child, pty_proxy.as_ref().map(|p| p.poll_fds().0));
             let _signal_forwarding_guard = SignalForwardingGuard;
@@ -1616,6 +1664,29 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 p.release_terminal_for_prompt();
             }
 
+            // Close the recording before the audit log records the session
+            // end, so every chunk record precedes `session_ended`.
+            let capture_summary = pty_proxy
+                .as_mut()
+                .and_then(|p| p.finish_capture(capture_exit_status(&status)));
+            if let Some(summary) = capture_summary.as_ref() {
+                info!(
+                    "Terminal recording closed: {} events, {} chunks, {} bytes raw, {} stored, \
+                     {} credential redactions, {} suppressed inputs, {} lost, truncated: {}, \
+                     unmatched credentials: {:?}",
+                    summary.events,
+                    summary.writer.chunks,
+                    summary.writer.raw_bytes,
+                    summary.writer.stored_bytes,
+                    summary.writer.redactions,
+                    summary.writer.suppressed_inputs,
+                    summary.writer.lost_events,
+                    summary.writer.truncated,
+                    summary.unmatched_credentials,
+                );
+            }
+            let capture_failed = capture_summary.as_ref().and_then(|s| s.fatal.clone());
+
             let exit_code = match status {
                 WaitStatus::Exited(_, code) => {
                     debug!("Supervised child exited with code {}", code);
@@ -1636,6 +1707,18 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     warn!("Unexpected wait status: {:?}", other);
                     1
                 }
+            };
+
+            // A required recording that failed fails the exit, whatever the
+            // agent's own status was (NEP-0010: fail closed).
+            let exit_code = match capture_failed {
+                Some(reason) => {
+                    print_terminal_safe_stderr(&format!(
+                        "[nono] Required session recording is incomplete: {reason}"
+                    ));
+                    crate::terminal_capture::RECORDING_FAILED_EXIT_CODE
+                }
+                None => exit_code,
             };
 
             // Let the caller explain this specific exit (e.g. the resource cgroup
@@ -2170,6 +2253,7 @@ fn wait_for_child_with_pty(
         handle_pty_detach_request(Some(pty), pause_requested, in_band_detach_requested);
         handle_pty_signal_relay(Some(pty));
         handle_pty_suspension(Some(pty), child);
+        handle_pty_capture(Some(pty), child);
         service_off_thread_prompts(Some(pty));
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -2524,6 +2608,34 @@ fn handle_pty_signal_relay(pty: Option<&mut crate::pty_proxy::PtyProxy>) {
 /// parent, nono, is elsewhere), so the kernel drops SIGTSTP and we must drive
 /// suspension manually: SIGSTOP, restore the terminal, raise(SIGTSTP) on nono
 /// itself, then SIGCONT on resume.
+/// How a session ended, as recorded in the `exited` lifecycle event.
+fn capture_exit_status(status: &WaitStatus) -> String {
+    match status {
+        WaitStatus::Exited(_, code) => format!("exited:{code}"),
+        WaitStatus::Signaled(_, sig, _) => format!("signaled:{}", sig.as_str()),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Service session terminal capture, and stop the session when a required
+/// recording destination fails (NEP-0010 §5: fail closed).
+fn handle_pty_capture(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pid) {
+    let Some(pty) = pty else {
+        return;
+    };
+    let Some(reason) = pty.service_capture() else {
+        return;
+    };
+    print_terminal_safe_stderr(&format!(
+        "[nono] Required session recording failed ({reason}); stopping the session."
+    ));
+    warn!("stopping session: required terminal recording failed: {reason}");
+    // The child leads its own process group under the PTY; stop the group,
+    // then the child itself in case it has left it.
+    let _ = signal::kill(Pid::from_raw(-child.as_raw()), Signal::SIGKILL);
+    let _ = signal::kill(child, Signal::SIGKILL);
+}
+
 fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pid) {
     let pty = match pty {
         Some(p) => p,
@@ -2573,6 +2685,8 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
         }
     }
 
+    pty.capture_lifecycle(crate::terminal_capture::events::Lifecycle::Suspended);
+
     // Save raw settings for restore-on-resume, and preserve the
     // cooked settings for later detach (restore_terminal consumes them).
     let raw_termios = nix::sys::termios::tcgetattr(std::io::stdin()).ok();
@@ -2602,6 +2716,8 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
     }
     // Restore cooked settings so detach works correctly later.
     pty.saved_termios = cooked_termios;
+
+    pty.capture_lifecycle(crate::terminal_capture::events::Lifecycle::Resumed);
 
     // Re-enter the alternate screen the child was using before resuming it.
     pty.reenter_screen_for_resume();
@@ -2832,6 +2948,7 @@ fn run_supervisor_loop(
         );
         handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
+        handle_pty_capture(pty.as_deref_mut(), child);
         service_off_thread_prompts(pty.as_deref_mut());
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -3051,6 +3168,7 @@ fn run_supervisor_loop_inner(
     let tool_sandbox_url_listener_fd =
         tool_sandbox_runtime.and_then(|runtime| runtime.url_listener_fd());
     let mut rate_limiter = supervisor_linux::RateLimiter::new(10, 5);
+    let mut unix_socket_decisions = supervisor_linux::UnixSocketSessionDecisions::new();
     let mut denials = SupervisorDenials {
         fs: Vec::new(),
         url: Vec::new(),
@@ -3201,6 +3319,7 @@ fn run_supervisor_loop_inner(
                             denials: &mut denials.fs,
                             trust_interceptor: trust_interceptor.as_mut(),
                             pty: pty.as_deref_mut(),
+                            unix_socket_decisions: &mut unix_socket_decisions,
                         },
                     )
                 {
@@ -3220,6 +3339,7 @@ fn run_supervisor_loop_inner(
                             denials: &mut denials.fs,
                             trust_interceptor: trust_interceptor.as_mut(),
                             pty: pty.as_deref_mut(),
+                            unix_socket_decisions: &mut unix_socket_decisions,
                         },
                         &mut *network_throttle,
                         &mut ipc_denials,
@@ -3297,6 +3417,7 @@ fn run_supervisor_loop_inner(
         );
         handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
+        handle_pty_capture(pty.as_deref_mut(), child);
         service_off_thread_prompts(pty.as_deref_mut());
 
         // Drain reparented orphans; if the primary child was among them,
@@ -3368,6 +3489,66 @@ fn run_supervisor_loop_inner(
 
     let status = wait_for_child(child)?;
     Ok((status, denials.fs, ipc_denials, denials.url))
+}
+
+/// Stops the mount mask watch when the session ends.
+#[cfg(target_os = "linux")]
+struct MountWatchGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MountWatchGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Run `watch` on its own thread until the guard drops. On a lost mask, or
+/// if the watch itself fails, every process in the sandbox is killed: the
+/// masks are a security boundary and are never silently given up.
+#[cfg(target_os = "linux")]
+fn spawn_mount_watch(mut watch: nono::MountMaskWatch) -> Result<MountWatchGuard> {
+    use std::sync::atomic::Ordering;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = std::sync::Arc::clone(&stop);
+    let spawned = std::thread::Builder::new()
+        .name("nono-mount-watch".to_string())
+        .spawn(move || {
+            loop {
+                // Re-check on every wake-up, not only on a change event, so
+                // a missed event costs at most one interval.
+                let waited = watch.wait(500);
+                if thread_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let reason = match waited.and_then(|_| watch.removed_mask()) {
+                    Ok(None) => continue,
+                    Ok(Some(path)) => format!(
+                        "the host removed the mount mask over {} (the path was deleted, \
+                         replaced or unmounted)",
+                        path.display()
+                    ),
+                    Err(error) => format!("the mount mask watch failed: {error}"),
+                };
+                if thread_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let killed = watch.terminate_sandbox();
+                warn!("{reason}; sandbox terminated ({killed:?})");
+                eprintln!(
+                    "\n  [nono] {reason}. The sandbox was terminated so that host endpoint stays \
+                     unreachable."
+                );
+                return;
+            }
+        });
+    // Without the watch a host-side change could expose a masked socket, so
+    // the caller ends the session instead of running unwatched.
+    spawned.map_err(|error| {
+        NonoError::SandboxInit(format!("cannot start the mount mask watch: {error}"))
+    })?;
+    Ok(MountWatchGuard { stop })
 }
 
 #[cfg(target_os = "linux")]
@@ -3793,6 +3974,22 @@ fn handle_url_listener_connection(
         }
     };
 
+    let peer_pid = match crate::session_auth::authenticate(
+        sock.as_raw_fd(),
+        config.session_socket_auth,
+        |pid| {
+            config
+                .tool_sandbox_runtime
+                .is_some_and(|runtime| runtime.owns_orphan(pid))
+        },
+    ) {
+        Ok(pid) => pid,
+        Err(err) => {
+            warn!("Rejected URL listener connection: {err}");
+            return;
+        }
+    };
+
     let msg = match sock.recv_message() {
         Ok(m) => m,
         Err(e) => {
@@ -3802,7 +3999,9 @@ fn handle_url_listener_connection(
     };
 
     match msg {
-        SupervisorMessage::OpenUrl(url_request) => {
+        SupervisorMessage::OpenUrl(mut url_request) => {
+            url_request.child_pid = peer_pid;
+            url_request.session_id = config.session_id.to_string();
             let request_id = url_request.request_id.clone();
             let (success, error, push_denial) =
                 match validate_and_open_url(&url_request.url, config) {
@@ -5593,6 +5792,7 @@ mod tests {
 
         let backend = DenyAll;
         let sup_cfg = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -5725,6 +5925,7 @@ mod tests {
         // ProxyOnly mode with proxy_port set, but seccomp_proxy_fallback is false
         // (simulating V4+ where Landlock handles networking).
         let sup_cfg = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -5818,24 +6019,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_url_allowed_origin() {
-        let backend = TestDenyBackend;
-        let origins = vec!["https://claude.ai".to_string()];
-        let config = SupervisorConfig {
+    fn url_test_config<'a>(
+        caps: &'a CapabilitySet,
+        redaction_policy: &'a nono::ScrubPolicy,
+    ) -> SupervisorConfig<'a> {
+        SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
-            approval_backend: &backend,
+            approval_backend: &TestDenyBackend,
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
-            caps: &nono::CapabilitySet::default(),
-            open_url_origins: &origins,
+            caps,
+            open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
             proxy_handle: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
+            redaction_policy,
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -5856,6 +6058,84 @@ mod tests {
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
+        }
+    }
+
+    #[test]
+    fn default_url_listener_uses_server_identity_for_audit() {
+        use crate::audit_integrity::{AUDIT_EVENTS_FILENAME, AuditEventPayload, AuditRecorder};
+
+        let dir = tempfile::Builder::new()
+            .prefix("url-audit-")
+            .tempdir_in("/tmp")
+            .expect("tempdir");
+        let path = dir.path().join("s");
+        let listener = SupervisorListener::bind(&path).expect("bind listener");
+        let recorder = Arc::new(Mutex::new(
+            AuditRecorder::new(dir.path().to_path_buf()).expect("audit recorder"),
+        ));
+        let caps = CapabilitySet::default();
+        let redactions = nono::ScrubPolicy::secure_default();
+        let config = SupervisorConfig {
+            audit_recorder: Some(recorder),
+            ..url_test_config(&caps, &redactions)
+        };
+        assert!(!config.session_socket_auth);
+
+        for supplied_session in ["", "forged-session"] {
+            let mut client = SupervisorSocket::connect(&path).expect("connect");
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("read timeout");
+            client
+                .send_message(&SupervisorMessage::OpenUrl(
+                    nono::supervisor::UrlOpenRequest {
+                        request_id: format!("url-{supplied_session}"),
+                        url: "https://denied.example/".to_string(),
+                        child_pid: u32::MAX,
+                        session_id: supplied_session.to_string(),
+                    },
+                ))
+                .expect("send request");
+
+            // Deny the URL before invoking a browser, while exercising the real
+            // default-mode listener and its audit attribution.
+            handle_url_listener_connection(&listener, &config, &mut Vec::new());
+            assert!(matches!(
+                client.recv_response().expect("URL policy response"),
+                SupervisorResponse::UrlOpened { success: false, .. }
+            ));
+        }
+
+        let mut recorded = 0;
+        crate::audit_event_reader::for_each_event_record(
+            &dir.path().join(AUDIT_EVENTS_FILENAME),
+            false,
+            |record| {
+                let AuditEventPayload::UrlOpen {
+                    request, success, ..
+                } = record.event
+                else {
+                    panic!("expected URL audit event");
+                };
+                assert!(!success);
+                assert_eq!(request.child_pid, std::process::id());
+                assert_eq!(request.session_id, config.session_id);
+                recorded += 1;
+            },
+        )
+        .expect("read audit records");
+        assert_eq!(recorded, 2);
+    }
+
+    #[test]
+    fn test_validate_url_allowed_origin() {
+        let origins = vec!["https://claude.ai".to_string()];
+        let caps = CapabilitySet::default();
+        let redactions = nono::ScrubPolicy::secure_default();
+        let config = SupervisorConfig {
+            open_url_origins: &origins,
+            ..url_test_config(&caps, &redactions)
         };
 
         // Allowed origin: validation passes
@@ -5874,6 +6154,7 @@ mod tests {
     fn test_validate_url_blocks_non_https() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -5932,6 +6213,7 @@ mod tests {
         let backend = TestDenyBackend;
         let origins = vec!["https://claude.ai".to_string()];
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6006,6 +6288,7 @@ mod tests {
     fn test_validate_url_localhost() {
         let backend = TestDenyBackend;
         let config_allow = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6041,6 +6324,7 @@ mod tests {
             tool_sandbox_runtime: None,
         };
         let config_deny = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6095,6 +6379,7 @@ mod tests {
     fn test_validate_url_max_length() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6254,6 +6539,7 @@ mod tests {
 
         let backend = TestBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6317,6 +6603,7 @@ mod tests {
         let backend = TestDenyBackend;
         let origins = vec!["https://idp.example.com".to_string()];
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6369,6 +6656,7 @@ mod tests {
     fn test_validate_url_ipv6_localhost() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,
@@ -6440,6 +6728,7 @@ mod tests {
     fn test_validate_url_rejects_data_scheme() {
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &backend,

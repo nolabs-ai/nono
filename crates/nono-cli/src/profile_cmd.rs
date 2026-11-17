@@ -881,6 +881,15 @@ fn print_profile_line(
 
 #[allow(deprecated)] // reads profile.commands.{allow,deny} (deprecated v0.33.0)
 pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
+    if matches!(args.format, Some(crate::cli::ProfileShowFormat::Portable)) {
+        let profile = profile::bundle::export(std::path::Path::new(&args.profile))?;
+        println!(
+            "{}",
+            serde_json::to_string(&profile)
+                .map_err(|error| NonoError::ProfileParse(error.to_string()))?
+        );
+        return Ok(());
+    }
     // Order matters: `load_profile_extends` opens an internal
     // `WarningSuppressionGuard` for its preview parse, so deprecation
     // warnings fire only on the subsequent real `load_profile` call.
@@ -988,6 +997,13 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             theme::fg(if elev { "enabled" } else { "disabled" }, t.text)
         );
     }
+    if let Some(enabled) = profile.security.session_socket_auth {
+        println!(
+            "  {} {}",
+            theme::fg("Session socket authentication:", t.subtext),
+            theme::fg(if enabled { "enabled" } else { "disabled" }, t.text)
+        );
+    }
     if let Some(policy) = profile.security.wsl2_proxy_policy {
         println!(
             "  {} {}",
@@ -1092,7 +1108,14 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
                 .iter()
                 .map(|e| match e {
                     profile::AllowDomainEntry::Plain(s) => s.clone(),
-                    profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+                    profile::AllowDomainEntry::WithEndpoints {
+                        domain,
+                        endpoint_policy: Some(_),
+                        ..
+                    } => format!("{} (endpoint policy)", domain),
+                    profile::AllowDomainEntry::WithEndpoints {
+                        domain, endpoints, ..
+                    } => {
                         format!("{} ({} endpoint rules)", domain, endpoints.len())
                     }
                 })
@@ -1219,6 +1242,34 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         }
     }
 
+    // Session recording
+    if let Some(recording) = profile
+        .session_recording
+        .as_ref()
+        .filter(|recording| recording.is_enabled())
+    {
+        let mut parts = vec![if recording.required == Some(true) {
+            "required".to_string()
+        } else {
+            "on".to_string()
+        }];
+        if recording.input == Some(crate::profile::SessionRecordingInput::Off) {
+            parts.push("input off".to_string());
+        }
+        if let Some(max_bytes) = recording.max_bytes {
+            parts.push(format!("max {max_bytes} bytes"));
+        }
+        if let Some(file) = recording.file.as_deref() {
+            parts.push(format!("file {file}"));
+        }
+        println!();
+        println!(
+            "  {}  {}",
+            theme::fg("Session recording:", t.subtext).bold(),
+            theme::fg(&parts.join(", "), t.text)
+        );
+    }
+
     // Open URLs
     if let Some(ref urls) = profile.open_urls {
         println!();
@@ -1303,6 +1354,9 @@ fn profile_to_json(
     // Serialize with the right rename_all annotations, so values render as
     // snake_case (`isolated`, `allow_same_sandbox`, …).
     let mut security = serde_json::Map::new();
+    if let Some(enabled) = profile.security.session_socket_auth {
+        security.insert("session_socket_auth".into(), serde_json::json!(enabled));
+    }
     if let Some(v) = profile.security.signal_mode {
         security.insert("signal_mode".into(), serde_json::json!(v));
     }
@@ -1381,6 +1435,10 @@ fn profile_to_json(
         "exclude_patterns": profile.rollback.exclude_patterns,
         "exclude_globs": profile.rollback.exclude_globs,
     });
+
+    if let Some(recording) = profile.session_recording.as_ref() {
+        val["session_recording"] = serde_json::json!(recording);
+    }
 
     // Env credentials
     if !profile.env_credentials.mappings.is_empty() {
@@ -1557,6 +1615,12 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
     }
 
     // Security scalar fields
+    any_diff |= diff_scalar_option(
+        "session_socket_auth",
+        &p1.security.session_socket_auth.map(|v| v.to_string()),
+        &p2.security.session_socket_auth.map(|v| v.to_string()),
+        t,
+    );
     any_diff |= diff_scalar_option(
         "capability_elevation",
         &p1.security.capability_elevation.map(|v| format!("{v}")),
@@ -2009,6 +2073,18 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
                     new.env_var
                 );
             }
+            if old.phantom_format != new.phantom_format {
+                println!(
+                    "      {} phantom_format: {:?}",
+                    theme::fg("-", t.red),
+                    old.phantom_format
+                );
+                println!(
+                    "      {} phantom_format: {:?}",
+                    theme::fg("+", t.green),
+                    new.phantom_format
+                );
+            }
         }
     }
 
@@ -2113,6 +2189,11 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "profile1": p1.security.capability_elevation,
             "profile2": p2.security.capability_elevation,
             "changed": p1.security.capability_elevation != p2.security.capability_elevation,
+        },
+        "session_socket_auth": {
+            "profile1": p1.security.session_socket_auth,
+            "profile2": p2.security.session_socket_auth,
+            "changed": p1.security.session_socket_auth != p2.security.session_socket_auth,
         },
         "wsl2_proxy_policy": {
             "profile1": p1.security.wsl2_proxy_policy,
@@ -2350,6 +2431,12 @@ fn diff_custom_credentials_json(
             detail.insert(
                 "env_var".into(),
                 serde_json::json!({"profile1": old.env_var, "profile2": new.env_var}),
+            );
+        }
+        if old.phantom_format != new.phantom_format {
+            detail.insert(
+                "phantom_format".into(),
+                serde_json::json!({"profile1": old.phantom_format, "profile2": new.phantom_format}),
             );
         }
         changed_details.insert((*k).clone(), serde_json::Value::Object(detail));
@@ -2973,6 +3060,12 @@ fn resolve_to_manifest(
 ) -> Result<nono::manifest::CapabilityManifest> {
     use nono::manifest;
 
+    if prof.security.session_socket_auth == Some(true) {
+        return Err(NonoError::ConfigParse(
+            "session_socket_auth is CLI policy and cannot be represented in a capability manifest; use --profile to preserve it".to_string(),
+        ));
+    }
+
     // Helper: expand a path template and convert to string for the manifest
     let expand = |tmpl: &str| -> Result<String> {
         let expanded = profile::expand_vars(tmpl, workdir)?;
@@ -3137,14 +3230,32 @@ fn resolve_to_manifest(
         manifest::NetworkMode::Unrestricted
     };
 
+    // Manifest export of network endpoints is left as is here; it already has
+    // known gaps. The manifest has no deny or approve rules, so entries with
+    // endpoint_policy are rejected rather than exported partially.
+    if let Some(entry) = prof.network.allow_domain.iter().find(|e| {
+        matches!(
+            e,
+            profile::AllowDomainEntry::WithEndpoints {
+                endpoint_policy: Some(_),
+                ..
+            }
+        )
+    }) {
+        return Err(NonoError::ProfileParse(format!(
+            "allow_domain entry '{}' uses endpoint_policy, which a capability manifest cannot represent",
+            entry.domain()
+        )));
+    }
+
     let manifest_endpoints: Vec<manifest::NetworkEndpoint> = prof
         .network
         .allow_domain
         .iter()
         .filter_map(|e| match e {
-            profile::AllowDomainEntry::WithEndpoints { domain, endpoints }
-                if !endpoints.is_empty() =>
-            {
+            profile::AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } if !endpoints.is_empty() => {
                 let host: manifest::NetworkEndpointHost = domain.as_str().try_into().ok()?;
                 let rules = endpoints
                     .iter()
@@ -3292,6 +3403,12 @@ fn resolve_to_manifest(
             })
             .collect::<Result<Vec<_>>>()?;
 
+        if cred.phantom_format.is_some() {
+            eprintln!(
+                "warning: custom credential '{name}': `phantom_format` is not representable in the capability manifest and was omitted"
+            );
+        }
+
         credentials.push(manifest::Credential {
             name: name
                 .parse()
@@ -3386,9 +3503,55 @@ fn make_fs_grant(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_diff_custom_credentials_json_reports_phantom_format() {
+        let base: profile::CustomCredentialDef = serde_json::from_str(
+            r#"{"upstream":"https://api.github.com","credential_key":"k","env_var":"GH_TOKEN"}"#,
+        )
+        .unwrap();
+        let formatted = profile::CustomCredentialDef {
+            phantom_format: Some("ghp_{}".to_string()),
+            ..base.clone()
+        };
+        let old = std::collections::HashMap::from([("github".to_string(), base)]);
+        let new = std::collections::HashMap::from([("github".to_string(), formatted)]);
+        let diff = diff_custom_credentials_json(&old, &new);
+        assert_eq!(
+            diff["changed"]["github"]["phantom_format"],
+            serde_json::json!({"profile1": null, "profile2": "ghp_{}"})
+        );
+    }
     use super::*;
     use crate::profile::Profile;
     use std::path::PathBuf;
+
+    #[test]
+    fn session_socket_auth_survives_profile_show_and_cannot_be_lost_in_manifest_export() {
+        for enabled in [None, Some(false), Some(true)] {
+            let mut profile = Profile::default();
+            profile.security.session_socket_auth = enabled;
+            let shown = profile_to_json("test", &profile, &None);
+            let restored: profile::SecurityConfig =
+                serde_json::from_value(shown["security"].clone()).expect("shown security settings");
+            assert_eq!(restored.session_socket_auth, enabled);
+            let manifest = resolve_to_manifest(&profile, std::path::Path::new("/tmp"));
+            if enabled == Some(true) {
+                assert!(
+                    manifest
+                        .expect_err("manifest cannot preserve authentication")
+                        .to_string()
+                        .contains("session_socket_auth")
+                );
+            } else {
+                assert!(
+                    manifest.is_ok(),
+                    "default manifest export remains compatible"
+                );
+            }
+        }
+    }
 
     /// The profile authoring guide is compiled into the binary and surfaced
     /// via `nono profile guide`. It must not instruct users to run the

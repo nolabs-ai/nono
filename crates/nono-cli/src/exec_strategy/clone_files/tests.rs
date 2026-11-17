@@ -71,6 +71,7 @@ fn config(caps: &CapabilitySet, filesystem: bool, proxy: bool) -> ExecConfig<'_>
         },
         sandbox_policy: LinuxSandboxPolicy::Auto,
         namespaces: None,
+        mount_mask: None,
         allowed_env_vars: None,
         denied_env_vars: None,
         case_insensitive_env_vars: false,
@@ -117,11 +118,23 @@ fn supervise(
     port: u16,
     bind: u16,
 ) -> Result<i32> {
+    supervise_with_backend(bootstrap, caps, policy, port, bind, &Deny)
+}
+
+fn supervise_with_backend(
+    bootstrap: &Bootstrap,
+    caps: &CapabilitySet,
+    policy: SeccompPolicy,
+    port: u16,
+    bind: u16,
+    backend: &dyn nono::ApprovalBackend,
+) -> Result<i32> {
     let scrub = nono::ScrubPolicy::secure_default();
     let config = SupervisorConfig {
+        session_socket_auth: false,
         protected_roots: &[],
         deny_paths: &[],
-        approval_backend: &Deny,
+        approval_backend: backend,
         session_id: "clone-test",
         attach_initial_client: false,
         detach_sequence: None,
@@ -195,12 +208,85 @@ fn supervise(
                     denials: &mut denials,
                     trust_interceptor: None,
                     pty: None,
+                    unix_socket_decisions: &mut Default::default(),
                 },
                 &mut network_throttle,
                 &mut ipc_denials,
             )?;
         }
     }
+}
+
+#[test]
+fn expired_unix_socket_approval_is_discarded() -> Result<()> {
+    isolated("expired_unix_socket_approval_is_discarded", || {
+        use nix::sys::signal::{Signal, kill};
+        use nix::sys::wait::{Id, WaitPidFlag, waitid};
+        use nono::{ApprovalBackend, ApprovalDecision, ApprovalRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CancelRequest {
+            decision: ApprovalDecision,
+            calls: AtomicUsize,
+        }
+        impl ApprovalBackend for CancelRequest {
+            fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+                let ApprovalRequest::UnixSocket { child_pid, .. } = request else {
+                    return Err(failure("expected socket approval"));
+                };
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let child = nix::unistd::Pid::from_raw(*child_pid as i32);
+                kill(child, Signal::SIGKILL).map_err(|e| failure(&e.to_string()))?;
+                waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT)
+                    .map_err(|e| failure(&e.to_string()))?;
+                Ok(self.decision.clone())
+            }
+
+            fn backend_name(&self) -> &str {
+                "cancel-request"
+            }
+        }
+
+        let _lock = lock_listener_ownership()?;
+        let dir = tempfile::tempdir().map_err(NonoError::Io)?;
+        let path = dir.path().join("test.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).map_err(NonoError::Io)?;
+        let caps = capabilities(34567, 34568)?;
+        let exec = config(&caps, false, false);
+        for decision in [
+            ApprovalDecision::Granted,
+            ApprovalDecision::Denied {
+                reason: "denied".into(),
+            },
+            ApprovalDecision::Timeout,
+        ] {
+            let backend = CancelRequest {
+                decision,
+                calls: AtomicUsize::new(0),
+            };
+            let script = format!(
+                "import socket; socket.socket(socket.AF_UNIX).connect({:?})",
+                path.to_string_lossy()
+            );
+            let bootstrap = run(
+                &exec,
+                &script,
+                landlock::ABI::V4,
+                Fault::None,
+                None,
+                None,
+                None,
+            )?;
+            let mut policy = exec.seccomp_policy;
+            policy.capability_elevation = true;
+            assert_eq!(
+                supervise_with_backend(&bootstrap, &caps, policy, 34567, 34568, &backend)?,
+                128 + libc::SIGKILL
+            );
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        }
+        Ok(())
+    })
 }
 
 fn run(
@@ -466,8 +552,12 @@ fn fd_churn_signals_and_late_descriptors() -> Result<()> {
         struct Restore(libc::sigaction);
         impl Drop for Restore {
             fn drop(&mut self) {
-                // SAFETY: restore the action saved by sigaction.
+                // Ignoring first discards a pending SIGUSR1 another thread has not taken yet.
+                // SAFETY: SIG_IGN is a valid action and self.0 was saved by sigaction.
                 unsafe {
+                    let mut ignore: libc::sigaction = std::mem::zeroed();
+                    ignore.sa_sigaction = libc::SIG_IGN;
+                    libc::sigaction(libc::SIGUSR1, &ignore, std::ptr::null_mut());
                     libc::sigaction(libc::SIGUSR1, &self.0, std::ptr::null_mut());
                 }
             }
@@ -792,6 +882,7 @@ fn full_cli_supervisor_combined_path() -> Result<()> {
         config.threading = ThreadingContext::CryptoExpected;
         let scrub = nono::ScrubPolicy::secure_default();
         let supervisor = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &Deny,
@@ -818,6 +909,7 @@ fn full_cli_supervisor_combined_path() -> Result<()> {
         let code = crate::exec_strategy::execute_supervised(
             &config,
             Some(&supervisor),
+            None,
             None,
             None,
             None,
@@ -859,6 +951,7 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
         let credentials = std::collections::BTreeSet::new();
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
+                session_socket_auth: false,
                 config: &policy,
                 initial_program: Path::new("/usr/bin/python3"),
                 resolved_command_binaries: None,
@@ -870,6 +963,7 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
                 blocked_commands: &[],
                 outer_caps: &caps,
                 deny_paths: &[],
+                approval_sockets: &[],
                 policy_root: directory.path(),
                 proxy_credentials: &credentials,
                 reserved_proxy_ports: &Default::default(),

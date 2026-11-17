@@ -53,6 +53,18 @@ The final envelope is posted to `/api/v1/audit/ingest`:
 }
 ```
 
+`profile_ref` is the explicit profile selector, otherwise the executable's
+recommended pack reference, otherwise `null`. The client captures this analytics
+label at launch in `platform-audit-profile.json` beside the session audit files.
+Uploads and outbox reconstruction use that saved value; retries preserve the
+queued envelope. Older sessions without the file continue to report `null`.
+
+The label may contain a user-supplied profile name or path. It is sent to the
+enrolled platform, which can map known pack references to agent-family enums
+without forwarding custom names to product analytics. A recommendation does not
+mean that pack was applied. The request signature covers `profile_ref`, but the
+canonical session digest does not; it is not evidence of enforced policy.
+
 The client sends these authentication headers:
 
 ```text

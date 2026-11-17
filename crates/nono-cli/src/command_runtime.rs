@@ -321,6 +321,7 @@ pub(crate) fn run_shell(mut args: ShellArgs, silent: bool) -> Result<()> {
             policy: prepared.policy_session.clone(),
             session_id: Some(session_id),
             session_name: args.name,
+            profile_name: args.sandbox.profile.clone(),
             detach_sequence: load_configured_detach_sequence()?,
             ..SessionLaunchOptions::default()
         },

@@ -364,6 +364,7 @@ impl SandboxState {
     /// Replace the contents of a state file created by
     /// [`create_file`](Self::create_file), through its open handle, so the
     /// path is never re-resolved.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn rewrite(&self, file: &mut std::fs::File, path: &std::path::Path) -> Result<()> {
         use std::io::{Seek, SeekFrom};
         let json = serde_json::to_string_pretty(self).map_err(|e| {

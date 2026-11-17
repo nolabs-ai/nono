@@ -932,7 +932,10 @@ fn validate_command_policy_execution_support() -> Result<()> {
 /// it was granted (the applied mount mask) can still be recorded in it.
 struct CapabilityStateFile {
     path: std::path::PathBuf,
+    // Only the Linux mount mask is recorded after the file is written.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     file: std::fs::File,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     state: sandbox_state::SandboxState,
 }
 

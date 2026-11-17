@@ -2581,10 +2581,11 @@ pub struct LinuxConfig {
 
 /// Opt-in Linux namespace isolation (NEP-0004).
 ///
-/// Every field defaults off and is permanently opt-in. Fields merge by logical
-/// OR across profile layers and the CLI, like `network.block`: any layer can
-/// turn a namespace on, and no layer can turn one off.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Every field defaults off and is permanently opt-in. Boolean fields merge by
+/// logical OR across profile layers and the CLI, like `network.block`: any
+/// layer can turn a namespace on, and no layer can turn one off.
+/// `extra_masks` merges by deduplicated append, so no layer can remove a mask.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinuxIsolateConfig {
     /// New user + network namespace containing only loopback. Egress is
@@ -2601,16 +2602,32 @@ pub struct LinuxIsolateConfig {
     /// New UTS namespace (hostname and domain name).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub uts: bool,
+    /// New mount namespace with nono's default masks over host IPC endpoints
+    /// (`$XDG_RUNTIME_DIR`, the D-Bus system bus, container runtime sockets)
+    /// and a private, per-session `/tmp`. Granted paths are re-bound through
+    /// the masks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mounts: bool,
+    /// Additional paths to mask. Additive only: no layer can remove a default
+    /// or inherited mask. Requires `mounts`. Paths support variable expansion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_masks: Vec<String>,
 }
 
 impl LinuxIsolateConfig {
     /// Whether no namespace is requested.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        !self.network && !self.loopback && !self.ipc && !self.uts
+        !self.network
+            && !self.loopback
+            && !self.ipc
+            && !self.uts
+            && !self.mounts
+            && self.extra_masks.is_empty()
     }
 
-    /// OR-merge: the result requests every namespace either side requests.
+    /// OR-merge: the result requests every namespace either side requests,
+    /// and every mask either side lists.
     #[must_use]
     pub fn merge(self, other: Self) -> Self {
         Self {
@@ -2618,6 +2635,8 @@ impl LinuxIsolateConfig {
             loopback: self.loopback || other.loopback,
             ipc: self.ipc || other.ipc,
             uts: self.uts || other.uts,
+            mounts: self.mounts || other.mounts,
+            extra_masks: dedup_append(&self.extra_masks, &other.extra_masks),
         }
     }
 
@@ -2630,6 +2649,7 @@ impl LinuxIsolateConfig {
             (self.loopback, "loopback"),
             (self.ipc, "ipc"),
             (self.uts, "uts"),
+            (self.mounts, "mounts"),
         ]
         .into_iter()
         .filter_map(|(on, label)| on.then_some(label))
@@ -4344,7 +4364,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .or(base.linux.af_unix_mediation),
             sandbox_policy: child.linux.sandbox_policy.or(base.linux.sandbox_policy),
             // OR-merge: an extending profile can add isolation, never remove it.
-            isolate: base.linux.isolate.merge(child.linux.isolate),
+            isolate: base.linux.isolate.clone().merge(child.linux.isolate),
         },
         diagnostics: DiagnosticsConfig {
             redaction: RedactionConfig {
@@ -7775,13 +7795,34 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_rejects_unimplemented_isolate_fields() {
-        // Phase 2 mount masking is not implemented; accepting the field would
-        // let a profile believe it is masked when it is not.
+    fn test_profile_rejects_unknown_isolate_fields() {
+        // An unknown field must not let a profile believe it is isolated.
         let result = serde_json::from_str::<Profile>(
-            r#"{"meta":{"name":"iso"},"linux":{"isolate":{"mounts":true}}}"#,
+            r#"{"meta":{"name":"iso"},"linux":{"isolate":{"pid":true}}}"#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_profile_parses_and_merges_isolate_mounts() {
+        let base: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"base"},"linux":{"isolate":{"mounts":true,"extra_masks":["/opt/a.sock","/opt/b.sock"]}}}"#,
+        )
+        .expect("parse");
+        assert!(base.linux.isolate.mounts);
+        #[cfg(target_os = "linux")]
+        assert_eq!(base.linux.isolate.labels(), vec!["mounts"]);
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"linux":{"isolate":{"mounts":false,"extra_masks":["/opt/b.sock","/opt/c.sock"]}}}"#,
+        )
+        .expect("parse");
+        let merged = merge_profiles(base, child);
+        assert!(merged.linux.isolate.mounts, "child cannot drop mounts");
+        assert_eq!(
+            merged.linux.isolate.extra_masks,
+            vec!["/opt/a.sock", "/opt/b.sock", "/opt/c.sock"],
+            "extra_masks is a deduplicated append; no layer removes a mask"
+        );
     }
 
     #[test]

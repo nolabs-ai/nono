@@ -841,7 +841,7 @@ fn prepare_profile_with_options(
         #[cfg(target_os = "linux")]
         isolate: loaded_profile
             .as_ref()
-            .map(|profile| profile.linux.isolate)
+            .map(|profile| profile.linux.isolate.clone())
             .unwrap_or_default(),
         workdir_access: loaded_profile
             .as_ref()

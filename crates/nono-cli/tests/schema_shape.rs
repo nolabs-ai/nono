@@ -1157,7 +1157,7 @@ fn test_schema_linux_isolate_config_matches_rust_model() {
     assert_schema_properties(
         &schema,
         "LinuxIsolateConfig",
-        &["network", "loopback", "ipc", "uts"],
+        &["network", "loopback", "ipc", "uts", "mounts", "extra_masks"],
     );
 }
 
@@ -1169,10 +1169,15 @@ fn test_schema_validates_linux_isolate() {
     validator
         .validate(&profile)
         .unwrap_or_else(|e| panic!("linux.isolate should validate: {e}"));
-    // Phase 2 fields are not accepted until they are implemented, so a
-    // profile cannot believe it is mount-masked when it is not.
-    let phase_two = json!({ "linux": { "isolate": { "mounts": true } } });
-    assert!(validator.validate(&phase_two).is_err());
+    let phase_two =
+        json!({ "linux": { "isolate": { "mounts": true, "extra_masks": ["/opt/agent.sock"] } } });
+    validator
+        .validate(&phase_two)
+        .unwrap_or_else(|e| panic!("linux.isolate.mounts should validate: {e}"));
+    // Unknown fields stay rejected, so a profile cannot believe it is
+    // isolated by a field nono does not implement.
+    let unknown = json!({ "linux": { "isolate": { "pid": true } } });
+    assert!(validator.validate(&unknown).is_err());
 }
 
 #[test]

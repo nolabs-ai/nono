@@ -325,7 +325,7 @@ impl ExecutionFlags {
             #[cfg(target_os = "linux")]
             af_unix_mediation: prepared.af_unix_mediation,
             #[cfg(target_os = "linux")]
-            isolate: prepared.isolate,
+            isolate: prepared.isolate.clone(),
             #[cfg(target_os = "linux")]
             sandbox_policy: prepared.sandbox_policy,
             #[cfg(target_os = "linux")]

@@ -317,6 +317,11 @@ pub struct ExecConfig<'a> {
     /// Landlock and seccomp apply. Partial application is fatal.
     #[cfg(target_os = "linux")]
     pub namespaces: Option<nono::NamespaceSpec>,
+    /// Mount masks applied in the child's new mount namespace, after the id
+    /// maps are written and before Landlock. Present exactly when
+    /// `namespaces` requests a mount namespace.
+    #[cfg(target_os = "linux")]
+    pub mount_mask: Option<&'a nono::PreparedMountMask>,
     /// Allow-list of environment variable names. When set, only variables
     /// matching a glob pattern (e.g. `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -1521,6 +1526,25 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     return Err(error);
                 }
             }
+
+            // Mount masks are mounts on host dentries; the host removing or
+            // replacing one detaches the mask. Watch for that for the whole
+            // session and terminate the sandbox rather than let it reach the
+            // new host endpoint.
+            #[cfg(target_os = "linux")]
+            let _mount_watch = match clone_bootstrap
+                .as_mut()
+                .and_then(|bootstrap| bootstrap.mount_watch.take())
+                .map(spawn_mount_watch)
+                .transpose()
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let _ = signal::kill(child, Signal::SIGKILL);
+                    let _ = waitpid(child, None);
+                    return Err(error);
+                }
+            };
 
             // Set up signal forwarding.
             setup_signal_forwarding(child, pty_proxy.as_ref().map(|p| p.poll_fds().0));
@@ -3465,6 +3489,66 @@ fn run_supervisor_loop_inner(
 
     let status = wait_for_child(child)?;
     Ok((status, denials.fs, ipc_denials, denials.url))
+}
+
+/// Stops the mount mask watch when the session ends.
+#[cfg(target_os = "linux")]
+struct MountWatchGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MountWatchGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Run `watch` on its own thread until the guard drops. On a lost mask, or
+/// if the watch itself fails, every process in the sandbox is killed: the
+/// masks are a security boundary and are never silently given up.
+#[cfg(target_os = "linux")]
+fn spawn_mount_watch(mut watch: nono::MountMaskWatch) -> Result<MountWatchGuard> {
+    use std::sync::atomic::Ordering;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = std::sync::Arc::clone(&stop);
+    let spawned = std::thread::Builder::new()
+        .name("nono-mount-watch".to_string())
+        .spawn(move || {
+            loop {
+                // Re-check on every wake-up, not only on a change event, so
+                // a missed event costs at most one interval.
+                let waited = watch.wait(500);
+                if thread_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let reason = match waited.and_then(|_| watch.removed_mask()) {
+                    Ok(None) => continue,
+                    Ok(Some(path)) => format!(
+                        "the host removed the mount mask over {} (the path was deleted, \
+                         replaced or unmounted)",
+                        path.display()
+                    ),
+                    Err(error) => format!("the mount mask watch failed: {error}"),
+                };
+                if thread_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let killed = watch.terminate_sandbox();
+                warn!("{reason}; sandbox terminated ({killed:?})");
+                eprintln!(
+                    "\n  [nono] {reason}. The sandbox was terminated so that host endpoint stays \
+                     unreachable."
+                );
+                return;
+            }
+        });
+    // Without the watch a host-side change could expose a masked socket, so
+    // the caller ends the session instead of running unwatched.
+    spawned.map_err(|error| {
+        NonoError::SandboxInit(format!("cannot start the mount mask watch: {error}"))
+    })?;
+    Ok(MountWatchGuard { stop })
 }
 
 #[cfg(target_os = "linux")]

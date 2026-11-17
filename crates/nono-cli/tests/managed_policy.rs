@@ -40,6 +40,8 @@ fn digest(bytes: &[u8]) -> String {
 struct Platform {
     stopped: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
+    refresh_status: Arc<AtomicUsize>,
+    corrupt_response: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -71,6 +73,10 @@ struct Client {
 
 impl Client {
     fn new(profile: Option<serde_json::Value>) -> Self {
+        Self::with_pack(profile, false)
+    }
+
+    fn with_pack(profile: Option<serde_json::Value>, include_pack: bool) -> Self {
         let test = nono_test!("managed-policy");
         let allowed = test.root().join("allowed.txt");
         let denied = test.root().join("denied.txt");
@@ -97,17 +103,54 @@ impl Client {
             "audit_only"
         };
         let profile = profile.map(|mut profile| {
-            profile["groups"] = json!({"include":["assigned-files"]});
-            let text = json!({
-                "root":profile, "profiles":{},
-                "groups":{"assigned-files":{"description":"delivered grant", "allow":{"read":[allowed]}}}
-            }).to_string();
-            DeliveredPolicy { profile_id:"assigned".into(), revision:1, delta_version:0, content_digest:digest(text.as_bytes()), profile_json:text }
+            if include_pack {
+                let pack = test.home().join(".config/nono/packages/acme/assets");
+                fs::create_dir_all(pack.join("skills")).expect("pack");
+                fs::write(pack.join("package.json"), json!({"schema_version":1,"name":"assets","artifacts":[{"type":"plugin","path":"skills/SKILL.md"}],"wiring":[{"type":"write_file","source":"skills/SKILL.md","dest":"$HOME/SHOULD_NOT_BE_INSTALLED"}]}).to_string()).expect("manifest");
+                fs::write(pack.join("skills/SKILL.md"), "# Signed skill\n").expect("skill");
+                fs::write(pack.join("bundle.sig"), "{\"upstream\":\"preserved\"}").expect("upstream signature");
+                fs::create_dir_all(pack.join("assets")).expect("assets");
+                fs::write(pack.join("assets/blob.bin"),vec![7u8;2*1024*1024]).expect("large asset");
+                profile["packs"] = json!(["acme/assets"]);
+            }
+            profile["filesystem"]["read"] = json!([allowed]);
+            let source = test.root().join("source.json");
+            fs::write(&source, profile.to_string()).expect("source");
+            let output = test.command()
+                .args(["profile", "show"]).arg(&source).args(["--format", "bundle"])
+                .output().expect("export");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let mut export: UnsignedBundle = serde_json::from_slice(&output.stdout).expect("exported files");
+            export.statement["predicate"]["revision"] = json!(1);
+            let payload = serde_json::to_vec(&export.statement).expect("manifest");
+            let typ = nono::trust::IN_TOTO_PAYLOAD_TYPE;
+            let key = EcdsaKeyPair::from_pkcs8(
+                &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(),
+            ).expect("bundle key");
+            let signature = key.sign(&rng, &nono::trust::pae(typ, &payload)).expect("bundle signature");
+            AssignedBundle {
+                profile_id: "assigned".into(),
+                revision: 1,
+                delta_version: 0,
+                content_digest: digest(&payload),
+                bundle: Some(SignedBundle {
+                    signature: json!({
+                        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+                        "verificationMaterial": {"publicKey": {"hint": trust.key_id}, "tlogEntries": []},
+                        "dsseEnvelope": {
+                            "payloadType": typ,
+                            "payload": STANDARD.encode(payload),
+                            "signatures": [{"sig": STANDARD.encode(signature.as_ref())}]
+                        }
+                    }),
+                    files: export.files,
+                }),
+            }
         });
         let config = test.home().join(".config/nono");
         fs::create_dir_all(&config).expect("config");
         fs::write(config.join("platform.json"), json!({
-            "protocol_version":PROTOCOL, "platform_url":origin, "tenant_id":"tenant", "subject_id":"device",
+            "protocol_version":"1", "platform_url":origin, "tenant_id":"tenant", "subject_id":"device",
             "subject_kind":"device", "management_mode":"audit_only", "last_policy_mode":mode,
             "key_algorithm":trust.algorithm, "key_ref":format!("file://{}",key_file.display()), "enrolled_at":"2026-01-01T00:00:00Z"
         }).to_string()).expect("enrollment");
@@ -126,21 +169,39 @@ impl Client {
         let requests = Arc::new(AtomicUsize::new(0));
         let stop = stopped.clone();
         let count = requests.clone();
+        let refresh_status = Arc::new(AtomicUsize::new(200));
+        let status = refresh_status.clone();
+        let corrupt_response = Arc::new(AtomicBool::new(false));
+        let corrupt = corrupt_response.clone();
         let thread = thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let (path, request_id) = read_request(&mut stream);
-                        if path != TRUST_PATH && path != REFRESH_PATH {
+                        if path == REFRESH_PATH && status.load(Ordering::SeqCst) != 200 {
+                            write!(stream,"HTTP/1.1 {} Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",status.load(Ordering::SeqCst)).expect("refresh unavailable");
+                            continue;
+                        }
+                        if path != TRUST_PATH
+                            && path != REFRESH_PATH
+                            && path != "/api/v1/enrollment/exchange"
+                        {
                             stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("audit unavailable");
                             continue;
                         }
-                        let response = if path == TRUST_PATH {
+                        let response = if path == "/api/v1/enrollment/exchange" {
+                            serde_json::to_vec(&json!({
+                                "protocol_version":"1","tenant_id":"tenant","subject_id":"device",
+                                "subject_kind":"device","management_mode":"audit_only",
+                                "enrolled_at":"2026-01-01T00:00:00Z","policy_trust_root":trust
+                            }))
+                            .expect("enrollment response")
+                        } else if path == TRUST_PATH {
                             serde_json::to_vec(&trust).expect("trust response")
                         } else {
                             assert_eq!(path, REFRESH_PATH);
                             count.fetch_add(1, Ordering::SeqCst);
-                            let claims = PolicyClaims {
+                            let claims = AssignmentClaims {
                                 protocol_version: PROTOCOL.into(),
                                 tenant_id: "tenant".into(),
                                 subject_id: "device".into(),
@@ -152,12 +213,18 @@ impl Client {
                                 policy: profile.clone(),
                             };
                             let payload = serde_json::to_vec(&claims).expect("claims");
-                            serde_json::to_vec(&SignedPolicyResponse {
+                            serde_json::to_vec(&PolicyRefreshResponse {
                                 algorithm: trust.algorithm.clone(),
                                 key_id: trust.key_id.clone(),
                                 payload: URL_SAFE_NO_PAD.encode(&payload),
-                                signature: URL_SAFE_NO_PAD
-                                    .encode(key.sign(&rng, &payload).expect("signature").as_ref()),
+                                signature: if corrupt.load(Ordering::SeqCst) {
+                                    URL_SAFE_NO_PAD.encode([0u8; 64])
+                                } else {
+                                    URL_SAFE_NO_PAD.encode(
+                                        key.sign(&rng, &payload).expect("signature").as_ref(),
+                                    )
+                                },
+                                bundle: profile.as_ref().and_then(|policy| policy.bundle.clone()),
                             })
                             .expect("response")
                         };
@@ -176,6 +243,8 @@ impl Client {
             platform: Platform {
                 stopped,
                 requests,
+                refresh_status,
+                corrupt_response,
                 thread: Some(thread),
             },
             cache,
@@ -227,6 +296,299 @@ fn read_request(stream: &mut TcpStream) -> (String, String) {
 
 fn static_profile() -> serde_json::Value {
     json!({"meta":{"name":"managed-wrap"}, "network":{"block":true}})
+}
+
+fn cached_bundle_directory(client: &Client) -> PathBuf {
+    walkdir::WalkDir::new(client.cache.with_extension(""))
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().is_dir())
+        .expect("bundle directory")
+        .into_path()
+}
+
+#[test]
+fn recorded_revocation_never_silently_restores_local_startup() {
+    for advisory in [true, false] {
+        let client = Client::new(advisory.then(static_profile));
+        client
+            .test
+            .wrap()
+            .exec(Argv::new("/bin/echo").arg("ONLINE"))
+            .assert_success("verified assignment");
+        let path = client.test.home().join(".config/nono/platform.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("state")).expect("JSON");
+        state["revoked"] = json!(true);
+        fs::write(path, state.to_string()).expect("record revocation");
+        for command in ["run", "wrap"] {
+            for explicit in [false, true] {
+                let mut run = client.test.command();
+                run.arg(command);
+                if explicit {
+                    run.args(["--profile", "default"]);
+                }
+                let output = run
+                    .args(["--", "/bin/echo", "MUST_NOT_RUN"])
+                    .output()
+                    .expect("launch");
+                assert!(!output.status.success());
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("MUST_NOT_RUN"));
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    error.contains("revoked") && error.contains("Session not started."),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_refresh_repairs_cache_only_after_fresh_verification_and_preserves_pin() {
+    let client = Client::new(Some(static_profile()));
+    client
+        .test
+        .wrap()
+        .exec(Argv::new("/bin/cat").arg(&client.allowed))
+        .assert_success("initial bundle");
+    let cached: serde_json::Value =
+        serde_json::from_slice(&fs::read(&client.cache).expect("cache")).expect("JSON");
+    let directory = cached_bundle_directory(&client);
+    fs::write(directory.join("policy.json"), "{}").expect("corrupt");
+    client
+        .test
+        .wrap()
+        .exec(Argv::new("/bin/echo").arg("MUST_NOT_RUN"))
+        .assert_failure("startup never repairs or accepts tampered content")
+        .assert_stdout_lacks("MUST_NOT_RUN");
+    client
+        .platform
+        .corrupt_response
+        .store(true, Ordering::SeqCst);
+    let rejected = client
+        .test
+        .command()
+        .args(["platform", "status", "--refresh"])
+        .output()
+        .expect("invalid refresh");
+    assert!(!rejected.status.success());
+    assert_eq!(
+        fs::read_to_string(directory.join("policy.json")).expect("still corrupt"),
+        "{}"
+    );
+    client
+        .platform
+        .corrupt_response
+        .store(false, Ordering::SeqCst);
+    for damage in ["policy", "extra", "signature", "missing"] {
+        match damage {
+            "policy" => {}
+            "extra" => fs::write(directory.join("unsigned-hook.sh"), "unapproved").expect("extra"),
+            "signature" => fs::write(directory.join("bundle.sig"), "{}").expect("signature"),
+            _ => fs::remove_file(directory.join("groups.json")).expect("missing"),
+        }
+        let refreshed = client
+            .test
+            .command()
+            .args(["platform", "status", "--refresh", "--json"])
+            .output()
+            .expect("repair");
+        assert!(
+            refreshed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&refreshed.stderr)
+        );
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&fs::read(&client.cache).expect("cache")).expect("JSON");
+        assert_eq!(repaired["trust_root"], cached["trust_root"]);
+        assert!(!directory.join("unsigned-hook.sh").exists());
+        client
+            .test
+            .wrap()
+            .exec(Argv::new("/bin/cat").arg(&client.allowed))
+            .assert_success("repaired bundle remains platform policy")
+            .assert_stdout_contains("ASSIGNED_ACCESS");
+    }
+}
+
+fn enroll(client: &Client) -> std::process::Output {
+    let path = client.test.home().join(".config/nono/platform.json");
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("enrollment")).expect("JSON");
+    fs::remove_file(path).expect("clear fixture enrollment");
+    fs::remove_file(&client.cache).expect("clear fixture pin");
+    client
+        .test
+        .command()
+        .args([
+            "platform",
+            "enroll",
+            "--url",
+            state["platform_url"].as_str().expect("URL"),
+            "--token",
+            "test-token",
+            "--keyref",
+            state["key_ref"].as_str().expect("key"),
+            "--name",
+            "Test laptop",
+        ])
+        .output()
+        .expect("enroll")
+}
+
+#[test]
+fn enrollment_immediately_verifies_and_reports_the_effective_assignment() {
+    for advisory in [false, true] {
+        let client = Client::new(advisory.then(static_profile));
+        let output = enroll(&client);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        for expected in [
+            "Device enrolled",
+            "Policy verified",
+            "Verified and ready",
+            if advisory {
+                "Advisory"
+            } else {
+                "Local / audit only"
+            },
+            if advisory {
+                "managed-wrap · revision 1"
+            } else {
+                "Local profiles"
+            },
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert_eq!(client.platform.requests.load(Ordering::SeqCst), 1);
+        let output = client
+            .test
+            .command()
+            .args(["platform", "status", "--json"])
+            .output()
+            .expect("status");
+        assert!(output.status.success());
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+        assert_eq!(
+            status["management_mode"],
+            if advisory { "advisory" } else { "audit_only" }
+        );
+        assert!(status["policy_assignment"].is_object());
+        assert_eq!(client.platform.requests.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn failed_enrollment_policy_check_keeps_identity_and_can_be_retried() {
+    for invalid_signature in [false, true] {
+        let client = Client::new(Some(static_profile()));
+        if invalid_signature {
+            client
+                .platform
+                .corrupt_response
+                .store(true, Ordering::SeqCst);
+        } else {
+            client.platform.refresh_status.store(503, Ordering::SeqCst);
+        }
+        let output = enroll(&client);
+        assert!(!output.status.success());
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("Device enrolled") && text.contains("Policy check failed"),
+            "{text}"
+        );
+        assert!(text.contains("Not verified") && !text.contains("Verified and ready"));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("Enrollment remains saved")
+                && error.contains("nono platform status --refresh"),
+            "{error}"
+        );
+        assert!(
+            error.contains(if invalid_signature {
+                "invalid platform policy signature"
+            } else {
+                "503"
+            }),
+            "{error}"
+        );
+        let state: serde_json::Value = serde_json::from_slice(
+            &fs::read(client.test.home().join(".config/nono/platform.json"))
+                .expect("saved enrollment"),
+        )
+        .expect("JSON");
+        assert!(state.get("last_policy_mode").is_none());
+        let cache: serde_json::Value =
+            serde_json::from_slice(&fs::read(&client.cache).expect("pin")).expect("JSON");
+        assert!(cache["trust_root"].is_object() && cache["response"].is_null());
+        client
+            .test
+            .wrap()
+            .exec(Argv::new("/bin/echo").arg("MUST_NOT_RUN"))
+            .assert_failure("unverified policy cannot start a session")
+            .assert_stdout_lacks("MUST_NOT_RUN");
+        client
+            .platform
+            .corrupt_response
+            .store(false, Ordering::SeqCst);
+        client.platform.refresh_status.store(200, Ordering::SeqCst);
+        let retry = client
+            .test
+            .command()
+            .args(["platform", "status", "--refresh", "--json"])
+            .output()
+            .expect("retry");
+        assert!(
+            retry.status.success(),
+            "{}",
+            String::from_utf8_lossy(&retry.stderr)
+        );
+        let status: serde_json::Value = serde_json::from_slice(&retry.stdout).expect("JSON");
+        assert_eq!(status["subject_id"], state["subject_id"]);
+        assert_eq!(status["management_mode"], "advisory");
+    }
+}
+
+#[test]
+fn first_assignment_must_be_verified_before_default_startup() {
+    let mut client = Client::new(Some(static_profile()));
+    let enrollment = client.test.home().join(".config/nono/platform.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&enrollment).expect("enrollment")).expect("JSON");
+    state
+        .as_object_mut()
+        .expect("object")
+        .remove("last_policy_mode");
+    fs::write(&enrollment, state.to_string()).expect("new enrollment");
+    for status in [404, 503, 0] {
+        if status == 0 {
+            client.platform.stop();
+        } else {
+            client
+                .platform
+                .refresh_status
+                .store(status, Ordering::SeqCst);
+        }
+        for command in ["run", "wrap"] {
+            let output = client
+                .test
+                .command()
+                .args([command, "--", "/bin/echo", "MUST_NOT_RUN"])
+                .output()
+                .expect("launch");
+            assert!(!output.status.success(), "{command}: HTTP {status}");
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("MUST_NOT_RUN"));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("platform policy"));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("Session not started."));
+        }
+    }
 }
 
 fn sessions(client: &Client) -> Vec<serde_json::Value> {
@@ -410,7 +772,188 @@ fn detached_launch_reparses_cli_and_environment_sources() {
 }
 
 #[test]
-fn wrap_applies_signed_groups_and_rejects_tampering_before_execution() {
+fn obsolete_cache_versions_cannot_disable_managed_startup() {
+    let mut client = Client::new(Some(static_profile()));
+    let corrupt = |client: &Client| {
+        let mut cache: serde_json::Value =
+            serde_json::from_slice(&fs::read(&client.cache).expect("cache")).expect("JSON");
+        cache["response"]["payload"] = URL_SAFE_NO_PAD
+            .encode(br#"{"protocol_version":"obsolete"}"#)
+            .into();
+        fs::write(&client.cache, cache.to_string()).expect("obsolete cache");
+    };
+    client
+        .test
+        .wrap()
+        .exec(Argv::new("/bin/cat").arg(&client.allowed))
+        .assert_success("initial bundle");
+    corrupt(&client);
+    client
+        .test
+        .wrap()
+        .exec(Argv::new("/bin/cat").arg(&client.allowed))
+        .assert_success("fresh canonical delivery replaces obsolete cache");
+    corrupt(&client);
+    client.platform.stop();
+    client
+        .test
+        .wrap()
+        .exec(Argv::new("/bin/echo").arg("must not execute"))
+        .assert_failure("obsolete cache cannot erase the remembered mode");
+}
+
+#[test]
+fn file_bundle_delivery_runs_from_a_verified_readable_cache() {
+    let client = Client::new(Some(static_profile()));
+    for _ in 0..2 {
+        client
+            .test
+            .wrap()
+            .exec(Argv::new("/bin/cat").arg(&client.allowed))
+            .assert_success("v2 policy grants the assigned file")
+            .assert_stdout_contains("ASSIGNED_ACCESS");
+    }
+    client
+        .test
+        .wrap()
+        .exec(Argv::new("/bin/cat").arg(&client.denied))
+        .assert_failure("v2 policy denies ungranted files");
+    let cache: serde_json::Value =
+        serde_json::from_slice(&fs::read(&client.cache).expect("cache")).expect("JSON");
+    assert_eq!(cache["response"]["bundle"]["files"], json!({}));
+    let directory = walkdir::WalkDir::new(client.cache.with_extension(""))
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name() == "bundle.sig")
+        .expect("cached bundle.sig")
+        .path()
+        .parent()
+        .expect("bundle root")
+        .to_path_buf();
+    assert!(directory.join("policy.json").is_file());
+    fs::write(directory.join("policy.json"), "{}").expect("tamper");
+    client
+        .test
+        .wrap()
+        .exec(Argv::new("/bin/cat").arg(&client.allowed))
+        .assert_failure("modified cache is rejected before launch")
+        .assert_stderr_contains("policy.json")
+        .assert_stderr_contains("size differs from the signed inventory")
+        .assert_stderr_contains("Session not started.")
+        .assert_stdout_lacks("ASSIGNED_ACCESS");
+}
+
+#[test]
+fn bundle_verification_logs_context_without_policy_contents_or_signatures() {
+    let mut profile = static_profile();
+    profile["meta"]["description"] = json!("POLICY_CONTENT_SHOULD_NOT_BE_LOGGED");
+    let client = Client::new(Some(profile));
+    let log = client.test.root().join("verification.log");
+    let run = || {
+        client
+            .test
+            .command()
+            .env(
+                "RUST_LOG",
+                "nono::platform_policy=debug,nono::profile::bundle::files=debug",
+            )
+            .arg("--log-file")
+            .arg(&log)
+            .args(["wrap", "--", "/bin/echo", "MUST_NOT_RUN_AFTER_TAMPERING"])
+            .output()
+            .expect("launch")
+    };
+    assert!(run().status.success());
+    let cache: serde_json::Value =
+        serde_json::from_slice(&fs::read(&client.cache).expect("cache")).expect("JSON");
+    let directory = walkdir::WalkDir::new(client.cache.with_extension(""))
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name() == "bundle.sig")
+        .expect("bundle.sig")
+        .path()
+        .parent()
+        .expect("bundle directory")
+        .to_owned();
+    fs::write(directory.join("policy.json"), "{}").expect("tamper");
+    let rejected = run();
+    assert!(!rejected.status.success());
+    assert!(!String::from_utf8_lossy(&rejected.stdout).contains("MUST_NOT_RUN_AFTER_TAMPERING"));
+    let output = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        output.contains("policy.json") && output.contains("Session not started."),
+        "{output}"
+    );
+    let logged = fs::read_to_string(log).expect("log");
+    for expected in [
+        "Requesting platform policy",
+        "Received platform policy response",
+        "Verified fresh platform policy assignment",
+        "Reading cached platform bundle",
+        "Verified platform bundle signature and complete file inventory",
+        "Bundle file verification failed",
+        "policy.json",
+        "Platform policy startup rejected; session not started",
+    ] {
+        assert!(logged.contains(expected), "missing {expected}: {logged}");
+    }
+    for secret in [
+        "POLICY_CONTENT_SHOULD_NOT_BE_LOGGED",
+        cache["response"]["payload"].as_str().expect("payload"),
+        cache["response"]["signature"].as_str().expect("signature"),
+        cache["response"]["bundle"]["signature"]["dsseEnvelope"]["payload"]
+            .as_str()
+            .expect("inventory"),
+    ] {
+        assert!(
+            !logged.contains(secret),
+            "policy contents or signature leaked to logs"
+        );
+    }
+}
+
+#[test]
+fn complete_pack_is_cached_without_wiring_and_every_asset_is_verified() {
+    let client = Client::with_pack(Some(static_profile()), true);
+    client
+        .test
+        .wrap()
+        .exec(Argv::new("/bin/cat").arg(&client.allowed))
+        .assert_success("complete pack delivery")
+        .assert_stdout_contains("ASSIGNED_ACCESS");
+    let directory = walkdir::WalkDir::new(client.cache.with_extension(""))
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name() == "policy.json")
+        .expect("policy")
+        .path()
+        .parent()
+        .expect("bundle root")
+        .to_owned();
+    let skill = directory.join("packs/acme/assets/skills/SKILL.md");
+    assert_eq!(
+        fs::read_to_string(&skill).expect("delivered skill"),
+        "# Signed skill\n"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.join("packs/acme/assets/bundle.sig"))
+            .expect("upstream signature"),
+        "{\"upstream\":\"preserved\"}"
+    );
+    assert!(!client.test.home().join("SHOULD_NOT_BE_INSTALLED").exists());
+    fs::write(&skill, "# Changed skill\n").expect("tamper");
+    client
+        .test
+        .wrap()
+        .exec(Argv::new("/bin/echo").arg("MUST_NOT_RUN"))
+        .assert_failure("tampered non-policy asset blocks startup")
+        .assert_stderr_contains("packs/acme/assets/skills/SKILL.md")
+        .assert_stderr_contains("Session not started.")
+        .assert_stdout_lacks("MUST_NOT_RUN");
+}
+
+#[test]
+fn wrap_applies_signed_bundle_and_rejects_tampering_before_execution() {
     let client = Client::new(Some(static_profile()));
     client
         .test

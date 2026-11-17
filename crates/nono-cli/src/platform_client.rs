@@ -148,7 +148,41 @@ fn enroll(args: PlatformEnrollArgs) -> Result<()> {
             None,
         )
     );
-    Ok(())
+    check_enrollment_policy(&stored.state)
+}
+
+pub(crate) fn check_enrollment_policy(state: &PlatformState) -> Result<()> {
+    let checked = crate::platform_policy::refresh(state).and_then(|policy| {
+        policy.ok_or_else(|| {
+            NonoError::ActionRequired("platform returned no verified assignment".into())
+        })
+    });
+    match checked {
+        Ok(policy) => {
+            print!(
+                "{}",
+                crate::platform_policy::display::enrollment_summary(&policy)
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::warn!("Post-enrollment policy check failed; enrollment remains saved");
+            let mut text = summary_heading("Policy check failed", SummaryKind::Attention);
+            text.push_str(&summary_row("Enrollment", "Saved"));
+            text.push_str(&summary_row("Policy", "Not verified"));
+            text.push_str(&summary_row("Next step", "nono platform status --refresh"));
+            println!("{text}");
+            let subject = if state.subject_kind == "workload" {
+                "Workload"
+            } else {
+                "Device"
+            };
+            Err(NonoError::ActionRequired(format!(
+                "{subject} enrolled; policy check failed: {}\nEnrollment remains saved. Retry `nono platform status --refresh`; do not enrol again. Default startup still requires a successful policy check.",
+                safe_text(&error.to_string())
+            )))
+        }
+    }
 }
 
 fn status(args: PlatformStatusArgs) -> Result<()> {
@@ -230,8 +264,8 @@ fn status(args: PlatformStatusArgs) -> Result<()> {
 fn status_text(
     context: Option<&crate::platform_oauth::session::SessionRecord>,
     stored: Option<&StoredEnrollment>,
-    policy: Option<&crate::platform_policy::protocol::PolicyClaims>,
-    previous: Option<&crate::platform_policy::protocol::PolicyClaims>,
+    policy: Option<&crate::platform_policy::protocol::AssignmentClaims>,
+    previous: Option<&crate::platform_policy::protocol::AssignmentClaims>,
     refreshed: bool,
 ) -> String {
     let t = crate::theme::current();
@@ -651,6 +685,17 @@ pub(crate) fn load_active_state() -> Result<Option<PlatformState>> {
     Ok(load_enrollment()?
         .filter(|stored| !stored.revoked)
         .map(|stored| stored.state))
+}
+
+pub(crate) fn load_policy_state() -> Result<Option<PlatformState>> {
+    let stored = load_enrollment()?;
+    if stored.as_ref().is_some_and(|stored| stored.revoked) {
+        return Err(NonoError::ActionRequired(
+            "device enrollment was revoked; recover the enrollment before starting a session"
+                .into(),
+        ));
+    }
+    Ok(stored.map(|stored| stored.state))
 }
 
 pub(crate) fn enrollment_revoked() -> Result<bool> {

@@ -4,7 +4,7 @@ This document specifies the open client contract used by `nono` to enroll an
 audit-only device or workload and deliver a completed session to a compatible
 control plane. Enrollment does not imply mandatory fleet policy or session
 conformance. Optional managed startup policy is specified in
-[managed advisory policy v1](managed-advisory-policy-v1.md).
+[managed policy delivery v2](managed-policy-v2.md).
 
 ## Enrollment
 

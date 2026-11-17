@@ -18,6 +18,11 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
+    if args.fetch_only && args.init {
+        return Err(NonoError::PackageInstall(
+            "--fetch-only cannot be combined with --init".into(),
+        ));
+    }
     let package_ref = package::parse_package_ref(&args.package_ref)?;
     let registry_url = resolve_registry_url(args.registry.as_deref());
     let client = RegistryClient::new(registry_url.clone());
@@ -27,8 +32,17 @@ pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
     validate_pull_response(&package_ref, &pull)?;
 
     let lockfile = package::read_lockfile()?;
+    if args.fetch_only
+        && lockfile
+            .packages
+            .get(&package_ref.key())
+            .is_some_and(|existing| !existing.wiring_record.is_empty())
+    {
+        return Err(NonoError::PackageInstall("fetch-only requires an unwired package store; use a separate store instead of reversing existing wiring".into()));
+    }
     if let Some(existing) = lockfile.packages.get(&package_ref.key())
         && existing.version == pull.version
+        && existing.fetch_only == args.fetch_only
         && !args.force
     {
         eprintln!(
@@ -71,6 +85,7 @@ pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
     // proceed to apply the new directives). The lockfile entry stays
     // intact so the user can investigate.
     if let Some(prior_pkg) = lockfile.packages.get(&package_ref.key())
+        && !args.fetch_only
         && !prior_pkg.wiring_record.is_empty()
     {
         let failures = crate::wiring::reverse(&prior_pkg.wiring_record);
@@ -98,6 +113,7 @@ pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
         &manifest,
         &downloads,
         args.init,
+        args.fetch_only,
         &pack_owned_files,
     )?;
     update_lockfile(
@@ -107,7 +123,7 @@ pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
         &signer_identity,
         &manifest,
         &downloads.artifacts,
-        &install.wiring_record,
+        &install,
     )?;
 
     let install_dir = package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
@@ -334,6 +350,7 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
                             registry: args.registry.clone(),
                             force: args.force,
                             init: false,
+                            fetch_only: pkg.fetch_only,
                             help: None,
                         },
                         PullReason::Update,
@@ -596,6 +613,7 @@ struct VerifiedDownloads {
 struct InstallSummary {
     installed_artifacts: usize,
     copied_to_project: usize,
+    fetch_only: bool,
     /// Records produced by the wiring interpreter, persisted into the
     /// lockfile so `nono remove` can reverse them.
     wiring_record: Vec<crate::wiring::WiringRecord>,
@@ -776,6 +794,7 @@ fn install_package(
     manifest: &PackageManifest,
     downloads: &VerifiedDownloads,
     init: bool,
+    fetch_only: bool,
     pack_owned_files: &HashMap<PathBuf, String>,
 ) -> Result<InstallSummary> {
     let staging_parent = package::package_store_dir()?
@@ -807,6 +826,7 @@ fn install_package(
             })?;
         install_manifest_artifact(&staging_root, artifact, &downloaded.path)?;
         if init
+            && !fetch_only
             && artifact.artifact_type == ArtifactType::Instruction
             && artifact.placement.as_deref() == Some("project")
         {
@@ -830,7 +850,7 @@ fn install_package(
     // executes the closed vocabulary the pack supplies as data. The
     // returned records go into the lockfile so `nono remove` can
     // reverse them deterministically.
-    let wiring_record = if manifest.wiring.is_empty() {
+    let wiring_record = if fetch_only || manifest.wiring.is_empty() {
         Vec::new()
     } else {
         let ctx = crate::wiring::WiringContext {
@@ -846,6 +866,7 @@ fn install_package(
     };
 
     Ok(InstallSummary {
+        fetch_only,
         installed_artifacts: manifest.artifacts.len(),
         copied_to_project,
         wiring_record,
@@ -999,7 +1020,7 @@ fn update_lockfile(
     signer_identity: &str,
     manifest: &PackageManifest,
     downloads: &[DownloadedArtifact],
-    wiring_record: &[crate::wiring::WiringRecord],
+    install: &InstallSummary,
 ) -> Result<()> {
     let mut lockfile = package::read_lockfile()?;
     lockfile.lockfile_version = package::LOCKFILE_VERSION;
@@ -1046,6 +1067,7 @@ fn update_lockfile(
     lockfile.packages.insert(
         package_ref.key(),
         LockedPackage {
+            fetch_only: install.fetch_only,
             version: pull.version.clone(),
             installed_at: Utc::now().to_rfc3339(),
             pinned: was_pinned,
@@ -1062,7 +1084,7 @@ fn update_lockfile(
                     .unwrap_or_else(|| Utc::now().to_rfc3339()),
             }),
             artifacts,
-            wiring_record: wiring_record.to_vec(),
+            wiring_record: install.wiring_record.clone(),
         },
     );
 
@@ -1190,7 +1212,7 @@ fn file_name(path: &str) -> Result<&str> {
         .ok_or_else(|| NonoError::PackageInstall(format!("invalid artifact path '{}'", path)))
 }
 
-fn installed_artifact_relative_path(artifact: &ArtifactEntry) -> Result<String> {
+pub(crate) fn installed_artifact_relative_path(artifact: &ArtifactEntry) -> Result<String> {
     let path = match artifact.artifact_type {
         ArtifactType::Profile => {
             let install_name = artifact.install_as.as_deref().ok_or_else(|| {
@@ -1291,6 +1313,80 @@ fn format_timestamp(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_only_preserves_verified_pack_files_without_applying_absolute_wiring() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("environment lock");
+        let home = tempfile::tempdir().expect("private home");
+        let outside = tempfile::tempdir().expect("service state outside private home");
+        let config = home.path().join("config");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home.path().to_str().expect("home")),
+            ("XDG_CONFIG_HOME", config.to_str().expect("config")),
+        ]);
+        let target = outside.path().join("settings.json");
+        fs::write(&target, r#"{"setting":"original"}"#).expect("settings");
+        let manifest: PackageManifest = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"name":"data","artifacts":[{"type":"plugin","path":"patch.json"}],
+            "wiring":[{"type":"json_merge","file":target,"patch":"patch.json"}]
+        }))
+        .expect("manifest");
+        let downloads = tempfile::tempdir().expect("verified downloads");
+        let mut artifacts = Vec::new();
+        for (name, bytes) in [
+            (
+                "package.json",
+                serde_json::to_vec(&manifest).expect("manifest"),
+            ),
+            ("patch.json", br#"{"setting":"changed"}"#.to_vec()),
+        ] {
+            let path = downloads.path().join(name);
+            fs::write(&path, &bytes).expect("download");
+            artifacts.push(DownloadedArtifact {
+                filename: name.into(),
+                path,
+                sha256_digest: crate::platform_client::sha256_hex(&bytes),
+            });
+        }
+        let verified = VerifiedDownloads {
+            _tempdir: downloads,
+            bundle_json: "{}".into(),
+            signer_identity: SignerIdentity::Keyed {
+                key_id: "fixture".into(),
+            },
+            artifacts,
+        };
+        let package = package::parse_package_ref("review/data").expect("package");
+        let fetched = install_package(&package, &manifest, &verified, false, true, &HashMap::new())
+            .expect("fetch only");
+        assert!(fetched.wiring_record.is_empty());
+        assert!(
+            fs::read_to_string(&target)
+                .expect("settings")
+                .contains("original")
+        );
+        let stored = package::package_install_dir("review", "data").expect("store");
+        assert_eq!(
+            fs::read(stored.join("package.json")).expect("manifest"),
+            serde_json::to_vec(&manifest).expect("manifest")
+        );
+        assert!(stored.join("patch.json").is_file() && stored.join(".nono-trust.bundle").is_file());
+        let installed = install_package(
+            &package,
+            &manifest,
+            &verified,
+            false,
+            false,
+            &HashMap::new(),
+        )
+        .expect("explicit installation control");
+        assert!(!installed.wiring_record.is_empty());
+        assert!(
+            fs::read_to_string(&target)
+                .expect("settings")
+                .contains("changed")
+        );
+    }
 
     #[test]
     fn compare_versions_honors_prerelease_ordering() {

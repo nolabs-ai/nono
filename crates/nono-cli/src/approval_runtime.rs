@@ -254,6 +254,9 @@ const PLATFORM_APPROVALS_PATH: &str = "/api/v1/approvals";
 /// Pause between polls when the server answers `pending` immediately instead
 /// of holding the request open.
 const PLATFORM_POLL_BACKOFF: Duration = Duration::from_millis(250);
+/// Longest a webhook query waits for the PTY relay to pause so it can show
+/// its "waiting for approval" notice. Past this it queries without a notice.
+const BACKEND_NOTICE_PAUSE_WAIT: Duration = Duration::from_secs(1);
 /// Header carrying the client's remaining patience so the server-side hold and
 /// deadline match this backend's `timeout_secs`.
 const HEADER_TIMEOUT_SECS: &str = "X-Nono-Timeout-Secs";
@@ -673,7 +676,7 @@ impl ApprovalBackend for WebhookApproval {
             ))
         })?;
         let started = Instant::now();
-        match &self.platform {
+        let query = || match &self.platform {
             None => self.request_unsigned(&body, started),
             Some(state) => self.drive_platform_approval(
                 request.request_id(),
@@ -681,7 +684,28 @@ impl ApprovalBackend for WebhookApproval {
                 started,
                 |step, remaining| self.send_platform(state, step, remaining),
             ),
-        }
+        };
+        // Tell the user the agent is waiting on this backend. Off the
+        // supervisor thread the PTY relay owns the terminal, so ask it to
+        // pause for the wait. The notice is best effort: if the pause does
+        // not take effect quickly, query without it. The clock started above,
+        // so the wait counts against this backend's timeout.
+        let pause_deadline = started
+            .checked_add(BACKEND_NOTICE_PAUSE_WAIT.min(self.timeout))
+            .unwrap_or(started);
+        crate::relay_prompt_gate::run_preferring_relay_paused(pause_deadline, |terminal_free| {
+            let announced = terminal_free
+                && crate::terminal_approval::announce_backend_query(
+                    &self.name,
+                    request,
+                    self.timeout,
+                );
+            let decision = query();
+            if announced {
+                crate::terminal_approval::announce_backend_decision(&self.name, &decision);
+            }
+            decision
+        })
     }
 
     fn backend_name(&self) -> &str {

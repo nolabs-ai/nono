@@ -154,12 +154,7 @@ fn resolve_program_from_profile_or_cli(
 }
 
 pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
-    let extra_overrides: &[&str] = if run_args.capability_elevation {
-        &["capability-elevation"]
-    } else {
-        &[]
-    };
-    crate::platform_policy::prepare_start(&mut run_args.sandbox, silent, extra_overrides)?;
+    crate::platform_policy::prepare_start(&mut run_args.sandbox, silent)?;
     let command = run_args.command.clone();
 
     // Load profile once and reuse for binary resolution and command_args.
@@ -246,7 +241,7 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
 }
 
 pub(crate) fn run_shell(mut args: ShellArgs, silent: bool) -> Result<()> {
-    crate::platform_policy::prepare_start(&mut args.sandbox, silent, &[])?;
+    crate::platform_policy::prepare_start(&mut args.sandbox, silent)?;
     let shell_path = args
         .shell
         .or_else(|| {
@@ -380,7 +375,7 @@ fn reject_network_approvals_under_wrap(
 
 pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     let mut args: SandboxArgs = wrap_args.sandbox.into();
-    crate::platform_policy::prepare_start(&mut args, silent, &[])?;
+    crate::platform_policy::prepare_start(&mut args, silent)?;
     let command = wrap_args.command;
     let no_diagnostics = wrap_args.no_diagnostics;
 

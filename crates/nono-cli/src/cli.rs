@@ -1062,6 +1062,8 @@ pub struct ProfileGroupsArgs {
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SandboxArgs {
     #[arg(skip)]
+    pub(crate) policy_inputs: crate::platform_policy::inputs::PolicyInputs,
+    #[arg(skip)]
     pub(crate) managed_profile: Option<crate::profile::bundle::ManagedProfile>,
     #[arg(skip)]
     pub(crate) policy_session: Option<crate::platform_policy::PolicySession>,
@@ -1674,6 +1676,8 @@ pub struct ProxyArgs {
 
 #[derive(Parser, Debug, Clone, Default)]
 pub struct WrapSandboxArgs {
+    #[arg(skip)]
+    pub(crate) policy_inputs: crate::platform_policy::inputs::PolicyInputs,
     // ── Filesystem ───────────────────────────────────────────────────────
     /// Allow read+write access to a directory (recursive)
     #[arg(
@@ -1914,6 +1918,7 @@ impl SandboxArgs {
 impl From<WrapSandboxArgs> for SandboxArgs {
     fn from(args: WrapSandboxArgs) -> Self {
         Self {
+            policy_inputs: args.policy_inputs,
             managed_profile: None,
             policy_session: None,
             allow: args.allow,

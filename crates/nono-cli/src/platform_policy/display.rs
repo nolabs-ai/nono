@@ -199,6 +199,7 @@ mod tests {
             policy_source: "platform".into(),
             effective_profile_digest: None,
             overrides: vec!["block-net".into()],
+            override_sources: Default::default(),
         };
         let text = session_summary(&session);
         assert!(text.contains("Engineering · revision 2"));

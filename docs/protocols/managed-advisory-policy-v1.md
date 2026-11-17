@@ -96,11 +96,28 @@ an unknown assignment version rather than inventing a profile or revision.
 The supervisor stores policy attribution on the session and emits a `platform_policy`
 audit extension after `session_started`. It records assigned mode/profile/revision/
 digest, assignment version, selected source, resolved-profile digest where available,
-and override option names. Credential values are never included. The resolved-profile
+and override option names. `override_sources` adds the selected input source for
+each name (`command_line` or `environment`); older records may omit it. Credential
+values are never included. The resolved-profile
 digest identifies the finalized profile, not the complete OS sandbox or every flag.
 The existing audit hash chain covers the extension and existing ingest delivers it.
 Fleet exposes the last reported session separately from the currently assigned policy
 and retains the audit ingest/verification status. Older sessions remain unknown.
+
+The CLI captures explicitly supplied named options from its parser before launch,
+including options declared on `run` and recording settings. Canonical names cover
+aliases and short flags. Defaults, positional agent arguments, presentation/session
+controls and rollback-only options are excluded; `skip-dir` is included because it
+also affects trust scanning. New named options are recorded unless explicitly
+excluded. An explicit false environment value is still a supplied input; attribution
+does not imply that it changed effective permissions. When CLI and environment
+values compete, the selected value's source is recorded. Detached launches perform
+the same capture after re-exec. Environment settings read outside the parser are
+not covered by this metadata.
+
+Audit-only and advisory modes continue to allow `--no-audit`. Its input attribution
+remains in local session state, but no session audit is delivered when auditing is
+disabled. Input tracking does not implement enforced-mode option restrictions.
 
 `nono wrap` verifies and applies static managed policy, including on `--dry-run`.
 It refuses proxy rules and managed settings that require a supervisor, including

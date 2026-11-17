@@ -1,5 +1,6 @@
 //! Fetch policy once per launch; cached state is for discovery, never offline authority.
 pub(crate) mod display;
+pub(crate) mod inputs;
 pub(crate) mod protocol;
 
 use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
@@ -29,6 +30,8 @@ pub(crate) struct PolicySession {
     pub policy_source: String,
     pub effective_profile_digest: Option<String>,
     pub overrides: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub override_sources: inputs::PolicyInputs,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -326,75 +329,6 @@ pub(crate) fn cached(state: &PlatformState) -> Result<Option<PolicyClaims>> {
     }
 }
 
-fn overrides(args: &SandboxArgs) -> Vec<String> {
-    let mut names = Vec::new();
-    macro_rules! list { ($($field:ident),*) => { $(if !args.$field.is_empty() { names.push(stringify!($field).replace('_', "-")); })* }; }
-    macro_rules! option { ($($field:ident),*) => { $(if args.$field.is_some() { names.push(stringify!($field).replace('_', "-")); })* }; }
-    macro_rules! flag { ($($field:ident),*) => { $(if args.$field { names.push(stringify!($field).replace('_', "-")); })* }; }
-    list!(
-        allow,
-        read,
-        write,
-        allow_file,
-        read_file,
-        write_file,
-        extends,
-        bypass_protection,
-        allow_unix_socket,
-        allow_unix_socket_bind,
-        allow_unix_socket_dir,
-        allow_unix_socket_dir_bind,
-        allow_unix_socket_subtree,
-        allow_unix_socket_subtree_bind,
-        allow_proxy,
-        deny_proxy,
-        allow_bind,
-        allow_port,
-        allow_connect_port,
-        external_proxy_bypass,
-        proxy_credential,
-        env_credential_map,
-        allow_command,
-        block_command,
-        allow_endpoint
-    );
-    option!(
-        env_credential,
-        profile,
-        config,
-        network_profile,
-        external_proxy,
-        proxy_port,
-        proxy_ca_validity,
-        memory,
-        max_processes
-    );
-    flag!(
-        allow_cwd,
-        allow_net,
-        block_net,
-        allow_launch_services,
-        allow_gpu,
-        allow_http2,
-        strict_broker_path
-    );
-    #[cfg(target_os = "linux")]
-    option!(sandbox_policy);
-    for name in &mut names {
-        *name = match name.as_str() {
-            "allow-proxy" => "allow-domain".into(),
-            "deny-proxy" => "deny-domain".into(),
-            "proxy-credential" => "credential".into(),
-            "allow-bind" => "listen-port".into(),
-            "allow-port" => "open-port".into(),
-            "external-proxy" => "upstream-proxy".into(),
-            "external-proxy-bypass" => "upstream-bypass".into(),
-            _ => name.clone(),
-        };
-    }
-    names
-}
-
 pub(crate) fn with_effective_profile<T: Serialize>(
     session: Option<&PolicySession>,
     profile: Option<&T>,
@@ -414,11 +348,7 @@ pub(crate) fn with_effective_profile<T: Serialize>(
     Ok(Some(session))
 }
 
-pub(crate) fn prepare_start(
-    args: &mut SandboxArgs,
-    silent: bool,
-    extra_overrides: &[&str],
-) -> Result<()> {
+pub(crate) fn prepare_start(args: &mut SandboxArgs, silent: bool) -> Result<()> {
     let Some(state) = platform_client::load_active_state()? else {
         return Ok(());
     };
@@ -452,8 +382,6 @@ pub(crate) fn prepare_start(
         return Ok(());
     };
     let assigned = selected.and_then(|policy| policy.policy.as_ref());
-    let mut changed = overrides(args);
-    changed.extend(extra_overrides.iter().map(|name| (*name).to_string()));
     let mut session = PolicySession {
         management_mode: mode.into(),
         assignment_version: selected
@@ -465,7 +393,8 @@ pub(crate) fn prepare_start(
         assigned_digest: assigned.map(|p| p.content_digest.clone()),
         policy_source: "local".into(),
         effective_profile_digest: None,
-        overrides: changed,
+        overrides: args.policy_inputs.keys().cloned().collect(),
+        override_sources: args.policy_inputs.clone(),
     };
     if mode == "advisory" && !local_override {
         let policy = claims.as_ref().and_then(|c| c.policy.as_ref()).ok_or_else(|| NonoError::ActionRequired("platform policy could not be refreshed; explicitly choose --profile to run locally".into()))?;
@@ -629,18 +558,6 @@ mod tests {
         assert!(verify(&response, &root, &state(), Some("request-a")).is_err());
     }
 
-    #[test]
-    fn override_names_never_capture_credential_values() {
-        let args = SandboxArgs {
-            env_credential: Some("secret-credential-value".into()),
-            allow_net: true,
-            ..SandboxArgs::default()
-        };
-        let names = overrides(&args);
-        assert!(names.contains(&"env-credential".to_string()));
-        assert!(names.contains(&"allow-net".to_string()));
-        assert!(!format!("{names:?}").contains("secret-credential-value"));
-    }
     #[test]
     fn shared_signature_fixture_verifies_with_the_pinned_key() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(

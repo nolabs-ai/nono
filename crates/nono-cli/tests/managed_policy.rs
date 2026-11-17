@@ -131,6 +131,10 @@ impl Client {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let (path, request_id) = read_request(&mut stream);
+                        if path != TRUST_PATH && path != REFRESH_PATH {
+                            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("audit unavailable");
+                            continue;
+                        }
                         let response = if path == TRUST_PATH {
                             serde_json::to_vec(&trust).expect("trust response")
                         } else {
@@ -223,6 +227,186 @@ fn read_request(stream: &mut TcpStream) -> (String, String) {
 
 fn static_profile() -> serde_json::Value {
     json!({"meta":{"name":"managed-wrap"}, "network":{"block":true}})
+}
+
+fn sessions(client: &Client) -> Vec<serde_json::Value> {
+    fs::read_dir(client.test.state().join("nono/sessions"))
+        .expect("sessions")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .map(|path| {
+            serde_json::from_slice(&fs::read(path).expect("session")).expect("session JSON")
+        })
+        .collect()
+}
+
+fn policy_event(client: &Client, session: &serde_json::Value) -> serde_json::Value {
+    let dir = client
+        .test
+        .audit_root()
+        .join(session["session_id"].as_str().expect("session ID"));
+    let events = fs::read_to_string(dir.join(nono::audit::AUDIT_EVENTS_FILENAME)).expect("audit");
+    assert!(
+        nono::audit::verify_audit_log(&dir, None)
+            .expect("audit integrity")
+            .records_verified
+    );
+    events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event"))
+        .find(|record| record["event"]["type"] == "platform_policy")
+        .expect("policy event")["event"]
+        .clone()
+}
+
+#[test]
+fn run_and_shell_persist_input_sources_in_session_and_audit() {
+    for subcommand in ["run", "shell"] {
+        let client = Client::new(Some(static_profile()));
+        let mut command = client.test.command();
+        command.arg(subcommand).env("NONO_BLOCK_NET", "false");
+        if subcommand == "run" {
+            command.args([
+                "--no-rollback",
+                "--skip-dir",
+                "private-skip-value",
+                "--no-diagnostics",
+                "--",
+                "/bin/echo",
+            ]);
+        } else {
+            command.args(["--shell", "/bin/sh"]);
+        }
+        let output = command.output().expect("launch");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records = sessions(&client);
+        assert_eq!(records.len(), 1);
+        let session = &records[0];
+        assert_eq!(
+            session["policy"]["override_sources"]["block-net"], "environment",
+            "{subcommand}: {}",
+            session["policy"]
+        );
+        let event = policy_event(&client, session);
+        assert_eq!(
+            event["override_sources"],
+            session["policy"]["override_sources"]
+        );
+        assert!(
+            event["overrides"]
+                .as_array()
+                .expect("names")
+                .contains(&json!("block-net"))
+        );
+        if subcommand == "run" {
+            assert_eq!(event["override_sources"]["skip-dir"], "command_line");
+            assert!(event["override_sources"].get("no-rollback").is_none());
+            assert!(!event.to_string().contains("private-skip-value"));
+        }
+    }
+}
+
+#[test]
+fn no_audit_remains_available_and_records_only_local_session_attribution() {
+    for advisory in [true, false] {
+        let client = Client::new(advisory.then(static_profile));
+        let output = client
+            .test
+            .command()
+            .args(["run", "--no-audit", "--no-diagnostics", "--", "/bin/echo"])
+            .output()
+            .expect("run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records = sessions(&client);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0]["policy"]["override_sources"]["no-audit"],
+            "command_line"
+        );
+        assert!(!client.test.audit_root().exists());
+    }
+}
+
+#[test]
+fn detached_launch_reparses_cli_and_environment_sources() {
+    let client = Client::new(Some(static_profile()));
+    let mut command = client.test.command();
+    let mut policy = static_profile();
+    policy["workdir"] = json!({"access":"readwrite"});
+    let profile = client.test.workspace().join("local-profile.json");
+    fs::write(&profile, policy.to_string()).expect("profile");
+    let output = command
+        .env("NONO_PROFILE", &profile)
+        .args([
+            "run",
+            "--detach",
+            "--name",
+            "provenance",
+            "--no-rollback",
+            "--no-diagnostics",
+            "--block-net",
+            "--",
+            "/bin/sleep",
+            "5",
+        ])
+        .output()
+        .expect("detached launch");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = sessions(&client);
+    let id = records.first().expect("session")["session_id"]
+        .as_str()
+        .expect("ID")
+        .to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let records = sessions(&client);
+        let session = records
+            .iter()
+            .find(|record| record["session_id"] == id)
+            .expect("session");
+        if session["status"] != "running" {
+            assert_eq!(
+                session["policy"]["override_sources"]["profile"],
+                "environment"
+            );
+            assert_eq!(
+                session["policy"]["override_sources"]["block-net"],
+                "command_line"
+            );
+            assert!(
+                session["policy"]["override_sources"]
+                    .get("detached")
+                    .is_none()
+            );
+            assert!(session["policy"]["override_sources"].get("name").is_none());
+            let event = policy_event(&client, session);
+            assert_eq!(
+                event["override_sources"],
+                session["policy"]["override_sources"]
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached session did not finish"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]

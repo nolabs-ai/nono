@@ -5878,7 +5878,8 @@ mod tests {
         let mut entry = test_capture_entry_no_cache(vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            r#"test -n "$BROWSER" && test -x "$BROWSER" && test -S "$NONO_SUPERVISOR_PATH" && printf browser-ok"#.to_string(),
+            // Braced names stay literal for the shell; capture args expand `$VAR` from the test process env.
+            r#"test -n "${BROWSER}" && test -x "${BROWSER}" && test -S "${NONO_SUPERVISOR_PATH}" && printf browser-ok"#.to_string(),
         ]);
         entry.interaction = Some(crate::profile::CredentialCaptureInteraction {
             stdio: false,

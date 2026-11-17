@@ -1264,7 +1264,11 @@ mod tests {
         config.chunk_max_duration = Duration::from_millis(50);
         let mut capture = h.start(config);
         capture.output(OutputStream::Pty, b"a");
-        std::thread::sleep(Duration::from_millis(200));
+        // The writer thread closes the chunk asynchronously; a loaded runner can take well over the window.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.chunk_events().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(h.chunk_events().len(), 1, "timer closed the first chunk");
         capture.output(OutputStream::Pty, b"b");
         capture.finish("exited:0".to_string());

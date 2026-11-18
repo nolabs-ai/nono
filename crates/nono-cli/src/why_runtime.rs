@@ -13,6 +13,7 @@ struct WhyContext {
     pathname_socket_enforcement: Option<sandbox_state::PathnameSocketEnforcement>,
     allowed_domains: Vec<String>,
     denied_domains: Vec<String>,
+    network_approvals: bool,
     domain_endpoints: Vec<sandbox_state::DomainEndpointState>,
     command_policies: Option<CommandPoliciesConfig>,
     /// Host paths hidden by the Linux mount mask (`linux.isolate.mounts`).
@@ -196,6 +197,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
                     pathname_socket_enforcement,
                     allowed_domains: state.allowed_domains.clone(),
                     denied_domains: state.denied_domains.clone(),
+                    network_approvals: state.network_approvals,
                     domain_endpoints,
                     command_policies: None,
                     masked_paths,
@@ -270,6 +272,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             pathname_socket_enforcement,
             allowed_domains,
             denied_domains,
+            network_approvals: !profile.network.approval_backends.is_empty(),
             domain_endpoints,
             command_policies,
             masked_paths,
@@ -292,6 +295,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             pathname_socket_enforcement: sandbox_state::pathname_socket_enforcement(false),
             allowed_domains: merge_cli_allow_domains(Vec::new(), &args.allow_proxy)?,
             denied_domains: merge_cli_deny_domains(Vec::new(), &args.deny_proxy)?,
+            network_approvals: false,
             domain_endpoints: vec![],
             command_policies: None,
             masked_paths: Vec::new(),
@@ -367,6 +371,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             &ctx.allowed_domains,
             &ctx.denied_domains,
             &ctx.domain_endpoints,
+            ctx.network_approvals,
         )
     } else if let Some(ref scope) = args.scope {
         query_scope(scope_query(scope), &ctx.caps)
@@ -1065,6 +1070,7 @@ mod tests {
             &resolve_allowed_domains(&profile).expect("resolve allowlist"),
             &resolve_denied_domains(&profile).expect("resolve denylist"),
             &resolve_domain_endpoints(&profile),
+            !profile.network.approval_backends.is_empty(),
         )
     }
 

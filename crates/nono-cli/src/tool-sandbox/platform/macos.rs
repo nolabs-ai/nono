@@ -14,15 +14,15 @@ use crate::tool_sandbox::env::{
     split_env_entry,
 };
 use crate::tool_sandbox::launch::{
-    exit_status_code, prepare_launcher_command, remove_launch_spec, write_launch_spec,
+    LauncherCommand, exit_status_code, prepare_launcher_command, receive_launch_spec,
 };
 use crate::tool_sandbox::protocol::{
     ChildCapsSpec, FsGrantSpec, StdioFds, StdioLimitActionSpec, StdioLimitSpec,
-    StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT,
-    ToolSandboxChildLaunchSpec, ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse,
-    ToolSandboxShimRequest, ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame,
-    recv_frame_ack, recv_stdio_fds, send_frame_ack, send_stdio_fds, validate_ipc_request,
-    write_frame, write_response,
+    StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_FD_ENV, TOOL_SANDBOX_LAUNCH_SPEC_ENV,
+    TOOL_SANDBOX_URL_IO_TIMEOUT, ToolSandboxChildLaunchSpec, ToolSandboxOpenUrlRequest,
+    ToolSandboxOpenUrlResponse, ToolSandboxShimRequest, ToolSandboxShimResponse,
+    UnixSocketGrantSpec, read_frame, recv_frame_ack, recv_stdio_fds, send_frame_ack,
+    send_stdio_fds, validate_ipc_request, write_frame, write_response,
 };
 use nix::libc;
 use nix::sys::signal::{self, Signal};
@@ -631,7 +631,9 @@ impl PreparedToolSandboxRuntime {
 // ── Shim / child launcher entrypoints ────────────────────────────────────
 
 pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
-    if std::env::var_os(TOOL_SANDBOX_LAUNCH_SPEC_ENV).is_some() {
+    if std::env::var_os(TOOL_SANDBOX_LAUNCH_SPEC_ENV).is_some()
+        || std::env::var_os(TOOL_SANDBOX_LAUNCH_FD_ENV).is_some()
+    {
         exit_from_result(run_child_launcher());
         return true;
     }
@@ -745,20 +747,7 @@ fn run_child_launcher() -> Result<()> {
     // is what surfaces the library's generated-Seatbelt-profile debug log for
     // the brokered child. No-op unless RUST_LOG is set.
     crate::cli_bootstrap::init_internal_entrypoint_tracing();
-    let spec_path = std::env::var_os(TOOL_SANDBOX_LAUNCH_SPEC_ENV)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            NonoError::SandboxInit("command-mediation launch spec env missing".to_string())
-        })?;
-    let bytes = fs::read(&spec_path).map_err(|source| NonoError::ConfigRead {
-        path: spec_path.clone(),
-        source,
-    })?;
-    let spec: ToolSandboxChildLaunchSpec = serde_json::from_slice(&bytes).map_err(|err| {
-        NonoError::ConfigParse(format!(
-            "failed to parse command-mediation launch spec: {err}"
-        ))
-    })?;
+    let spec = receive_launch_spec()?;
     if spec.stdio_mode != "direct_fds" {
         return Err(NonoError::ConfigParse(format!(
             "invalid command-mediation stdio mode '{}'",
@@ -4129,8 +4118,8 @@ fn kill_mediated_child_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-fn prepare_mediated_command(spec_path: &Path) -> Result<Command> {
-    let mut command = prepare_launcher_command(spec_path)?;
+fn prepare_mediated_command(spec: &ToolSandboxChildLaunchSpec) -> Result<LauncherCommand> {
+    let mut command = prepare_launcher_command(spec)?;
     install_session_lineage(&mut command);
     Ok(command)
 }
@@ -4143,18 +4132,14 @@ fn launch_child(
     spec: ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
-    let spec_path = write_launch_spec(&state.runtime_dir, &spec)?;
-    let result = launch_child_with_direct_fds(
+    launch_child_with_direct_fds(
         state,
         command_name,
         launch_caller,
         requester_pid,
-        &spec_path,
         &spec,
         stdio,
-    );
-    remove_launch_spec(&spec_path);
-    result
+    )
 }
 
 fn launch_child_with_direct_fds(
@@ -4162,7 +4147,6 @@ fn launch_child_with_direct_fds(
     command_name: &str,
     launch_caller: &Caller,
     requester_pid: u32,
-    spec_path: &Path,
     spec: &ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
@@ -4172,12 +4156,11 @@ fn launch_child_with_direct_fds(
             command_name,
             launch_caller,
             requester_pid,
-            spec_path,
             spec,
             stdio,
         );
     }
-    let mut command = prepare_mediated_command(spec_path)?;
+    let mut command = prepare_mediated_command(spec)?;
     command
         .stdin(Stdio::from(File::from(stdio.stdin)))
         .stdout(Stdio::from(File::from(stdio.stdout)))
@@ -4202,7 +4185,6 @@ fn launch_child_with_brokered_stdio(
     command_name: &str,
     launch_caller: &Caller,
     requester_pid: u32,
-    spec_path: &Path,
     spec: &ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
@@ -4217,7 +4199,7 @@ fn launch_child_with_brokered_stdio(
         stderr,
     } = stdio;
 
-    let mut command = prepare_mediated_command(spec_path)?;
+    let mut command = prepare_mediated_command(spec)?;
     command
         .stdin(Stdio::from(File::from(stdin)))
         .stdout(Stdio::from(File::from(stdout_write)))
@@ -4477,8 +4459,7 @@ fn launch_child_with_capture(
     let pipe_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
     let pipe_write = unsafe { File::from_raw_fd(pipe_fds[1]) };
 
-    let spec_path = write_launch_spec(&state.runtime_dir, &spec)?;
-    let mut command = prepare_mediated_command(&spec_path)?;
+    let mut command = prepare_mediated_command(&spec)?;
     command
         .stdin(Stdio::from(File::from(stdio.stdin)))
         .stdout(Stdio::from(pipe_write))
@@ -4503,7 +4484,6 @@ fn launch_child_with_capture(
 
     let status = child.wait().map_err(NonoError::CommandExecution);
     untrack_child(state, child.id())?;
-    remove_launch_spec(&spec_path);
 
     read_result.map_err(|err| {
         NonoError::SandboxInit(format!(

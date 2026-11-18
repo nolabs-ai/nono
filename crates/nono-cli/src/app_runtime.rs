@@ -21,6 +21,7 @@ use crate::why_runtime::run_why;
 use crate::{DETACHED_LAUNCH_ENV, Result};
 
 pub(crate) fn run(cli: Cli) -> Result<()> {
+    crate::platform_policy::enforced::guard_command(&cli.command)?;
     let mut update_handle = start_update_check_handle(&cli);
     dispatch_command(cli.command, cli.silent, &mut update_handle)
 }
@@ -168,8 +169,9 @@ fn run_command_with_banner_and_update<T>(
     run_command_with_update(update_handle, silent, command)
 }
 
-fn run_or_detach(args: RunArgs, silent: bool) -> Result<()> {
+fn run_or_detach(mut args: RunArgs, silent: bool) -> Result<()> {
     if args.detached && std::env::var_os(DETACHED_LAUNCH_ENV).is_none() {
+        crate::platform_policy::prepare_start(&mut args.sandbox, silent)?;
         run_detached_launch(args, silent)
     } else {
         output::print_banner(silent);

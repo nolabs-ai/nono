@@ -250,7 +250,7 @@ impl ApprovalBackend for NamedTerminalApproval {
 
 /// Path of the platform's enrolled approval ingest, relative to the enrolled
 /// platform URL. The poll route is `<this>/{request_id}`.
-const PLATFORM_APPROVALS_PATH: &str = "/api/v1/approvals";
+pub(crate) const PLATFORM_APPROVALS_PATH: &str = "/api/v1/approvals";
 /// Pause between polls when the server answers `pending` immediately instead
 /// of holding the request open.
 const PLATFORM_POLL_BACKOFF: Duration = Duration::from_millis(250);

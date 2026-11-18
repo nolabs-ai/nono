@@ -572,7 +572,7 @@ fn read_state(path: &Path) -> Result<Option<StoredEnrollment>> {
         || stored
             .last_policy_mode
             .as_deref()
-            .is_some_and(|mode| !matches!(mode, "audit_only" | "advisory"))
+            .is_some_and(|mode| !matches!(mode, "audit_only" | "advisory" | "enforced"))
     {
         return Err(NonoError::ConfigParse(
             "unsupported local platform enrollment state".into(),
@@ -590,9 +590,13 @@ pub(crate) fn save_login_enrollment(
     display_name: &str,
 ) -> Result<()> {
     let path = scoped_state_path(&state.platform_url, &state.tenant_id, &session.user_subject)?;
-    let last_policy_mode = read_state(&path)?
-        .filter(|stored| same_enrollment(&stored.state, &state))
-        .and_then(|stored| stored.last_policy_mode);
+    let last_policy_mode = if enforced_identity_is_active(&state)? {
+        Some("enforced".into())
+    } else {
+        read_state(&path)?
+            .filter(|stored| same_enrollment(&stored.state, &state))
+            .and_then(|stored| stored.last_policy_mode)
+    };
     let stored = StoredEnrollment {
         tenant: session
             .organizations
@@ -638,6 +642,7 @@ pub(crate) fn remember_policy_mode(state: &PlatformState, mode: &str) -> Result<
 
 fn write_enrollment(stored: &StoredEnrollment) -> Result<()> {
     let state = &stored.state;
+    enforced_identity_is_active(state)?;
     if let Some(user) = &stored.login_user_id {
         write_json_secure(
             &scoped_state_path(&state.platform_url, &state.tenant_id, user)?,
@@ -645,6 +650,19 @@ fn write_enrollment(stored: &StoredEnrollment) -> Result<()> {
         )?;
     }
     write_json_secure(&state_path()?, stored)
+}
+
+fn enforced_identity_is_active(next: &PlatformState) -> Result<bool> {
+    let active = read_state(&state_path()?)?;
+    if let Some(active) = active
+        && active.last_policy_mode.as_deref() == Some("enforced")
+    {
+        if !same_enrollment(&active.state, next) {
+            return Err(NonoError::ActionRequired("enforced platform policy: changing the active enrollment requires a verified platform mode change first".into()));
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn selected_enrollment(
@@ -671,7 +689,9 @@ fn selected_enrollment(
 pub(crate) fn activate_login_enrollment(
     session: &crate::platform_oauth::session::SessionRecord,
 ) -> Result<()> {
-    if let Some(stored) = selected_enrollment(session)? {
+    if let Some(stored) = selected_enrollment(session)?
+        && !enforced_identity_is_active(&stored.state)?
+    {
         write_json_secure(&state_path()?, &stored)?;
     }
     Ok(())
@@ -724,10 +744,17 @@ fn with_tenant_label(mut stored: StoredEnrollment, session: &SessionRecord) -> S
 }
 
 fn load_enrollment() -> Result<Option<StoredEnrollment>> {
+    let active = read_state(&state_path()?)?;
+    if active
+        .as_ref()
+        .is_some_and(|stored| stored.last_policy_mode.as_deref() == Some("enforced"))
+    {
+        return Ok(active);
+    }
     if let Some(session) = crate::platform_oauth::session::load_record()? {
         return load_for_session(&session);
     }
-    read_state(&state_path()?)
+    Ok(active)
 }
 
 pub(crate) fn enrollment_for_login(session: &SessionRecord) -> Result<Option<PlatformState>> {
@@ -1094,6 +1121,38 @@ mod tests {
         };
         save_login_enrollment(second.clone(), &login, "Laptop").unwrap();
         assert_eq!(last_policy_mode(&second).expect("other tenant mode"), None);
+        remember_policy_mode(&second, "enforced").unwrap();
+        fs::remove_file(
+            scoped_state_path(&second.platform_url, &second.tenant_id, &login.user_subject)
+                .unwrap(),
+        )
+        .unwrap();
+        save_login_enrollment(second.clone(), &login, "Laptop").unwrap();
+        assert_eq!(
+            last_policy_mode(&second).unwrap().as_deref(),
+            Some("enforced"),
+            "refreshing the same identity preserves enforcement even if its scoped copy was lost"
+        );
+        login.tenant_id = "t-1".into();
+        login.tenant_selection_pending = true;
+        session::save_record(&lock, &login).unwrap();
+        assert_eq!(
+            load_state().unwrap().unwrap().subject_id,
+            "device-two",
+            "enforced enrollment wins over changed or pending human context"
+        );
+        assert!(
+            activate_login_enrollment(&login).is_err(),
+            "lazy remote sign-in cannot activate another enrollment"
+        );
+        assert!(
+            save_login_enrollment(first.clone(), &login, "Laptop").is_err(),
+            "enrollment writes cannot bypass the identity guard"
+        );
+        assert_eq!(load_state().unwrap().unwrap().subject_id, "device-two");
+        login.tenant_id = "t-2".into();
+        login.tenant_selection_pending = false;
+        session::save_record(&lock, &login).unwrap();
         remember_policy_mode(&second, "audit_only").expect("remember local");
         assert!(!enrollment_revoked().unwrap());
         login.tenant_id = "t-1".into();

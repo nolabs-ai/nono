@@ -1,5 +1,6 @@
 //! Fetch policy once per launch; cached state is for discovery, never offline authority.
 pub(crate) mod display;
+pub(crate) mod enforced;
 pub(crate) mod inputs;
 pub(crate) mod protocol;
 
@@ -65,6 +66,16 @@ impl RefreshFailure {
         previous: Option<&AssignmentClaims>,
         remembered_mode: Option<&str>,
     ) -> bool {
+        if remembered_mode == Some("enforced")
+            || previous.is_some_and(|policy| policy.management_mode == "enforced")
+        {
+            return false;
+        }
+        let mode =
+            remembered_mode.or_else(|| previous.map(|policy| policy.management_mode.as_str()));
+        if !matches!(mode, Some("audit_only" | "advisory")) {
+            return false;
+        }
         match self {
             Self::Unavailable(_) => {
                 explicit_local
@@ -263,7 +274,7 @@ fn verify(
     }
     match claims.management_mode.as_str() {
         "audit_only" if claims.policy.is_none() => {}
-        "advisory" if claims.policy.is_some() => {}
+        "advisory" | "enforced" if claims.policy.is_some() => {}
         _ => {
             return Err(NonoError::ConfigParse(
                 "unsupported platform management mode or policy shape".into(),
@@ -511,13 +522,19 @@ fn prepare_start_inner(args: &mut SandboxArgs, silent: bool) -> Result<()> {
         overrides: args.policy_inputs.keys().cloned().collect(),
         override_sources: args.policy_inputs.clone(),
     };
-    if mode == "advisory" && !local_override {
+    if mode == "enforced" {
+        enforced::validate_inputs(args)?;
+    }
+    if mode == "enforced" || (mode == "advisory" && !local_override) {
         let policy = claims.as_ref().and_then(|c| c.policy.as_ref()).ok_or_else(|| NonoError::ActionRequired("platform policy could not be refreshed; explicitly choose --profile to run locally".into()))?;
         let root = load(&state)?
             .trust_root
             .ok_or_else(|| NonoError::ConfigParse("missing policy trust root".into()))?;
         let loaded =
             profile::bundle::ManagedProfile::from_sources(&policy_sources(policy, &root)?)?;
+        if mode == "enforced" {
+            enforced::validate_profile(&loaded.profile, &state)?;
+        }
         session.policy_source = "platform".into();
         args.managed_profile = Some(loaded);
     }
@@ -663,7 +680,7 @@ mod tests {
 
     #[test]
     fn missing_bundles_unsupported_modes_and_legacy_documents_fail_closed() {
-        for mode in ["enforced", "unknown", "audit_only"] {
+        for mode in ["unknown", "audit_only"] {
             let mut value = claims();
             value.management_mode = mode.into();
             let (root, response) = signed(&value);
@@ -673,6 +690,9 @@ mod tests {
             );
         }
         let mut value = claims();
+        value.management_mode = "enforced".into();
+        let (root, response) = signed(&value);
+        assert!(verify(&response, &root, &state(), Some("request-a")).is_ok());
         value.policy = None;
         let (root, response) = signed(&value);
         assert!(verify(&response, &root, &state(), Some("request-a")).is_err());
@@ -723,5 +743,12 @@ mod tests {
         assert!(service.allows_local_fallback(true, Some(&advisory), None));
         let invalid = RefreshFailure::Invalid("invalid signature or assignment".into());
         assert!(!invalid.allows_local_fallback(true, Some(&advisory), Some("advisory")));
+        let mut enforced = claims();
+        enforced.management_mode = "enforced".into();
+        for failure in [&offline, &service, &invalid] {
+            assert!(!failure.allows_local_fallback(true, None, None));
+            assert!(!failure.allows_local_fallback(true, Some(&enforced), Some("advisory")));
+            assert!(!failure.allows_local_fallback(true, Some(&advisory), Some("enforced")));
+        }
     }
 }

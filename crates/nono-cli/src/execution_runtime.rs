@@ -959,6 +959,10 @@ fn write_capability_state_file(
         denied_domains,
         domain_endpoints,
     );
+    state.network_approvals = flags
+        .network
+        .proxy_options()
+        .is_some_and(|proxy| !proxy.network_approval_backends.is_empty());
     #[cfg(target_os = "linux")]
     let linux_af_unix_mediation = flags.af_unix_mediation.is_pathname();
     #[cfg(not(target_os = "linux"))]

@@ -37,7 +37,18 @@ pub(crate) struct PolicySession {
 #[derive(Default, Serialize, Deserialize)]
 struct CachedPolicy {
     trust_root: Option<PolicyTrustRoot>,
-    response: Option<SignedPolicyResponse>,
+    response: Option<PolicyRefreshResponse>,
+}
+
+fn policy_sources(
+    policy: &AssignedBundle,
+    root: &PolicyTrustRoot,
+) -> Result<profile::bundle::PolicySources> {
+    let bundle = policy
+        .bundle
+        .as_ref()
+        .ok_or_else(|| NonoError::ConfigParse("missing signed bundle".into()))?;
+    profile::bundle::files::verify(bundle, root, &policy.content_digest, policy.revision)
 }
 
 #[derive(Debug)]
@@ -51,14 +62,16 @@ impl RefreshFailure {
     fn allows_local_fallback(
         &self,
         explicit_local: bool,
-        previous: Option<&PolicyClaims>,
+        previous: Option<&AssignmentClaims>,
         remembered_mode: Option<&str>,
     ) -> bool {
         match self {
             Self::Unavailable(_) => {
                 explicit_local
                     || (remembered_mode != Some("advisory")
-                        && previous.is_none_or(|policy| policy.management_mode == "audit_only"))
+                        && (remembered_mode == Some("audit_only")
+                            || previous
+                                .is_some_and(|policy| policy.management_mode == "audit_only")))
             }
             Self::ServiceUnavailable(_) => explicit_local,
             Self::Invalid(_) => false,
@@ -77,7 +90,14 @@ impl RefreshFailure {
 
 impl From<NonoError> for RefreshFailure {
     fn from(error: NonoError) -> Self {
-        Self::Invalid(error.to_string())
+        Self::Invalid(error_reason(error))
+    }
+}
+
+fn error_reason(error: NonoError) -> String {
+    match error {
+        NonoError::ConfigParse(message) | NonoError::ActionRequired(message) => message,
+        other => other.to_string(),
     }
 }
 
@@ -89,9 +109,8 @@ fn state_path(state: &PlatformState) -> Result<PathBuf> {
         .join(format!("{}.json", platform_client::sha256_hex(&scope))))
 }
 
-fn load(state: &PlatformState) -> Result<CachedPolicy> {
-    let path = state_path(state)?;
-    match std::fs::read(path) {
+fn load_record(state: &PlatformState) -> Result<CachedPolicy> {
+    match std::fs::read(state_path(state)?) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
             NonoError::ConfigParse(format!("invalid cached platform policy: {error}"))
         }),
@@ -100,6 +119,57 @@ fn load(state: &PlatformState) -> Result<CachedPolicy> {
             "cannot read cached platform policy: {error}"
         ))),
     }
+}
+
+fn load(state: &PlatformState) -> Result<CachedPolicy> {
+    let mut cache = load_record(state)?;
+    hydrate_cache(state, &mut cache)?;
+    Ok(cache)
+}
+
+fn hydrate_cache(state: &PlatformState, cache: &mut CachedPolicy) -> Result<()> {
+    if let Some(response) = &cache.response {
+        let payload = URL_SAFE_NO_PAD
+            .decode(&response.payload)
+            .map_err(|error| NonoError::ConfigParse(error.to_string()))?;
+        let claims: serde_json::Value = serde_json::from_slice(&payload)
+            .map_err(|error| NonoError::ConfigParse(error.to_string()))?;
+        if claims["protocol_version"].as_str() != Some(PROTOCOL) {
+            tracing::debug!(
+                "Discarding obsolete cached assignment; a fresh verified assignment is required"
+            );
+            cache.response = None;
+        }
+    }
+    if let Some(response) = &mut cache.response
+        && let Some(bundle) = &response.bundle
+    {
+        let claims: AssignmentClaims = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(&response.payload)
+                .map_err(|e| NonoError::ConfigParse(e.to_string()))?,
+        )
+        .map_err(|e| NonoError::ConfigParse(e.to_string()))?;
+        let policy = claims
+            .policy
+            .ok_or_else(|| NonoError::ConfigParse("cached bundle has no assignment".into()))?;
+        let directory = profile::bundle::files::cache_path(
+            &state_path(state)?.with_extension(""),
+            bundle,
+            &policy.content_digest,
+            policy.revision,
+        )?;
+        let stored = profile::bundle::files::read_directory(&directory)?;
+        if stored.signature != bundle.signature {
+            tracing::debug!(file = "bundle.sig", directory = ?directory, "Cached signature differs from the recorded platform bundle signature");
+            return Err(NonoError::ConfigParse(format!(
+                "bundle verification failed: cached signature file {:?} differs from the recorded platform bundle signature",
+                directory.join("bundle.sig")
+            )));
+        }
+        response.bundle = Some(stored);
+    }
+    Ok(())
 }
 
 fn validate_root(root: &PolicyTrustRoot) -> Result<()> {
@@ -139,11 +209,11 @@ pub(crate) fn pin_enrollment_key(
 }
 
 fn verify(
-    response: &SignedPolicyResponse,
+    response: &PolicyRefreshResponse,
     root: &PolicyTrustRoot,
     state: &PlatformState,
     request_id: Option<&str>,
-) -> Result<PolicyClaims> {
+) -> Result<AssignmentClaims> {
     validate_root(root)?;
     if response.algorithm != root.algorithm || response.key_id != root.key_id {
         return Err(NonoError::ConfigParse(
@@ -159,22 +229,37 @@ fn verify(
     UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, decode(&root.public_key)?)
         .verify(&bytes, &decode(&response.signature)?)
         .map_err(|_| NonoError::ConfigParse("invalid platform policy signature".into()))?;
-    let claims: PolicyClaims = serde_json::from_slice(&bytes)
+    let mut claims: AssignmentClaims = serde_json::from_slice(&bytes)
         .map_err(|error| NonoError::ConfigParse(format!("invalid policy claims: {error}")))?;
-    if claims.protocol_version != PROTOCOL
-        || claims.tenant_id != state.tenant_id
-        || claims.subject_id != state.subject_id
-        || request_id.is_some_and(|id| {
-            claims.request_id != id
-                || Utc::now()
-                    .timestamp_millis()
-                    .abs_diff(claims.issued_at.timestamp_millis())
-                    > 300_000
-        })
-    {
-        return Err(NonoError::ConfigParse(
-            "policy response does not match this device, request or freshness window".into(),
+    let invalid = |reason: &str| NonoError::ConfigParse(reason.into());
+    if claims.protocol_version != PROTOCOL {
+        return Err(invalid(
+            "platform assignment uses an unsupported delivery protocol; expected v2",
         ));
+    }
+    if claims.tenant_id != state.tenant_id {
+        return Err(invalid("platform assignment belongs to a different tenant"));
+    }
+    if claims.subject_id != state.subject_id {
+        return Err(invalid(
+            "platform assignment belongs to a different device or workload",
+        ));
+    }
+    if let Some(id) = request_id {
+        if claims.request_id != id {
+            return Err(invalid(
+                "platform assignment answers a different request; possible replay",
+            ));
+        }
+        if Utc::now()
+            .timestamp_millis()
+            .abs_diff(claims.issued_at.timestamp_millis())
+            > 300_000
+        {
+            return Err(invalid(
+                "platform assignment is outside the five-minute freshness window; check the device clock and retry",
+            ));
+        }
     }
     match claims.management_mode.as_str() {
         "audit_only" if claims.policy.is_none() => {}
@@ -185,18 +270,14 @@ fn verify(
             ));
         }
     }
+    if response.bundle.is_some() && claims.policy.is_none() {
+        return Err(NonoError::ConfigParse("unexpected file bundle".into()));
+    }
+    if let Some(policy) = &mut claims.policy {
+        policy.bundle = response.bundle.clone();
+    }
     if let Some(policy) = &claims.policy {
-        if policy.content_digest
-            != format!(
-                "sha256:{}",
-                platform_client::sha256_hex(policy.profile_json.as_bytes())
-            )
-        {
-            return Err(NonoError::ConfigParse(
-                "platform policy digest mismatch".into(),
-            ));
-        }
-        profile::bundle::parse_delivered(&policy.profile_json)?;
+        policy_sources(policy, root)?;
     }
     Ok(claims)
 }
@@ -207,7 +288,8 @@ fn request<T: serde::de::DeserializeOwned>(
     path: &str,
     body: &[u8],
     id: Uuid,
-) -> std::result::Result<Option<T>, RefreshFailure> {
+) -> std::result::Result<T, RefreshFailure> {
+    tracing::debug!(method, endpoint = path, request_id = %id, "Requesting platform policy");
     let url = platform_client::endpoint_url(&state.platform_url, path)?;
     let target =
         url::Url::parse(&url).map_err(|error| RefreshFailure::Invalid(error.to_string()))?;
@@ -233,14 +315,12 @@ fn request<T: serde::de::DeserializeOwned>(
     let mut response = agent
         .run(request)
         .map_err(|error| RefreshFailure::Unavailable(error.to_string()))?;
-    if response.status().as_u16() == 404 {
-        return Ok(None);
-    }
+    tracing::debug!(endpoint = path, request_id = %id, status = response.status().as_u16(), "Received platform policy response");
     if !response.status().is_success() {
         let message = format!("policy endpoint returned HTTP {}", response.status());
         return Err(
             if response.status().is_server_error()
-                || matches!(response.status().as_u16(), 408 | 429)
+                || matches!(response.status().as_u16(), 404 | 408 | 429)
             {
                 RefreshFailure::ServiceUnavailable(message)
             } else {
@@ -251,30 +331,25 @@ fn request<T: serde::de::DeserializeOwned>(
     let bytes = response
         .body_mut()
         .with_config()
-        .limit(2 * 1024 * 1024)
+        .limit(profile::bundle::files::MAX_RESPONSE_BYTES)
         .read_to_vec()
         .map_err(|error| RefreshFailure::Invalid(error.to_string()))?;
     serde_json::from_slice(&bytes)
-        .map(Some)
         .map_err(|error| RefreshFailure::Invalid(format!("invalid policy response: {error}")))
 }
 
 fn refresh_inner(
     state: &PlatformState,
-    remembered_mode: Option<&str>,
-) -> std::result::Result<Option<PolicyClaims>, RefreshFailure> {
-    let mut cache = load(state)?;
+    repair: bool,
+) -> std::result::Result<Option<AssignmentClaims>, RefreshFailure> {
+    let mut cache = if repair {
+        load_record(state)?
+    } else {
+        load(state)?
+    };
     if cache.trust_root.is_none() {
         // Existing audit-only enrollments bootstrap over their authenticated TLS connection.
-        let Some(root) = request::<PolicyTrustRoot>(state, "GET", TRUST_PATH, &[], Uuid::new_v4())?
-        else {
-            if remembered_mode == Some("advisory") {
-                return Err(RefreshFailure::Unavailable(
-                    "platform no longer supports managed policy".into(),
-                ));
-            }
-            return Ok(None);
-        };
+        let root = request::<PolicyTrustRoot>(state, "GET", TRUST_PATH, &[], Uuid::new_v4())?;
         validate_root(&root)?;
         cache.trust_root = Some(root);
         platform_client::write_json_secure(&state_path(state)?, &cache)?;
@@ -291,21 +366,44 @@ fn refresh_inner(
     let body =
         serde_json::to_vec(&context).map_err(|error| RefreshFailure::Invalid(error.to_string()))?;
     let id = Uuid::new_v4();
-    let Some(response) = request::<SignedPolicyResponse>(state, "POST", REFRESH_PATH, &body, id)?
-    else {
-        return if cache.response.is_some() || remembered_mode == Some("advisory") {
-            Err(RefreshFailure::Unavailable(
-                "platform no longer supports managed policy".into(),
-            ))
-        } else {
-            Ok(None)
-        };
-    };
+    let mut response = request::<PolicyRefreshResponse>(state, "POST", REFRESH_PATH, &body, id)?;
     let root = cache
         .trust_root
         .as_ref()
         .ok_or_else(|| RefreshFailure::Invalid("missing policy trust root".into()))?;
     let claims = verify(&response, root, state, Some(&id.to_string()))?;
+    tracing::info!(mode = ?claims.management_mode, revision = claims.policy.as_ref().map(|policy| policy.revision), "Verified fresh platform policy assignment");
+    if let (Some(policy), Some(bundle)) = (&claims.policy, &mut response.bundle) {
+        let directory = profile::bundle::files::cache_path(
+            &state_path(state)?.with_extension(""),
+            bundle,
+            &policy.content_digest,
+            policy.revision,
+        )?;
+        if !directory.exists()
+            && let Err(error) = profile::bundle::files::write_directory(&directory, bundle)
+            && !repair
+            && !directory.exists()
+        {
+            return Err(error.into());
+        }
+        let read_verified = || -> Result<SignedBundle> {
+            let stored = profile::bundle::files::read_directory(&directory)?;
+            profile::bundle::files::verify(&stored, root, &policy.content_digest, policy.revision)?;
+            Ok(stored)
+        };
+        let stored = match read_verified() {
+            Ok(stored) => stored,
+            Err(_) if repair => {
+                tracing::warn!(directory = ?directory, "Replacing damaged policy cache with a freshly verified platform bundle");
+                profile::bundle::files::replace_directory(&directory, bundle)?;
+                read_verified()?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        bundle.signature = stored.signature;
+        bundle.files.clear();
+    }
     // Keep the last verified mode outside the disposable bundle cache.
     platform_client::remember_policy_mode(state, &claims.management_mode)?;
     cache.response = Some(response);
@@ -313,12 +411,11 @@ fn refresh_inner(
     Ok(Some(claims))
 }
 
-pub(crate) fn refresh(state: &PlatformState) -> Result<Option<PolicyClaims>> {
-    let remembered_mode = platform_client::last_policy_mode(state)?;
-    refresh_inner(state, remembered_mode.as_deref()).map_err(RefreshFailure::error)
+pub(crate) fn refresh(state: &PlatformState) -> Result<Option<AssignmentClaims>> {
+    refresh_inner(state, true).map_err(RefreshFailure::error)
 }
 
-pub(crate) fn cached(state: &PlatformState) -> Result<Option<PolicyClaims>> {
+pub(crate) fn cached(state: &PlatformState) -> Result<Option<AssignmentClaims>> {
     let cache = load(state)?;
     match (&cache.response, &cache.trust_root) {
         (Some(response), Some(root)) => verify(response, root, state, None).map(Some),
@@ -349,13 +446,27 @@ pub(crate) fn with_effective_profile<T: Serialize>(
 }
 
 pub(crate) fn prepare_start(args: &mut SandboxArgs, silent: bool) -> Result<()> {
-    let Some(state) = platform_client::load_active_state()? else {
+    prepare_start_inner(args, silent).map_err(|error| {
+        tracing::error!(
+            stage = "platform_policy_startup",
+            "Platform policy startup rejected; session not started"
+        );
+        let reason = error_reason(error);
+        let reason = reason.strip_prefix("platform policy: ").unwrap_or(&reason);
+        NonoError::ActionRequired(format!(
+            "platform policy startup failed: {reason}\nSession not started."
+        ))
+    })
+}
+
+fn prepare_start_inner(args: &mut SandboxArgs, silent: bool) -> Result<()> {
+    let Some(state) = platform_client::load_policy_state()? else {
         return Ok(());
     };
     let local_override = args.profile.is_some() || args.config.is_some();
     let previous = cached(&state)?;
     let remembered_mode = platform_client::last_policy_mode(&state)?;
-    let claims = match refresh_inner(&state, remembered_mode.as_deref()) {
+    let claims = match refresh_inner(&state, false) {
         Ok(claims) => claims,
         Err(error)
             if error.allows_local_fallback(
@@ -364,6 +475,10 @@ pub(crate) fn prepare_start(args: &mut SandboxArgs, silent: bool) -> Result<()> 
                 remembered_mode.as_deref(),
             ) =>
         {
+            tracing::debug!(
+                explicit_local = local_override,
+                "Platform unavailable; using permitted local policy fallback"
+            );
             if !silent {
                 eprintln!(
                     "{}; using explicit or previously local policy",
@@ -398,7 +513,11 @@ pub(crate) fn prepare_start(args: &mut SandboxArgs, silent: bool) -> Result<()> 
     };
     if mode == "advisory" && !local_override {
         let policy = claims.as_ref().and_then(|c| c.policy.as_ref()).ok_or_else(|| NonoError::ActionRequired("platform policy could not be refreshed; explicitly choose --profile to run locally".into()))?;
-        let loaded = profile::bundle::ManagedProfile::parse(&policy.profile_json)?;
+        let root = load(&state)?
+            .trust_root
+            .ok_or_else(|| NonoError::ConfigParse("missing policy trust root".into()))?;
+        let loaded =
+            profile::bundle::ManagedProfile::from_sources(&policy_sources(policy, &root)?)?;
         session.policy_source = "platform".into();
         args.managed_profile = Some(loaded);
     }
@@ -414,8 +533,12 @@ mod tests {
     use super::*;
     use aws_lc_rs::{
         rand::SystemRandom,
-        signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair},
+        signature::{
+            ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair,
+        },
     };
+    use base64::engine::general_purpose::STANDARD;
+    use serde_json::{Value, json};
 
     fn state() -> PlatformState {
         PlatformState {
@@ -431,31 +554,27 @@ mod tests {
         }
     }
 
-    pub(super) fn claims() -> PolicyClaims {
-        let profile_json = r#"{"meta":{"name":"managed"},"filesystem":{"read":["$HOME/shared"]},"network":{"block":true}}"#.to_string();
-        PolicyClaims {
-            protocol_version: "1".into(),
-            tenant_id: "tenant-a".into(),
-            subject_id: "device-a".into(),
-            request_id: "request-a".into(),
-            issued_at: Utc::now(),
-            management_mode: "advisory".into(),
-            assignment_version: "assignment-a".into(),
-            resolved_via: serde_json::json!({"layer":"group"}),
-            policy: Some(DeliveredPolicy {
-                profile_id: "managed".into(),
-                revision: 7,
-                delta_version: 0,
-                content_digest: format!(
-                    "sha256:{}",
-                    platform_client::sha256_hex(profile_json.as_bytes())
-                ),
-                profile_json,
-            }),
-        }
+    fn fixture() -> (PolicyTrustRoot, PolicyRefreshResponse) {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/nono-bundle-v1.json"))
+                .expect("fixture");
+        (
+            serde_json::from_value(fixture["trust_root"].clone()).expect("root"),
+            serde_json::from_value(fixture["response"].clone()).expect("response"),
+        )
     }
 
-    fn signed(claims: &PolicyClaims) -> (PolicyTrustRoot, SignedPolicyResponse) {
+    pub(super) fn claims() -> AssignmentClaims {
+        let (_, response) = fixture();
+        let mut claims: AssignmentClaims =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(response.payload).expect("payload"))
+                .expect("claims");
+        claims.issued_at = Utc::now();
+        claims.policy.as_mut().expect("policy").bundle = response.bundle;
+        claims
+    }
+
+    fn signed(claims: &AssignmentClaims) -> (PolicyTrustRoot, PolicyRefreshResponse) {
         let rng = SystemRandom::new();
         let pkcs8 =
             EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).expect("key");
@@ -469,33 +588,61 @@ mod tests {
             ),
             public_key: URL_SAFE_NO_PAD.encode(key.public_key().as_ref()),
         };
+        let mut bundle = claims
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.bundle.clone());
+        if let Some(bundle) = &mut bundle {
+            let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref())
+                .expect("bundle key");
+            let payload = STANDARD
+                .decode(
+                    bundle.signature["dsseEnvelope"]["payload"]
+                        .as_str()
+                        .expect("payload"),
+                )
+                .expect("base64");
+            let signature = key
+                .sign(
+                    &rng,
+                    &nono::trust::pae(nono::trust::IN_TOTO_PAYLOAD_TYPE, &payload),
+                )
+                .expect("signature");
+            bundle.signature["verificationMaterial"]["publicKey"]["hint"] = json!(root.key_id);
+            bundle.signature["dsseEnvelope"]["signatures"] =
+                json!([{"sig":STANDARD.encode(signature.as_ref())}]);
+        }
         let bytes = serde_json::to_vec(claims).expect("claims");
         let signature = key.sign(&rng, &bytes).expect("signature");
-        let response = SignedPolicyResponse {
+        let response = PolicyRefreshResponse {
             algorithm: root.algorithm.clone(),
             key_id: root.key_id.clone(),
             payload: URL_SAFE_NO_PAD.encode(bytes),
             signature: URL_SAFE_NO_PAD.encode(signature.as_ref()),
+            bundle,
         };
         (root, response)
     }
 
     #[test]
-    fn signed_policy_preserves_device_paths_and_grants() {
-        let (root, response) = signed(&claims());
-        let accepted = verify(&response, &root, &state(), Some("request-a")).expect("verified");
+    fn canonical_bundle_fixture_preserves_device_paths_and_grants() {
+        let (root, response) = fixture();
+        let accepted = verify(&response, &root, &state(), None).expect("verified");
+        let policy = accepted.policy.expect("policy");
+        assert_eq!(display::policy_name(&policy), "Engineering");
+        let sources = policy_sources(&policy, &root).expect("sources");
+        let loaded = profile::bundle::ManagedProfile::from_sources(&sources).expect("profile");
         assert!(
-            accepted
-                .policy
-                .expect("policy")
-                .profile_json
-                .contains("$HOME/shared")
+            serde_json::to_string(&loaded.profile)
+                .expect("profile")
+                .contains("$HOME/shared.txt")
         );
     }
 
     #[test]
     fn signature_binding_and_freshness_fail_closed() {
         let (root, response) = signed(&claims());
+        assert!(verify(&response, &root, &state(), Some("request-a")).is_ok());
         assert!(verify(&response, &root, &state(), Some("other-request")).is_err());
         let mut other = state();
         other.subject_id = "other-device".into();
@@ -515,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_modes_missing_policy_and_modified_documents_fail_closed() {
+    fn missing_bundles_unsupported_modes_and_legacy_documents_fail_closed() {
         for mode in ["enforced", "unknown", "audit_only"] {
             let mut value = claims();
             value.management_mode = mode.into();
@@ -529,47 +676,32 @@ mod tests {
         value.policy = None;
         let (root, response) = signed(&value);
         assert!(verify(&response, &root, &state(), Some("request-a")).is_err());
-        value = claims();
-        value
-            .policy
-            .as_mut()
-            .expect("policy")
-            .profile_json
-            .push(' ');
+        let mut value = claims();
+        value.policy.as_mut().expect("policy").bundle = None;
         let (root, response) = signed(&value);
         assert!(verify(&response, &root, &state(), Some("request-a")).is_err());
-        value = claims();
-        value.management_mode = "audit_only".into();
-        value.policy = None;
+        let mut value = claims();
+        value.protocol_version = "1".into();
         let (root, response) = signed(&value);
+        assert!(verify(&response, &root, &state(), Some("request-a")).is_err());
+        let mut legacy = serde_json::to_value(claims()).expect("claims");
+        legacy["policy"]["profile_json"] = json!("{}");
+        assert!(serde_json::from_value::<AssignmentClaims>(legacy).is_err());
+        let (root, mut response) = signed(&claims());
+        response
+            .bundle
+            .as_mut()
+            .expect("bundle")
+            .files
+            .insert("policy.json".into(), STANDARD.encode(b"{}"));
+        assert!(verify(&response, &root, &state(), Some("request-a")).is_err());
+        let mut local = claims();
+        local.management_mode = "audit_only".into();
+        local.policy = None;
+        let (root, response) = signed(&local);
         assert!(verify(&response, &root, &state(), Some("request-a")).is_ok());
     }
 
-    #[test]
-    fn unresolved_inheritance_is_never_loaded_from_local_state() {
-        let mut value = claims();
-        let policy = value.policy.as_mut().expect("policy");
-        policy.profile_json = r#"{"meta":{"name":"managed"},"extends":"default"}"#.into();
-        policy.content_digest = format!(
-            "sha256:{}",
-            platform_client::sha256_hex(policy.profile_json.as_bytes())
-        );
-        let (root, response) = signed(&value);
-        assert!(verify(&response, &root, &state(), Some("request-a")).is_err());
-    }
-
-    #[test]
-    fn shared_signature_fixture_verifies_with_the_pinned_key() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/managed-policy-v1.json"
-        ))
-        .expect("fixture");
-        let root = serde_json::from_value(fixture["trust_root"].clone()).expect("trust root");
-        let response = serde_json::from_value(fixture["response"].clone()).expect("response");
-        let claims = verify(&response, &root, &state(), None).expect("stored signature");
-        assert_eq!(claims.management_mode, "advisory");
-        assert_eq!(claims.policy.expect("document").profile_id, "shared-policy");
-    }
     #[test]
     fn startup_fallback_distinguishes_offline_local_use_from_a_rejected_assignment() {
         let advisory = claims();
@@ -577,7 +709,7 @@ mod tests {
         local.management_mode = "audit_only".into();
         local.policy = None;
         let offline = RefreshFailure::Unavailable("offline".into());
-        assert!(offline.allows_local_fallback(false, None, None));
+        assert!(!offline.allows_local_fallback(false, None, None));
         assert!(offline.allows_local_fallback(false, Some(&local), None));
         assert!(!offline.allows_local_fallback(false, Some(&advisory), None));
         assert!(offline.allows_local_fallback(true, Some(&advisory), None));

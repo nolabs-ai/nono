@@ -718,6 +718,10 @@ pub struct PullArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub init: bool,
 
+    /// Fetch verified pack files without applying wiring or project installation
+    #[arg(long, conflicts_with = "init", help_heading = "OPTIONS")]
+    pub fetch_only: bool,
+
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
@@ -984,7 +988,7 @@ pub struct ProfileShowArgs {
     /// Show raw paths before expansion (e.g., $HOME instead of /Users/luke)
     #[arg(long)]
     pub raw: bool,
-    /// Output format: profile, manifest, or portable (self-contained policy sources)
+    /// Output format: profile, manifest, or bundle (self-contained files)
     #[arg(long, value_enum, value_name = "FORMAT")]
     pub format: Option<ProfileShowFormat>,
 }
@@ -993,8 +997,8 @@ pub struct ProfileShowArgs {
 pub enum ProfileShowFormat {
     Profile,
     Manifest,
-    /// Self-contained profile sources with dependencies and device predicates preserved.
-    Portable,
+    /// File inventory and contents for platform signing; no files are executed.
+    Bundle,
 }
 
 #[derive(Parser, Debug)]

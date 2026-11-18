@@ -255,6 +255,14 @@ fn finish_login(args: &LoginArgs, select: bool) -> Result<()> {
         eprintln!(
             "Device enrollment could not be confirmed: {error}\nRetry `{retry}` to enroll, or use `nono platform login --no-enroll` to sign in only."
         );
+    } else if matches!(
+        enrollment,
+        Ok(EnrollmentResult::Enrolled | EnrollmentResult::Reenrolled | EnrollmentResult::Reused)
+    ) {
+        let state = platform_client::load_active_state()?.ok_or_else(|| {
+            NonoError::ActionRequired("device enrollment was saved but is unavailable for the policy check; run `nono platform status`".into())
+        })?;
+        platform_client::check_enrollment_policy(&state)?;
     }
     Ok(())
 }

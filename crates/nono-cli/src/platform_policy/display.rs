@@ -13,20 +13,12 @@ fn mode_label(mode: &str) -> &str {
     }
 }
 
-pub(super) fn policy_name(policy: &DeliveredPolicy) -> String {
-    let document = serde_json::from_str::<serde_json::Value>(&policy.profile_json).ok();
-    let name = document.as_ref().and_then(|document| {
-        document
-            .get("root")
-            .unwrap_or(document)
-            .get("meta")?
-            .get("name")?
-            .as_str()
-    });
-    safe_text(
-        name.filter(|name| !name.trim().is_empty())
-            .unwrap_or(&policy.profile_id),
-    )
+pub(super) fn policy_name(policy: &AssignedBundle) -> String {
+    if let Some(bundle) = &policy.bundle {
+        let name = crate::profile::bundle::files::name(bundle);
+        return safe_text(name.as_deref().unwrap_or(&policy.profile_id));
+    }
+    safe_text(&policy.profile_id)
 }
 
 pub(crate) fn session_summary(session: &PolicySession) -> String {
@@ -75,7 +67,7 @@ fn checked_at(issued: DateTime<Utc>, now: DateTime<Utc>) -> String {
     format!("{} · {age}", issued.format("%d %b %Y, %H:%M:%S UTC"))
 }
 
-fn refresh_message(previous: Option<&PolicyClaims>, current: &PolicyClaims) -> String {
+fn refresh_message(previous: Option<&AssignmentClaims>, current: &AssignmentClaims) -> String {
     let Some(previous) = previous else {
         return match &current.policy {
             Some(policy) => format!("Fetched revision {}", policy.revision),
@@ -98,8 +90,8 @@ fn refresh_message(previous: Option<&PolicyClaims>, current: &PolicyClaims) -> S
 }
 
 pub(crate) fn status_rows(
-    policy: Option<&PolicyClaims>,
-    previous: Option<&PolicyClaims>,
+    policy: Option<&AssignmentClaims>,
+    previous: Option<&AssignmentClaims>,
     refreshed: bool,
 ) -> String {
     let Some(policy) = policy else {
@@ -112,12 +104,7 @@ pub(crate) fn status_rows(
             },
         );
     };
-    let mut text = summary_row("Mode", mode_label(&policy.management_mode));
-    let profile = match &policy.policy {
-        Some(policy) => format!("{} · revision {}", policy_name(policy), policy.revision),
-        None => "Local profiles".into(),
-    };
-    text.push_str(&summary_row("Policy", &profile));
+    let mut text = assignment_rows(policy);
     let checked = format!(
         "{} · {}",
         checked_at(policy.issued_at, Utc::now()),
@@ -133,6 +120,24 @@ pub(crate) fn status_rows(
             &fg(&refresh_message(previous, policy), theme::current().green).to_string(),
         ));
     }
+    text
+}
+
+fn assignment_rows(policy: &AssignmentClaims) -> String {
+    let mut text = summary_row("Mode", mode_label(&policy.management_mode));
+    let profile = match &policy.policy {
+        Some(policy) => format!("{} · revision {}", policy_name(policy), policy.revision),
+        None => "Local profiles".into(),
+    };
+    text.push_str(&summary_row("Policy", &profile));
+    text
+}
+
+pub(crate) fn enrollment_summary(policy: &AssignmentClaims) -> String {
+    let mut text = summary_heading("Policy verified", SummaryKind::Success);
+    text.push_str(&assignment_rows(policy));
+    text.push_str(&summary_row("Status", "Verified and ready"));
+    text.push('\n');
     text
 }
 
@@ -181,9 +186,22 @@ mod tests {
         let mut policy = super::super::tests::claims()
             .policy
             .expect("assigned policy");
-        policy.profile_json = r#"{"root":{"meta":{"name":"Engineering\u001b[2J"}}}"#.into();
+        let bundle = policy.bundle.as_mut().expect("bundle");
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(
+                bundle.signature["dsseEnvelope"]["payload"]
+                    .as_str()
+                    .expect("payload"),
+            )
+            .expect("base64");
+        let mut statement: serde_json::Value = serde_json::from_slice(&payload).expect("statement");
+        statement["predicate"]["name"] = serde_json::json!("Engineering\u{001b}[2J");
+        bundle.signature["dsseEnvelope"]["payload"] = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&statement).expect("statement"))
+            .into();
         assert_eq!(policy_name(&policy), "Engineering");
-        policy.profile_json = "{}".into();
+        policy.bundle = None;
         assert_eq!(policy_name(&policy), policy.profile_id);
     }
 

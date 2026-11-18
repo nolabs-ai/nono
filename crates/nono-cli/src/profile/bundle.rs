@@ -4,9 +4,10 @@ use super::{
     resolve_extends_with, validate_delivered_profile,
 };
 use nono::{NonoError, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+
+pub(crate) mod files;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ManagedProfile {
@@ -15,16 +16,14 @@ pub(crate) struct ManagedProfile {
 }
 
 impl ManagedProfile {
-    pub(crate) fn parse(text: &str) -> Result<Self> {
-        let (profile, policy) = parse_delivered(text)?;
+    pub(crate) fn from_sources(sources: &PolicySources) -> Result<Self> {
+        let (profile, policy) = parse_sources(sources)?;
         let profile = super::finalize_profile_with_policy(profile, &policy)?;
         Ok(Self { profile, policy })
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ProfileBundle {
+pub(crate) struct PolicySources {
     root: serde_json::Value,
     profiles: BTreeMap<String, serde_json::Value>,
     groups: BTreeMap<String, serde_json::Value>,
@@ -35,6 +34,8 @@ struct Collector {
     profiles: BTreeMap<String, serde_json::Value>,
     sources: BTreeMap<String, String>,
     stack: Vec<String>,
+    packs: BTreeSet<String>,
+    files: BTreeMap<String, Vec<u8>>,
 }
 
 fn read_document(path: &Path) -> Result<serde_json::Value> {
@@ -52,6 +53,34 @@ fn parse_profile(value: &serde_json::Value) -> Result<Profile> {
 }
 
 impl Collector {
+    fn include_declared_packs(&mut self, profile: &Profile) -> Result<()> {
+        for pack in &profile.packs {
+            self.include_pack(pack)?;
+        }
+        if let Some(overrides) = &profile.platform_overrides {
+            for profile in [&overrides.macos, &overrides.linux, &overrides.windows]
+                .into_iter()
+                .flatten()
+            {
+                self.include_declared_packs(&profile.0)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn include_pack(&mut self, name: &str) -> Result<()> {
+        let package = crate::package::parse_package_ref(name)?;
+        if package.version.is_some() {
+            return Err(NonoError::ProfileParse(format!(
+                "versioned pack references are not supported: {name:?}"
+            )));
+        }
+        if self.packs.insert(package.key()) {
+            files::collect_pack(&package, &mut self.files)?;
+        }
+        Ok(())
+    }
+
     fn collect(
         &mut self,
         mut document: serde_json::Value,
@@ -59,6 +88,7 @@ impl Collector {
     ) -> Result<serde_json::Value> {
         let raw = parse_profile(&document)?;
         validate_delivered_profile(&raw)?;
+        self.include_declared_packs(&raw)?;
         if self.stack.len() >= MAX_INHERITANCE_DEPTH {
             return Err(NonoError::ProfileInheritance(
                 "delivered inheritance is too deep".into(),
@@ -69,6 +99,9 @@ impl Collector {
             let (base, base_path, identity) =
                 match load_base_profile_raw(&name, source.and_then(Path::parent), source)? {
                     ResolvedBase::Sibling(_, path) => {
+                        if super::is_registry_ref(&name) {
+                            self.include_pack(&name)?;
+                        }
                         let document = read_document(&path)?;
                         let identity = path.to_string_lossy().into_owned();
                         (document, Some(path), identity)
@@ -106,6 +139,17 @@ impl Collector {
             .as_object_mut()
             .ok_or_else(|| NonoError::ProfileParse("profile must be an object".into()))?;
         object.remove("packs");
+        if let Some(overrides) = object
+            .get_mut("platform_overrides")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for profile in overrides
+                .values_mut()
+                .filter_map(serde_json::Value::as_object_mut)
+            {
+                profile.remove("packs");
+            }
+        }
         if references.is_empty() {
             object.remove("extends");
         } else {
@@ -145,7 +189,7 @@ fn collect_group_names(value: &serde_json::Value, names: &mut std::collections::
     }
 }
 
-pub(crate) fn export(path: &Path) -> Result<ProfileBundle> {
+fn collect_sources(path: &Path) -> Result<(PolicySources, BTreeMap<String, Vec<u8>>)> {
     let source = path
         .canonicalize()
         .map_err(|error| NonoError::ProfileParse(error.to_string()))?;
@@ -160,17 +204,17 @@ pub(crate) fn export(path: &Path) -> Result<ProfileBundle> {
         .into_iter()
         .filter(|(name, _)| names.contains(name))
         .collect();
-    let bundle = ProfileBundle {
+    let bundle = PolicySources {
         root,
         profiles: collector.profiles,
         groups,
     };
     // Check references using the same resolver the device uses, without finalizing its OS policy.
     resolve(&bundle)?;
-    Ok(bundle)
+    Ok((bundle, collector.files))
 }
 
-fn resolve(bundle: &ProfileBundle) -> Result<Profile> {
+fn resolve(bundle: &PolicySources) -> Result<Profile> {
     let root = parse_profile(&bundle.root)?;
     let mut loader = |name: &str, _: Option<&Path>, _: Option<&Path>| {
         let document = bundle.profiles.get(name).ok_or_else(|| {
@@ -188,21 +232,9 @@ fn resolve(bundle: &ProfileBundle) -> Result<Profile> {
     Ok(profile)
 }
 
-pub(crate) fn parse_delivered(text: &str) -> Result<(Profile, crate::policy::Policy)> {
-    let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|error| NonoError::ProfileParse(error.to_string()))?;
-    let bundle = if value.get("root").is_some() {
-        serde_json::from_value::<ProfileBundle>(value)
-            .map_err(|error| NonoError::ProfileParse(error.to_string()))?
-    } else {
-        ProfileBundle {
-            root: value,
-            profiles: BTreeMap::new(),
-            groups: BTreeMap::new(),
-        }
-    };
-    let profile = resolve(&bundle)?;
-    let policy = crate::policy::delivered_policy(&bundle.groups)?;
+pub(crate) fn parse_sources(sources: &PolicySources) -> Result<(Profile, crate::policy::Policy)> {
+    let profile = resolve(sources)?;
+    let policy = crate::policy::delivered_policy(&sources.groups)?;
     Ok((profile, policy))
 }
 
@@ -211,6 +243,14 @@ mod tests {
     use super::*;
     use crate::capability_ext::CapabilitySetExt;
     use serde_json::json;
+
+    fn sources(value: serde_json::Value) -> PolicySources {
+        PolicySources {
+            root: value["root"].clone(),
+            profiles: serde_json::from_value(value["profiles"].clone()).expect("profiles"),
+            groups: serde_json::from_value(value["groups"].clone()).expect("groups"),
+        }
+    }
 
     #[test]
     fn delivered_groups_are_isolated_between_launches_and_local_policy() {
@@ -225,11 +265,11 @@ mod tests {
         std::fs::write(&first, "first").expect("first");
         std::fs::write(&second, "second").expect("second");
         let prepare = |path: &Path| {
-            ManagedProfile::parse(&json!({
+            ManagedProfile::from_sources(&sources(json!({
                 "root": {"meta":{"name":"managed"}, "groups":{"include":["launch-scope"]}},
                 "profiles": {},
                 "groups": {"launch-scope":{"description":"launch-specific deny", "deny":{"access":[path]}}}
-            }).to_string()).expect("managed profile")
+            }))).expect("managed profile")
         };
         let first_profile = prepare(&first);
         let second_profile = prepare(&second);
@@ -264,7 +304,7 @@ mod tests {
         })
         .to_string();
         assert!(
-            ManagedProfile::parse(&text)
+            ManagedProfile::from_sources(&sources(serde_json::from_str(&text).expect("source")))
                 .expect_err("required group")
                 .to_string()
                 .contains("tenant-required")
@@ -281,7 +321,9 @@ mod tests {
             ]}}},
             "groups": {"delivered-test":{"description":"fixture", "allow":{"read":["$HOME/shared"]}}}
         }).to_string();
-        let (profile, groups) = parse_delivered(&text).expect("delivered source");
+        let (profile, groups) =
+            parse_sources(&sources(serde_json::from_str(&text).expect("source")))
+                .expect("delivered source");
         if cfg!(target_os = "linux") {
             assert_eq!(profile.filesystem.read, ["$HOME/linux-only"]);
         }
@@ -301,9 +343,9 @@ mod tests {
     #[test]
     fn missing_or_cyclic_bases_never_fall_back_to_builtin_profiles() {
         let mut bundle = json!({"root":{"extends":"default"},"profiles":{},"groups":{}});
-        assert!(parse_delivered(&bundle.to_string()).is_err());
+        assert!(parse_sources(&sources(bundle.clone())).is_err());
         bundle["profiles"]["default"] = json!({"extends":"default"});
-        assert!(parse_delivered(&bundle.to_string()).is_err());
+        assert!(parse_sources(&sources(bundle.clone())).is_err());
     }
 
     #[test]
@@ -320,6 +362,6 @@ mod tests {
         let mut groups = serde_json::Map::new();
         groups.insert(name.clone(), json!({"description":"replacement"}));
         let bundle = json!({"root":{"meta":{"name":"fixture"}},"profiles":{},"groups":groups});
-        assert!(parse_delivered(&bundle.to_string()).is_err());
+        assert!(parse_sources(&sources(bundle.clone())).is_err());
     }
 }

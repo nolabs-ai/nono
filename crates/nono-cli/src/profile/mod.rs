@@ -3670,26 +3670,6 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
     parse_profile_file(path)
 }
 
-pub(crate) fn validate_delivered_profile(profile: &Profile) -> Result<()> {
-    if profile.session_hooks.before.is_some()
-        || profile.session_hooks.after.is_some()
-        || !profile.hooks.hooks.is_empty()
-    {
-        return Err(NonoError::ProfileParse(
-            "delivered policies cannot contain host or session hooks".into(),
-        ));
-    }
-    if let Some(overrides) = &profile.platform_overrides {
-        for item in [&overrides.macos, &overrides.linux, &overrides.windows]
-            .into_iter()
-            .flatten()
-        {
-            validate_delivered_profile(&item.0)?;
-        }
-    }
-    Ok(())
-}
-
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
 pub(crate) fn finalize_profile(profile: Profile) -> Result<Profile> {
     finalize_profile_with_policy(profile, &crate::policy::load_embedded_policy()?)

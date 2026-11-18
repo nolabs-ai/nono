@@ -120,9 +120,12 @@ The separate `policy.json` and `profiles/` files are policy projections with
 closed inheritance bindings and runtime pack references removed. Clients use
 these projections and the delivered groups for sandboxing. Included pack files
 are verified and cached but do not install agent configuration, execute hooks or
-activate skills. Existing restrictions on executable profile content remain in
-force. New execution semantics require their own compatibility and permission
-decisions; authenticating a file never authorizes its execution.
+activate skills. Hook declarations are retained in the signed policy sources,
+including inherited profiles and OS overrides. Consumers clear host and session
+hooks only from the in-memory managed runtime profile before launch; the signed
+sources and cached pack files remain unchanged. New execution semantics require
+their own compatibility and permission decisions; authenticating a file never
+authorizes its execution.
 
 ## Managed delivery v2
 

@@ -426,22 +426,38 @@ fn bundle_export_includes_bases_and_preserves_device_predicates() {
 }
 
 #[test]
-fn bundle_export_rejects_host_hooks_before_delivery() {
+fn bundle_export_retains_hook_declarations_without_executing_them() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     let dir = tempfile::tempdir().expect("fixture");
     let path = dir.path().join("managed.json");
-    std::fs::write(
-        &path,
-        r#"{"meta":{"name":"managed"},"hooks":{"claude":{"command":"untrusted-helper"}}}"#,
-    )
-    .expect("profile");
+    let profile = serde_json::json!({
+        "meta":{"name":"managed"},
+        "hooks":{"claude":{"event":"PreToolUse","matcher":"Bash","script":"missing-hook.sh"}},
+        "session_hooks":{
+            "before":{"script":"/missing/before.sh"},
+            "after":{"script":"/missing/after.sh"}
+        }
+    });
+    std::fs::write(&path, profile.to_string()).expect("profile");
     let output = nono_bin()
         .args(["profile", "show"])
         .arg(&path)
         .args(["--format", "bundle"])
         .output()
         .expect("export");
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let export: serde_json::Value = serde_json::from_slice(&output.stdout).expect("export");
+    let delivered: serde_json::Value = serde_json::from_slice(
+        &STANDARD
+            .decode(export["files"]["policy.json"].as_str().expect("policy"))
+            .expect("base64"),
+    )
+    .expect("policy JSON");
+    assert_eq!(delivered, profile);
 }
 
 fn complete_pack_fixture() -> (
@@ -456,7 +472,14 @@ fn complete_pack_fixture() -> (
             "agent",
             json!({"meta":{"name":"agent"},"extends":"acme/base"}),
         ),
-        ("base", json!({"meta":{"name":"base"}})),
+        (
+            "base",
+            json!({
+                "meta":{"name":"base"},
+                "hooks":{"claude":{"event":"PreToolUse","matcher":"Bash","script":"bin/hook.sh"}},
+                "session_hooks":{"before":{"script":"$PACK_DIR/bin/hook.sh"}}
+            }),
+        ),
     ] {
         let manifest = json!({"schema_version":1,"name":name,"artifacts":[
             {"type":"profile","path":"policy.json","install_as":name},

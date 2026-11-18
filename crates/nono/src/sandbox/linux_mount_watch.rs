@@ -25,7 +25,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// `NS_GET_PARENT` from `linux/nsfs.h`: `_IO(0xb7, 0x2)`.
-const NS_GET_PARENT: libc::c_ulong = 0xb702;
+///
+/// Typed as `libc::Ioctl` because the request type is `c_ulong` on glibc but
+/// `c_int` on musl.
+const NS_GET_PARENT: libc::Ioctl = 0xb702;
 /// User namespaces nest at most 32 deep.
 const MAX_USERNS_DEPTH: usize = 33;
 /// Rounds of scanning and killing before giving up on a forking sandbox.

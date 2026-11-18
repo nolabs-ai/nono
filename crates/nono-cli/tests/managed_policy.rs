@@ -106,12 +106,34 @@ impl Client {
             if include_pack {
                 let pack = test.home().join(".config/nono/packages/acme/assets");
                 fs::create_dir_all(pack.join("skills")).expect("pack");
-                fs::write(pack.join("package.json"), json!({"schema_version":1,"name":"assets","artifacts":[{"type":"plugin","path":"skills/SKILL.md"}],"wiring":[{"type":"write_file","source":"skills/SKILL.md","dest":"$HOME/SHOULD_NOT_BE_INSTALLED"}]}).to_string()).expect("manifest");
+                fs::create_dir_all(pack.join("profiles")).expect("profiles");
+                fs::create_dir_all(pack.join("bin")).expect("scripts");
+                fs::write(pack.join("package.json"), json!({"schema_version":1,"name":"assets","artifacts":[{"type":"profile","path":"policy.json","install_as":"assets"},{"type":"plugin","path":"skills/SKILL.md"},{"type":"plugin","path":"bin/hook.sh"}],"wiring":[{"type":"write_file","source":"skills/SKILL.md","dest":"$HOME/SHOULD_NOT_BE_INSTALLED"}]}).to_string()).expect("manifest");
+                fs::write(pack.join("profiles/assets.json"), json!({
+                    "hooks":{"claude":{"event":"PreToolUse","matcher":"Bash","script":"bin/hook.sh"}},
+                    "session_hooks":{
+                        "before":{"script":"$PACK_DIR/bin/hook.sh"},
+                        "after":{"script":"$PACK_DIR/bin/hook.sh"}
+                    }
+                }).to_string()).expect("profile with hooks");
+                let hook = pack.join("bin/hook.sh");
+                fs::write(&hook, "#!/bin/sh\nprintf '%s\\n' \"$NONO_HOOK_TYPE\" >> \"$HOME/HOOK_EXECUTED\"\n").expect("hook script");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).expect("executable hook");
+                }
                 fs::write(pack.join("skills/SKILL.md"), "# Signed skill\n").expect("skill");
                 fs::write(pack.join("bundle.sig"), "{\"upstream\":\"preserved\"}").expect("upstream signature");
                 fs::create_dir_all(pack.join("assets")).expect("assets");
                 fs::write(pack.join("assets/blob.bin"),vec![7u8;2*1024*1024]).expect("large asset");
                 profile["packs"] = json!(["acme/assets"]);
+                profile["extends"] = json!("acme/assets");
+                // Resolvable local paths prove non-execution independently of
+                // the inherited $PACK_DIR declarations retained in the pack.
+                profile["session_hooks"] = json!({
+                    "before":{"script":hook},"after":{"script":hook}
+                });
             }
             profile["filesystem"]["read"] = json!([allowed]);
             let source = test.root().join("source.json");
@@ -941,15 +963,135 @@ fn complete_pack_is_cached_without_wiring_and_every_asset_is_verified() {
         "{\"upstream\":\"preserved\"}"
     );
     assert!(!client.test.home().join("SHOULD_NOT_BE_INSTALLED").exists());
-    fs::write(&skill, "# Changed skill\n").expect("tamper");
-    client
+    assert!(!client.test.home().join("HOOK_EXECUTED").exists());
+    assert_eq!(
+        fs::read_to_string(directory.join("packs/acme/assets/bin/hook.sh"))
+            .expect("delivered hook"),
+        "#!/bin/sh\nprintf '%s\\n' \"$NONO_HOOK_TYPE\" >> \"$HOME/HOOK_EXECUTED\"\n"
+    );
+    let original: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("packs/acme/assets/policy.json")).expect("original pack profile"),
+    )
+    .expect("pack profile JSON");
+    assert_eq!(
+        original["session_hooks"]["before"]["script"],
+        "$PACK_DIR/bin/hook.sh"
+    );
+    assert_eq!(
+        original["session_hooks"]["after"]["script"],
+        "$PACK_DIR/bin/hook.sh"
+    );
+    assert_eq!(original["hooks"]["claude"]["script"], "bin/hook.sh");
+    for relative in [
+        "skills/SKILL.md",
+        "bin/hook.sh",
+        "package.json",
+        "policy.json",
+    ] {
+        let path = directory.join("packs/acme/assets").join(relative);
+        let original = fs::read(&path).expect("original asset");
+        let mut changed = original.clone();
+        changed[0] ^= 1; // Same size: verification must check the digest.
+        fs::write(&path, changed).expect("tamper");
+        for mode in ["run", "wrap"] {
+            let output = client
+                .test
+                .command()
+                .args([mode, "--", "/bin/echo", "MUST_NOT_RUN"])
+                .output()
+                .expect("tampered startup");
+            assert!(!output.status.success(), "{mode}: {relative}");
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                error.contains(&format!("packs/acme/assets/{relative}")),
+                "{error}"
+            );
+            assert!(error.contains("Session not started."), "{error}");
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("MUST_NOT_RUN"));
+            assert!(!client.test.home().join("HOOK_EXECUTED").exists());
+            assert!(!client.test.home().join("SHOULD_NOT_BE_INSTALLED").exists());
+        }
+        fs::write(path, original).expect("restore test asset");
+    }
+}
+
+#[test]
+fn delivered_hooks_stay_inactive_in_run_and_wrap_while_policy_is_enforced() {
+    let client = Client::with_pack(Some(static_profile()), true);
+    let hook = client
         .test
-        .wrap()
-        .exec(Argv::new("/bin/echo").arg("MUST_NOT_RUN"))
-        .assert_failure("tampered non-policy asset blocks startup")
-        .assert_stderr_contains("packs/acme/assets/skills/SKILL.md")
-        .assert_stderr_contains("Session not started.")
-        .assert_stdout_lacks("MUST_NOT_RUN");
+        .home()
+        .join(".config/nono/packages/acme/assets/bin/hook.sh");
+    let marker = client.test.home().join("HOOK_EXECUTED");
+    let control = client.test.root().join("local-hook-control.json");
+    fs::write(
+        &control,
+        json!({"session_hooks":{
+            "before":{"script":hook},"after":{"script":hook}
+        }})
+        .to_string(),
+    )
+    .expect("local hook control");
+    let output = client
+        .test
+        .command()
+        .args(["run", "--no-diagnostics", "--profile"])
+        .arg(&control)
+        .args(["--", "/bin/echo", "LOCAL_CONTROL"])
+        .output()
+        .expect("local hook control");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&marker).expect("local hooks executed"),
+        "before\nafter\n"
+    );
+    fs::remove_file(&marker).expect("clear control marker");
+
+    for mode in ["run", "wrap"] {
+        let allowed = client
+            .test
+            .command()
+            .args([mode, "--", "/bin/cat"])
+            .arg(&client.allowed)
+            .output()
+            .expect("managed allowed read");
+        assert!(
+            allowed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+        assert!(String::from_utf8_lossy(&allowed.stdout).contains("ASSIGNED_ACCESS"));
+        let denied = client
+            .test
+            .command()
+            .args([mode, "--", "/bin/cat"])
+            .arg(&client.denied)
+            .output()
+            .expect("managed denied read");
+        assert!(!denied.status.success());
+        assert!(!String::from_utf8_lossy(&denied.stdout).contains("UNGRANTED_ACCESS"));
+        assert!(
+            !marker.exists(),
+            "{mode} must not execute either delivered session hook"
+        );
+        assert!(!client.test.home().join("SHOULD_NOT_BE_INSTALLED").exists());
+        let directory = cached_bundle_directory(&client);
+        let sources: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.join("policy.json")).expect("delivered sources"),
+        )
+        .expect("source JSON");
+        assert_eq!(sources["session_hooks"]["before"]["script"], json!(hook));
+        assert_eq!(sources["session_hooks"]["after"]["script"], json!(hook));
+        assert!(
+            directory
+                .join("packs/acme/assets/skills/SKILL.md")
+                .is_file()
+        );
+    }
 }
 
 #[test]

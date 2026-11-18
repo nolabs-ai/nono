@@ -1,7 +1,7 @@
 //! Preserve source predicates until the requesting device resolves its policy.
 use super::{
     MAX_INHERITANCE_DEPTH, Profile, ResolvedBase, load_base_profile_raw, parse_profile_bytes,
-    resolve_extends_with, validate_delivered_profile,
+    resolve_extends_with,
 };
 use nono::{NonoError, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -87,7 +87,6 @@ impl Collector {
         source: Option<&Path>,
     ) -> Result<serde_json::Value> {
         let raw = parse_profile(&document)?;
-        validate_delivered_profile(&raw)?;
         self.include_declared_packs(&raw)?;
         if self.stack.len() >= MAX_INHERITANCE_DEPTH {
             return Err(NonoError::ProfileInheritance(
@@ -222,14 +221,34 @@ fn resolve(bundle: &PolicySources) -> Result<Profile> {
         })?;
         parse_profile(document).map(ResolvedBase::Global)
     };
-    let profile = resolve_extends_with(root, &mut Vec::new(), 0, None, None, &mut loader)?;
+    let mut profile = resolve_extends_with(root, &mut Vec::new(), 0, None, None, &mut loader)?;
     if !profile.packs.is_empty() {
         return Err(NonoError::ProfileParse(
             "delivered policy contains runtime package dependencies".into(),
         ));
     }
-    validate_delivered_profile(&profile)?;
+    disable_hooks(&mut profile);
     Ok(profile)
+}
+
+/// Delivered hook declarations and files are retained as authenticated content.
+/// Keep them out of the runtime profile until managed hook execution and wiring
+/// have their own activation contract. This never changes the signed sources.
+fn disable_hooks(profile: &mut Profile) {
+    profile.hooks = Default::default();
+    profile.session_hooks = Default::default();
+    if let Some(overrides) = &mut profile.platform_overrides {
+        for item in [
+            &mut overrides.macos,
+            &mut overrides.linux,
+            &mut overrides.windows,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            disable_hooks(&mut item.0);
+        }
+    }
 }
 
 pub(crate) fn parse_sources(sources: &PolicySources) -> Result<(Profile, crate::policy::Policy)> {
@@ -249,6 +268,56 @@ mod tests {
             root: value["root"].clone(),
             profiles: serde_json::from_value(value["profiles"].clone()).expect("profiles"),
             groups: serde_json::from_value(value["groups"].clone()).expect("groups"),
+        }
+    }
+
+    #[test]
+    fn delivered_hooks_are_retained_in_sources_but_disabled_for_managed_launches() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("environment lock");
+        let hooks = json!({"claude":{"event":"PreToolUse","matcher":"Bash","script":"hook.sh"}});
+        let session_hooks = json!({
+            "before":{"script":"$PACK_DIR/bin/before.sh"},
+            "after":{"script":"$PACK_DIR/bin/after.sh"}
+        });
+        for inherited in [false, true] {
+            let fragment = json!({"hooks":hooks,"session_hooks":session_hooks});
+            let mut document = fragment.clone();
+            document["platform_overrides"] = json!({
+                "linux":fragment,"macos":fragment,"windows":fragment
+            });
+            let bundle = sources(if inherited {
+                json!({"root":{"extends":"base"},"profiles":{"base":document},"groups":{}})
+            } else {
+                json!({"root":document,"profiles":{},"groups":{}})
+            });
+            let source = if inherited {
+                &bundle.profiles["base"]
+            } else {
+                &bundle.root
+            };
+            let original = source.clone();
+            let local = parse_profile(source).expect("local profile retains hooks");
+            assert!(!local.hooks.hooks.is_empty());
+            assert!(local.session_hooks.before.is_some());
+            assert!(local.session_hooks.after.is_some());
+
+            let (profile, _) = parse_sources(&bundle).expect("inert delivered profile");
+            let assert_disabled = |profile: &Profile| {
+                assert!(profile.hooks.hooks.is_empty());
+                assert!(profile.session_hooks.before.is_none());
+                assert!(profile.session_hooks.after.is_none());
+            };
+            assert_disabled(&profile);
+            let overrides = profile.platform_overrides.as_ref().expect("OS overrides");
+            for item in [&overrides.linux, &overrides.macos, &overrides.windows] {
+                assert_disabled(&item.as_ref().expect("OS profile").0);
+            }
+            let managed = ManagedProfile::from_sources(&bundle).expect("managed runtime profile");
+            assert_disabled(&managed.profile);
+            assert_eq!(
+                *source, original,
+                "signed hook declarations must stay intact"
+            );
         }
     }
 

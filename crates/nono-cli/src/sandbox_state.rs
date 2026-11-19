@@ -52,6 +52,9 @@ pub struct SandboxState {
     /// Proxy domain allowlist at sandbox creation time
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+    /// Unlisted hosts require a network approval, including with an empty allowlist.
+    #[serde(default)]
+    pub network_approvals: bool,
     /// Proxy domain denylist (`network.deny_domain`) at sandbox creation time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_domains: Vec<String>,
@@ -290,6 +293,7 @@ impl SandboxState {
             applied_bypasses: bypass_protection_paths.to_vec(),
             deny_paths: deny_paths.iter().map(|p| p.display().to_string()).collect(),
             allowed_domains: allowed_domains.to_vec(),
+            network_approvals: false,
             denied_domains: denied_domains.to_vec(),
             domain_endpoints: domain_endpoints.to_vec(),
             resource_limits: caps.resource_limits().copied(),
@@ -333,7 +337,7 @@ impl SandboxState {
             caps.add_unix_socket(restore_unix_socket_capability(stored)?);
         }
 
-        if !self.allowed_domains.is_empty() {
+        if !self.allowed_domains.is_empty() || self.network_approvals {
             caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
                 port: 0,
                 bind_ports: vec![],
@@ -1169,6 +1173,7 @@ mod tests {
             applied_bypasses: vec![],
             deny_paths: vec![],
             allowed_domains: vec![],
+            network_approvals: false,
             denied_domains: vec![],
             domain_endpoints: vec![],
             resource_limits: None,

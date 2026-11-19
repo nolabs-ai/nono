@@ -158,7 +158,9 @@ The client first verifies the fresh assignment using the pinned enrollment
 key and existing request/freshness checks. It then verifies the file bundle
 using that key, checks that the decoded statement digest equals the assignment's
 `content_digest`, and checks its signed revision against the assignment.
-Audit-only responses contain no bundle. Enforced mode remains unsupported.
+Audit-only responses contain no bundle. Advisory and enforced responses carry
+the same complete bundle; the signed mode determines whether local overrides
+are permitted. See [enforced startup](managed-policy-v2.md#enforced-startup).
 
 The platform computes v2 assignment identity from mode, resolution provenance,
 profile ID, revision, grant-delta version and manifest digest. Randomized bundle

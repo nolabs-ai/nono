@@ -713,7 +713,11 @@ pub(crate) fn resolve_detached_cwd_prompt_response(
     args: &SandboxArgs,
     silent: bool,
 ) -> Result<Option<DetachedCwdPromptResponse>> {
-    if silent || args.allow_cwd || args.config.is_some() {
+    if silent
+        || args.allow_cwd
+        || args.config.is_some()
+        || crate::platform_policy::enforced::active(args)
+    {
         return Ok(None);
     }
 
@@ -763,6 +767,11 @@ fn finalize_prepared_sandbox(
         args.memory.as_deref(),
         args.max_processes,
     )? {
+        if crate::platform_policy::enforced::active(args)
+            && let Some(existing) = prepared.caps.resource_limits()
+        {
+            crate::platform_policy::enforced::validate_resource_limits(existing, &limits)?;
+        }
         prepared.caps = prepared.caps.with_resource_limits(limits);
     }
 
@@ -1865,8 +1874,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     #[cfg(target_os = "linux")]
     let proc_comm_notify = gpu_activation.proc_comm_notify;
 
-    if let Some(request) =
-        pending_cwd_access_request(&caps, &workdir, profile_workdir_access.as_ref())?
+    if !crate::platform_policy::enforced::active(args)
+        && let Some(request) =
+            pending_cwd_access_request(&caps, &workdir, profile_workdir_access.as_ref())?
     {
         if args.allow_cwd
             || matches!(

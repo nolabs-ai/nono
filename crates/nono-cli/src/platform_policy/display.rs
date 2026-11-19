@@ -50,7 +50,12 @@ pub(crate) fn session_summary(session: &PolicySession) -> String {
             .map(|name| format!("--{}", safe_text(name)))
             .collect::<Vec<_>>()
             .join(", ");
-        text.push_str(&summary_row("Overrides", &overrides));
+        let label = if session.management_mode == "enforced" {
+            "Local options"
+        } else {
+            "Overrides"
+        };
+        text.push_str(&summary_row(label, &overrides));
     }
     text.push('\n');
     text

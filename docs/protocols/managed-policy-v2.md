@@ -21,8 +21,9 @@ A changed key requires re-enrollment; rotation remains separate work.
 * `advisory`: the assigned bundle is the default. An explicit local profile or
   capability manifest replaces it; permitted local policy flags can modify it.
   Overrides and their input sources are recorded.
-* `enforced`: unsupported. The server rejects activation and the client refuses
-  to interpret it as advisory.
+* `enforced`: the assigned bundle is the only policy source. Every launch needs
+  a fresh verified response. Local grants, profile selection and audit suppression
+  are refused. `wrap` is refused because it has no supervisor.
 
 Mode is the strictest applicable subject, group or ancestor-unit assignment,
 resolved independently of profile precedence. Assignment mode and content come
@@ -62,11 +63,13 @@ other failed first refresh prevents default startup. A network failure never
 silently replaces a previously advisory policy with local defaults. An advisory
 user may explicitly select a local profile or capability manifest when the
 platform is unavailable; invalid signatures, unsupported formats and rejected
-assignments remain errors. Previously local and unenrolled clients keep local
+assignments remain errors. An enrollment with no verified mode cannot use an
+explicit override to bypass its first check. Enforced devices have no offline
+fallback, including explicit profiles. Previously local and unenrolled clients keep local
 offline operation.
 
 The last verified mode is stored with enrollment, separately from disposable
-bundle caches. Deleting a cache cannot make a previously advisory device local.
+bundle caches. Deleting a cache cannot make an advisory or enforced device local.
 Obsolete cached protocol versions are discarded, preserving the trust root and
 remembered mode, and require a fresh response before managed use. Same-enrollment
 login preserves that mode. A fresh signed audit-only assignment can return the
@@ -114,10 +117,69 @@ proxy rules and settings requiring a supervisor, including runtime elevation,
 command policies and recording. Direct exec cannot deliver session audit
 evidence, and advisory wrap launches explain that limitation.
 
+## Enforced startup
+
+Mode is verified before any local policy is loaded, including detached-launch
+preflight. The detached supervisor repeats verification. Only the signed bundle
+configures the sandbox; locally installed profiles and pack contents are not
+consulted. There is no interactive workspace-sharing grant or automatic Claude
+LaunchServices exception. Administrators must put required paths in the policy,
+including an explicit `$WORKDIR` grant when appropriate. Project-root constraints
+on the choice of workspace are separate work.
+
+Enforced launch options use an allow-list. Session/output options and rollback
+options retain their existing behavior. Policy inputs permitted today are
+`--block-net`, `--deny-domain`, `--block-command`, `--memory`, `--max-processes`,
+`--isolate`, `--strict-broker-path`, `--workdir`, `--shell`, `--record`,
+`--record-required`, `--deliver-to` (platform only) and `--audit-integrity`.
+Resource flags cannot raise a limit from the policy. All other policy inputs
+are refused, including explicit false environment settings. `--allow-endpoint`
+is refused because its current append semantics can widen an existing endpoint
+allow-list. `--record-file` is also refused; destinations belong in the policy.
+Unknown future options are refused until reviewed. Child-program arguments are
+not nono options.
+
+Policy-changing `NONO_*` variables produce errors naming the setting, without
+printing its value. `NONO_PLATFORM_URL`, `NONO_TENANT`, `NONO_ORG` and
+`NONO_REGISTRY` cannot redirect an enforced launch. The enrolled origin and
+tenant remain authoritative; an enforced enrollment also takes precedence over
+the saved human sign-in context.
+
+Command mediation resolves tool policy from the verified bundle and keeps launch
+permissions in supervisor memory. On macOS, a private, single-use socket carries
+them to the launcher. Before and after a fresh challenge, the launcher verifies
+its direct parent's identity using the socket audit token and matching valid
+code-signing hash. Failed authentication, changed parents and oversized messages
+prevent execution; the handoff closes before the tool starts. On Linux, the
+supervisor prepares restrictions before fork and the child applies them before
+executing the verified binary through its open descriptor. There is no external
+Linux launcher. Both paths apply in every mode, require running-process integrity
+and avoid a platform request per tool.
+
+Configured approval backends must be platform-authenticated webhooks to the
+enrolled approval endpoint. Runtime elevation without a platform backend is
+refused. An enforced supervisor without a configured platform backend denies
+capability requests, including direct IPC requests when elevation is disabled;
+it never falls back to a local terminal prompt.
+
+Network policy queries preserve approval requirements: an empty domain allow-list
+with configured approval backends requires review rather than granting every
+host. Static allows still pass, and explicit domain and metadata-IP denies stay
+denied. The platform uses this same query for its approval precheck.
+
+Local setup, standalone proxy, profile creation/promotion, trust mutation,
+unenrollment, login/logout and tenant selection are refused while enforced.
+Read-only inspection, cache refresh, session controls and rollback restoration
+remain available. To change enrollment through the CLI, an administrator first
+changes every applicable enforced assignment on the platform; a fresh signed
+response must confirm the less restrictive mode. Offline checks cannot authorize
+the change. A dedicated management-approval lease is not implemented.
+
 ## Scope
 
 This implements startup delivery and verification. Running sessions retain their
-original policy. It does not enable enforced lockdown, policy polling, offline
-managed launches, hardware attestation, key rotation, full pack import, skill
-activation or hook wiring. Additional files can be authenticated without
-authorizing their execution.
+original policy. Enforced startup governs this enrolled client; machine owners
+can still replace binaries or local enrollment state, and run agents directly.
+Device management and binary attestation are separate controls. Policy polling,
+offline managed launches, key rotation, skill activation and hook wiring remain
+separate work. Additional signed files do not authorize their execution.

@@ -184,7 +184,9 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
         silent,
     )?;
 
-    if should_auto_enable_claude_launch_services(&run_args.sandbox, &program, &cmd_args) {
+    if !crate::platform_policy::enforced::active(&run_args.sandbox)
+        && should_auto_enable_claude_launch_services(&run_args.sandbox, &program, &cmd_args)
+    {
         warn!(
             "Auto-enabling --allow-launch-services for Claude Code because no refresh-capable local auth was detected"
         );
@@ -377,6 +379,7 @@ fn reject_network_approvals_under_wrap(
 pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     let mut args: SandboxArgs = wrap_args.sandbox.into();
     crate::platform_policy::prepare_start(&mut args, silent)?;
+    crate::platform_policy::enforced::reject_wrap(args.policy_session.as_ref())?;
     let command = wrap_args.command;
     let no_diagnostics = wrap_args.no_diagnostics;
 

@@ -42,6 +42,7 @@ struct Platform {
     requests: Arc<AtomicUsize>,
     refresh_status: Arc<AtomicUsize>,
     corrupt_response: Arc<AtomicBool>,
+    mode: Arc<AtomicUsize>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -195,6 +196,8 @@ impl Client {
         let status = refresh_status.clone();
         let corrupt_response = Arc::new(AtomicBool::new(false));
         let corrupt = corrupt_response.clone();
+        let mode_setting = Arc::new(AtomicUsize::new(if profile.is_some() { 1 } else { 0 }));
+        let response_mode = mode_setting.clone();
         let thread = thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 match listener.accept() {
@@ -229,7 +232,12 @@ impl Client {
                                 subject_id: "device".into(),
                                 request_id,
                                 issued_at: chrono::Utc::now(),
-                                management_mode: mode.into(),
+                                management_mode: match response_mode.load(Ordering::SeqCst) {
+                                    0 => "audit_only",
+                                    1 => "advisory",
+                                    _ => "enforced",
+                                }
+                                .into(),
                                 assignment_version: "assignment-1".into(),
                                 resolved_via: json!({"layer":"subject"}),
                                 policy: profile.clone(),
@@ -267,6 +275,7 @@ impl Client {
                 requests,
                 refresh_status,
                 corrupt_response,
+                mode: mode_setting,
                 thread: Some(thread),
             },
             cache,
@@ -318,6 +327,493 @@ fn read_request(stream: &mut TcpStream) -> (String, String) {
 
 fn static_profile() -> serde_json::Value {
     json!({"meta":{"name":"managed-wrap"}, "network":{"block":true}})
+}
+
+#[test]
+fn enforced_internal_launcher_rejects_local_permissions() {
+    use std::os::{
+        fd::AsRawFd,
+        unix::{net::UnixStream, process::CommandExt},
+    };
+
+    let client = Client::new(Some(static_profile()));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    assert!(
+        client
+            .test
+            .command()
+            .args(["platform", "status", "--refresh"])
+            .output()
+            .expect("refresh")
+            .status
+            .success()
+    );
+    let requests = client.platform.requests.load(Ordering::SeqCst);
+    let path = client.test.workspace().join("forged-launch.json");
+    fs::write(
+        &path,
+        json!({"caps":{"fs":[{"path":"/","access":"read"}]}}).to_string(),
+    )
+    .expect("local launch specification");
+    let output = client
+        .test
+        .command()
+        .env("NONO_TOOL_SANDBOX_LAUNCH_SPEC", &path)
+        .output()
+        .expect("local specification");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("file-based launch specifications are not accepted")
+    );
+    for value in ["not-a-descriptor", "-1", "0", "1", "2", "999999"] {
+        let output = client
+            .test
+            .command()
+            .env("NONO_TOOL_SANDBOX_LAUNCH_FD", value)
+            .output()
+            .expect("invalid descriptor");
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("command-mediation launch rejected")
+        );
+    }
+    let (_parent, child) = UnixStream::pair().expect("forged handoff");
+    let fd = child.as_raw_fd();
+    let mut command = client.test.command();
+    command.env("NONO_TOOL_SANDBOX_LAUNCH_FD", fd.to_string());
+    // SAFETY: child remains open until spawn completes; fcntl is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            if nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().expect("forged descriptor");
+    assert!(!output.status.success());
+    let reason = if cfg!(target_os = "macos") {
+        "parent is not the running nono executable"
+    } else {
+        "external launch descriptors are not accepted"
+    };
+    assert!(String::from_utf8_lossy(&output.stderr).contains(reason));
+    assert_eq!(client.platform.requests.load(Ordering::SeqCst), requests);
+}
+
+#[test]
+fn enforced_command_mediation_uses_the_delivered_policy() {
+    let mut profile = static_profile();
+    profile["filesystem"]["allow"] = json!(["$WORKDIR"]);
+    profile["command_policies"] = json!({"commands":{"cat":{
+        "executable":"/bin/cat",
+        "sandbox":{"fs_read":["."]}
+    }}});
+    let client = Client::new(Some(profile));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    let file = client.test.workspace().join("mediated.txt");
+    fs::write(&file, "PLATFORM_MEDIATED_ACCESS").expect("workspace file");
+    client
+        .test
+        .run()
+        .no_rollback()
+        .exec(Argv::new("cat").arg(&file))
+        .assert_success("platform command policy can launch mediated tools")
+        .assert_stdout_contains("PLATFORM_MEDIATED_ACCESS");
+    client
+        .test
+        .run()
+        .no_rollback()
+        .exec(Argv::new("cat").arg(&client.denied))
+        .assert_failure("mediated tools cannot read outside their signed policy")
+        .assert_stdout_lacks("UNGRANTED_ACCESS");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn enforced_raw_capability_requests_cannot_fall_back_to_local_approval() {
+    let mut profile = static_profile();
+    profile["filesystem"]["read_file"] = json!([std::env::current_exe().expect("test executable")]);
+    let client = Client::new(Some(profile));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    let output = client
+        .test
+        .command()
+        .env("ENFORCED_TEST_REQUEST_PATH", &client.denied)
+        .args(["run", "--no-rollback", "--"])
+        .arg(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "raw_capability_request_child", "--nocapture"])
+        .output()
+        .expect("raw IPC request");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("PLATFORM_APPROVAL_REQUIRED"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn raw_capability_request_child() {
+    use nono::supervisor::{
+        ApprovalDecision, CapabilityRequest, SupervisorMessage, SupervisorResponse,
+    };
+    use std::os::{
+        fd::{BorrowedFd, RawFd},
+        unix::net::UnixStream,
+    };
+
+    let Some(path) = std::env::var_os("ENFORCED_TEST_REQUEST_PATH") else {
+        return;
+    };
+    let fd = (3..256)
+        .find(|fd: &RawFd| {
+            let mut kind = 0i32;
+            let mut size = std::mem::size_of_val(&kind) as nix::libc::socklen_t;
+            // SAFETY: getsockopt validates each descriptor and receives a sized output.
+            unsafe {
+                nix::libc::getsockopt(
+                    *fd,
+                    nix::libc::SOL_SOCKET,
+                    nix::libc::SO_TYPE,
+                    (&mut kind as *mut i32).cast(),
+                    &mut size,
+                ) == 0
+                    && kind == nix::libc::SOCK_STREAM
+            }
+        })
+        .expect("inherited supervisor socket");
+    // SAFETY: getsockopt identified this live descriptor; clone owns its duplicate.
+    let stream = UnixStream::from(
+        unsafe { BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .expect("duplicate socket"),
+    );
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let mut socket = nono::supervisor::SupervisorSocket::from_stream(stream);
+    socket
+        .send_message(&SupervisorMessage::Request(CapabilityRequest {
+            request_id: "enforced-raw-request".into(),
+            path: path.into(),
+            access: nono::AccessMode::Read,
+            reason: None,
+            child_pid: std::process::id(),
+            session_id: "raw-request".into(),
+        }))
+        .expect("request");
+    let response = socket.recv_response().expect("response");
+    assert!(
+        matches!(response, SupervisorResponse::Decision {
+        decision: ApprovalDecision::Denied { ref reason }, ..
+    } if reason.contains("local approvals are not permitted")),
+        "{response:?}"
+    );
+    println!("PLATFORM_APPROVAL_REQUIRED");
+}
+
+#[test]
+fn enforced_policy_runs_only_with_signed_grants_and_keeps_audit_attribution() {
+    let client = Client::new(Some(static_profile()));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    client
+        .test
+        .run()
+        .no_rollback()
+        .exec(Argv::new("/bin/cat").arg(&client.allowed))
+        .assert_success("enforced policy supplies the grant")
+        .assert_stdout_contains("ASSIGNED_ACCESS")
+        .assert_stderr_contains("Enforced");
+    client
+        .test
+        .run()
+        .no_rollback()
+        .exec(
+            Argv::new("/bin/echo")
+                .arg("--profile")
+                .arg("child-profile")
+                .arg("--allow")
+                .arg("/"),
+        )
+        .assert_success("child arguments do not become nono overrides")
+        .assert_stdout_contains("--profile child-profile --allow /");
+    client
+        .test
+        .run()
+        .no_rollback()
+        .exec(Argv::new("/bin/cat").arg(&client.denied))
+        .assert_failure("ungranted file stays denied")
+        .assert_stdout_lacks("UNGRANTED_ACCESS");
+    let cwd_file = client.test.workspace().join("unassigned-workspace.txt");
+    fs::write(&cwd_file, "LOCAL_WORKSPACE_ACCESS").expect("workspace");
+    client
+        .test
+        .run()
+        .no_rollback()
+        .exec(Argv::new("/bin/cat").arg(&cwd_file))
+        .assert_failure("no local workspace grant or prompt")
+        .assert_stderr_lacks("Share ")
+        .assert_stdout_lacks("LOCAL_WORKSPACE_ACCESS");
+    let records = sessions(&client);
+    assert!(
+        records
+            .iter()
+            .all(|record| record["policy"]["management_mode"] == "enforced"
+                && record["policy"]["policy_source"] == "platform")
+    );
+}
+
+#[test]
+fn enforced_mode_rejects_grants_overrides_audit_reduction_and_environment_inputs() {
+    let client = Client::new(Some(static_profile()));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    for options in [
+        vec!["--allow", "/"],
+        vec!["--read", "/"],
+        vec!["--allow-cwd"],
+        vec!["--profile", "default"],
+        vec!["--config", "/nonexistent/manifest.json"],
+        vec!["--allow-net"],
+        vec!["--allow-domain", "example.com"],
+        vec!["--allow-endpoint", "github:*:/**"],
+        vec!["--credential", "github"],
+        vec!["--bypass-protection", "/"],
+        vec!["--no-audit"],
+        vec!["--no-audit-integrity"],
+        vec!["--trust-override"],
+        vec!["--skip-dir", "secret"],
+        vec!["--capability-elevation"],
+    ] {
+        let output = client
+            .test
+            .command()
+            .arg("run")
+            .args(&options)
+            .args(["--", "/bin/echo", "MUST_NOT_RUN"])
+            .output()
+            .expect("run");
+        assert!(!output.status.success(), "{options:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(options[0])
+                && stderr.contains("enforced")
+                && stderr.contains("Session not started"),
+            "{options:?}: {stderr}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("MUST_NOT_RUN"));
+    }
+    for (name, value) in [
+        ("NONO_PROFILE", "default"),
+        ("NONO_ALLOW", "/"),
+        ("NONO_TRUST_OVERRIDE", "false"),
+        ("NONO_CAPABILITY_ELEVATION", "true"),
+        ("NONO_PLATFORM_URL", "http://127.0.0.1:1"),
+        ("NONO_TENANT", "other"),
+        ("NONO_REGISTRY", "http://127.0.0.1:1"),
+    ] {
+        let output = client
+            .test
+            .command()
+            .env(name, value)
+            .args(["run", "--", "/bin/echo", "MUST_NOT_RUN"])
+            .output()
+            .expect("run");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(name) && stderr.contains("enforced"),
+            "{name}: {stderr}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("MUST_NOT_RUN"));
+    }
+}
+
+#[test]
+fn enforced_shell_wrap_and_management_commands_cannot_bypass_assignment() {
+    let client = Client::new(Some(static_profile()));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    for args in [
+        vec!["shell", "--profile", "default"],
+        vec!["wrap", "--", "/bin/echo", "MUST_NOT_RUN"],
+        vec!["wrap", "--dry-run", "--", "/bin/echo", "MUST_NOT_RUN"],
+        vec!["proxy", "--no-auth"],
+        vec!["setup"],
+        vec!["profile", "init", "bypass"],
+        vec!["trust", "init"],
+        vec!["platform", "unenroll"],
+        vec!["platform", "logout"],
+        vec!["platform", "login", "--no-enroll"],
+        vec!["platform", "tenant", "use", "personal", "--no-enroll"],
+    ] {
+        let output = client.test.command().args(&args).output().expect("command");
+        assert!(!output.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("enforced"), "{args:?}: {stderr}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("MUST_NOT_RUN"));
+        assert!(
+            client
+                .test
+                .home()
+                .join(".config/nono/platform.json")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn enforced_offline_startup_and_cache_deletion_never_allow_local_override() {
+    let mut client = Client::new(Some(static_profile()));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    let output = client
+        .test
+        .command()
+        .args(["platform", "status", "--refresh"])
+        .output()
+        .expect("refresh");
+    assert!(output.status.success());
+    client.platform.refresh_status.store(404, Ordering::SeqCst);
+    client
+        .test
+        .run()
+        .profile_name("default")
+        .exec(Argv::new("/bin/echo").arg("MUST_NOT_RUN"))
+        .assert_failure("HTTP failure never allows local overrides")
+        .assert_stdout_lacks("MUST_NOT_RUN");
+    client.platform.stop();
+    fs::remove_dir_all(client.cache.parent().expect("cache root")).expect("delete cache");
+    for command in [client.test.run(), client.test.run().profile_name("default")] {
+        command
+            .exec(Argv::new("/bin/echo").arg("MUST_NOT_RUN"))
+            .assert_failure("remembered enforced mode survives cache deletion")
+            .assert_stderr_contains("Session not started")
+            .assert_stdout_lacks("MUST_NOT_RUN");
+    }
+    let output = client
+        .test
+        .command()
+        .args(["platform", "unenroll"])
+        .output()
+        .expect("unenroll");
+    assert!(!output.status.success());
+    assert!(
+        client
+            .test
+            .home()
+            .join(".config/nono/platform.json")
+            .exists()
+    );
+}
+
+#[test]
+fn signed_platform_downgrade_restores_advisory_overrides() {
+    let client = Client::new(Some(static_profile()));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    client
+        .test
+        .run()
+        .no_rollback()
+        .exec(Argv::new("/bin/echo").arg("ENFORCED"))
+        .assert_success("verified enforced mode");
+    client.platform.mode.store(1, Ordering::SeqCst);
+    client
+        .test
+        .run()
+        .profile_name("default")
+        .no_rollback()
+        .exec(Argv::new("/bin/echo").arg("ADVISORY"))
+        .assert_success("fresh signed advisory mode allows an override")
+        .assert_stderr_contains("Advisory");
+}
+
+#[test]
+fn enforced_elevation_never_uses_local_or_alternate_approval_backends() {
+    for backend in [
+        None,
+        Some(json!({"type":"terminal"})),
+        Some(json!({"type":"webhook", "url":"https://alternate.example/approvals"})),
+        Some(
+            json!({"type":"webhook", "auth":"platform", "url":"https://alternate.example/api/v1/approvals"}),
+        ),
+    ] {
+        let mut profile = static_profile();
+        profile["security"] = json!({"capability_elevation":true});
+        if let Some(backend) = backend {
+            profile["security"]["approval_backends"] = json!({"reviewer":backend});
+            profile["security"]["approval_defaults"] = json!({"backend":"reviewer"});
+        }
+        let client = Client::new(Some(profile));
+        client.platform.mode.store(2, Ordering::SeqCst);
+        client
+            .test
+            .run()
+            .exec(Argv::new("/bin/echo").arg("MUST_NOT_RUN"))
+            .assert_failure("elevation must use the enrolled platform")
+            .assert_stderr_contains("approval backend")
+            .assert_stdout_lacks("MUST_NOT_RUN");
+    }
+}
+
+#[test]
+fn enforced_detached_launch_checks_policy_before_local_preflight() {
+    let client = Client::new(Some(static_profile()));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    let output = client
+        .test
+        .command()
+        .args([
+            "run",
+            "--detached",
+            "--profile",
+            "nonexistent-profile",
+            "--",
+            "/bin/sleep",
+            "5",
+        ])
+        .output()
+        .expect("detached override");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("enforced") && stderr.contains("--profile"),
+        "{stderr}"
+    );
+    let output = client
+        .test
+        .command()
+        .args([
+            "run",
+            "--detached",
+            "--name",
+            "enforced-detached",
+            "--no-rollback",
+            "--",
+            "/bin/sleep",
+            "5",
+        ])
+        .output()
+        .expect("detached launch");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Share "));
+    let record = sessions(&client)
+        .into_iter()
+        .find(|record| record["name"] == "enforced-detached")
+        .expect("enforced session");
+    assert_eq!(record["policy"]["management_mode"], "enforced");
+    assert_eq!(record["policy"]["policy_source"], "platform");
+    client
+        .test
+        .command()
+        .arg("stop")
+        .arg(record["session_id"].as_str().expect("session id"))
+        .output()
+        .expect("stop");
 }
 
 fn cached_bundle_directory(client: &Client) -> PathBuf {
@@ -599,16 +1095,24 @@ fn first_assignment_must_be_verified_before_default_startup() {
                 .store(status, Ordering::SeqCst);
         }
         for command in ["run", "wrap"] {
-            let output = client
-                .test
-                .command()
-                .args([command, "--", "/bin/echo", "MUST_NOT_RUN"])
-                .output()
-                .expect("launch");
-            assert!(!output.status.success(), "{command}: HTTP {status}");
-            assert!(!String::from_utf8_lossy(&output.stdout).contains("MUST_NOT_RUN"));
-            assert!(String::from_utf8_lossy(&output.stderr).contains("platform policy"));
-            assert!(String::from_utf8_lossy(&output.stderr).contains("Session not started."));
+            for explicit in [false, true] {
+                let mut cmd = client.test.command();
+                cmd.arg(command);
+                if explicit {
+                    cmd.args(["--profile", "default"]);
+                }
+                let output = cmd
+                    .args(["--", "/bin/echo", "MUST_NOT_RUN"])
+                    .output()
+                    .expect("launch");
+                assert!(
+                    !output.status.success(),
+                    "{command}: HTTP {status}, explicit: {explicit}"
+                );
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("MUST_NOT_RUN"));
+                assert!(String::from_utf8_lossy(&output.stderr).contains("platform policy"));
+                assert!(String::from_utf8_lossy(&output.stderr).contains("Session not started."));
+            }
         }
     }
 }
@@ -843,15 +1347,7 @@ fn file_bundle_delivery_runs_from_a_verified_readable_cache() {
     let cache: serde_json::Value =
         serde_json::from_slice(&fs::read(&client.cache).expect("cache")).expect("JSON");
     assert_eq!(cache["response"]["bundle"]["files"], json!({}));
-    let directory = walkdir::WalkDir::new(client.cache.with_extension(""))
-        .into_iter()
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_name() == "bundle.sig")
-        .expect("cached bundle.sig")
-        .path()
-        .parent()
-        .expect("bundle root")
-        .to_path_buf();
+    let directory = cached_bundle_directory(&client);
     assert!(directory.join("policy.json").is_file());
     fs::write(directory.join("policy.json"), "{}").expect("tamper");
     client
@@ -888,15 +1384,7 @@ fn bundle_verification_logs_context_without_policy_contents_or_signatures() {
     assert!(run().status.success());
     let cache: serde_json::Value =
         serde_json::from_slice(&fs::read(&client.cache).expect("cache")).expect("JSON");
-    let directory = walkdir::WalkDir::new(client.cache.with_extension(""))
-        .into_iter()
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_name() == "bundle.sig")
-        .expect("bundle.sig")
-        .path()
-        .parent()
-        .expect("bundle directory")
-        .to_owned();
+    let directory = cached_bundle_directory(&client);
     fs::write(directory.join("policy.json"), "{}").expect("tamper");
     let rejected = run();
     assert!(!rejected.status.success());
@@ -943,15 +1431,7 @@ fn complete_pack_is_cached_without_wiring_and_every_asset_is_verified() {
         .exec(Argv::new("/bin/cat").arg(&client.allowed))
         .assert_success("complete pack delivery")
         .assert_stdout_contains("ASSIGNED_ACCESS");
-    let directory = walkdir::WalkDir::new(client.cache.with_extension(""))
-        .into_iter()
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_name() == "policy.json")
-        .expect("policy")
-        .path()
-        .parent()
-        .expect("bundle root")
-        .to_owned();
+    let directory = cached_bundle_directory(&client);
     let skill = directory.join("packs/acme/assets/skills/SKILL.md");
     assert_eq!(
         fs::read_to_string(&skill).expect("delivered skill"),

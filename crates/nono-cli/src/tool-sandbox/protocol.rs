@@ -7,6 +7,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 pub(crate) const TOOL_SANDBOX_LAUNCH_SPEC_ENV: &str = "NONO_TOOL_SANDBOX_LAUNCH_SPEC";
+pub(crate) const TOOL_SANDBOX_LAUNCH_FD_ENV: &str = "NONO_TOOL_SANDBOX_LAUNCH_FD";
 
 /// Read/write timeout the runtime applies to an accepted URL-open connection so
 /// a slow or idle client cannot stall the handler (and, on Linux, the
@@ -33,7 +34,7 @@ pub(crate) struct ToolSandboxOpenUrlResponse {
     pub(crate) error: Option<String>,
 }
 
-const MAX_FRAME: usize = 1024 * 1024;
+pub(super) const MAX_FRAME: usize = 1024 * 1024;
 const MAX_ARGC: usize = 4096;
 const MAX_ARG: usize = 128 * 1024;
 const MAX_ENV: usize = 4096;

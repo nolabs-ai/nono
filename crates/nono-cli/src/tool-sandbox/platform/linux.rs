@@ -16,16 +16,14 @@ use crate::tool_sandbox::env::{
     effective_argv_for_binary, env_shebang_target_interpreter, inject_url_open_env,
     split_env_entry,
 };
-use crate::tool_sandbox::launch::{
-    exit_status_code, prepare_launcher_command, remove_launch_spec, write_launch_spec,
-};
+use crate::tool_sandbox::launch::exit_status_code;
 use crate::tool_sandbox::protocol::{
     ChildCapsSpec, FsGrantSpec, StdioFds, StdioLimitActionSpec, StdioLimitSpec,
-    StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT,
-    ToolSandboxChildLaunchSpec, ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse,
-    ToolSandboxShimRequest, ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame,
-    recv_frame_ack, recv_stdio_fds, send_frame_ack, send_stdio_fds, validate_ipc_request,
-    write_frame, write_response,
+    StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_FD_ENV, TOOL_SANDBOX_LAUNCH_SPEC_ENV,
+    TOOL_SANDBOX_URL_IO_TIMEOUT, ToolSandboxChildLaunchSpec, ToolSandboxOpenUrlRequest,
+    ToolSandboxOpenUrlResponse, ToolSandboxShimRequest, ToolSandboxShimResponse,
+    UnixSocketGrantSpec, read_frame, recv_frame_ack, recv_stdio_fds, send_frame_ack,
+    send_stdio_fds, validate_ipc_request, write_frame, write_response,
 };
 use landlock::{
     AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -718,8 +716,17 @@ impl Drop for RuntimeDirCleanup {
 }
 
 pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
-    if std::env::var_os(TOOL_SANDBOX_LAUNCH_SPEC_ENV).is_some() {
-        exit_from_result(run_child_launcher());
+    if std::env::var_os(TOOL_SANDBOX_LAUNCH_SPEC_ENV).is_some()
+        || std::env::var_os(TOOL_SANDBOX_LAUNCH_FD_ENV).is_some()
+    {
+        let reason = if std::env::var_os(TOOL_SANDBOX_LAUNCH_SPEC_ENV).is_some() {
+            "file-based launch specifications are not accepted"
+        } else {
+            "external launch descriptors are not accepted on Linux"
+        };
+        exit_from_result(Err(NonoError::SandboxInit(format!(
+            "command-mediation launch rejected: {reason}; launch permissions must come from the session supervisor"
+        ))));
         return true;
     }
 
@@ -864,183 +871,83 @@ fn run_shim(shim_exe: &Path, socket_path: &Path) -> Result<()> {
     std::process::exit(response.exit_code);
 }
 
-fn run_child_launcher() -> Result<()> {
-    // The launcher re-exec returns from main() before init_tracing() runs, so
-    // install a stderr subscriber here (honoring the forwarded RUST_LOG) — this
-    // surfaces the library's generated-ruleset debug log for the brokered child.
-    // No-op unless RUST_LOG is set.
-    crate::cli_bootstrap::init_internal_entrypoint_tracing();
-    let start_launcher = std::time::Instant::now();
-    let spec_path = std::env::var_os(TOOL_SANDBOX_LAUNCH_SPEC_ENV)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            NonoError::SandboxInit("command-mediation launch spec env missing".to_string())
-        })?;
-    let start_parse = std::time::Instant::now();
-    let bytes = fs::read(&spec_path).map_err(|err| NonoError::ConfigRead {
-        path: spec_path.clone(),
-        source: err,
-    })?;
-    let spec: ToolSandboxChildLaunchSpec = serde_json::from_slice(&bytes).map_err(|err| {
-        NonoError::ConfigParse(format!(
-            "failed to parse command-mediation launch spec: {err}"
-        ))
-    })?;
-    tool_sandbox_profile_log!(
-        "launcher:read_and_parse_spec: {:?} ({} bytes)",
-        start_parse.elapsed(),
-        bytes.len()
-    );
-    match spec.stdio_mode.as_str() {
-        "pty" => unsafe {
-            crate::pty_proxy::setup_child_pty(libc::STDIN_FILENO);
-        },
-        "direct_fds" => {
-            let result = unsafe { libc::setpgid(0, 0) };
-            if result != 0 {
-                return Err(NonoError::SandboxInit(format!(
-                    "command-mediation direct_fds setpgid failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-        }
-        other => {
-            return Err(NonoError::ConfigParse(format!(
-                "invalid command-mediation stdio mode '{other}'"
-            )));
-        }
-    }
-    let real_binary = OsString::from_vec(spec.real_binary.clone());
-    let cwd = OsString::from_vec(spec.cwd.clone());
-    std::env::set_current_dir(&cwd).map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "command sandbox chdir failed before sandboxing: {err}"
-        ))
-    })?;
-
-    // R3: Open the binary with O_RDONLY|O_NOFOLLOW, verify identity by
-    // fstat'ing and hashing the SAME fd we will exec, then execveat via
-    // that fd. The supervisor's earlier verify_binary_identity is only a
-    // pre-flight; THIS check is the integrity boundary because the fd we
-    // open here is the inode the kernel will execute (via AT_EMPTY_PATH).
-    let start_verify = std::time::Instant::now();
-    let binary_fd = open_and_verify_binary(&real_binary, &spec)?;
-    tool_sandbox_profile_log!("launcher:verify_binary_fd: {:?}", start_verify.elapsed());
-
-    let start_caps_from = std::time::Instant::now();
+fn prepare_launcher_command(spec: &ToolSandboxChildLaunchSpec) -> Result<Command> {
+    let binary = OsStr::from_bytes(&spec.real_binary);
+    let binary_fd = open_and_verify_binary(binary, spec)?;
     let caps = caps_from_spec(&spec.caps)?;
-    tool_sandbox_profile_log!("launcher:caps_from_spec: {:?}", start_caps_from.elapsed());
-    let start_sandbox_apply = std::time::Instant::now();
-    Sandbox::apply_seccomp(&caps, nono::SeccompOpts::network_baseline())?;
-    tool_sandbox_profile_log!(
-        "launcher:sandbox_apply: {:?}",
-        start_sandbox_apply.elapsed()
-    );
-
-    // Stack a second Landlock layer restricting execute access.
-    // AccessMode::Read maps to AccessFs::Execute in the Linux sandbox, so
-    // any fs_read dir grant (e.g. fs_read:["."] in the git profile) would
-    // otherwise let the child exec arbitrary workspace binaries. This layer
-    // confines exec to the specific binary, interpreter (if any), and command-sandbox
-    // shims listed in allowed_exec_paths by the supervisor.
+    let abi = Sandbox::detect_abi()?;
+    let sandbox =
+        Sandbox::prepare_seccomp_with_abi(&caps, &abi, nono::SeccompOpts::network_baseline())?;
     let exec_paths: Vec<PathBuf> = spec
         .allowed_exec_paths
         .iter()
         .map(|bytes| PathBuf::from(OsString::from_vec(bytes.clone())))
         .collect();
-    let start_exec_restrict = std::time::Instant::now();
-    Sandbox::restrict_execute(&exec_paths)?;
-    tool_sandbox_profile_log!(
-        "launcher:restrict_execute: {:?}",
-        start_exec_restrict.elapsed()
-    );
-    tool_sandbox_profile_log!("launcher:total_to_exec: {:?}", start_launcher.elapsed());
-
-    // Build argv / envp as CString arrays. NUL-byte rejection is enforced
-    // earlier (validate_ipc_request, env builder) but we re-check defensively.
-    let mut argv_c: Vec<CString> = Vec::with_capacity(spec.argv.len());
-    for arg in &spec.argv {
-        argv_c.push(CString::new(arg.as_slice()).map_err(|_| {
-            NonoError::SandboxInit("command-mediation argv contains NUL".to_string())
-        })?);
-    }
-    let argv_ptrs: Vec<*const libc::c_char> = argv_c
-        .iter()
-        .map(|s| s.as_ptr())
-        .chain(std::iter::once(std::ptr::null()))
-        .collect();
-
-    let mut envp_c: Vec<CString> = Vec::with_capacity(spec.env.len());
+    let exec_gate = Option::<OwnedFd>::from(prepare_outer_exec_gate(&exec_paths, &[], abi)?)
+        .ok_or_else(|| {
+            NonoError::SandboxInit("command-mediation execution gate was not created".into())
+        })?;
+    let argv0 = spec
+        .argv
+        .first()
+        .ok_or_else(|| NonoError::SandboxInit("command-mediation argv is empty".into()))?;
+    let mut command = Command::new(format!("/proc/self/fd/{}", binary_fd.as_raw_fd()));
+    command
+        .arg0(OsStr::from_bytes(argv0))
+        .args(spec.argv.iter().skip(1).map(|arg| OsStr::from_bytes(arg)))
+        .current_dir(OsStr::from_bytes(&spec.cwd))
+        .env_clear();
     for entry in &spec.env {
-        envp_c.push(CString::new(entry.as_slice()).map_err(|_| {
-            NonoError::SandboxInit("command-mediation env entry contains NUL".to_string())
-        })?);
+        let (name, value) = split_env_entry(entry).ok_or_else(|| {
+            NonoError::SandboxInit("invalid command-mediation environment entry".into())
+        })?;
+        command.env(OsStr::from_bytes(name), OsStr::from_bytes(value));
     }
-    let envp_ptrs: Vec<*const libc::c_char> = envp_c
-        .iter()
-        .map(|s| s.as_ptr())
-        .chain(std::iter::once(std::ptr::null()))
-        .collect();
-
-    let empty_path = CString::new("").map_err(|_| {
-        NonoError::SandboxInit("command-mediation: failed to build empty path CString".to_string())
-    })?;
-
-    // For shebang scripts, execveat(AT_EMPTY_PATH) passes the fd to the
-    // interpreter via /proc/self/fd/<N>. FD_CLOEXEC would close the fd at
-    // the execveat boundary, making that path inaccessible to the
-    // interpreter (ENOENT). Clear the flag now; the fd is fully verified
-    // and is about to be exec'd — the leak window is the exec itself.
-    if spec.executable_kind == "ShebangScript" {
-        unsafe {
-            libc::fcntl(binary_fd.as_raw_fd(), libc::F_SETFD, 0);
+    let pty = match spec.stdio_mode.as_str() {
+        "pty" => true,
+        "direct_fds" => false,
+        other => {
+            return Err(NonoError::ConfigParse(format!(
+                "invalid command-mediation stdio mode '{other}'"
+            )));
         }
-    }
-
-    // execveat(fd, "", argv, envp, AT_EMPTY_PATH) — the kernel uses the
-    // open fd as the binary, so a path-based swap between verification and
-    // exec cannot redirect us to a different inode.
-    //
-    // The libc binding on Linux GNU declares argv/envp as *const *mut c_char
-    // (POSIX convention: outer pointer is const, inner is mutable) while
-    // CString::as_ptr() yields *const c_char. The kernel does not mutate
-    // the strings; cast at the call site to satisfy the type checker.
-    //
-    // Use syscall() directly rather than libc::execveat() to avoid a link
-    // dependency on the glibc execveat wrapper, which was only added in
-    // glibc 2.34. The syscall number (SYS_execveat) is a compile-time
-    // constant and syscall() itself is available in all glibc versions.
+    };
+    let script = spec.executable_kind == "ShebangScript";
+    // SAFETY: all policy resolution, hashing and ruleset preparation happens in
+    // the supervisor. The child only applies prepared rules and descriptor/process
+    // operations before Command execs the verified inode through its open fd.
     unsafe {
-        libc::syscall(
-            libc::SYS_execveat,
-            binary_fd.as_raw_fd() as libc::c_long,
-            empty_path.as_ptr(),
-            argv_ptrs.as_ptr().cast::<*mut libc::c_char>(),
-            envp_ptrs.as_ptr().cast::<*mut libc::c_char>(),
-            libc::AT_EMPTY_PATH,
-        );
+        command.pre_exec(move || {
+            if pty {
+                crate::pty_proxy::setup_child_pty(libc::STDIN_FILENO);
+            } else if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            sandbox
+                .apply_raw()
+                .map_err(|error| std::io::Error::from_raw_os_error(error.errno()))?;
+            if libc::syscall(
+                libc::SYS_landlock_restrict_self,
+                exec_gate.as_raw_fd(),
+                0_u32,
+            ) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if script && libc::fcntl(binary_fd.as_raw_fd(), libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
-    let err = std::io::Error::last_os_error();
-    if spec.executable_kind == "ShebangScript" {
-        let interpreter = spec
-            .interpreter
-            .map(OsString::from_vec)
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "<unknown>".to_string());
-        return Err(NonoError::SandboxInit(format!(
-            "command sandbox execveat failed for script {} using interpreter {}: {err}. The selected command sandbox policy must grant the script, interpreter, interpreter ELF dependencies, and any required language runtime/package directories.",
-            PathBuf::from(real_binary).display(),
-            interpreter
-        )));
-    }
-    Err(NonoError::CommandExecution(err))
+    Ok(command)
 }
 
 /// Open the binary with `O_RDONLY|O_NOFOLLOW`, verify dev/ino/size/mtime
 /// against the supervisor's plan-build snapshot, then read content from the
 /// same fd to verify the SHA-256 captured at plan-build. The returned fd is
-/// what `execveat(AT_EMPTY_PATH)` runs — verified-object equals
-/// executed-object, no path-based TOCTOU window.
+/// what the child executes through `/proc/self/fd`, so replacing the binary's
+/// original path cannot change the executed inode.
 fn open_and_verify_binary(path: &OsStr, spec: &ToolSandboxChildLaunchSpec) -> Result<OwnedFd> {
     use std::io::Read;
 
@@ -1091,9 +998,7 @@ fn open_and_verify_binary(path: &OsStr, spec: &ToolSandboxChildLaunchSpec) -> Re
         )));
     }
 
-    // Hash content via a duplicate fd so the original fd's offset stays at 0
-    // for execveat. (execveat doesn't actually depend on offset, but keeping
-    // the original untouched avoids relying on undocumented kernel behavior.)
+    // Hash through a duplicate so execution keeps its own descriptor alive.
     let dup_fd = fd.try_clone().map_err(|err| {
         NonoError::SandboxInit(format!("command-mediation fd dup for hash: {err}"))
     })?;
@@ -4612,20 +4517,12 @@ fn launch_child(
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
     let start_total = std::time::Instant::now();
-    let start_write = std::time::Instant::now();
-    let spec_path = write_launch_spec(&state.runtime_dir, &spec)?;
-    tool_sandbox_profile_log!("launch_child:write_spec: {:?}", start_write.elapsed());
     let start_spawn_wait = std::time::Instant::now();
     let result = match spec.stdio_mode.as_str() {
-        "pty" => launch_child_with_pty(state, command_name, launch_caller, &spec_path, stdio),
-        "direct_fds" => launch_child_with_direct_fds(
-            state,
-            command_name,
-            launch_caller,
-            &spec_path,
-            &spec,
-            stdio,
-        ),
+        "pty" => launch_child_with_pty(state, command_name, launch_caller, &spec, stdio),
+        "direct_fds" => {
+            launch_child_with_direct_fds(state, command_name, launch_caller, &spec, stdio)
+        }
         other => Err(NonoError::ConfigParse(format!(
             "invalid command-mediation stdio mode '{other}'"
         ))),
@@ -4634,7 +4531,6 @@ fn launch_child(
         "launch_child:spawn_and_wait: {:?}",
         start_spawn_wait.elapsed()
     );
-    remove_launch_spec(&spec_path);
     tool_sandbox_profile_log!("launch_child:total: {:?}", start_total.elapsed());
     result
 }
@@ -4643,21 +4539,13 @@ fn launch_child_with_direct_fds(
     state: &ToolSandboxState,
     command_name: &str,
     launch_caller: &Caller,
-    spec_path: &Path,
     spec: &ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
     if spec.stdio_limits.is_some() {
-        return launch_child_with_brokered_stdio(
-            state,
-            command_name,
-            launch_caller,
-            spec_path,
-            spec,
-            stdio,
-        );
+        return launch_child_with_brokered_stdio(state, command_name, launch_caller, spec, stdio);
     }
-    let mut command = prepare_launcher_command(spec_path)?;
+    let mut command = prepare_launcher_command(spec)?;
     command
         .stdin(Stdio::from(File::from(stdio.stdin)))
         .stdout(Stdio::from(File::from(stdio.stdout)))
@@ -4678,7 +4566,6 @@ fn launch_child_with_brokered_stdio(
     state: &ToolSandboxState,
     command_name: &str,
     launch_caller: &Caller,
-    spec_path: &Path,
     spec: &ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
@@ -4693,7 +4580,7 @@ fn launch_child_with_brokered_stdio(
         stderr,
     } = stdio;
 
-    let mut command = prepare_launcher_command(spec_path)?;
+    let mut command = prepare_launcher_command(spec)?;
     command
         .stdin(Stdio::from(File::from(stdin)))
         .stdout(Stdio::from(File::from(stdout_write)))
@@ -4954,8 +4841,7 @@ fn launch_child_with_capture(
     let pipe_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
     let pipe_write = unsafe { File::from_raw_fd(pipe_fds[1]) };
 
-    let spec_path = write_launch_spec(&state.runtime_dir, &spec)?;
-    let mut command = prepare_launcher_command(&spec_path)?;
+    let mut command = prepare_launcher_command(&spec)?;
     command
         .stdin(Stdio::from(File::from(stdio.stdin)))
         .stdout(Stdio::from(pipe_write))
@@ -4971,10 +4857,7 @@ fn launch_child_with_capture(
     // the parent, so reading from pipe_read will yield EOF when the child
     // closes its stdout (on exit or explicit close).
 
-    if let Err(err) = track_spawned_child(state, command_name, launch_caller, &mut child) {
-        remove_launch_spec(&spec_path);
-        return Err(err);
-    }
+    track_spawned_child(state, command_name, launch_caller, &mut child)?;
 
     let mut captured = Vec::new();
     let mut pipe_reader =
@@ -4985,7 +4868,6 @@ fn launch_child_with_capture(
 
     let status = child.wait().map_err(NonoError::CommandExecution);
     untrack_child(state, child.id())?;
-    remove_launch_spec(&spec_path);
 
     read_result.map_err(|e| {
         NonoError::SandboxInit(format!("command-mediation Capture: pipe read failed: {e}"))
@@ -5003,7 +4885,7 @@ fn launch_child_with_pty(
     state: &ToolSandboxState,
     command_name: &str,
     launch_caller: &Caller,
-    spec_path: &Path,
+    spec: &ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
     let pty = crate::pty_proxy::open_pty()?;
@@ -5016,7 +4898,7 @@ fn launch_child_with_pty(
     let stderr_slave = nix::unistd::dup(&pty.slave).map_err(|err| {
         NonoError::SandboxInit(format!("command-mediation PTY dup stderr failed: {err}"))
     })?;
-    let mut command = prepare_launcher_command(spec_path)?;
+    let mut command = prepare_launcher_command(spec)?;
     command
         .stdin(Stdio::from(File::from(stdin_slave)))
         .stdout(Stdio::from(File::from(stdout_slave)))
@@ -7582,7 +7464,7 @@ mod tests {
     }
 
     #[test]
-    fn child_chaining_caps_do_not_grant_runtime_launch_specs() -> Result<()> {
+    fn child_chaining_caps_do_not_grant_private_runtime_state() -> Result<()> {
         let runtime_dir = create_runtime_dir()?;
         let _cleanup = RuntimeDirCleanup::new(runtime_dir.clone());
         let socket_path = runtime_dir.join("supervisor.sock");
@@ -7590,10 +7472,10 @@ mod tests {
         let shim_dir = create_shim_dir(&runtime_dir)?;
         let shim_source = materialize_shim_source(&shim_dir)?;
         let shim = materialize_shim(&shim_source, &shim_dir, "git")?;
-        let launch_spec = runtime_dir.join("launch-test.json");
-        fs::write(&launch_spec, br#"{"secret":"must-not-be-readable"}"#).map_err(|source| {
+        let private_state = runtime_dir.join("private-state.json");
+        fs::write(&private_state, br#"{"secret":"must-not-be-readable"}"#).map_err(|source| {
             NonoError::ConfigWrite {
-                path: launch_spec.clone(),
+                path: private_state.clone(),
                 source,
             }
         })?;
@@ -7618,9 +7500,9 @@ mod tests {
             !spec.fs.iter().any(|grant| {
                 !grant.is_file
                     && matches!(grant.access.as_str(), "read" | "read+write")
-                    && launch_spec.starts_with(Path::new(OsStr::from_bytes(&grant.path)))
+                    && private_state.starts_with(Path::new(OsStr::from_bytes(&grant.path)))
             }),
-            "child must not receive a recursive read grant covering launch specs"
+            "child must not receive a recursive read grant covering private runtime state"
         );
         Ok(())
     }

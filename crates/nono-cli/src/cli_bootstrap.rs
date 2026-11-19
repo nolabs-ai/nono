@@ -26,6 +26,7 @@ pub(crate) fn init_theme(cli: &Cli) {
 /// `RUST_LOG=debug`. It is a no-op when `RUST_LOG` is unset or empty, so normal
 /// runs stay silent. Errors from a double-init are swallowed: the launcher only
 /// ever calls this once, but `try_init` keeps it defensive.
+#[cfg(target_os = "macos")]
 pub(crate) fn init_internal_entrypoint_tracing() {
     let Some(filter) = std::env::var_os("RUST_LOG") else {
         return;

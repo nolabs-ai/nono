@@ -96,6 +96,7 @@ regex = "1"
 urlencoding = "2"
 tempfile.workspace = true
 vt100 = "0.18.1"
+vte = "0.15"
 shlex = "2"
 jsonc-parser = { version = "0.34", features = ["serde"] }
 zstd = "0.14"

@@ -335,7 +335,7 @@ fn backend_decision_line(backend: &str, decision: &Result<ApprovalDecision>) -> 
 
 /// One-line, terminal-safe description of what `request` asks for. Omits
 /// free-text reasons and endpoint paths (which may carry query strings).
-fn request_summary(request: &ApprovalRequest) -> String {
+pub(crate) fn request_summary(request: &ApprovalRequest) -> String {
     match request {
         ApprovalRequest::Capability { path, access, .. } => format!(
             "{} access to {}",

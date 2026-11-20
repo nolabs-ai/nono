@@ -3553,6 +3553,7 @@ pub(crate) fn is_registry_ref(s: &str) -> bool {
         && !s.starts_with('~')
         && !s.starts_with('/')
         && !s.ends_with(".json")
+        && !s.ends_with(".jsonc")
         && parts.iter().all(|p| !p.is_empty())
 }
 
@@ -4038,12 +4039,15 @@ fn load_base_profile_raw(
         )));
     }
 
-    // 0. Sibling in the same directory as the child profile.
-    //    Skip if the sibling path is the source file itself to avoid
+    // 0. Sibling in the same directory as the child profile, `.jsonc` first
+    //    like user profiles. Skip the source file itself to avoid
     //    self-references (e.g. `.nono/codex.json` extending "codex").
     if let Some(dir) = context_dir {
-        let sibling_path = dir.join(format!("{name}.json"));
-        if sibling_path.is_file() {
+        for ext in ["jsonc", "json"] {
+            let sibling_path = dir.join(format!("{name}.{ext}"));
+            if !sibling_path.is_file() {
+                continue;
+            }
             let (profile, source_path) = parse_file_backed_profile(&sibling_path)?;
             let is_self = source_file.is_some_and(|src| source_path == src);
             if !is_self {
@@ -9584,6 +9588,71 @@ mod tests {
             "should inherit default groups"
         );
         assert!(profile.filesystem.allow.contains(&"/tmp/extra".to_string()));
+    }
+
+    #[test]
+    fn test_extends_resolves_jsonc_sibling() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("shared.jsonc"),
+            r#"{
+                // comment
+                "meta": { "name": "shared" },
+                "filesystem": { "allow": ["/tmp/shared"] },
+            }"#,
+        )
+        .expect("write");
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{ "extends": "shared", "meta": { "name": "child" } }"#,
+        )
+        .expect("write");
+
+        let profile = match load_from_file(&child_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("resolve: {err}"),
+        };
+        assert!(
+            profile
+                .filesystem
+                .allow
+                .contains(&"/tmp/shared".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extends_jsonc_self_still_resolves_json_sibling() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{ "meta": { "name": "base" }, "filesystem": { "allow": ["/tmp/base"] } }"#,
+        )
+        .expect("write");
+        let self_path = dir.path().join("base.jsonc");
+        std::fs::write(
+            &self_path,
+            r#"{ "extends": "base", "meta": { "name": "my-base" } }"#,
+        )
+        .expect("write");
+
+        let profile = match load_from_file(&self_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("resolve: {err}"),
+        };
+        assert!(profile.filesystem.allow.contains(&"/tmp/base".to_string()));
+    }
+
+    #[test]
+    fn test_profile_file_paths_are_not_registry_refs() {
+        for path in ["profiles/foo.json", "profiles/foo.jsonc"] {
+            assert!(!is_registry_ref(path), "{path} is not a registry ref");
+            assert!(is_file_path_ref(path), "{path} is a file path");
+        }
+        for pkg in ["acme/claude", "acme/claude@1.0.0"] {
+            assert!(is_registry_ref(pkg), "{pkg} is a registry ref");
+            assert!(!is_file_path_ref(pkg), "{pkg} is not a file path");
+        }
     }
 
     #[test]

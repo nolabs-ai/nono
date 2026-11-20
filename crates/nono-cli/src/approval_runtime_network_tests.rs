@@ -560,6 +560,32 @@ async fn webhook_retry_and_signed_polls_retain_the_attempt_id() {
 }
 
 #[tokio::test]
+async fn caller_deadline_ends_remote_wait_before_the_backend_timeout() {
+    let mut webhook = WebhookServer::start().await;
+    let backend = webhook.backend();
+    let request = ApprovalRequest::Capability {
+        request_id: "caller-deadline".into(),
+        path: "/test/file".into(),
+        access: nono::AccessMode::Read,
+        reason: None,
+        child_pid: 42,
+        session_id: "test-session".into(),
+    };
+    let query = tokio::task::spawn_blocking(move || {
+        backend
+            .request_approval_with_deadline(&request, Instant::now() + Duration::from_millis(100))
+    });
+    let held = webhook.next().await;
+    let result = tokio::time::timeout(Duration::from_secs(2), query).await;
+    // Close the held connection even on regression, so the worker cannot leak.
+    drop(held);
+    let result = result
+        .expect("caller deadline must end the transport and its pending notice")
+        .unwrap();
+    assert!(result.is_err() || matches!(result, Ok(ApprovalDecision::Timeout)));
+}
+
+#[tokio::test]
 async fn unsigned_webhook_is_given_only_the_remaining_budget() {
     let mut webhook = WebhookServer::start().await;
     let backend = webhook.backend();

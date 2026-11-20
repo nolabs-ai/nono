@@ -2728,6 +2728,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "vt100",
+ "vte",
  "walkdir",
  "which",
  "x509-parser",

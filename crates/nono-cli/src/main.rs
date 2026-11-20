@@ -4,6 +4,7 @@
 
 mod app_runtime;
 mod approval_runtime;
+mod approval_status;
 mod audit_attestation;
 mod audit_client;
 mod audit_commands;
@@ -92,6 +93,7 @@ mod temp_keepalive;
 mod tenant_selector;
 mod terminal_approval;
 mod terminal_capture;
+mod terminal_modes;
 mod terminal_prompt;
 mod terminal_selector;
 mod theme;

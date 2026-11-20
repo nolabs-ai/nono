@@ -120,6 +120,18 @@ by nono, including upstream-bypass destinations. CONNECTs forwarded to an
 enterprise upstream proxy do not consult these backends: unlisted destinations
 remain denied, so forwarded destinations need static allowlist grants.
 
+### Remote approval display
+
+With a PTY session, a remote approval pending for at least 300 ms opens a
+supervisor-owned approval view using the usual platform summary format. Agent
+output continues updating the captured screen while the view is visible.
+Approval, denial, timeout or backend failure restores the current agent screen.
+Esc returns to the agent without cancelling or deciding the request. Concurrent
+requests remain tracked independently; a new request can reopen the view.
+Reattaching shows outstanding requests. Without a PTY, nono prints the existing
+request and completion notices. Presentation never changes approval decisions
+or enables a local fallback for platform requests.
+
 ### Terminal approval deadline
 
 Terminal approval has a total deadline set by the terminal backend's

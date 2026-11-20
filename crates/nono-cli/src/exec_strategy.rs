@@ -3597,21 +3597,64 @@ struct SupervisorDenials {
     seen_request_ids: HashSet<String>,
 }
 
-/// Run a supervisor-thread approval request with the PTY relay paused.
-///
-/// See [`crate::pty_proxy::PtyProxy::run_with_terminal_paused`]. Requests
-/// raised on other threads pause the relay through
-/// [`service_off_thread_prompts`] instead.
-fn request_approval_with_relay_paused(
+/// Keep the terminal relay alive while a blocking backend decides. Interactive
+/// backends still acquire the prompt gate; remote backends publish status.
+fn request_approval_with_relay(
     config: &SupervisorConfig<'_>,
     request: &nono::supervisor::ApprovalRequest,
+    child: Pid,
     pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<ApprovalDecision> {
-    let request_approval = || config.approval_backend.request_approval(request);
-    match pty {
-        Some(proxy) => proxy.run_with_terminal_paused(request_approval),
-        None => request_approval(),
-    }
+    let Some(pty) = pty else {
+        return config.approval_backend.request_approval(request);
+    };
+    let backend = config.approval_backend;
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("approval".into())
+            .spawn_scoped(scope, || backend.request_approval(request))
+            .map_err(|err| {
+                NonoError::SandboxInit(format!("cannot start approval worker: {err}"))
+            })?;
+        let mut relay_open = true;
+        while !worker.is_finished() {
+            let (master, client, attach, resize) = pty.poll_fds();
+            let mut fds =
+                [if relay_open { master } else { -1 }, client, attach, resize].map(|fd| {
+                    libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }
+                });
+            // SAFETY: fds contains four initialized pollfd values, valid for
+            // this synchronous call; descriptors are borrowed from the relay.
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 50) } > 0 {
+                relay_open = handle_pty_poll_events(
+                    pty,
+                    fds[0].revents,
+                    fds[1].revents,
+                    fds[2].revents,
+                    fds[3].revents,
+                    "approval wait",
+                );
+            }
+            let pause_requested = drain_pause_pipe();
+            if pause_requested {
+                pty.sync_current_terminal_winsize();
+            }
+            let detach_requested = pty.take_detach_request();
+            handle_pty_detach_request(Some(pty), pause_requested, detach_requested);
+            handle_pty_signal_relay(Some(pty));
+            handle_pty_suspension(Some(pty), child);
+            handle_pty_capture(Some(pty), child);
+            service_off_thread_prompts(Some(pty));
+        }
+        pty.service_approval_view();
+        worker
+            .join()
+            .map_err(|_| NonoError::SandboxInit("approval worker failed; access denied".into()))?
+    })
 }
 
 /// Pause the PTY relay for terminal prompts raised off the supervisor thread.
@@ -3625,6 +3668,7 @@ fn service_off_thread_prompts(pty: Option<&mut crate::pty_proxy::PtyProxy>) {
         crate::relay_prompt_gate::service_pending_prompts(|prompts| {
             proxy.run_with_terminal_paused(prompts)
         });
+        proxy.service_approval_view();
     }
 }
 
@@ -3750,9 +3794,10 @@ fn handle_supervisor_message(
                         // Stash the verified digest for TOCTOU re-check at open time
                         verified_digest = Some(verified.digest);
                         // Instruction file verified — proceed to approval backend
-                        let backend_decision = match request_approval_with_relay_paused(
+                        let backend_decision = match request_approval_with_relay(
                             config,
                             &nono::supervisor::ApprovalRequest::from(request.clone()),
+                            child,
                             pty.as_deref_mut(),
                         ) {
                             Ok(d) => {
@@ -3816,9 +3861,10 @@ fn handle_supervisor_message(
                 }
             } else {
                 // 3. Delegate to approval backend (non-instruction files)
-                let backend_decision = match request_approval_with_relay_paused(
+                let backend_decision = match request_approval_with_relay(
                     config,
                     &nono::supervisor::ApprovalRequest::from(request.clone()),
+                    child,
                     pty,
                 ) {
                     Ok(d) => {

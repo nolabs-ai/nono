@@ -261,6 +261,7 @@ const BACKEND_NOTICE_PAUSE_WAIT: Duration = Duration::from_secs(1);
 /// deadline match this backend's `timeout_secs`.
 const HEADER_TIMEOUT_SECS: &str = "X-Nono-Timeout-Secs";
 
+#[derive(Clone)]
 struct WebhookApproval {
     name: String,
     url: String,
@@ -688,6 +689,22 @@ impl WebhookApproval {
 }
 
 impl ApprovalBackend for WebhookApproval {
+    fn request_approval_with_deadline(
+        &self,
+        request: &ApprovalRequest,
+        deadline: Instant,
+    ) -> Result<ApprovalDecision> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(ApprovalDecision::Timeout);
+        }
+        Self {
+            timeout: self.timeout.min(remaining),
+            ..self.clone()
+        }
+        .request_approval(request)
+    }
+
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
         let body = serde_json::to_vec(&WebhookApprovalRequest {
             backend: &self.name,
@@ -701,9 +718,18 @@ impl ApprovalBackend for WebhookApproval {
         })?;
         let started = Instant::now();
         let deadline = started.checked_add(self.timeout).unwrap_or(started);
-        let announced = Self::show_notice(deadline, || {
-            crate::terminal_approval::announce_backend_query(&self.name, request, self.timeout)
+        let progress = crate::relay_prompt_gate::relay_active().then(|| {
+            crate::approval_status::PendingNotice::start(
+                &self.name,
+                request,
+                self.timeout,
+                self.platform.is_some(),
+            )
         });
+        let announced = progress.is_none()
+            && Self::show_notice(deadline, || {
+                crate::terminal_approval::announce_backend_query(&self.name, request, self.timeout)
+            });
         let decision = match &self.platform {
             None => self.request_unsigned(&body, started),
             Some(state) => self.drive_platform_approval(

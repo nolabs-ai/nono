@@ -3956,6 +3956,10 @@ mod tests {
             "system_read_linux_core must grant read access to '/etc/mime.types'"
         );
         assert!(
+            read_paths.iter().any(|p| p == "/etc/debian_version"),
+            "system_read_linux_core must grant read access to '/etc/debian_version'"
+        );
+        assert!(
             !read_paths.iter().any(|p| p == "/etc"),
             "system_read_linux_core must not grant bare '/etc'; use specific paths instead. Found: {:?}",
             read_paths

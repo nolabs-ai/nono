@@ -127,6 +127,7 @@ enum StaticNetworkFilter {
     None,
     BlockAll,
     TcpOnly,
+    TcpUdp,
 }
 
 /// A Landlock ruleset whose allocation and path opening happened in the
@@ -1091,7 +1092,7 @@ pub fn apply_landlock(caps: &CapabilitySet) -> Result<()> {
 ///
 /// Same contract as `apply_landlock` but avoids re-probing the kernel ABI.
 pub fn apply_landlock_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<()> {
-    apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly).map(|_| ())
+    apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly, false).map(|_| ())
 }
 
 /// Prepare Landlock-only enforcement without installing a seccomp fallback.
@@ -1100,7 +1101,7 @@ pub fn prepare_landlock_with_abi(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
 ) -> Result<PreparedLandlockSandbox> {
-    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly, None)
+    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly, false, None)
 }
 
 /// Like [`prepare_landlock_with_abi`], but resolve every filesystem rule path
@@ -1115,7 +1116,13 @@ pub fn prepare_landlock_with_abi_in_root(
     abi: &DetectedAbi,
     root: BorrowedFd<'_>,
 ) -> Result<PreparedLandlockSandbox> {
-    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly, Some(root))
+    prepare_with_abi_inner(
+        caps,
+        abi,
+        TcpNetworkEnforcement::LandlockOnly,
+        false,
+        Some(root),
+    )
 }
 
 /// Apply Landlock filesystem/process sandboxing and use seccomp for TCP
@@ -1136,7 +1143,7 @@ pub fn apply_seccomp_with_abi(
     abi: &DetectedAbi,
     opts: SeccompOpts,
 ) -> Result<SeccompNetFallback> {
-    apply_with_abi_inner(caps, abi, opts.tcp_network.into())
+    apply_with_abi_inner(caps, abi, opts.tcp_network.into(), opts.mediated_udp)
 }
 
 /// Prepare the Linux sandbox policy for child-side, allocation-free apply.
@@ -1149,7 +1156,7 @@ pub fn prepare_seccomp_with_abi(
     abi: &DetectedAbi,
     opts: SeccompOpts,
 ) -> Result<PreparedLandlockSandbox> {
-    prepare_with_abi_inner(caps, abi, opts.tcp_network.into(), None)
+    prepare_with_abi_inner(caps, abi, opts.tcp_network.into(), opts.mediated_udp, None)
 }
 
 /// Like [`prepare_seccomp_with_abi`], but resolve every filesystem rule path
@@ -1160,13 +1167,20 @@ pub fn prepare_seccomp_with_abi_in_root(
     opts: SeccompOpts,
     root: BorrowedFd<'_>,
 ) -> Result<PreparedLandlockSandbox> {
-    prepare_with_abi_inner(caps, abi, opts.tcp_network.into(), Some(root))
+    prepare_with_abi_inner(
+        caps,
+        abi,
+        opts.tcp_network.into(),
+        opts.mediated_udp,
+        Some(root),
+    )
 }
 
 fn prepare_with_abi_inner(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
     tcp_network: TcpNetworkEnforcement,
+    mediated_udp: bool,
     root: Option<BorrowedFd<'_>>,
 ) -> Result<PreparedLandlockSandbox> {
     let target_abi = abi.enforced_abi();
@@ -1287,7 +1301,12 @@ fn prepare_with_abi_inner(
         },
         path_rules,
         net_rules,
-        static_network_filter: selected_static_network_filter(tcp_network, caps, &fallback),
+        static_network_filter: selected_static_network_filter(
+            tcp_network,
+            mediated_udp,
+            caps,
+            &fallback,
+        ),
         fallback,
     })
 }
@@ -1317,7 +1336,7 @@ pub fn apply_auto(caps: &CapabilitySet) -> Result<SeccompNetFallback> {
 
 /// Apply sandboxing with automatic fallback and a pre-detected ABI.
 pub fn apply_auto_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<SeccompNetFallback> {
-    apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::AutoSeccompFallback)
+    apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::AutoSeccompFallback, false)
 }
 
 /// Internal implementation shared by all public `apply_*` entry points.
@@ -1325,6 +1344,7 @@ fn apply_with_abi_inner(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
     tcp_network: TcpNetworkEnforcement,
+    mediated_udp: bool,
 ) -> Result<SeccompNetFallback> {
     let target_abi = abi.enforced_abi();
     info!(
@@ -1659,7 +1679,7 @@ fn apply_with_abi_inner(
         }
     }
 
-    match selected_static_network_filter(tcp_network, caps, &seccomp_net_fallback) {
+    match selected_static_network_filter(tcp_network, mediated_udp, caps, &seccomp_net_fallback) {
         StaticNetworkFilter::None => {}
         StaticNetworkFilter::BlockAll => {
             install_seccomp_block_network().map_err(|e| {
@@ -1670,14 +1690,18 @@ fn apply_with_abi_inner(
             })?;
             info!("Seccomp full-network block enforced");
         }
-        StaticNetworkFilter::TcpOnly => {
-            install_seccomp_tcp_only_network().map_err(|e| {
+        selected @ (StaticNetworkFilter::TcpOnly | StaticNetworkFilter::TcpUdp) => {
+            install_static_network_filter(selected, "TCP-only network baseline").map_err(|e| {
                 NonoError::SandboxInit(format!(
                     "Failed to install seccomp TCP-only baseline: {}",
                     e
                 ))
             })?;
-            info!("Seccomp TCP-only network baseline enforced");
+            if selected == StaticNetworkFilter::TcpUdp {
+                info!("Seccomp TCP/UDP network baseline enforced");
+            } else {
+                info!("Seccomp TCP-only network baseline enforced");
+            }
         }
     }
     // ProxyOnly is NOT installed here — it requires a notify fd that must
@@ -2390,8 +2414,10 @@ fn build_seccomp_block_network_filter() -> ArchGuarded<[SockFilterInsn; 16]> {
 /// be TCP streams (`SOCK_STREAM` with protocol 0 or `IPPROTO_TCP`); UDP, raw,
 /// SCTP, netlink, and every other family are denied. `io_uring_setup()` is
 /// denied because io_uring can create and drive sockets without a visible
-/// syscall for each network operation.
-fn build_seccomp_tcp_only_network_filter() -> ArchGuarded<[SockFilterInsn; 29]> {
+/// syscall for each network operation. With `allow_udp`, Internet datagram
+/// sockets with protocol 0 are also allowed; callers must confine them to a
+/// loopback-only network namespace.
+fn build_seccomp_tcp_only_network_filter(allow_udp: bool) -> ArchGuarded<[SockFilterInsn; 29]> {
     let errno_ret = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
 
     let filter = [
@@ -2493,12 +2519,21 @@ fn build_seccomp_tcp_only_network_filter() -> ArchGuarded<[SockFilterInsn; 29]> 
             jf: 0,
             k: libc::SOCK_STREAM as u32,
         },
-        // 14: non-stream Internet socket -> deny
-        SockFilterInsn {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: errno_ret,
+        // 14: SOCK_DGRAM -> protocol check at 15 when UDP is mediated, else deny
+        if allow_udp {
+            SockFilterInsn {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 0,
+                jf: 3,
+                k: libc::SOCK_DGRAM as u32,
+            }
+        } else {
+            SockFilterInsn {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: errno_ret,
+            }
         },
         // 15: protocol
         SockFilterInsn {
@@ -2569,8 +2604,9 @@ fn install_static_network_filter_raw(
             let filter = build_seccomp_block_network_filter();
             install_static_network_filter_program_raw(&filter)
         }
-        StaticNetworkFilter::TcpOnly => {
-            let filter = build_seccomp_tcp_only_network_filter();
+        StaticNetworkFilter::TcpOnly | StaticNetworkFilter::TcpUdp => {
+            let filter =
+                build_seccomp_tcp_only_network_filter(selected == StaticNetworkFilter::TcpUdp);
             install_static_network_filter_program_raw(&filter)
         }
     }
@@ -2616,10 +2652,6 @@ fn install_static_network_filter_program_raw<T: AsRef<[SockFilterInsn]>>(
 /// `io_uring_setup()` attempts that could drive network I/O.
 pub fn install_seccomp_block_network() -> Result<()> {
     install_static_network_filter(StaticNetworkFilter::BlockAll, "network block")
-}
-
-fn install_seccomp_tcp_only_network() -> Result<()> {
-    install_static_network_filter(StaticNetworkFilter::TcpOnly, "TCP-only network baseline")
 }
 
 fn install_static_network_filter(selected: StaticNetworkFilter, label: &str) -> Result<()> {
@@ -3120,6 +3152,7 @@ pub enum SeccompNetFallback {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeccompOpts {
     tcp_network: SeccompTcpNetwork,
+    mediated_udp: bool,
 }
 
 impl SeccompOpts {
@@ -3129,6 +3162,7 @@ impl SeccompOpts {
     pub fn network_fallback() -> Self {
         Self {
             tcp_network: SeccompTcpNetwork::Fallback,
+            mediated_udp: false,
         }
     }
 
@@ -3143,6 +3177,7 @@ impl SeccompOpts {
     pub fn network_baseline() -> Self {
         Self {
             tcp_network: SeccompTcpNetwork::Baseline,
+            mediated_udp: false,
         }
     }
 
@@ -3152,6 +3187,7 @@ impl SeccompOpts {
     pub fn external_tcp() -> Self {
         Self {
             tcp_network: SeccompTcpNetwork::External,
+            mediated_udp: false,
         }
     }
 
@@ -3168,6 +3204,7 @@ impl SeccompOpts {
     pub fn external_tcp_with_baseline() -> Self {
         Self {
             tcp_network: SeccompTcpNetwork::ExternalWithBaseline,
+            mediated_udp: false,
         }
     }
 
@@ -3181,7 +3218,15 @@ impl SeccompOpts {
     pub fn preinstalled_tcp_filter() -> Self {
         Self {
             tcp_network: SeccompTcpNetwork::External,
+            mediated_udp: false,
         }
+    }
+
+    /// Allow Internet UDP sockets in the TCP-only baseline; only a loopback-only network namespace may confine them.
+    #[must_use]
+    pub fn with_mediated_udp(mut self, enabled: bool) -> Self {
+        self.mediated_udp = enabled;
+        self
     }
 }
 
@@ -3289,10 +3334,11 @@ fn static_network_baseline_filter(caps: &CapabilitySet) -> StaticNetworkFilter {
 
 fn selected_static_network_filter(
     tcp_network: TcpNetworkEnforcement,
+    mediated_udp: bool,
     caps: &CapabilitySet,
     fallback: &SeccompNetFallback,
 ) -> StaticNetworkFilter {
-    if matches!(fallback, SeccompNetFallback::BlockAll) {
+    let selected = if matches!(fallback, SeccompNetFallback::BlockAll) {
         StaticNetworkFilter::BlockAll
     } else if matches!(tcp_network, TcpNetworkEnforcement::ExternalWithBaseline) {
         // TCP is confined by the caller, so TCP sockets must be creatable
@@ -3302,6 +3348,11 @@ fn selected_static_network_filter(
         static_network_baseline_filter(caps)
     } else {
         StaticNetworkFilter::None
+    };
+    if mediated_udp && selected == StaticNetworkFilter::TcpOnly {
+        StaticNetworkFilter::TcpUdp
+    } else {
+        selected
     }
 }
 
@@ -3326,8 +3377,9 @@ fn selected_static_network_filter(
 /// failed AF_UNIX bind (regression on Landlock V2 kernels where this
 /// fallback fires). The supervisor is the sole arbiter now.
 ///
-/// `socket()` allows all `AF_UNIX` types and only TCP streams for
-/// `AF_INET`/`AF_INET6`.
+/// `socket()` allows all `AF_UNIX` types and only TCP streams and UDP
+/// datagrams for `AF_INET`/`AF_INET6`; the static baseline decides
+/// whether UDP sockets exist.
 /// `socketpair()` is allowed only for `AF_UNIX`.
 ///
 /// The three io_uring syscalls return `EPERM`, preventing queued socket
@@ -3383,11 +3435,11 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> ArchGuarded<Vec<SockFilt
     // 24: ld [args[1]]              (Internet socket type)
     // 25: and SOCK_TYPE_MASK
     // 26: jeq SOCK_STREAM -> insn 28
-    // 27: ret ERRNO                 (UDP/raw/non-stream Internet socket)
+    // 27: jeq SOCK_DGRAM -> insn 28, else insn 31 (raw/other Internet socket)
     // 28: ld [args[2]]              (Internet socket protocol)
     // 29: jeq 0 -> insn 32
     // 30: jeq IPPROTO_TCP -> insn 32
-    // 31: ret ERRNO                 (non-TCP stream protocol)
+    // 31: ret ERRNO                 (raw socket or explicit non-TCP protocol)
     // 32: ret ALLOW                 (validated socket/socketpair)
 
     let filter = vec![
@@ -3580,12 +3632,12 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> ArchGuarded<Vec<SockFilt
             jf: 0,
             k: libc::SOCK_STREAM as u32,
         },
-        // 27: UDP/raw/non-stream Internet socket -> deny
+        // 27: SOCK_DGRAM -> protocol check at 28, else deny at 31 (jf = 31-27-1 = 3)
         SockFilterInsn {
-            code: BPF_RET | BPF_K,
+            code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 0,
-            jf: 0,
-            k: errno_ret,
+            jf: 3,
+            k: libc::SOCK_DGRAM as u32,
         },
         // 28: ld [args[2]] -- Internet socket protocol
         SockFilterInsn {
@@ -3608,7 +3660,7 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> ArchGuarded<Vec<SockFilt
             jf: 0,
             k: libc::IPPROTO_TCP as u32,
         },
-        // 31: non-TCP stream protocol -> deny
+        // 31: raw socket or explicit non-TCP protocol -> deny
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
@@ -5326,7 +5378,7 @@ mod tests {
 
     #[test]
     fn test_tcp_only_baseline_allows_only_unix_and_internet_tcp() {
-        let filter = build_seccomp_tcp_only_network_filter();
+        let filter = build_seccomp_tcp_only_network_filter(false);
         let denied = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
         let socket = |family: i32, socket_type: i32, protocol: i32| {
             evaluate_static_bpf(
@@ -5382,6 +5434,80 @@ mod tests {
         assert_eq!(
             evaluate_static_bpf(&filter, libc::SYS_read as i32, [0; 6]),
             SECCOMP_RET_ALLOW
+        );
+    }
+
+    #[test]
+    fn test_tcp_udp_baseline_adds_only_internet_datagrams() {
+        let filter = build_seccomp_tcp_only_network_filter(true);
+        let denied = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
+        let socket = |family: i32, socket_type: i32, protocol: i32| {
+            evaluate_static_bpf(
+                &filter,
+                SYS_SOCKET,
+                [family as u64, socket_type as u64, protocol as u64, 0, 0, 0],
+            )
+        };
+
+        assert_eq!(
+            socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            socket(libc::AF_INET6, libc::SOCK_DGRAM, 0),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            socket(libc::AF_INET, libc::SOCK_STREAM, 0),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP),
+            denied
+        );
+        assert_eq!(socket(libc::AF_INET, libc::SOCK_RAW, 0), denied);
+        assert_eq!(socket(libc::AF_NETLINK, libc::SOCK_DGRAM, 0), denied);
+        assert_eq!(
+            evaluate_static_bpf(&filter, SYS_IO_URING_SETUP, [0; 6]),
+            denied
+        );
+    }
+
+    #[test]
+    fn mediated_udp_upgrades_only_the_tcp_only_baseline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let abi = DetectedAbi::new(ABI::V6);
+        let prepare = |caps: CapabilitySet, opts: SeccompOpts| {
+            let caps = caps
+                .allow_path(temp.path(), AccessMode::Read)
+                .expect("path capability");
+            prepare_seccomp_with_abi(&caps, &abi, opts)
+                .expect("prepare policy")
+                .static_network_filter
+        };
+        let mediated = SeccompOpts::network_baseline().with_mediated_udp(true);
+
+        assert_eq!(
+            prepare(CapabilitySet::new().proxy_only(8080), mediated),
+            StaticNetworkFilter::TcpUdp
+        );
+        assert_eq!(
+            prepare(
+                CapabilitySet::new().proxy_only(8080),
+                SeccompOpts::network_baseline()
+            ),
+            StaticNetworkFilter::TcpOnly
+        );
+        assert_eq!(
+            prepare(CapabilitySet::new().block_network(), mediated),
+            StaticNetworkFilter::BlockAll
+        );
+        assert_eq!(
+            prepare(
+                CapabilitySet::new().block_network(),
+                SeccompOpts::external_tcp_with_baseline().with_mediated_udp(true)
+            ),
+            StaticNetworkFilter::TcpUdp
         );
     }
 
@@ -6045,6 +6171,14 @@ mod tests {
                 &filter,
                 SYS_SOCKET,
                 [libc::AF_INET as u64, libc::SOCK_DGRAM as u64, 0, 0, 0, 0,],
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate_static_bpf(
+                &filter,
+                SYS_SOCKET,
+                [libc::AF_INET as u64, libc::SOCK_RAW as u64, 0, 0, 0, 0,],
             ),
             SECCOMP_RET_ERRNO | (libc::EACCES as u32)
         );

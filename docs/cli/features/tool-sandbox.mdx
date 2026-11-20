@@ -259,6 +259,8 @@ A command sandbox policy that grants a proxy credential without `network.allow_d
 
 Proxy credentials cannot be combined with `network.allow_all`: unrestricted loopback access would let the command reach a broader proxy and defeat route isolation. On Linux, a raw `tcp_connect_ports` grant that collides with any active nono proxy port also fails closed at launch.
 
+Under `linux.isolate.network`, such a command runs inside the session's network namespace; see [Namespace isolation](/cli/features/namespace-isolation#mediated-commands).
+
 A command-scoped proxy policy needs an active nono proxy, such as one activated by a top-level network policy with `network.allow_domain`. A command-scoped proxy credential activates the proxy by itself. If the selected command sandbox requires a scoped proxy but none is available, the command fails closed at launch.
 
 | Invocation | Selected command sandbox |

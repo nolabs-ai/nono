@@ -422,6 +422,7 @@
           "~/.local/bin/mise",
           "~/.config/mise",
           "~/.local/share/mise",
+          "~/.local/state/mise",
           "~/.tool-versions"
         ]
       }

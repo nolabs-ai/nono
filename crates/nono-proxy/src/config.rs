@@ -1027,6 +1027,91 @@ pub struct ProxyInjectConfig {
     pub query_param_name: Option<String>,
 }
 
+/// URL path glob of an endpoint rule, normalized on construction.
+///
+/// Request paths are matched after [`normalize_path`], which strips the
+/// trailing slash, so a pattern such as `/3322/` could never match a request
+/// for `/3322/` (normalized to `/3322`): allow rules silently failed and deny
+/// or approve rules never fired. Every constructor (including
+/// deserialization) therefore strips trailing slashes, keeping the root `/`.
+/// The normalized pattern matches exactly what the slash-less form matches,
+/// so this never broadens a grant. Nothing else is rewritten because the
+/// value is a glob, not a request path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub struct EndpointPath(String);
+
+impl EndpointPath {
+    /// Build a normalized endpoint path pattern.
+    #[must_use]
+    pub fn new(pattern: impl Into<String>) -> Self {
+        let mut pattern = pattern.into();
+        let trimmed_len = pattern.trim_end_matches('/').len();
+        if trimmed_len == 0 && !pattern.is_empty() {
+            pattern.truncate(1);
+        } else {
+            pattern.truncate(trimmed_len);
+        }
+        Self(pattern)
+    }
+
+    /// The normalized pattern.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for EndpointPath {
+    fn from(pattern: String) -> Self {
+        Self::new(pattern)
+    }
+}
+
+impl From<&str> for EndpointPath {
+    fn from(pattern: &str) -> Self {
+        Self::new(pattern)
+    }
+}
+
+impl From<EndpointPath> for String {
+    fn from(path: EndpointPath) -> Self {
+        path.0
+    }
+}
+
+impl std::ops::Deref for EndpointPath {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for EndpointPath {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for EndpointPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for EndpointPath {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for EndpointPath {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 /// An HTTP method+path access rule for reverse proxy endpoint filtering.
 ///
 /// Used to restrict which API endpoints an agent can access through a
@@ -1039,7 +1124,7 @@ pub struct EndpointRule {
     pub method: String,
     /// URL path pattern with glob segments.
     /// Example: "/api/v4/projects/*/merge_requests/**"
-    pub path: String,
+    pub path: EndpointPath,
 }
 
 /// L7 endpoint action used by route endpoint policies.
@@ -1078,7 +1163,7 @@ impl Default for EndpointPolicyDefault {
 #[serde(deny_unknown_fields)]
 pub struct EndpointPolicyRule {
     pub method: String,
-    pub path: String,
+    pub path: EndpointPath,
     #[serde(default)]
     pub backend: Option<String>,
     #[serde(default)]
@@ -1174,7 +1259,7 @@ pub struct CompiledEndpointPolicy {
 
 struct CompiledPolicyRule {
     method: String,
-    path: String,
+    path: EndpointPath,
     matcher: globset::GlobMatcher,
     backend: Option<String>,
     reason: Option<String>,
@@ -1298,7 +1383,7 @@ impl CompiledEndpointRules {
     pub fn compile(rules: &[EndpointRule]) -> Result<Self, String> {
         let mut compiled = Vec::with_capacity(rules.len());
         for rule in rules {
-            let glob = GlobBuilder::new(normalize_rule_path(&rule.path))
+            let glob = GlobBuilder::new(&rule.path)
                 .literal_separator(true)
                 .build()
                 .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
@@ -1489,7 +1574,7 @@ impl CompiledEndpointPolicy {
 fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPolicyRule>, String> {
     let mut compiled = Vec::with_capacity(rules.len());
     for rule in rules {
-        let glob = GlobBuilder::new(normalize_rule_path(&rule.path))
+        let glob = GlobBuilder::new(&rule.path)
             .literal_separator(true)
             .build()
             .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
@@ -1689,32 +1774,13 @@ fn endpoint_allowed(rules: &[EndpointRule], method: &str, path: &str) -> bool {
     let normalized = normalize_path(path);
     rules.iter().any(|r| {
         (r.method == "*" || r.method.eq_ignore_ascii_case(method))
-            && GlobBuilder::new(normalize_rule_path(&r.path))
+            && GlobBuilder::new(&r.path)
                 .literal_separator(true)
                 .build()
                 .ok()
                 .map(|g| g.compile_matcher())
                 .is_some_and(|m| m.is_match(&normalized))
     })
-}
-
-/// Normalize an endpoint rule path pattern so it lines up with request
-/// paths after [`normalize_path`], which strips the trailing slash.
-///
-/// Without this, a rule such as `/3322/` could never match a request for
-/// `/3322/` (normalized to `/3322`), so allow rules silently failed and deny
-/// or approve rules never fired. Only trailing slashes are removed (root `/`
-/// is preserved); the rule matches exactly what the slash-less form matches,
-/// so this never broadens a grant. The pattern is otherwise left untouched
-/// because it is a glob, not a request path.
-#[must_use]
-pub fn normalize_rule_path(pattern: &str) -> &str {
-    let trimmed = pattern.trim_end_matches('/');
-    if trimmed.is_empty() && !pattern.is_empty() {
-        "/"
-    } else {
-        trimmed
-    }
 }
 
 /// Normalize a URL path for matching: percent-decode, strip query string,
@@ -2196,7 +2262,7 @@ mod tests {
     fn test_endpoint_rule_exact_path() {
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/v1/chat/completions".to_string(),
+            path: "/v1/chat/completions".into(),
         };
         assert!(check(&rule, "GET", "/v1/chat/completions"));
         assert!(!check(&rule, "GET", "/v1/chat"));
@@ -2207,7 +2273,7 @@ mod tests {
     fn test_endpoint_rule_method_case_insensitive() {
         let rule = EndpointRule {
             method: "get".to_string(),
-            path: "/api".to_string(),
+            path: "/api".into(),
         };
         assert!(check(&rule, "GET", "/api"));
         assert!(check(&rule, "Get", "/api"));
@@ -2217,7 +2283,7 @@ mod tests {
     fn test_endpoint_rule_method_wildcard() {
         let rule = EndpointRule {
             method: "*".to_string(),
-            path: "/api/resource".to_string(),
+            path: "/api/resource".into(),
         };
         assert!(check(&rule, "GET", "/api/resource"));
         assert!(check(&rule, "DELETE", "/api/resource"));
@@ -2228,7 +2294,7 @@ mod tests {
     fn test_endpoint_rule_method_mismatch() {
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/api/resource".to_string(),
+            path: "/api/resource".into(),
         };
         assert!(!check(&rule, "POST", "/api/resource"));
         assert!(!check(&rule, "DELETE", "/api/resource"));
@@ -2238,7 +2304,7 @@ mod tests {
     fn test_endpoint_rule_single_wildcard() {
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/api/v4/projects/*/merge_requests".to_string(),
+            path: "/api/v4/projects/*/merge_requests".into(),
         };
         assert!(check(&rule, "GET", "/api/v4/projects/123/merge_requests"));
         assert!(check(
@@ -2255,7 +2321,7 @@ mod tests {
     fn test_endpoint_rule_single_wildcard_rejects_multi_segment() {
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/api/v4/projects/*/merge_requests".to_string(),
+            path: "/api/v4/projects/*/merge_requests".into(),
         };
         assert!(!check(
             &rule,
@@ -2265,7 +2331,7 @@ mod tests {
 
         let one_star = EndpointRule {
             method: "*".to_string(),
-            path: "/repos/*".to_string(),
+            path: "/repos/*".into(),
         };
         assert!(check(&one_star, "GET", "/repos/one"));
         assert!(!check(&one_star, "GET", "/repos/one/two"));
@@ -2273,7 +2339,7 @@ mod tests {
 
         let two_star = EndpointRule {
             method: "*".to_string(),
-            path: "/repos/**".to_string(),
+            path: "/repos/**".into(),
         };
         assert!(check(&two_star, "GET", "/repos/one"));
         assert!(check(&two_star, "GET", "/repos/one/two"));
@@ -2284,7 +2350,7 @@ mod tests {
     fn test_endpoint_rule_double_wildcard() {
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/api/v4/projects/**".to_string(),
+            path: "/api/v4/projects/**".into(),
         };
         assert!(check(&rule, "GET", "/api/v4/projects/123"));
         assert!(check(&rule, "GET", "/api/v4/projects/123/merge_requests"));
@@ -2296,7 +2362,7 @@ mod tests {
     fn test_endpoint_rule_double_wildcard_middle() {
         let rule = EndpointRule {
             method: "*".to_string(),
-            path: "/api/**/notes".to_string(),
+            path: "/api/**/notes".into(),
         };
         assert!(check(&rule, "GET", "/api/notes"));
         assert!(check(&rule, "POST", "/api/projects/123/notes"));
@@ -2308,7 +2374,7 @@ mod tests {
     fn test_endpoint_rule_strips_query_string() {
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/api/data".to_string(),
+            path: "/api/data".into(),
         };
         assert!(check(&rule, "GET", "/api/data?page=1&limit=10"));
     }
@@ -2317,7 +2383,7 @@ mod tests {
     fn test_endpoint_rule_trailing_slash_normalized() {
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/api/data".to_string(),
+            path: "/api/data".into(),
         };
         assert!(check(&rule, "GET", "/api/data/"));
         assert!(check(&rule, "GET", "/api/data"));
@@ -2327,7 +2393,7 @@ mod tests {
     fn test_endpoint_rule_double_slash_normalized() {
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/api/data".to_string(),
+            path: "/api/data".into(),
         };
         assert!(check(&rule, "GET", "/api//data"));
     }
@@ -2336,7 +2402,7 @@ mod tests {
     fn test_endpoint_rule_root_path() {
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/".to_string(),
+            path: "/".into(),
         };
         assert!(check(&rule, "GET", "/"));
         assert!(!check(&rule, "GET", "/anything"));
@@ -2347,11 +2413,11 @@ mod tests {
         let rules = vec![
             EndpointRule {
                 method: "GET".to_string(),
-                path: "/repos/*/issues".to_string(),
+                path: "/repos/*/issues".into(),
             },
             EndpointRule {
                 method: "POST".to_string(),
-                path: "/repos/*/issues/*/comments".to_string(),
+                path: "/repos/*/issues/*/comments".into(),
             },
         ];
         let compiled = CompiledEndpointRules::compile(&rules).unwrap();
@@ -2371,7 +2437,7 @@ mod tests {
     fn test_compiled_endpoint_rules_invalid_pattern_rejected() {
         let rules = vec![EndpointRule {
             method: "GET".to_string(),
-            path: "/api/[invalid".to_string(),
+            path: "/api/[invalid".into(),
         }];
         assert!(CompiledEndpointRules::compile(&rules).is_err());
     }
@@ -2380,7 +2446,7 @@ mod tests {
     fn test_compiled_endpoint_policy_preserves_legacy_allow_list() {
         let rules = vec![EndpointRule {
             method: "GET".to_string(),
-            path: "/v1/tasks/**".to_string(),
+            path: "/v1/tasks/**".into(),
         }];
         let policy = CompiledEndpointPolicy::compile(None, &rules).unwrap();
 
@@ -2404,7 +2470,7 @@ mod tests {
             },
             deny: vec![EndpointPolicyRule {
                 method: "POST".to_string(),
-                path: "/v1/tasks/*/comments".to_string(),
+                path: "/v1/tasks/*/comments".into(),
                 backend: None,
                 reason: Some("blocked".to_string()),
                 timeout_secs: None,
@@ -2412,7 +2478,7 @@ mod tests {
             }],
             approve: vec![EndpointPolicyRule {
                 method: "POST".to_string(),
-                path: "/v1/tasks/*/comments".to_string(),
+                path: "/v1/tasks/*/comments".into(),
                 backend: Some("terminal".to_string()),
                 reason: None,
                 timeout_secs: Some(5),
@@ -2420,7 +2486,7 @@ mod tests {
             }],
             allow: vec![EndpointPolicyRule {
                 method: "POST".to_string(),
-                path: "/v1/tasks/*/comments".to_string(),
+                path: "/v1/tasks/*/comments".into(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -2446,7 +2512,7 @@ mod tests {
         let policy = EndpointPolicyConfig {
             allow: vec![EndpointPolicyRule {
                 method: "GET".to_string(),
-                path: "/repos/*".to_string(),
+                path: "/repos/*".into(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -2519,7 +2585,7 @@ mod tests {
             },
             deny: vec![EndpointPolicyRule {
                 method: "*".to_string(),
-                path: "/v1/secrets/**".to_string(),
+                path: "/v1/secrets/**".into(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -2572,7 +2638,7 @@ mod tests {
     fn test_endpoint_rules_reject_ambiguous_paths() {
         let rules = vec![EndpointRule {
             method: "GET".to_string(),
-            path: "/repos/**".to_string(),
+            path: "/repos/**".into(),
         }];
         let compiled = CompiledEndpointRules::compile(&rules).unwrap();
         assert!(compiled.is_allowed("GET", "/repos/myrepo/issues"));
@@ -2589,7 +2655,7 @@ mod tests {
         let policy = EndpointPolicyConfig {
             approve: vec![EndpointPolicyRule {
                 method: "GET".to_string(),
-                path: "/v1/secrets/**".to_string(),
+                path: "/v1/secrets/**".into(),
                 backend: Some("terminal".to_string()),
                 reason: Some("sensitive endpoint".to_string()),
                 timeout_secs: Some(10),
@@ -2613,7 +2679,7 @@ mod tests {
     fn op_rule(method: &str, path: &str, ops: &[&str]) -> EndpointPolicyRule {
         EndpointPolicyRule {
             method: method.to_string(),
-            path: path.to_string(),
+            path: path.into(),
             backend: None,
             reason: None,
             timeout_secs: None,
@@ -2762,7 +2828,7 @@ mod tests {
         let policy = EndpointPolicyConfig {
             allow: vec![EndpointPolicyRule {
                 method: "POST".to_string(),
-                path: "/".to_string(),
+                path: "/".into(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -2812,11 +2878,11 @@ mod tests {
         let rules = vec![
             EndpointRule {
                 method: "GET".to_string(),
-                path: "/repos/*/issues".to_string(),
+                path: "/repos/*/issues".into(),
             },
             EndpointRule {
                 method: "POST".to_string(),
-                path: "/repos/*/issues/*/comments".to_string(),
+                path: "/repos/*/issues/*/comments".into(),
             },
         ];
         assert!(endpoint_allowed(&rules, "GET", "/repos/myrepo/issues"));
@@ -2864,7 +2930,7 @@ mod tests {
         // e.g., /api/v4/%70rojects should match a rule for /api/v4/projects/*
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/api/v4/projects/*/issues".to_string(),
+            path: "/api/v4/projects/*/issues".into(),
         };
         assert!(check(&rule, "GET", "/api/v4/%70rojects/123/issues"));
         assert!(check(&rule, "GET", "/api/v4/pro%6Aects/123/issues"));
@@ -2874,7 +2940,7 @@ mod tests {
     fn test_endpoint_rule_percent_encoded_full_segment() {
         let rule = EndpointRule {
             method: "POST".to_string(),
-            path: "/api/data".to_string(),
+            path: "/api/data".into(),
         };
         // %64%61%74%61 = "data"
         assert!(check(&rule, "POST", "/api/%64%61%74%61"));
@@ -2884,7 +2950,7 @@ mod tests {
     fn test_compiled_endpoint_rules_percent_encoded() {
         let rules = vec![EndpointRule {
             method: "GET".to_string(),
-            path: "/repos/*/issues".to_string(),
+            path: "/repos/*/issues".into(),
         }];
         let compiled = CompiledEndpointRules::compile(&rules).unwrap();
         // %69ssues = "issues"
@@ -2899,7 +2965,7 @@ mod tests {
         // invalid bytes with U+FFFD, so the path won't match real segments.
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/api/projects".to_string(),
+            path: "/api/projects".into(),
         };
         // %FF is not valid UTF-8 — must not match "/api/projects"
         assert!(!check(&rule, "GET", "/api/%FFprojects"));
@@ -2909,7 +2975,7 @@ mod tests {
     fn test_endpoint_rule_serde_roundtrip() {
         let rule = EndpointRule {
             method: "GET".to_string(),
-            path: "/api/*/data".to_string(),
+            path: "/api/*/data".into(),
         };
         let json = serde_json::to_string(&rule).unwrap();
         let deserialized: EndpointRule = serde_json::from_str(&json).unwrap();
@@ -3249,20 +3315,31 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rule_path_strips_trailing_slash() {
-        assert_eq!(normalize_rule_path("/3322/"), "/3322");
-        assert_eq!(normalize_rule_path("/3322"), "/3322");
-        assert_eq!(normalize_rule_path("/api/**/"), "/api/**");
-        assert_eq!(normalize_rule_path("/a//"), "/a");
-        assert_eq!(normalize_rule_path("/"), "/");
-        assert_eq!(normalize_rule_path("//"), "/");
+    fn endpoint_path_strips_trailing_slash() {
+        assert_eq!(EndpointPath::new("/3322/"), "/3322");
+        assert_eq!(EndpointPath::new("/3322"), "/3322");
+        assert_eq!(EndpointPath::new("/api/**/"), "/api/**");
+        assert_eq!(EndpointPath::new("/a//"), "/a");
+        assert_eq!(EndpointPath::new("/"), "/");
+        assert_eq!(EndpointPath::new("//"), "/");
+        assert_eq!(EndpointPath::new(""), "");
+    }
+
+    #[test]
+    fn endpoint_path_is_normalized_when_deserialized() {
+        let rule: EndpointRule =
+            serde_json::from_str(r#"{"method":"GET","path":"/3322/"}"#).unwrap();
+        assert_eq!(rule.path, "/3322");
+        let policy_rule: EndpointPolicyRule =
+            serde_json::from_str(r#"{"method":"GET","path":"/admin/"}"#).unwrap();
+        assert_eq!(policy_rule.path, "/admin");
     }
 
     #[test]
     fn endpoint_rules_with_trailing_slash_match_request() {
         let compiled = CompiledEndpointRules::compile(&[EndpointRule {
             method: "GET".to_string(),
-            path: "/3322/".to_string(),
+            path: "/3322/".into(),
         }])
         .unwrap();
         assert!(compiled.is_allowed("GET", "/3322/"));
@@ -3281,7 +3358,7 @@ mod tests {
             },
             deny: vec![EndpointPolicyRule {
                 method: "*".to_string(),
-                path: "/admin/".to_string(),
+                path: "/admin/".into(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -3414,7 +3491,7 @@ mod tests {
         assert!(EndpointPolicyConfig::from_legacy_rules(&[]).allows_all_without_l7());
         let legacy = EndpointPolicyConfig::from_legacy_rules(&[EndpointRule {
             method: "GET".to_string(),
-            path: "/a/**".to_string(),
+            path: "/a/**".into(),
         }]);
         assert!(!legacy.allows_all_without_l7());
         assert_eq!(legacy.default.decision, EndpointPolicyDecision::Deny);
@@ -3427,7 +3504,7 @@ mod tests {
             Some(&EndpointPolicyConfig {
                 approve: vec![EndpointPolicyRule {
                     method: "*".to_string(),
-                    path: "/*/*/**".to_string(),
+                    path: "/*/*/**".into(),
                     backend: None,
                     reason: None,
                     timeout_secs: None,

@@ -1362,7 +1362,7 @@ fn custom_credential_from_manifest_entry(cred: &nono::manifest::Credential) -> C
         .iter()
         .map(|rule| nono_proxy::config::EndpointRule {
             method: rule.method.as_str().to_string(),
-            path: rule.path.as_str().to_string(),
+            path: rule.path.as_str().into(),
         })
         .collect();
 
@@ -6657,7 +6657,7 @@ mod tests {
         nono_proxy::config::EndpointPolicyConfig {
             allow: vec![nono_proxy::config::EndpointPolicyRule {
                 method: "POST".to_string(),
-                path: "/".to_string(),
+                path: "/".into(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -10019,7 +10019,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
-                path: "/repos/my-org/**".to_string(),
+                path: "/repos/my-org/**".into(),
             }],
         }];
         let child = vec![AllowDomainEntry::WithEndpoints {
@@ -10027,7 +10027,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "POST".to_string(),
-                path: "/repos/my-org/*/issues".to_string(),
+                path: "/repos/my-org/*/issues".into(),
             }],
         }];
 
@@ -10055,7 +10055,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
-                path: "/repos/**".to_string(),
+                path: "/repos/**".into(),
             }],
         }];
 
@@ -10295,7 +10295,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
-                path: "/repos/**".to_string(),
+                path: "/repos/**".into(),
             }],
         }];
 

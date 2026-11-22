@@ -322,6 +322,9 @@ pub struct ExecConfig<'a> {
     /// `namespaces` requests a mount namespace.
     #[cfg(target_os = "linux")]
     pub mount_mask: Option<&'a nono::PreparedMountMask>,
+    /// Command-scoped proxies, bridged into the session network namespace for mediated commands.
+    #[cfg(target_os = "linux")]
+    pub scoped_proxy_handles: &'a [nono_proxy::server::ProxyHandle],
     /// Allow-list of environment variable names. When set, only variables
     /// matching a glob pattern (e.g. `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -1519,6 +1522,36 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                                     "cannot attach namespace isolation bridge to proxy: {e}"
                                 ))
                             })
+                    });
+                if let Err(error) = attached {
+                    let _ = signal::kill(child, Signal::SIGKILL);
+                    let _ = waitpid(child, None);
+                    return Err(error);
+                }
+            }
+
+            // Mediated commands join the session network namespace and reach their scoped proxies there.
+            #[cfg(target_os = "linux")]
+            if let Some(bootstrap) = clone_bootstrap.as_mut() {
+                let attached = std::mem::take(&mut bootstrap.scoped_bridges)
+                    .into_iter()
+                    .zip(config.scoped_proxy_handles)
+                    .try_for_each(|(bridge, handle)| {
+                        handle
+                            .add_listener(std::net::TcpListener::from(bridge))
+                            .map_err(|e| {
+                                NonoError::SandboxInit(format!(
+                                    "cannot attach command proxy bridge to proxy: {e}"
+                                ))
+                            })
+                    })
+                    .and_then(|()| {
+                        match (bootstrap.session_netns.take(), config.tool_sandbox_runtime) {
+                            (Some((user, net)), Some(runtime)) => {
+                                runtime.set_session_netns(user, net)
+                            }
+                            _ => Ok(()),
+                        }
                     });
                 if let Err(error) = attached {
                     let _ = signal::kill(child, Signal::SIGKILL);

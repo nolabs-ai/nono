@@ -72,6 +72,7 @@ fn config(caps: &CapabilitySet, filesystem: bool, proxy: bool) -> ExecConfig<'_>
         sandbox_policy: LinuxSandboxPolicy::Auto,
         namespaces: None,
         mount_mask: None,
+        scoped_proxy_handles: &[],
         allowed_env_vars: None,
         denied_env_vars: None,
         case_insensitive_env_vars: false,

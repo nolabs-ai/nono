@@ -91,6 +91,7 @@ pub(super) enum Fault {
     BadAck,
     AfterAck,
     Fragmented,
+    ExtraInterface,
 }
 
 fn failure(detail: &str) -> NonoError {
@@ -103,6 +104,11 @@ fn namespace_confines_tcp(config: &ExecConfig<'_>) -> bool {
     config
         .namespaces
         .is_some_and(|spec| spec.has_network() && spec.loopback_tcp_enabled())
+}
+
+/// UDP stays inside a network namespace only when it is loopback-only; `isolate.loopback` keeps UDP denied.
+fn namespace_grants_udp(config: &ExecConfig<'_>) -> bool {
+    config.namespaces.is_some_and(|spec| spec.has_network()) && !namespace_confines_tcp(config)
 }
 
 /// Mediated commands join the child's netns unless loopback TCP lets the session reach their bridges.
@@ -122,12 +128,15 @@ fn prepare(
     abi: &DetectedAbi,
     policy: LinuxSandboxPolicy,
     namespace_tcp: bool,
+    namespace_udp: bool,
     root: Option<std::os::fd::BorrowedFd<'_>>,
 ) -> Result<PreparedLandlockSandbox> {
     let opts = match (policy, namespace_tcp) {
-        (LinuxSandboxPolicy::Auto, false) => Some(nono::SeccompOpts::network_baseline()),
-        // TCP confined by the network namespace: no Landlock TCP rules, but
-        // UDP, raw and non-IP sockets stay denied by the static baseline.
+        // Only a loopback-only network namespace confines UDP; a notify check races the child's memory.
+        (LinuxSandboxPolicy::Auto, false) => {
+            Some(nono::SeccompOpts::network_baseline().with_mediated_udp(namespace_udp))
+        }
+        // TCP confined by the loopback-only network namespace; UDP, raw and non-IP stay denied (NEP-0004).
         (LinuxSandboxPolicy::Auto, true) => Some(nono::SeccompOpts::external_tcp_with_baseline()),
         // External delegates TCP already; Landlock policy installs no seccomp,
         // so with loopback it keeps Landlock filesystem rules only.
@@ -156,7 +165,7 @@ fn notify_filter(
     let policy = config.seccomp_policy;
     let network = if policy.proxy_fallback {
         let has_bind = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { bind_ports, .. } if !bind_ports.is_empty());
-        sandbox::prepare_seccomp_proxy_filter(has_bind)
+        sandbox::prepare_seccomp_proxy_filter_with_udp(has_bind, namespace_grants_udp(config))
     } else if policy.af_unix_mediation {
         sandbox::prepare_seccomp_af_unix_filter()
     } else if policy.needs_openat_notify() {
@@ -297,11 +306,13 @@ pub(super) fn spawn(
     if network.is_none() && namespaces.is_none() {
         return Err(failure("nothing requires the raw-clone bootstrap"));
     }
+    let namespace_udp = namespace_grants_udp(config);
     let baseline = prepare(
         caps,
         &abi,
         config.sandbox_policy,
         namespace_confines_tcp(config),
+        namespace_udp,
         None,
     )?;
     let gate = config
@@ -452,6 +463,7 @@ pub(super) fn spawn(
             &abi,
             config.sandbox_policy,
             namespace_confines_tcp(config),
+            namespace_udp,
             child_root.as_ref().map(std::os::fd::AsFd::as_fd),
         )?;
         drop(child_root);
@@ -532,6 +544,24 @@ pub(super) fn spawn(
             sandbox::validate_bridge_listener(borrowed, port)?;
             // SAFETY: validated above; ports are distinct, so this is the only parent owner.
             scoped_bridges.push(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        // UDP is safe only where loopback is the sole interface; the child is still blocked here.
+        if namespace_udp {
+            let devices = std::fs::read_to_string(format!("/proc/{pid}/net/dev"))
+                .map_err(|e| failure(&format!("cannot read the child's network devices: {e}")))?;
+            #[cfg(test)]
+            let devices = if command.fault == Fault::ExtraInterface {
+                devices + "  eth0: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+            } else {
+                devices
+            };
+            if devices
+                .lines()
+                .skip(2)
+                .any(|line| line.split(':').next().map(str::trim) != Some("lo"))
+            {
+                return Err(failure("UDP requires a loopback-only network namespace"));
+            }
         }
         let session_netns = if commands_join {
             let open = |name: &str| {

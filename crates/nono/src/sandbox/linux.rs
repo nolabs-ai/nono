@@ -3470,12 +3470,17 @@ fn build_seccomp_proxy_filter(
     // 24: ld [args[1]]              (Internet socket type)
     // 25: and SOCK_TYPE_MASK
     // 26: jeq SOCK_STREAM -> insn 28
-    // 27: ret ERRNO                 (UDP/raw/non-stream Internet socket)
+    // 27: jeq SOCK_DGRAM jt=5 -> insn 33 with allow_udp, else ret ERRNO; jf=3 -> insn 31
     // 28: ld [args[2]]              (Internet socket protocol)
     // 29: jeq 0 -> insn 32
     // 30: jeq IPPROTO_TCP -> insn 32
     // 31: ret ERRNO                 (non-TCP stream protocol)
     // 32: ret ALLOW                 (validated socket/socketpair)
+    // 33: ld [args[2]]              (datagram protocol)
+    // 34: jeq 0 -> insn 37
+    // 35: jeq IPPROTO_UDP -> insn 37
+    // 36: ret ERRNO                 (non-UDP datagram protocol)
+    // 37: ret ALLOW                 (validated datagram socket)
 
     let filter = vec![
         // 0: ld [nr]
@@ -5575,30 +5580,36 @@ mod tests {
 
     #[test]
     fn proxy_filter_allows_udp_only_when_mediated() {
-        let socket = |allow_udp: bool, socket_type: i32, protocol: i32| {
+        let socket = |allow_udp: bool, family: i32, socket_type: i32, protocol: i32| {
             evaluate_static_bpf(
                 &build_seccomp_proxy_filter(false, allow_udp),
                 SYS_SOCKET,
-                [
-                    libc::AF_INET as u64,
-                    socket_type as u64,
-                    protocol as u64,
-                    0,
-                    0,
-                    0,
-                ],
+                [family as u64, socket_type as u64, protocol as u64, 0, 0, 0],
             )
         };
         let denied = SECCOMP_RET_ERRNO | (libc::EACCES as u32);
-        assert_eq!(socket(false, libc::SOCK_DGRAM, 0), denied);
-        assert_eq!(socket(true, libc::SOCK_DGRAM, 0), SECCOMP_RET_ALLOW);
-        assert_eq!(
-            socket(true, libc::SOCK_DGRAM, libc::IPPROTO_UDP),
-            SECCOMP_RET_ALLOW
-        );
-        assert_eq!(socket(true, libc::SOCK_DGRAM, libc::IPPROTO_TCP), denied);
-        assert_eq!(socket(true, libc::SOCK_STREAM, libc::IPPROTO_UDP), denied);
-        assert_eq!(socket(true, libc::SOCK_RAW, 0), denied);
+        let dgram = libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            assert_eq!(socket(false, family, libc::SOCK_DGRAM, 0), denied);
+            assert_eq!(socket(true, family, libc::SOCK_DGRAM, 0), SECCOMP_RET_ALLOW);
+            assert_eq!(
+                socket(true, family, dgram, libc::IPPROTO_UDP),
+                SECCOMP_RET_ALLOW
+            );
+            assert_eq!(
+                socket(true, family, libc::SOCK_DGRAM, libc::IPPROTO_UDPLITE),
+                denied
+            );
+            assert_eq!(
+                socket(true, family, libc::SOCK_DGRAM, libc::IPPROTO_TCP),
+                denied
+            );
+            assert_eq!(
+                socket(true, family, libc::SOCK_STREAM, libc::IPPROTO_UDP),
+                denied
+            );
+            assert_eq!(socket(true, family, libc::SOCK_RAW, 0), denied);
+        }
     }
 
     #[test]

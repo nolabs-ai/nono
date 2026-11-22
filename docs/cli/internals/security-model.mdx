@@ -385,6 +385,8 @@ It is permanently opt-in, for two independent reasons:
 
 With `linux.isolate.loopback`, nono lifts its Landlock TCP rules and its proxy destination check for that session, and keeps the static seccomp filter that denies UDP, raw sockets, and netlink. This is sound only because the namespace contains nothing but loopback, has no routes, and the workload holds no capabilities to add any: every TCP endpoint it can reach is inside the sandbox. The relaxation is derived from the namespace nono actually created, so it never applies without it.
 
+With `linux.isolate.network` and without `loopback`, the static seccomp filter also allows `AF_INET`/`AF_INET6` UDP sockets, for the same reason: every UDP endpoint the workload can reach is inside the namespace. Outside such a namespace both the static filter and the proxy filter deny UDP.
+
 The setup capabilities the child holds inside its own user namespace exist only to bring up loopback and create the bridge listener. They grant nothing over host resources and are dropped at `exec`. nono runs no privileged setup code: where unprivileged namespaces are unavailable, provision the namespace externally and run nono inside it.
 
 ## Design Guidance

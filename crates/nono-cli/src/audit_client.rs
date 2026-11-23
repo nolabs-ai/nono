@@ -1,4 +1,7 @@
-//! Durable final-session audit delivery for audit-only platform enrollment.
+//! Durable delivery of completed platform audit sessions.
+
+mod delivery;
+pub(crate) use delivery::DeliveryWorker;
 
 use crate::cli::{AuditStatusArgs, AuditSyncArgs};
 use crate::output::{SummaryKind, summary_heading, summary_row};
@@ -193,10 +196,31 @@ pub(crate) fn maybe_ship_session(session_dir: &Path, metadata: &SessionMetadata)
     let Some(state) = session_origin(session_dir)? else {
         return Ok(());
     };
-    let queued = build_queued_audit(session_dir, metadata, &state)?;
+    if let Some((path, queued)) = queue_session(session_dir, metadata, &state)? {
+        let origin = queued_origin(&queued, Some(&state))?;
+        deliver_queued(origin, &path, &queued, Duration::from_secs(15))?;
+    }
+    Ok(())
+}
+
+fn queue_session(
+    session_dir: &Path,
+    metadata: &SessionMetadata,
+    state: &PlatformState,
+) -> Result<Option<(PathBuf, QueuedAudit)>> {
+    let _lock = delivery::lock_queue(true)?;
+    if session_dir.join(RECEIPT_FILENAME).is_file() {
+        return Ok(None);
+    }
+    for path in queued_paths()? {
+        if queued_session_id(&path).as_deref() == Some(&metadata.session_id) {
+            return Ok(Some((path.clone(), load_queued(&path)?)));
+        }
+    }
+    let queued = build_queued_audit(session_dir, metadata, state)?;
     let path = outbox_path(queued.ingest_id())?;
     write_json_secure(&path, &queued)?;
-    deliver_queued(&state, &path, &queued)
+    Ok(Some((path, queued)))
 }
 
 pub(crate) fn run_sync(args: AuditSyncArgs) -> Result<()> {
@@ -206,12 +230,9 @@ pub(crate) fn run_sync(args: AuditSyncArgs) -> Result<()> {
     let mut failures = recover_missing_queue_items()?;
     for path in queued_paths()? {
         attempted += 1;
-        let result = load_queued(&path).and_then(|queued| {
-            let origin = queued_origin(&queued, state.as_ref())?;
-            deliver_queued(origin, &path, &queued)
-        });
+        let result = deliver_path(&path, state.as_ref(), Duration::from_secs(15));
         match result {
-            Ok(()) => delivered += 1,
+            Ok(delivered_now) => delivered += usize::from(delivered_now),
             Err(error) => failures.push(format!("{}: {error}", path.display())),
         }
     }
@@ -231,7 +252,7 @@ pub(crate) fn run_sync(args: AuditSyncArgs) -> Result<()> {
     } else if summary.attempted == 0 && summary.failures.is_empty() {
         println!("No pending audit uploads.");
     } else {
-        let kind = if summary.failures.is_empty() {
+        let kind = if summary.failures.is_empty() && summary.remaining == 0 {
             SummaryKind::Success
         } else {
             SummaryKind::Attention
@@ -248,12 +269,15 @@ pub(crate) fn run_sync(args: AuditSyncArgs) -> Result<()> {
             eprintln!("  {failure}");
         }
     }
-    if summary.failures.is_empty() {
+    if summary.failures.is_empty() && summary.remaining == 0 {
         Ok(())
     } else {
-        Err(NonoError::ActionRequired(
-            "some audit sessions could not be delivered; retry `nono audit sync`".to_string(),
-        ))
+        let message = if summary.failures.is_empty() {
+            "audit uploads remain queued; another delivery may be in progress. Retry `nono audit sync` after it finishes"
+        } else {
+            "some audit sessions remain queued; review the per-upload errors before retrying"
+        };
+        Err(NonoError::ActionRequired(message.into()))
     }
 }
 
@@ -313,7 +337,10 @@ pub(crate) fn run_status(args: AuditStatusArgs) -> Result<()> {
         if enrolled {
             print!(
                 "{}",
-                summary_row("Delivery", "Automatic when sessions finish")
+                summary_row(
+                    "Delivery",
+                    "On completion; pending uploads retry during sessions"
+                )
             );
         }
         println!(
@@ -380,7 +407,31 @@ fn build_queued_audit(
     }))
 }
 
-fn deliver_queued(state: &PlatformState, path: &Path, queued: &QueuedAudit) -> Result<()> {
+fn deliver_path(path: &Path, active: Option<&PlatformState>, timeout: Duration) -> Result<bool> {
+    let queued = match load_queued(path) {
+        Err(NonoError::ConfigRead { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(false);
+        }
+        result => result?,
+    };
+    let origin = queued_origin(&queued, active)?;
+    deliver_queued(origin, path, &queued, timeout)
+}
+
+fn deliver_queued(
+    state: &PlatformState,
+    path: &Path,
+    queued: &QueuedAudit,
+    timeout: Duration,
+) -> Result<bool> {
+    let Some(_lock) = delivery::lock_queue(false)? else {
+        return Ok(false);
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
     let endpoint = endpoint_url(&state.platform_url, "/api/v1/audit/ingest")?;
     let request_path = url::Url::parse(&endpoint)
         .map_err(|error| NonoError::ConfigParse(format!("invalid ingest endpoint: {error}")))?
@@ -395,7 +446,7 @@ fn deliver_queued(state: &PlatformState, path: &Path, queued: &QueuedAudit) -> R
         body.as_bytes(),
     )?;
 
-    let mut response = http_agent(Duration::from_secs(15))
+    let mut response = http_agent(timeout)
         .post(&endpoint)
         .config()
         .http_status_as_error(false)
@@ -411,6 +462,15 @@ fn deliver_queued(state: &PlatformState, path: &Path, queued: &QueuedAudit) -> R
         .map_err(|error| NonoError::Snapshot(format!("audit ingest request failed: {error}")))?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
+        if matches!(status, 401 | 403) {
+            let safe = crate::terminal_approval::sanitize_for_terminal;
+            return Err(NonoError::ActionRequired(format!(
+                "audit delivery blocked (HTTP {status}) at {} for tenant {}, enrollment {}: authentication or authorization was refused. Ask the platform administrator to check this original enrollment and key; it may be revoked or no longer authorized. Evidence remains queued under its original identity. Re-enrolling does not transfer these sessions to the replacement.",
+                safe(&state.platform_url),
+                safe(&state.tenant_id),
+                safe(&state.subject_id),
+            )));
+        }
         let message = response
             .body_mut()
             .with_config()
@@ -444,7 +504,7 @@ fn deliver_queued(state: &PlatformState, path: &Path, queued: &QueuedAudit) -> R
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(())
+    Ok(true)
 }
 
 fn load_queued(path: &Path) -> Result<QueuedAudit> {
@@ -499,11 +559,8 @@ fn recover_missing_queue_items() -> Result<Vec<String>> {
         let Some(origin) = session_origin(&session.dir)? else {
             continue;
         };
-        match build_queued_audit(&session.dir, &session.metadata, &origin).and_then(|queued| {
-            let path = outbox_path(queued.ingest_id())?;
-            write_json_secure(&path, &queued)
-        }) {
-            Ok(()) => {
+        match queue_session(&session.dir, &session.metadata, &origin) {
+            Ok(_) => {
                 queued_session_ids.insert(session.metadata.session_id);
             }
             Err(error) => failures.push(format!("{}: {error}", session.dir.display())),
@@ -569,6 +626,228 @@ mod tests {
     use crate::audit_integrity::AuditRecorder;
     use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use nono::undo::{AuditIntegritySummary, ContentHash, ExecutableIdentity};
+
+    #[test]
+    fn automatic_retry_preserves_the_envelope_and_waits_for_a_valid_receipt() {
+        use crate::trust_keystore::TrustKeyRef;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("config")).unwrap();
+        let _env = EnvVarGuard::set_all(&[
+            (
+                "XDG_STATE_HOME",
+                root.path().join("state").to_str().unwrap(),
+            ),
+            (
+                "XDG_CONFIG_HOME",
+                root.path().join("config").to_str().unwrap(),
+            ),
+        ]);
+        let dir = root.path().join("session");
+        fs::create_dir(&dir).unwrap();
+        let mut recorder = AuditRecorder::new(dir.clone()).unwrap();
+        recorder
+            .record_session_started("2026-07-01T10:00:00Z".into(), vec!["true".into()])
+            .unwrap();
+        recorder
+            .record_session_ended("2026-07-01T10:00:01Z".into(), 0)
+            .unwrap();
+        let metadata = metadata("retry-session", recorder.finalize().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut state = state();
+        state.platform_url = format!("http://{}", listener.local_addr().unwrap());
+        state.key_ref = format!("file://{}", root.path().join("device-key").display());
+        crate::platform_client::load_or_create_signing_key_for_ref(
+            &TrustKeyRef::parse(&state.key_ref).unwrap(),
+        )
+        .unwrap();
+        let ((path, queued), duplicate) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| queue_session(&dir, &metadata, &state).unwrap().unwrap());
+            let second = scope.spawn(|| queue_session(&dir, &metadata, &state).unwrap().unwrap());
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        let original = fs::read(&path).unwrap();
+        assert_eq!(duplicate.0, path);
+        assert_eq!(queued_paths().unwrap().len(), 1);
+        let lock = delivery::lock_queue(false).unwrap().unwrap();
+        let busy = run_sync(AuditSyncArgs {
+            json: true,
+            help: None,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            busy.contains("another delivery may be in progress"),
+            "{busy}"
+        );
+        assert!(!busy.contains("per-upload errors"), "{busy}");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        drop(lock);
+        let expected = queued.wire_body().unwrap();
+        let ingest_id = queued.ingest_id();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                assert_eq!(body, expected.as_bytes());
+                let (status, response) =
+                    if attempt == 0 {
+                        ("503 Service Unavailable", "unavailable".to_string())
+                    } else if attempt == 1 {
+                        (
+                            "401 Unauthorized",
+                            "SENSITIVE_SERVER_BODY_MUST_NOT_APPEAR".into(),
+                        )
+                    } else if attempt == 2 {
+                        (
+                            "403 Forbidden",
+                            "SENSITIVE_SERVER_BODY_MUST_NOT_APPEAR".into(),
+                        )
+                    } else {
+                        ("200 OK", serde_json::json!({
+                        "ingest_id": if attempt == 3 { Uuid::nil() } else { ingest_id },
+                        "session_id": "retry-session", "accepted_at": "2026-07-01T10:00:02Z",
+                        "platform_attestation": "pending", "event_count": 2,
+                        "verification_status": "pending", "object_path": "evidence",
+                    }).to_string())
+                    };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            }
+        });
+        let (_stop, receiver) = mpsc::channel();
+        let mut cursor = None;
+        for attempt in 0..4 {
+            if matches!(attempt, 1 | 2) {
+                let error = deliver_path(&path, None, Duration::from_secs(5))
+                    .unwrap_err()
+                    .to_string();
+                for detail in [
+                    &state.platform_url,
+                    &state.tenant_id,
+                    &state.subject_id,
+                    "administrator",
+                    "Evidence remains queued",
+                    "Re-enrolling does not transfer",
+                ] {
+                    assert!(error.contains(detail), "{error}");
+                }
+                assert!(
+                    error.contains(if attempt == 1 { "HTTP 401" } else { "HTTP 403" }),
+                    "{error}"
+                );
+                assert!(
+                    !error.contains("SENSITIVE_SERVER_BODY_MUST_NOT_APPEAR"),
+                    "{error}"
+                );
+                assert!(!error.contains(&state.key_ref), "{error}");
+            } else {
+                assert_eq!(
+                    delivery::retry_batch(&receiver, &mut cursor).unwrap(),
+                    Some(true)
+                );
+            }
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(!dir.join(RECEIPT_FILENAME).exists());
+        }
+        assert_eq!(
+            delivery::retry_batch(&receiver, &mut cursor).unwrap(),
+            Some(false)
+        );
+        server.join().unwrap();
+        assert!(!path.exists());
+        assert!(!deliver_path(&path, None, Duration::from_secs(1)).unwrap());
+        let receipt: AuditIngestReceipt =
+            serde_json::from_slice(&fs::read(dir.join(RECEIPT_FILENAME)).unwrap()).unwrap();
+        assert_eq!(receipt.verification_status, "pending");
+        assert!(queue_session(&dir, &metadata, &state).unwrap().is_none());
+    }
+
+    #[test]
+    fn automatic_batches_are_bounded_fair_and_cancellable() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("config")).unwrap();
+        let _env = EnvVarGuard::set_all(&[
+            ("XDG_STATE_HOME", root.path().to_str().unwrap()),
+            (
+                "XDG_CONFIG_HOME",
+                root.path().join("config").to_str().unwrap(),
+            ),
+        ]);
+        let dir = outbox_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        for index in 0..10 {
+            fs::write(dir.join(format!("{index:02}.json")), "invalid queue item").unwrap();
+        }
+        let (stop, receiver) = std::sync::mpsc::channel();
+        let mut cursor = None;
+        assert_eq!(
+            delivery::retry_batch(&receiver, &mut cursor).unwrap(),
+            Some(true)
+        );
+        assert_eq!(cursor, Some(dir.join("07.json")));
+        assert_eq!(
+            delivery::retry_batch(&receiver, &mut cursor).unwrap(),
+            Some(true)
+        );
+        assert_eq!(cursor, Some(dir.join("05.json")));
+        stop.send(()).unwrap();
+        assert_eq!(delivery::retry_batch(&receiver, &mut cursor).unwrap(), None);
+        assert_eq!(queued_count().unwrap(), 10);
+    }
+
+    #[test]
+    fn delivery_lock_excludes_other_workers_and_shutdown_interrupts_waits() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("config")).unwrap();
+        let _env = EnvVarGuard::set_all(&[
+            ("XDG_STATE_HOME", root.path().to_str().unwrap()),
+            (
+                "XDG_CONFIG_HOME",
+                root.path().join("config").to_str().unwrap(),
+            ),
+        ]);
+        let lock = delivery::lock_queue(false).unwrap().unwrap();
+        assert!(delivery::lock_queue(false).unwrap().is_none());
+        drop(lock);
+        assert!(delivery::lock_queue(false).unwrap().is_some());
+        assert!(DeliveryWorker::start().unwrap().is_none());
+        fs::create_dir_all(outbox_dir().unwrap()).unwrap();
+        fs::write(
+            outbox_dir().unwrap().join("pending.json"),
+            "invalid queue item",
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let worker = DeliveryWorker::start().unwrap().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        drop(worker);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn queued_audit_verifies_local_evidence_and_preserves_identity() {

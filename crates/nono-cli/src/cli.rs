@@ -2872,6 +2872,10 @@ pub struct PlatformEnrollArgs {
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct LoginArgs {
+    /// Operator-facing label for this installation
+    #[arg(long)]
+    pub name: Option<String>,
+
     /// Platform origin for a self-hosted platform; defaults to the platform
     /// you last signed in to, else https://app.nolabs.ai
     #[arg(long, env = "NONO_PLATFORM_URL")]

@@ -54,6 +54,7 @@ fn policy_sources(
 
 #[derive(Debug)]
 enum RefreshFailure {
+    Unauthorized(String),
     Unavailable(String),
     ServiceUnavailable(String),
     Invalid(String),
@@ -85,12 +86,15 @@ impl RefreshFailure {
                                 .is_some_and(|policy| policy.management_mode == "audit_only")))
             }
             Self::ServiceUnavailable(_) => explicit_local,
-            Self::Invalid(_) => false,
+            Self::Invalid(_) | Self::Unauthorized(_) => false,
         }
     }
 
     fn error(self) -> NonoError {
         let message = match self {
+            Self::Unauthorized(message) => format!(
+                "{message}; device authentication was refused. Run `nono platform re-enroll` to authorize recovery; the existing enrollment and policy remain in place."
+            ),
             Self::Unavailable(message)
             | Self::ServiceUnavailable(message)
             | Self::Invalid(message) => message,
@@ -329,6 +333,9 @@ fn request<T: serde::de::DeserializeOwned>(
     tracing::debug!(endpoint = path, request_id = %id, status = response.status().as_u16(), "Received platform policy response");
     if !response.status().is_success() {
         let message = format!("policy endpoint returned HTTP {}", response.status());
+        if response.status().as_u16() == 401 {
+            return Err(RefreshFailure::Unauthorized(message));
+        }
         return Err(
             if response.status().is_server_error()
                 || matches!(response.status().as_u16(), 404 | 408 | 429)
@@ -514,7 +521,9 @@ fn prepare_start_inner(args: &mut SandboxArgs, silent: bool) -> Result<()> {
             .map(|policy| policy.assignment_version.clone())
             .unwrap_or_else(|| "unknown".into()),
         assigned_profile: assigned.map(|p| p.profile_id.clone()),
-        assigned_name: assigned.map(display::policy_name),
+        assigned_name: selected
+            .filter(|claims| claims.policy.is_some())
+            .and_then(display::assigned_name),
         assigned_revision: assigned.map(|p| p.revision),
         assigned_digest: assigned.map(|p| p.content_digest.clone()),
         policy_source: "local".into(),
@@ -743,9 +752,12 @@ mod tests {
         assert!(service.allows_local_fallback(true, Some(&advisory), None));
         let invalid = RefreshFailure::Invalid("invalid signature or assignment".into());
         assert!(!invalid.allows_local_fallback(true, Some(&advisory), Some("advisory")));
+        let unauthorized = RefreshFailure::Unauthorized("HTTP 401".into());
+        assert!(!unauthorized.allows_local_fallback(true, Some(&advisory), Some("advisory")));
+        assert!(!unauthorized.allows_local_fallback(true, Some(&local), Some("audit_only")));
         let mut enforced = claims();
         enforced.management_mode = "enforced".into();
-        for failure in [&offline, &service, &invalid] {
+        for failure in [&offline, &service, &invalid, &unauthorized] {
             assert!(!failure.allows_local_fallback(true, None, None));
             assert!(!failure.allows_local_fallback(true, Some(&enforced), Some("advisory")));
             assert!(!failure.allows_local_fallback(true, Some(&advisory), Some("enforced")));

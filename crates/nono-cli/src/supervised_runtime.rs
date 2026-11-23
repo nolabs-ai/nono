@@ -483,11 +483,18 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         });
     }
 
+    let mut audit_delivery = None;
     let exit_code = {
         // Runs in the parent the instant the child is forked, with the child's pid;
         // records it on the session. The cgroup attach is the child's own job (see
         // `resource_procs_fd` above), so there's no parent-side escape window here.
         let mut on_fork = |child_pid: u32| {
+            if audit_state.is_some() {
+                match crate::audit_client::DeliveryWorker::start() {
+                    Ok(worker) => audit_delivery = worker,
+                    Err(error) => tracing::warn!("Automatic audit retries unavailable: {error}"),
+                }
+            }
             if let Some(ref mut guard) = session_guard {
                 guard.set_child_pid(child_pid);
             }
@@ -540,6 +547,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         )?
     };
 
+    drop(audit_delivery);
     if let Some(ref mut guard) = session_guard {
         guard.set_exited(exit_code);
     }

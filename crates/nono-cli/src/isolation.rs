@@ -102,7 +102,48 @@ pub(crate) fn validate_config(args: &SandboxArgs, prepared: &PreparedSandbox) ->
     if !prepared.no_proxy.is_empty() {
         conflicts.push("network.no_proxy (hosts that bypass the proxy)");
     }
-    reject_direct_grants(&conflicts)
+    reject_direct_grants(&conflicts)?;
+    reject_command_network_grants(isolate, prepared.command_policies.as_ref())
+}
+
+/// Commands with direct grants stay on the host and bypass isolation; proxied ones join it and lose host localhost.
+fn reject_command_network_grants(
+    isolate: &LinuxIsolateConfig,
+    policies: Option<&crate::command_policy::CommandPoliciesConfig>,
+) -> Result<()> {
+    let networks: Vec<_> = policies
+        .into_iter()
+        .flat_map(|p| &p.commands)
+        .filter_map(|(name, c)| Some((name.as_str(), c.sandbox.as_ref()?.network.as_ref()?)))
+        .collect();
+    let names = |grants: fn(&crate::command_policy::CommandNetworkConfig) -> bool| {
+        networks
+            .iter()
+            .filter(|(_, n)| grants(n))
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let direct =
+        names(|n| n.allow_all || !n.tcp_connect_ports.is_empty() || !n.tcp_bind_ports.is_empty());
+    if !direct.is_empty() {
+        return Err(NonoError::ConfigParse(format!(
+            "linux.isolate.network (--isolate net) cannot be combined with command \
+             network.allow_all, network.tcp_connect_ports or network.tcp_bind_ports, because \
+             those commands would reach the network directly from the host: {direct}. Use \
+             network.allow_domain, or do not use network isolation."
+        )));
+    }
+    let callbacks = names(|n| !n.open_port.is_empty() || !n.open_port_range.is_empty());
+    if isolate.loopback || callbacks.is_empty() {
+        return Ok(());
+    }
+    Err(NonoError::ConfigParse(format!(
+        "linux.isolate.network (--isolate net) cannot be combined with command \
+         network.open_port or network.open_port_range, because mediated commands run in the \
+         isolated namespace where host localhost ports are unreachable: {callbacks}. Remove \
+         these grants, add linux.isolate.loopback, or do not use network isolation."
+    )))
 }
 
 /// `loopback` lifts TCP enforcement on the grounds that the network namespace
@@ -568,6 +609,72 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("open_port"), "{message}");
         assert!(message.contains("connect_port"), "{message}");
+    }
+
+    #[test]
+    fn command_network_grants_are_rejected_under_isolation() {
+        use crate::command_policy::{
+            CommandNetworkConfig, CommandPoliciesConfig, CommandPolicyConfig, CommandSandboxConfig,
+        };
+        let policies = |network: CommandNetworkConfig| {
+            let sandbox = CommandSandboxConfig {
+                network: Some(network),
+                ..Default::default()
+            };
+            let mut policies = CommandPoliciesConfig::default();
+            policies.commands.insert(
+                "tool".into(),
+                CommandPolicyConfig {
+                    sandbox: Some(sandbox),
+                    ..Default::default()
+                },
+            );
+            policies
+                .commands
+                .insert("git".into(), CommandPolicyConfig::default());
+            policies
+        };
+        let loopback = LinuxIsolateConfig {
+            loopback: true,
+            ..isolate_network()
+        };
+        let callback = policies(CommandNetworkConfig {
+            open_port: vec![8250],
+            ..Default::default()
+        });
+        let message = reject_command_network_grants(&isolate_network(), Some(&callback))
+            .expect_err("open_port")
+            .to_string();
+        assert!(
+            message.contains("unreachable: tool") && !message.contains("git"),
+            "{message}"
+        );
+        assert!(reject_command_network_grants(&loopback, Some(&callback)).is_ok());
+        for direct in [
+            CommandNetworkConfig {
+                allow_all: true,
+                ..Default::default()
+            },
+            CommandNetworkConfig {
+                tcp_connect_ports: vec![22],
+                ..Default::default()
+            },
+            CommandNetworkConfig {
+                tcp_bind_ports: vec![8080],
+                ..Default::default()
+            },
+        ] {
+            for isolate in [&isolate_network(), &loopback] {
+                let error = reject_command_network_grants(isolate, Some(&policies(direct.clone())));
+                assert!(
+                    error
+                        .expect_err("direct")
+                        .to_string()
+                        .contains("directly from the host: tool")
+                );
+            }
+        }
+        assert!(reject_command_network_grants(&isolate_network(), None).is_ok());
     }
 
     #[test]

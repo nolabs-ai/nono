@@ -769,3 +769,114 @@ fn mounts_work_with_stdio_redirected_to_a_file() {
     let written = std::fs::read_to_string(&out_path).expect("read stdout file");
     assert!(written.contains("redirected-ok"), "stdout: {written:?}");
 }
+
+fn mediated_profile(py: &str, isolate: &str) -> String {
+    let command = |domain: &str| {
+        format!(
+            r#"{{"executable":"{py}","sandbox":{{"fs_read":["/usr","/lib64","/etc","/proc"],"network":{{"allow_domain":["{domain}"]}}}}}}"#
+        )
+    };
+    format!(
+        r#"{{"meta":{{"name":"iso-mediated"}},"network":{{"allow_domain":["example.com"]}},"linux":{{"isolate":{isolate}}},"command_policies":{{"commands":{{"pya":{},"pyb":{}}}}}}}"#,
+        command("a.invalid"),
+        command("b.invalid")
+    )
+}
+
+const PROXY_PROBE: &str = r#"
+import base64, http.client, os, socket, sys, urllib.parse
+own = urllib.parse.urlparse(os.environ["HTTP_PROXY"])
+target = urllib.parse.urlparse(sys.argv[1]) if len(sys.argv) > 1 else own
+auth = {"Proxy-Authorization": "Basic " + base64.b64encode(f"{own.username}:{own.password}".encode()).decode()}
+def status(host):
+    try:
+        c = http.client.HTTPConnection(target.hostname, target.port, timeout=10)
+        c.request("GET", f"http://{host}/", headers=auth)
+        return c.getresponse().status
+    except OSError as e:
+        return type(e).__name__
+try:
+    socket.create_connection(("1.1.1.1", 80), timeout=3); direct = "connected"
+except OSError:
+    direct = "blocked"
+print(f"url={os.environ['HTTP_PROXY'].split('@')[-1]} a={status('a.invalid')} b={status('b.invalid')} direct={direct} ifaces={len(open("/proc/net/dev").readlines()) - 2}")
+"#;
+
+fn run_mediated(isolate: &str) -> Option<String> {
+    let py = python3_bin().or_else(|| {
+        eprintln!("skipping: no system python3 available");
+        None
+    })?;
+    let t = nono_test!("iso-mediated");
+    let profile = t.write_profile("iso-mediated", &mediated_profile(&py, isolate));
+    let probe = PROXY_PROBE.replace('\'', r"'\''");
+    let script = format!(
+        "a=$(pya -c '{probe}') || exit 1; echo \"A $a\"; url=http://${{a#url=}}; url=${{url%% *}}; pyb -c '{probe}' \"$url\" | sed 's/^/B-on-A /'; {py} -c '{probe}' \"$url\" | sed 's/^/Agent-on-A /'"
+    );
+    let completed = t
+        .run()
+        .profile(&profile)
+        .exec(Argv::new("/bin/sh").arg("-c").arg(script));
+    if host_unsupported(&completed) {
+        return None;
+    }
+    Some(
+        completed
+            .assert_success("mediated commands run")
+            .stdout()
+            .to_string(),
+    )
+}
+
+fn assert_scoped_proxies(stdout: &str, joins_namespace: bool) {
+    let line = |label: &str| {
+        let prefix = format!("{label} url=127.0.0.1:");
+        let line = stdout.lines().find(|l| l.starts_with(&prefix));
+        line.unwrap_or_else(|| panic!("{label} missing: {stdout}"))
+            .to_string()
+    };
+    let own = line("A");
+    assert!(own.contains(" a=502 b=403 direct=blocked"), "{stdout}");
+    assert_eq!(own.ends_with(" ifaces=1"), joins_namespace, "{stdout}");
+    assert!(
+        line("B-on-A").contains("a=PermissionError b=PermissionError"),
+        "{stdout}"
+    );
+    let refusal = if joins_namespace {
+        "PermissionError"
+    } else {
+        "ConnectionRefusedError"
+    };
+    assert!(
+        line("Agent-on-A").contains(&format!("a={refusal} b={refusal}")),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn isolated_mediated_commands_use_only_their_own_proxy() {
+    if let Some(stdout) = run_mediated(r#"{"network":true}"#) {
+        assert_scoped_proxies(&stdout, true);
+    }
+}
+
+#[test]
+fn isolated_loopback_mediated_commands_use_only_their_own_proxy() {
+    if let Some(stdout) = run_mediated(r#"{"network":true,"loopback":true}"#) {
+        assert_scoped_proxies(&stdout, false);
+    }
+}
+
+#[test]
+fn isolated_network_rejects_command_callback_ports() {
+    let t = nono_test!("iso-callback");
+    let profile = t.write_profile(
+        "iso-callback",
+        r#"{"meta":{"name":"iso-callback"},"network":{"allow_domain":["example.com"]},"linux":{"isolate":{"network":true}},"command_policies":{"commands":{"vault":{"executable":"/bin/true","sandbox":{"network":{"open_port":[8250]}}}}}}"#,
+    );
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new("/bin/true"))
+        .assert_failure("command callback ports are a configuration error under isolation")
+        .assert_stderr_contains("host localhost ports are unreachable: vault");
+}

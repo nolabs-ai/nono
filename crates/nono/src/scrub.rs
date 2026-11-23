@@ -60,6 +60,7 @@ const SENSITIVE_ENV_VARS: &[&str] = &[
     "NONO_PROXY_TOKEN",
     "OPENAI_API_KEY",
     "TOGETHER_API_KEY",
+    "TYPESAFE_API_KEY",
 ];
 
 /// Redaction policy for diagnostics and persisted command context.

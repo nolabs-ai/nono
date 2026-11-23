@@ -23,6 +23,20 @@ fn minimal_manifest_deserializes() {
 }
 
 #[test]
+fn manifest_builder_preserves_validation_and_defaults() {
+    let manifest = CapabilityManifest::try_from(CapabilityManifest::builder().version("0.1.0"))
+        .expect("build minimal manifest");
+    assert_eq!(
+        serde_json::to_value(&manifest).expect("serialize built manifest"),
+        serde_json::json!({"version": "0.1.0"})
+    );
+    assert!(CapabilityManifest::try_from(CapabilityManifest::builder()).is_err());
+    assert!(
+        CapabilityManifest::try_from(CapabilityManifest::builder().version("invalid")).is_err()
+    );
+}
+
+#[test]
 fn round_trip_minimal() {
     let json = r#"{ "version": "0.1.0" }"#;
     let manifest = CapabilityManifest::from_json(json).expect("parse");

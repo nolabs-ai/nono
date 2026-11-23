@@ -824,6 +824,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         namespaces,
         #[cfg(target_os = "linux")]
         mount_mask: mount_mask.as_ref(),
+        #[cfg(target_os = "linux")]
+        scoped_proxy_handles: &scoped_proxy_handles,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         case_insensitive_env_vars: flags.case_insensitive_env_vars,

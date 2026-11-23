@@ -56,6 +56,10 @@ pub(super) struct Bootstrap {
     /// Watch over the child's mount masks, pinned after the child applied
     /// them and before it ran untrusted code.
     pub mount_watch: Option<nono::MountMaskWatch>,
+    /// In-namespace listeners for `ExecConfig::scoped_proxy_handles`, in the same order.
+    pub scoped_bridges: Vec<OwnedFd>,
+    /// The child's user and network namespaces, which mediated commands join.
+    pub session_netns: Option<(OwnedFd, OwnedFd)>,
 }
 
 pub(super) struct Command<'a> {
@@ -99,6 +103,14 @@ fn namespace_confines_tcp(config: &ExecConfig<'_>) -> bool {
     config
         .namespaces
         .is_some_and(|spec| spec.has_network() && spec.loopback_tcp_enabled())
+}
+
+/// Mediated commands join the child's netns unless loopback TCP lets the session reach their bridges.
+fn commands_join_namespace(config: &ExecConfig<'_>) -> bool {
+    config.tool_sandbox_runtime.is_some()
+        && config
+            .namespaces
+            .is_some_and(|spec| spec.has_network() && !spec.loopback_tcp_enabled())
 }
 
 /// Prepare the child's Landlock policy. With `root` (the child's
@@ -303,6 +315,16 @@ pub(super) fn spawn(
     let parent = above_stdio(parent.into())?;
     let child = above_stdio(child.into())?;
     let closed_stdio = reserve_stdio()?;
+    let commands_join = commands_join_namespace(config);
+    let mut scoped: Vec<(u16, RawFd)> = if commands_join {
+        config
+            .scoped_proxy_handles
+            .iter()
+            .map(|handle| (handle.port, -1))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let snapshot = listeners()?;
     let mut signals = Signals::block()?;
     // SAFETY: getpid takes no pointers and cannot fail.
@@ -327,6 +349,7 @@ pub(super) fn spawn(
             network.as_ref(),
             namespaces.as_ref(),
             mount_mask,
+            &mut scoped,
             gate.as_ref().map(AsRawFd::as_raw_fd),
             child.as_raw_fd(),
             parent.as_raw_fd(),
@@ -347,7 +370,7 @@ pub(super) fn spawn(
     let mut mount_watch = None;
     #[cfg(test)]
     let mut late_fd = None;
-    let handshake = (|| -> Result<(RawFd, Option<OwnedFd>)> {
+    let handshake = (|| -> Result<(RawFd, Bootstrap)> {
         // Harden before releasing the child, and before any untrusted code can
         // exec. The child independently enables inspection for notifications.
         // SAFETY: prctl changes only the parent's dumpability.
@@ -492,6 +515,34 @@ pub(super) fn spawn(
             None if bridge_fd == -1 => None,
             None => return Err(failure("unexpected bridge listener")),
         };
+        let mut scoped_bridges = Vec::with_capacity(scoped.len());
+        for &(port, _) in &scoped {
+            let mut record = [0_u8; 4];
+            if !transfer(parent.as_raw_fd(), &mut record, false, Some(pid)) {
+                return Err(failure(
+                    "child died before reporting a command proxy bridge",
+                ));
+            }
+            let fd = i32::from_ne_bytes(record);
+            if fd < 3 {
+                return Err(failure("invalid command proxy bridge slot"));
+            }
+            // SAFETY: same shared-table contract as the session bridge above.
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            sandbox::validate_bridge_listener(borrowed, port)?;
+            // SAFETY: validated above; ports are distinct, so this is the only parent owner.
+            scoped_bridges.push(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        let session_netns = if commands_join {
+            let open = |name: &str| {
+                std::fs::File::open(format!("/proc/{pid}/ns/{name}"))
+                    .map_err(|_| failure("cannot open the child's namespaces"))
+                    .and_then(|file| above_stdio(file.into()))
+            };
+            Some((open("user")?, open("net")?))
+        } else {
+            None
+        };
         // Use send(MSG_NOSIGNAL) only in the parent; the child's filter traps it.
         #[cfg(test)]
         if command.fault == Fault::FailedAck {
@@ -510,9 +561,19 @@ pub(super) fn spawn(
         if !transfer(parent.as_raw_fd(), &mut [ack], true, Some(pid)) {
             return Err(failure("acknowledgment failed"));
         }
-        Ok((network_fd, bridge))
+        Ok((
+            network_fd,
+            Bootstrap {
+                child: nix::unistd::Pid::from_raw(pid),
+                network: None,
+                bridge,
+                mount_watch: None,
+                scoped_bridges,
+                session_netns,
+            },
+        ))
     })();
-    let (network_fd, bridge) = match handshake {
+    let (network_fd, mut bootstrap) = match handshake {
         Ok(fds) => fds,
         Err(error) => {
             kill_and_reap(pid);
@@ -522,15 +583,11 @@ pub(super) fn spawn(
     };
     // SAFETY: DETACHED was received, identity/ownership checked, and this is
     // the only parent owner. The child closes its private copies before exec.
-    let network = network
+    bootstrap.network = network
         .is_some()
         .then(|| unsafe { OwnedFd::from_raw_fd(network_fd) });
-    Ok(Bootstrap {
-        child: nix::unistd::Pid::from_raw(pid),
-        network,
-        bridge,
-        mount_watch,
-    })
+    bootstrap.mount_watch = mount_watch;
+    Ok(bootstrap)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -540,6 +597,7 @@ fn child_exec(
     network: Option<&PreparedSeccompNotifyFilter>,
     namespaces: Option<&nono::NamespaceSpec>,
     mount_mask: Option<&nono::PreparedMountMask>,
+    scoped: &mut [(u16, RawFd)],
     gate: Option<RawFd>,
     socket: RawFd,
     parent_socket: RawFd,
@@ -570,10 +628,18 @@ fn child_exec(
     // Enter the namespaces before READY: the parent writes our id maps on
     // READY, then holds us until the ruleset arrives. No untrusted code runs
     // before this, so there is no window to observe a half-built namespace.
-    let bridge_fd = match namespaces.map(nono::NamespaceSpec::enter_raw) {
-        None => -1,
-        Some(Ok(fd)) => fd.unwrap_or(-1),
-        Some(Err(error)) => {
+    let entered = namespaces
+        .map(nono::NamespaceSpec::enter_raw)
+        .transpose()
+        .and_then(|fd| {
+            for (port, slot) in scoped.iter_mut() {
+                *slot = sandbox::bridge_listener_raw(*port)?;
+            }
+            Ok(fd.flatten().unwrap_or(-1))
+        });
+    let bridge_fd = match entered {
+        Ok(fd) => fd,
+        Err(error) => {
             let mut record = [0_u8; 6];
             record[0] = NAMESPACE_FAILED;
             record[1] = namespace_stage_code(error.stage());
@@ -682,7 +748,11 @@ fn child_exec(
     };
     #[cfg(not(test))]
     let sent = transfer(socket, &mut report, true, None);
-    if !sent {
+    if !sent
+        || !scoped
+            .iter()
+            .all(|(_, fd)| transfer(socket, &mut fd.to_ne_bytes(), true, None))
+    {
         die(126);
     }
     let mut ack = [0_u8];

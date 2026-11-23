@@ -637,8 +637,7 @@ fn path_matches_endpoint_rules(
     }
     let normalized = normalize_path(path);
     rules.iter().any(|r| {
-        let pattern = nono_proxy::config::normalize_rule_path(&r.path);
-        let Ok(glob) = globset::GlobBuilder::new(pattern)
+        let Ok(glob) = globset::GlobBuilder::new(&r.path)
             .literal_separator(true)
             .build()
         else {
@@ -1588,11 +1587,11 @@ mod tests {
             endpoints: vec![
                 crate::sandbox_state::EndpointRuleState {
                     method: "*".to_string(),
-                    path: "/atko-cic/**".to_string(),
+                    path: "/atko-cic/**".into(),
                 },
                 crate::sandbox_state::EndpointRuleState {
                     method: "*".to_string(),
-                    path: "/nolabs-ai/**".to_string(),
+                    path: "/nolabs-ai/**".into(),
                 },
             ],
         }];
@@ -1621,7 +1620,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![crate::sandbox_state::EndpointRuleState {
                 method: "*".to_string(),
-                path: "/atko-cic/**".to_string(),
+                path: "/atko-cic/**".into(),
             }],
         }];
         // Path that does NOT match any rule
@@ -1803,7 +1802,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![crate::sandbox_state::EndpointRuleState {
                 method: "*".to_string(),
-                path: "/atko-cic/**".to_string(),
+                path: "/atko-cic/**".into(),
             }],
         }];
         // Bare domain (no path) shows allowed with endpoint rules
@@ -1852,11 +1851,11 @@ mod tests {
         let rules = vec![
             crate::sandbox_state::EndpointRuleState {
                 method: "*".to_string(),
-                path: "/atko-cic/**".to_string(),
+                path: "/atko-cic/**".into(),
             },
             crate::sandbox_state::EndpointRuleState {
                 method: "GET".to_string(),
-                path: "/public/*".to_string(),
+                path: "/public/*".into(),
             },
         ];
         assert!(path_matches_endpoint_rules(
@@ -1879,7 +1878,7 @@ mod tests {
     fn test_path_matches_endpoint_rules_single_wildcard_rejects_multi_segment() {
         let rules = vec![crate::sandbox_state::EndpointRuleState {
             method: "*".to_string(),
-            path: "/repos/*".to_string(),
+            path: "/repos/*".into(),
         }];
         assert!(path_matches_endpoint_rules("/repos/one", &rules));
         assert!(!path_matches_endpoint_rules("/repos/one/two", &rules));
@@ -1892,7 +1891,7 @@ mod tests {
     fn test_path_matches_endpoint_rules_trailing_slash() {
         let rules = vec![crate::sandbox_state::EndpointRuleState {
             method: "*".to_string(),
-            path: "/3322/".to_string(),
+            path: "/3322/".into(),
         }];
         assert!(path_matches_endpoint_rules("/3322/", &rules));
         assert!(path_matches_endpoint_rules("/3322", &rules));

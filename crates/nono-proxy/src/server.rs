@@ -4682,7 +4682,7 @@ mod tests {
             },
             deny: vec![EndpointPolicyRule {
                 method: "*".to_string(),
-                path: "/v1/secrets/**".to_string(),
+                path: "/v1/secrets/**".into(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -5231,7 +5231,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let endpoint_rule = crate::config::EndpointRule {
             method: "GET".to_string(),
-            path: "/repos/*".to_string(),
+            path: "/repos/*".into(),
         };
         let config = ProxyConfig {
             routes: vec![
@@ -5322,7 +5322,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let endpoint_rule = crate::config::EndpointRule {
             method: "GET".to_string(),
-            path: "/**".to_string(),
+            path: "/**".into(),
         };
         let config = ProxyConfig {
             routes: vec![
@@ -5815,7 +5815,7 @@ mod tests {
                     phantom_format: None,
                     endpoint_rules: vec![crate::config::EndpointRule {
                         method: "GET".to_string(),
-                        path: "/**".to_string(),
+                        path: "/**".into(),
                     }],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -8219,7 +8219,7 @@ mod tests {
             phantom_format: None,
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "GET".to_string(),
-                path: "/get".to_string(),
+                path: "/get".into(),
             }],
             endpoint_policy: None,
             tls_ca: None,

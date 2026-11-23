@@ -140,3 +140,19 @@ After enrollment, `nono audit sync` also discovers finalized local sessions
 that have neither an outbox entry nor a platform receipt and reconstructs the
 missing outbox item. Sessions completed before enrollment are not backfilled
 automatically.
+
+While an audited session runs, its supervisor retries pending completed-session
+uploads in the background. Attempts start immediately, back off from 30 seconds
+to five minutes on failure, and process bounded batches. Concurrent supervisors
+and manual sync coordinate through a local lock. Each item uses its original
+enrollment and unchanged envelope; it is removed only after a matching acceptance
+receipt is saved. Accepted evidence remains pending verification on the platform.
+No delivery worker remains after the supervisor exits; `nono audit sync` remains
+the explicit retry and recovery command. Running sessions are not uploaded in
+parts by this protocol.
+
+HTTP 401/403 delivery errors identify the original platform, tenant and
+enrollment and require administrator attention. Authentication refusal alone
+does not establish revocation. The client retains the evidence and its identity;
+re-enrollment cannot transfer old sessions to a new subject. Manual sync reports
+these per-upload failures and exits nonzero while evidence remains undelivered.

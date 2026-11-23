@@ -77,6 +77,16 @@ device to local policy.
 
 `nono platform status` verifies and reports cached state; `--refresh` performs a
 fresh exchange. Cached inspection does not grant offline launch authority.
+Without a cached assignment, JSON status reports the last verified mode, or
+`null` if no mode has been verified. `last_verified_management_mode` exposes that
+remembered history separately; `policy_assignment: null` and
+`policy_refreshed: false` make clear that no assignment was inspected. Human
+output labels remembered mode `last verified` and directs the user to refresh.
+Signed `resolved_via` metadata may include `profile_id`, `profile_name` and
+`revision` for the effective assignment, including group and unit inheritance.
+The CLI uses that platform label, falling back to bundle metadata for older
+servers. In audit-only mode it distinguishes the assigned profile from the
+local profiles that govern the session.
 An explicit `--refresh` can replace damaged cached content after verifying the
 fresh assignment and complete bundle against the existing pinned key. It never
 accepts a replacement key from that response. Ordinary session startup continues
@@ -118,6 +128,13 @@ command policies and recording. Direct exec cannot deliver session audit
 evidence, and advisory wrap launches explain that limitation.
 
 ## Enforced startup
+
+Explicit `nono platform re-enroll` can start fresh human consent even when the
+old device key is refused. Activation requires the server to confirm an owned,
+revoked replacement with preserved policy context. The client carries its
+remembered mode into the replacement and verifies the fresh assignment;
+failed recovery does not release enforcement. Other enrollment changes retain
+their normal fresh-assignment guard.
 
 Mode is verified before any local policy is loaded, including detached-launch
 preflight. The detached supervisor repeats verification. Only the signed bundle

@@ -21,6 +21,21 @@ pub(super) fn policy_name(policy: &AssignedBundle) -> String {
     safe_text(&policy.profile_id)
 }
 
+pub(super) fn assigned_name(claims: &AssignmentClaims) -> Option<String> {
+    let source = &claims.resolved_via;
+    if claims
+        .policy
+        .as_ref()
+        .is_none_or(|policy| source["profile_id"].as_str() == Some(policy.profile_id.as_str()))
+        && let Some(name) = source["profile_name"]
+            .as_str()
+            .filter(|name| !name.trim().is_empty())
+    {
+        return Some(safe_text(name));
+    }
+    claims.policy.as_ref().map(policy_name)
+}
+
 pub(crate) fn session_summary(session: &PolicySession) -> String {
     let mut text = summary_heading("Policy", SummaryKind::Info);
     if let Some(profile) = &session.assigned_profile {
@@ -98,16 +113,23 @@ pub(crate) fn status_rows(
     policy: Option<&AssignmentClaims>,
     previous: Option<&AssignmentClaims>,
     refreshed: bool,
+    remembered_mode: Option<&str>,
 ) -> String {
     let Some(policy) = policy else {
-        return summary_row(
+        let mut text = remembered_mode
+            .map(|mode| summary_row("Mode", &format!("{} · last verified", mode_label(mode))))
+            .unwrap_or_default();
+        text.push_str(&summary_row(
             if refreshed { "Refresh" } else { "Policy" },
             if refreshed {
                 "Policy delivery unsupported by platform"
+            } else if remembered_mode.is_some() {
+                "Cached assignment unavailable · use --refresh"
             } else {
                 "Not checked · use --refresh"
             },
-        );
+        ));
+        return text;
     };
     let mut text = assignment_rows(policy);
     let checked = format!(
@@ -131,10 +153,23 @@ pub(crate) fn status_rows(
 fn assignment_rows(policy: &AssignmentClaims) -> String {
     let mut text = summary_row("Mode", mode_label(&policy.management_mode));
     let profile = match &policy.policy {
-        Some(policy) => format!("{} · revision {}", policy_name(policy), policy.revision),
+        Some(bundle) => format!(
+            "{} · revision {}",
+            assigned_name(policy).unwrap_or_else(|| policy_name(bundle)),
+            bundle.revision
+        ),
         None => "Local profiles".into(),
     };
     text.push_str(&summary_row("Policy", &profile));
+    if policy.policy.is_none()
+        && let Some(name) = assigned_name(policy)
+    {
+        let label = match policy.resolved_via["revision"].as_i64() {
+            Some(revision) => format!("{name} · revision {revision}"),
+            None => name,
+        };
+        text.push_str(&summary_row("Assigned policy", &label));
+    }
     text
 }
 
@@ -173,6 +208,39 @@ mod tests {
         assert_eq!(
             refresh_message(Some(&after), &before),
             "Policy applied · revision 7"
+        );
+    }
+
+    #[test]
+    fn status_uses_the_resolved_platform_name_for_every_assignment_layer() {
+        for layer in ["subject", "group", "unit_default"] {
+            let mut claims = super::super::tests::claims();
+            let id = claims.policy.as_ref().expect("policy").profile_id.clone();
+            claims.resolved_via = serde_json::json!({
+                "layer": layer, "profile_id": id, "profile_name": "Engineering baseline", "revision": 7,
+            });
+            assert_eq!(
+                assigned_name(&claims).as_deref(),
+                Some("Engineering baseline")
+            );
+            assert!(status_rows(Some(&claims), None, true, None).contains("Engineering baseline"));
+            claims.management_mode = "audit_only".into();
+            claims.policy = None;
+            let text = status_rows(Some(&claims), None, true, None);
+            assert!(text.contains("Local profiles"));
+            assert!(text.contains("Assigned policy"));
+            assert!(text.contains("Engineering baseline"));
+        }
+    }
+
+    #[test]
+    fn a_name_for_another_profile_does_not_override_bundle_metadata() {
+        let mut claims = super::super::tests::claims();
+        claims.resolved_via =
+            serde_json::json!({"profile_id":"different", "profile_name":"Wrong name"});
+        assert_eq!(
+            assigned_name(&claims),
+            claims.policy.as_ref().map(policy_name)
         );
     }
 

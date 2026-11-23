@@ -156,6 +156,7 @@ pub(crate) fn guard_command(command: &Commands) -> Result<()> {
         Commands::Platform(args) => !matches!(
             &args.command,
             PlatformCommands::Status(_)
+                | PlatformCommands::ReEnroll(_)
                 | PlatformCommands::Tenant(crate::cli::TenantArgs {
                     command: TenantCommands::List(_),
                     ..
@@ -205,6 +206,7 @@ pub(crate) fn guard_command(command: &Commands) -> Result<()> {
             ));
         }
         Err(error) if error.allows_local_fallback(true, None, remembered.as_deref()) => false,
+        Err(error @ super::RefreshFailure::Unauthorized(_)) => return Err(error.error()),
         Err(error) if remembered.as_deref() == Some("enforced") => {
             return Err(denied(format!(
                 "this command needs a fresh platform release from enforced mode; {}",

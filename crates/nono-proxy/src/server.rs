@@ -7681,19 +7681,65 @@ mod tests {
         );
     }
 
+    /// Wait for the fixture's headers and Content-Length body before replying.
+    /// A TCP read can contain just part of either, even over loopback.
+    async fn read_origin_request(stream: impl tokio::io::AsyncRead + Unpin) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                request.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+            request.push_str(&String::from_utf8_lossy(&body));
+            request
+        })
+        .await
+        .expect("origin must receive a complete request")
+    }
+
+    #[tokio::test]
+    async fn origin_fixture_reads_fragmented_request_without_waiting_for_eof() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut sender, receiver) = tokio::io::duplex(16);
+        let reader = tokio::spawn(read_origin_request(receiver));
+        let body = "fragmented request body";
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\ncOnTeNt-LeNgTh: {}\r\n\r\n",
+            body.len()
+        );
+        sender.write_all(head.as_bytes()).await.unwrap();
+        tokio::task::yield_now().await;
+        sender.write_all(body.as_bytes()).await.unwrap();
+        assert_eq!(reader.await.unwrap(), format!("{head}{body}"));
+    }
+
     /// Spawn a one-shot local HTTP/1.1 origin server that echoes the received
     /// request line back in the body and returns 200. Returns its address and
     /// a receiver that yields the raw request bytes it saw.
     async fn spawn_echo_origin() -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let received = String::from_utf8_lossy(&buf[..n]).to_string();
+                let received = read_origin_request(&mut sock).await;
                 let body = "ok";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -7727,9 +7773,7 @@ mod tests {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
             };
-            let mut buf = [0u8; 4096];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            let received = String::from_utf8_lossy(&buf[..n]).to_string();
+            let received = read_origin_request(&mut sock).await;
             let body = "event: message\r\ndata: {}\r\n\r\n";
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nmcp-session-id: s1\r\nconnection: keep-alive\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",

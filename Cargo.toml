@@ -50,7 +50,7 @@ globset = "0.4"
 # Shared system dependencies
 nix = "0.31.3"
 landlock = "0.4.7"
-url = "2"
+url = "2.5.9"
 idna = "1"
 getrandom = "0.4"
 base64 = "0.23"

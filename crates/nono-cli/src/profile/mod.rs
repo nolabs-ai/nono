@@ -6,7 +6,7 @@
 
 pub(crate) mod builtin;
 pub(crate) mod bundle;
-mod credential_provider;
+pub(crate) mod credential_provider;
 
 pub use credential_provider::{
     CredentialProviderDef, CredentialProviderRequestBodyFormat,
@@ -11389,6 +11389,9 @@ mod tests {
     fn test_profile_parses_oauth_capture_credential_provider() {
         let json = r#"{
             "meta": { "name": "provider-oauth-capture" },
+            "credential_capture": {
+                "oauth_vault": { "provider": { "command": ["/usr/local/bin/oauth-vault"] }, "timeout_secs": 5 }
+            },
             "credential_providers": {
                 "claude_code": {
                     "type": "oauth_capture",
@@ -11404,6 +11407,7 @@ mod tests {
                         }
                     ],
                     "api_hosts": ["https://api.anthropic.com"],
+                    "store": "cmd://oauth_vault",
                     "credential_store": {
                         "type": "keychain_json",
                         "service": "Claude Code-credentials",
@@ -11433,6 +11437,7 @@ mod tests {
                 }
             ]
         }"#;
+        validate_against_schema(json).expect("provider token store is in the schema");
         let profile = parse_profile_bytes(json.as_bytes()).expect("provider profile parses");
         let provider = profile
             .credential_providers
@@ -11443,6 +11448,20 @@ mod tests {
             provider.token_endpoints[0].host,
             "https://platform.claude.com"
         );
+        assert_eq!(provider.store.as_deref(), Some("cmd://oauth_vault"));
+        validate_credential_provider_resolved(&profile).expect("token store reference is valid");
+        let mut missing_reference = profile.clone();
+        missing_reference.credential_capture.clear();
+        assert!(validate_credential_provider_resolved(&missing_reference).is_err());
+        let wrong_protocol = json.replace("cmd://oauth_vault", "file://oauth_vault");
+        assert!(validate_against_schema(&wrong_protocol).is_err());
+        let mut command_only = profile.clone();
+        let entry = command_only
+            .credential_capture
+            .get_mut("oauth_vault")
+            .unwrap();
+        entry.command = entry.provider.take().unwrap().command;
+        assert!(validate_credential_provider_resolved(&command_only).is_err());
         assert_eq!(provider.api_hosts, vec!["https://api.anthropic.com"]);
         assert_eq!(profile.credential_routes[0].provider, "claude_code");
     }

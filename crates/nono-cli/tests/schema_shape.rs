@@ -1374,6 +1374,7 @@ fn test_schema_credential_provider_def_matches_rust_model() {
             "inject_header",
             "credential_format",
             "credential_store",
+            "store",
             "helpers",
         ],
     );

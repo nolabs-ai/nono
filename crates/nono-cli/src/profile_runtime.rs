@@ -1353,6 +1353,7 @@ mod tests {
                 api_hosts: Vec::new(),
                 inject_header: None,
                 credential_format: None,
+                store: None,
                 credential_store: Some(profile::CredentialProviderStore::FileJson {
                     path: "$HOME/.codex-nono-oauth/auth.json".to_string(),
                     phantom_fields: vec!["tokens.access_token".to_string()],
@@ -1408,6 +1409,7 @@ mod tests {
                 api_hosts: Vec::new(),
                 inject_header: None,
                 credential_format: None,
+                store: None,
                 credential_store: Some(profile::CredentialProviderStore::FileJson {
                     path: "$HOME/.codex-nono-oauth/auth.json".to_string(),
                     phantom_fields: vec!["tokens.access_token".to_string()],

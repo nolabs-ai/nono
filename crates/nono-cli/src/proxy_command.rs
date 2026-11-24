@@ -38,6 +38,11 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
 
     let proxy = build_launch_options(&args)?;
     let mut proxy_config = build_proxy_config_from_flags(&proxy)?;
+    crate::proxy_runtime::oauth_store::configure(
+        &mut proxy_config,
+        &proxy,
+        &nono::CapabilitySet::default(),
+    )?;
 
     // Bind + auth settings come from the standalone flags, not the profile.
     proxy_config.bind_addr = args.listen;
@@ -114,7 +119,7 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
             proxy
                 .network_approval_defaults
                 .as_ref()
-                .and_then(|defaults| defaults.backend.clone()),
+                .and_then(|defaults| defaults.backend.as_deref()),
         )),
         &proxy.session_id,
     )?;
@@ -833,6 +838,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn profile_credential_provider_and_route_carry_through()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let _lock = ENV_LOCK
@@ -845,6 +851,9 @@ mod tests {
             &profile_path,
             r#"{
                 "meta": { "name": "provider-test" },
+                "credential_capture": {
+                    "oauth_vault": { "provider": { "command": ["/usr/bin/true"] } }
+                },
                 "credential_providers": {
                     "example": {
                         "type": "oauth_capture",
@@ -853,7 +862,8 @@ mod tests {
                             "path": "/oauth/token",
                             "response_fields": [{ "path": "access_token" }]
                         }],
-                        "api_hosts": ["https://api.example.com"]
+                        "api_hosts": ["https://api.example.com"],
+                        "store": "cmd://oauth_vault"
                     }
                 },
                 "credential_routes": [{
@@ -874,7 +884,13 @@ mod tests {
         assert_eq!(opts.credential_routes[0].name, "example");
         assert_eq!(opts.credential_routes[0].provider, "example");
 
-        let config = build_proxy_config_from_flags(&opts)?;
+        let mut config = build_proxy_config_from_flags(&opts)?;
+        crate::proxy_runtime::oauth_store::configure(
+            &mut config,
+            &opts,
+            &nono::CapabilitySet::default(),
+        )?;
+        assert!(config.oauth_capture_command_stores.contains_key("example"));
         assert_eq!(config.oauth_capture.len(), 1);
         assert_eq!(config.oauth_capture[0].provider, "example");
         assert_eq!(config.routes.len(), 1);

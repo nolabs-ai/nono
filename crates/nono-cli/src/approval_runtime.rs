@@ -26,24 +26,29 @@ mod unix_transport;
 /// which nono only accepts when it names a command.
 pub(crate) fn build_proxy_approval_registry(
     config: Option<&CommandPoliciesConfig>,
-    network_fallback: Option<(&BTreeMap<String, ApprovalBackendConfig>, Option<String>)>,
+    network_fallback: Option<(&BTreeMap<String, ApprovalBackendConfig>, Option<&str>)>,
     session_id: &str,
 ) -> Result<Option<nono_proxy::approval::ApprovalBackendRegistry>> {
-    let (backends, default_backend) = match config {
-        Some(config) if !config.approval_backends.is_empty() => (
-            &config.approval_backends,
-            config.approval_defaults.backend.clone(),
-        ),
-        _ => match network_fallback {
-            Some((backends, default_backend)) if !backends.is_empty() => {
-                (backends, default_backend)
-            }
-            _ => return Ok(None),
-        },
+    let Some((backends, default_backend)) = proxy_approval_config(config, network_fallback) else {
+        return Ok(None);
     };
     Ok(Some(
-        build_approval_registry_from(backends, default_backend)?.with_session_id(session_id),
+        build_approval_registry_from(backends, default_backend.map(str::to_owned))?
+            .with_session_id(session_id),
     ))
+}
+
+pub(crate) fn proxy_approval_config<'a>(
+    config: Option<&'a CommandPoliciesConfig>,
+    network_fallback: Option<(&'a BTreeMap<String, ApprovalBackendConfig>, Option<&'a str>)>,
+) -> Option<(&'a BTreeMap<String, ApprovalBackendConfig>, Option<&'a str>)> {
+    match config {
+        Some(config) if !config.approval_backends.is_empty() => Some((
+            &config.approval_backends,
+            config.approval_defaults.backend.as_deref(),
+        )),
+        _ => network_fallback.filter(|(backends, _)| !backends.is_empty()),
+    }
 }
 
 pub(crate) fn build_approval_registry(
@@ -1288,9 +1293,9 @@ mod tests {
     #[test]
     fn endpoint_registry_prefers_command_policies_then_network_backends() {
         let network = BTreeMap::from([("net".to_string(), webhook("https://net.example"))]);
-        let fallback = Some((&network, Some("net".to_string())));
+        let fallback = Some((&network, Some("net")));
 
-        let registry = build_proxy_approval_registry(None, fallback.clone(), "sess-1")
+        let registry = build_proxy_approval_registry(None, fallback, "sess-1")
             .unwrap()
             .expect("network backends answer endpoint approvals without command policies");
         let (name, _) = registry.resolve(None).unwrap();

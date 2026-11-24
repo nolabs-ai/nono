@@ -36,9 +36,6 @@ use zeroize::Zeroizing;
 /// memory ceiling consistent.
 const MAX_HEADER_SIZE: usize = 64 * 1024;
 
-type InterceptResponseRewrite<'a> =
-    Box<dyn Fn(u16, &[(String, String)], &[u8]) -> Result<Vec<u8>> + Send + Sync + 'a>;
-
 /// Resolved upstream proxy for the intercept path.
 ///
 /// When `Some`, the upstream leg of the intercepted request must chain
@@ -1255,6 +1252,54 @@ where
         return handle_websocket_upgrade(tls_stream, ctx, route, service, &req, cred).await;
     }
 
+    if let Some(endpoint) =
+        oauth_endpoint.filter(|endpoint| ctx.oauth_capture_store.has_command_store(endpoint))
+    {
+        let Some(body) = take_or_read_body(tls_stream, &req).await? else {
+            return Ok(());
+        };
+        let content_type = reverse::filter_headers(&req.header_bytes, "")
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value);
+        let store = Arc::clone(&ctx.oauth_capture_store);
+        let endpoint = endpoint.clone();
+        let is_post = req.method == "POST";
+        let (mut body, refresh) = tokio::task::spawn_blocking(move || {
+            let body = Zeroizing::new(body);
+            let refresh = store.command_refresh(&endpoint, &body, content_type.as_deref(), is_post);
+            (body, refresh)
+        })
+        .await
+        .map_err(|_| ProxyError::Credential("OAuth refresh task failed".into()))?;
+        match refresh {
+            Ok(Some((content_type, body))) => {
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nPragma: no-cache\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                );
+                tls_stream.write_all(headers.as_bytes()).await?;
+                tls_stream.write_all(&body).await?;
+                tls_stream.flush().await?;
+                audit::log_l7_request(
+                    ctx.audit_log,
+                    audit::ProxyMode::ConnectIntercept,
+                    &audit::EventContext::default(),
+                    ctx.host,
+                    &req.method,
+                    &req.path,
+                    200,
+                );
+                return Ok(());
+            }
+            Ok(None) => req.body = Some(std::mem::take(&mut *body)),
+            Err(_) => {
+                reverse::send_credential_capture_error(tls_stream, req.method == "HEAD").await?;
+                return Ok(());
+            }
+        }
+    }
+
     // --- Path / credential transformation ---
     // Shared with the HTTP/2 path so URL-mode injection cannot diverge.
     let transformed_path = reverse::transform_path_for_credential(cred, &req.path)?;
@@ -1464,40 +1509,31 @@ where
         method: &req.method,
         path: &req.path,
     };
-    let response_rewrite: Option<InterceptResponseRewrite<'_>> =
-        if let Some(endpoint) = oauth_endpoint {
-            Some(Box::new(
-                move |status: u16, headers: &[(String, String)], body: &[u8]| {
-                    if (200..300).contains(&status) {
-                        ctx.oauth_capture_store
-                            .rewrite_response_body(endpoint, headers, body)
-                    } else {
-                        ctx.oauth_capture_store
-                            .inspect_capture_host_response(&host_port, &path, status, body)
-                    }
-                },
-            ))
+    let response_rewrite: Option<forward::OwnedResponseRewrite> =
+        if let Some(endpoint) = oauth_endpoint.cloned() {
+            let store = Arc::clone(&ctx.oauth_capture_store);
+            Some(Box::new(move |status, headers, body| {
+                if (200..300).contains(&status) {
+                    store.rewrite_response_body(&endpoint, headers, body)
+                } else {
+                    store.inspect_capture_host_response(&host_port, &path, status, body)
+                }
+            }))
         } else if is_oauth_capture_host {
-            Some(Box::new(
-                move |status: u16, _headers: &[(String, String)], body: &[u8]| {
-                    ctx.oauth_capture_store
-                        .inspect_capture_host_response(&host_port, &path, status, body)
-                },
-            ))
+            let store = Arc::clone(&ctx.oauth_capture_store);
+            Some(Box::new(move |status, _headers, body| {
+                store.inspect_capture_host_response(&host_port, &path, status, body)
+            }))
         } else {
             None
         };
-    let response_rewrite_ref = response_rewrite
-        .as_ref()
-        .map(|rewrite| rewrite.as_ref() as forward::ResponseRewrite<'_>);
-
-    if let Err(e) = forward::forward_request_with_response_rewrite(
+    if let Err(e) = forward::forward_request_with_blocking_rewrite(
         tls_stream,
         request.as_bytes(),
         &body,
         upstream_spec,
         audit_ctx,
-        response_rewrite_ref,
+        response_rewrite,
     )
     .await
     {
@@ -5110,6 +5146,213 @@ mod tests {
             response.extend_from_slice(&buf[..n]);
         }
         String::from_utf8_lossy(&response).to_string()
+    }
+
+    fn command_oauth_capture_config(port: u16) -> crate::config::OAuthCaptureConfig {
+        use crate::config::{OAuthTokenResponseFieldConfig, OAuthTokenResponseFieldKind};
+
+        let mut config = oauth_capture_config(port);
+        config.token_endpoints[0]
+            .response_fields
+            .push(OAuthTokenResponseFieldConfig {
+                path: "id_token".into(),
+                kind: OAuthTokenResponseFieldKind::Jwt,
+                format: None,
+            });
+        config
+    }
+
+    fn command_oauth_id_phantom() -> String {
+        crate::jwt_phantom::jwt_shaped_phantom(&format!("nono_{}", "d".repeat(64))).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct CommandOAuthBroker {
+        capture_phantoms: Option<Vec<String>>,
+    }
+    impl crate::oauth_capture::OAuthTokenStoreBackend for CommandOAuthBroker {
+        fn credential_name(&self) -> &str {
+            "broker"
+        }
+
+        fn cache_ttl(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+
+        fn put(
+            &self,
+            _: &crate::oauth_capture::LoadedOAuthEndpoint,
+            _: &[crate::oauth_capture::OAuthCapturedField<'_>],
+        ) -> Result<Vec<String>> {
+            Ok(self.capture_phantoms.clone().expect("unexpected capture"))
+        }
+
+        fn resolve(&self, _: &str, _: &str) -> Result<Option<Zeroizing<String>>> {
+            panic!("refresh must not resolve the real refresh token");
+        }
+
+        fn refresh(
+            &self,
+            _: &crate::oauth_capture::LoadedOAuthEndpoint,
+            phantom: &str,
+        ) -> Result<crate::oauth_capture::OAuthRefresh> {
+            if phantom != format!("nono_{}", "b".repeat(64)) {
+                return Err(ProxyError::Credential("fixture broker error".into()));
+            }
+            Ok(crate::oauth_capture::OAuthRefresh {
+                phantoms: [
+                    ("access_token".into(), format!("nono_{}", "a".repeat(64))),
+                    ("refresh_token".into(), phantom.to_owned()),
+                    ("id_token".into(), command_oauth_id_phantom()),
+                ]
+                .into(),
+                expires_in: Some(42),
+                refresh_token_expires_in: Some(84),
+                token_type: Some("Bearer".into()),
+                scope: Some(Zeroizing::new("openid profile".into())),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_capture_command_put_rejects_unredeemable_phantoms() {
+        use crate::oauth_capture::OAuthTokenStoreBackend;
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let connector = https_connector_trusting(ca.cert_pem());
+        let token = Zeroizing::new("session-tok".to_owned());
+        let filter = ProxyFilter::allow_all();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+
+        for (access_phantom, status) in [
+            ("service-unredeemable-token".to_owned(), "502"),
+            (format!("service-{}-token", "a".repeat(64)), "200"),
+        ] {
+            let (port, upstream_request) = spawn_mock_https_upstream(
+                &ca,
+                r#"{"access_token":"upstream-access","refresh_token":"upstream-refresh","id_token":"upstream-id"}"#,
+            )
+            .await;
+            let mut config = command_oauth_capture_config(port);
+            config.token_endpoints[0].response_fields[0].format = Some("service-{}-token".into());
+            let refresh_phantom = format!("nono_{}", "b".repeat(64));
+            let id_phantom = command_oauth_id_phantom();
+            let backend: Arc<dyn OAuthTokenStoreBackend> = Arc::new(CommandOAuthBroker {
+                capture_phantoms: Some(vec![
+                    access_phantom.clone(),
+                    refresh_phantom.clone(),
+                    id_phantom.clone(),
+                ]),
+            });
+            let store = OAuthCaptureStore::load_with_command_stores(
+                &[config],
+                Some(path.clone()),
+                HashMap::from([("github".into(), backend)]),
+            )
+            .unwrap();
+            let ctx = oauth_intercept_ctx(
+                ca.clone(),
+                &connector,
+                &filter,
+                &token,
+                Arc::new(store),
+                port,
+            );
+            let body = "grant_type=authorization_code&code=synthetic";
+            let request = format!(
+                "POST /copilot_internal/v2/token HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            );
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                drive_token_endpoint_request(&ctx, request),
+            )
+            .await
+            .unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(2), upstream_request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(request.ends_with(body));
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+            assert!(!response.contains("upstream-access"));
+            assert!(!response.contains("upstream-refresh"));
+            assert!(!response.contains("upstream-id"));
+            if status == "200" {
+                let (_, body) = response.split_once("\r\n\r\n").unwrap();
+                let json: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(json["access_token"], access_phantom);
+                assert_eq!(json["refresh_token"], refresh_phantom);
+                assert_eq!(json["id_token"], id_phantom);
+            }
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_capture_command_refresh_never_connects_upstream() {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let backend: Arc<dyn crate::oauth_capture::OAuthTokenStoreBackend> =
+            Arc::new(CommandOAuthBroker {
+                capture_phantoms: None,
+            });
+        let store = OAuthCaptureStore::load_with_command_stores(
+            &[command_oauth_capture_config(port)],
+            None,
+            HashMap::from([("github".into(), backend)]),
+        )
+        .unwrap();
+        let connector = https_connector_trusting(ca.cert_pem());
+        let token = Zeroizing::new("session-tok".to_owned());
+        let filter = ProxyFilter::allow_all();
+        let ctx = oauth_intercept_ctx(ca, &connector, &filter, &token, Arc::new(store), port);
+
+        for (digit, status) in [('b', "200"), ('c', "503")] {
+            let refresh = format!("nono_{}", digit.to_string().repeat(64));
+            let body = format!("grant_type=refresh_token&refresh_token={refresh}");
+            let request = format!(
+                "POST /copilot_internal/v2/token HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            );
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                drive_token_endpoint_request(&ctx, request),
+            )
+            .await
+            .unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+            assert!(!response.contains("fixture broker error"));
+            if status == "200" {
+                let (_, body) = response.split_once("\r\n\r\n").unwrap();
+                let json: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(json["refresh_token"], refresh);
+                assert_eq!(json["access_token"], format!("nono_{}", "a".repeat(64)));
+                assert_eq!(json["id_token"], command_oauth_id_phantom());
+                assert_eq!(json["expires_in"], 42);
+                assert_eq!(json["refresh_token_expires_in"], 84);
+                assert_eq!(json["token_type"], "Bearer");
+                assert_eq!(json["scope"], "openid profile");
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

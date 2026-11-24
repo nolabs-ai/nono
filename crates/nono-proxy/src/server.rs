@@ -1334,11 +1334,18 @@ pub async fn start_with_network_approval(
 
     info!("Proxy server listening on {}", local_addr);
 
-    let mut oauth_capture_store = OAuthCaptureStore::load_with_persistence(
+    let audit_log = if config.enable_network_audit {
+        Some(audit::new_audit_log())
+    } else {
+        None
+    };
+    let mut oauth_capture_store = OAuthCaptureStore::load_with_command_stores(
         &config.oauth_capture,
         config.oauth_capture_store_path.clone(),
+        config.oauth_capture_command_stores.clone(),
     )?;
     oauth_capture_store.set_secret_registry(config.secret_registry.clone());
+    oauth_capture_store.set_audit_log(audit_log.clone());
     let oauth_capture_store = Arc::new(oauth_capture_store);
     let effective_nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>> =
         if oauth_capture_store.is_empty() {
@@ -1438,11 +1445,6 @@ pub async fn start_with_network_approval(
 
     // Shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let audit_log = if config.enable_network_audit {
-        Some(audit::new_audit_log())
-    } else {
-        None
-    };
 
     // Compute NO_PROXY hosts: allowed_hosts that can be reached via
     // direct TCP connections (i.e. their port is in direct_connect_ports).

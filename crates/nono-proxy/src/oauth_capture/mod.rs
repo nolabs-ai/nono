@@ -6,11 +6,15 @@
 //! phantoms before responses reach the sandbox, and resolves those phantoms
 //! only for admitted consumers on egress.
 
+mod command_store;
 mod endpoint;
 mod persist;
 mod rewrite;
 
-use self::endpoint::{LoadedOAuthEndpoint, load_endpoint, provider_consumer};
+use self::command_store::CommandTokenStore;
+pub use self::command_store::{OAuthCapturedField, OAuthRefresh, OAuthTokenStoreBackend};
+pub use self::endpoint::LoadedOAuthEndpoint;
+use self::endpoint::{ResponseField, load_endpoint, provider_consumer};
 use self::persist::{load_persisted_tokens, persist_tokens};
 use crate::config::OAuthCaptureConfig;
 use crate::error::{ProxyError, Result};
@@ -23,7 +27,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 use zeroize::Zeroizing;
 
-#[derive(Debug)]
 pub(super) struct StoredOAuthToken {
     pub(super) real: Zeroizing<Vec<u8>>,
     pub(super) admitted_consumers: HashSet<String>,
@@ -37,18 +40,29 @@ pub struct OAuthCaptureHostPolicy {
 }
 
 /// In-memory OAuth phantom token store.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct OAuthCaptureStore {
     endpoints: Vec<LoadedOAuthEndpoint>,
     by_host: HashMap<String, Vec<usize>>,
     phantoms: Mutex<HashMap<String, StoredOAuthToken>>,
     persist_path: Option<PathBuf>,
+    command_stores: HashMap<String, CommandTokenStore>,
     /// Distinct visible-phantom templates declared across all endpoints, used
     /// to recognise and replace templated phantoms on egress.
     templates: Vec<PhantomTemplate>,
     /// Session secret registry. Real tokens are registered when captured and
     /// when resolved for injection (NEP-0010 §3.1).
     secret_registry: Option<SecretRegistry>,
+    audit_log: Option<crate::audit::SharedAuditLog>,
+}
+
+impl std::fmt::Debug for OAuthCaptureStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCaptureStore")
+            .field("endpoints", &self.endpoints.len())
+            .field("command_stores", &self.command_stores.len())
+            .finish_non_exhaustive()
+    }
 }
 
 const MAX_PERSISTED_PHANTOMS: usize = 4096;
@@ -63,6 +77,15 @@ impl OAuthCaptureStore {
         configs: &[OAuthCaptureConfig],
         persist_path: Option<PathBuf>,
     ) -> Result<Self> {
+        Self::load_with_command_stores(configs, persist_path, HashMap::new())
+    }
+
+    pub(crate) fn load_with_command_stores(
+        configs: &[OAuthCaptureConfig],
+        persist_path: Option<PathBuf>,
+        mut backends: HashMap<String, std::sync::Arc<dyn OAuthTokenStoreBackend>>,
+    ) -> Result<Self> {
+        let mut command_stores = HashMap::new();
         let mut endpoints = Vec::new();
         let mut by_host: HashMap<String, Vec<usize>> = HashMap::new();
 
@@ -73,6 +96,7 @@ impl OAuthCaptureStore {
                 .cloned()
                 .collect::<HashSet<_>>();
             admitted.insert(provider_consumer(&config.provider));
+            let first_endpoint = endpoints.len();
             for endpoint in &config.token_endpoints {
                 let loaded = load_endpoint(&config.provider, endpoint, admitted.clone())?;
                 debug!(
@@ -88,11 +112,34 @@ impl OAuthCaptureStore {
                     .push(index);
                 endpoints.push(loaded);
             }
+            if let Some(backend) = backends.remove(&config.provider) {
+                command_stores.insert(
+                    config.provider.clone(),
+                    CommandTokenStore::new(backend, admitted, &endpoints[first_endpoint..]),
+                );
+            }
         }
 
+        if !backends.is_empty() {
+            return Err(ProxyError::Config(
+                "OAuth command token store has no provider".into(),
+            ));
+        }
+        let persist_path = if configs.len() == command_stores.len() && !configs.is_empty() {
+            None
+        } else {
+            persist_path
+        };
         let phantoms = if let Some(path) = persist_path.as_deref() {
             let mut phantoms = load_persisted_tokens(path)?;
-            prune_phantoms(&mut phantoms);
+            phantoms.retain(|_, token| {
+                !command_stores.keys().any(|provider| {
+                    token
+                        .admitted_consumers
+                        .contains(&provider_consumer(provider))
+                })
+            });
+            prune_phantoms(&mut phantoms, MAX_PERSISTED_PHANTOMS);
             phantoms
         } else {
             HashMap::new()
@@ -112,8 +159,10 @@ impl OAuthCaptureStore {
             by_host,
             phantoms: Mutex::new(phantoms),
             persist_path,
+            command_stores,
             templates,
             secret_registry: None,
+            audit_log: None,
         })
     }
 
@@ -122,6 +171,14 @@ impl OAuthCaptureStore {
     /// earlier sessions) so they can be redacted from terminal recordings.
     pub fn set_secret_registry(&mut self, registry: Option<SecretRegistry>) {
         self.secret_registry = registry;
+    }
+
+    pub(crate) fn set_audit_log(&mut self, log: Option<crate::audit::SharedAuditLog>) {
+        self.audit_log = log;
+    }
+
+    pub(crate) fn has_command_store(&self, endpoint: &LoadedOAuthEndpoint) -> bool {
+        self.command_stores.contains_key(&endpoint.provider)
     }
 
     fn register_real(&self, name: &str, real: &[u8]) {
@@ -195,28 +252,72 @@ impl OAuthCaptureStore {
         endpoint
     }
 
-    /// Store `real` under the phantom key `phantom` (the string the sandbox
-    /// sees and later resents), admitting it for `admitted_consumers`.
-    pub(super) fn store_phantom(
+    /// Commit all token fields from a validated response before returning phantoms.
+    fn capture_fields(
         &self,
-        provider: &str,
-        phantom: &str,
-        real: &[u8],
-        admitted_consumers: &HashSet<String>,
+        endpoint: &LoadedOAuthEndpoint,
+        fields: &[(&ResponseField, &str)],
+    ) -> Result<Vec<String>> {
+        for (_, real) in fields {
+            self.register_real(
+                &format!("oauth_capture:{}", endpoint.provider),
+                real.as_bytes(),
+            );
+        }
+        if let Some(store) = self.command_stores.get(&endpoint.provider) {
+            return store.put(endpoint, fields, self.audit_log.as_ref());
+        }
+        let mut visible = Vec::with_capacity(fields.len());
+        let mut mappings = Vec::with_capacity(fields.len());
+        for (field, real) in fields {
+            let (phantom, value) = rewrite::mint_response_phantom(&endpoint.provider, field, real)?;
+            visible.push(value);
+            mappings.push((phantom, *real));
+        }
+        self.store_local_phantoms(endpoint, &mappings)?;
+        Ok(visible)
+    }
+
+    fn store_local_phantoms(
+        &self,
+        endpoint: &LoadedOAuthEndpoint,
+        mappings: &[(String, &str)],
     ) -> Result<()> {
-        self.register_real(&format!("oauth_capture:{provider}"), real);
-        let token = StoredOAuthToken {
-            real: Zeroizing::new(real.to_vec()),
-            admitted_consumers: admitted_consumers.clone(),
-            created_at_secs: now_secs(),
-        };
         let mut guard = self
             .phantoms
             .lock()
             .map_err(|_| ProxyError::Config("OAuth capture store lock poisoned".to_string()))?;
-        guard.insert(phantom.to_string(), token);
-        prune_phantoms(&mut guard);
-        self.persist_locked(&guard)?;
+        if mappings.len() > MAX_PERSISTED_PHANTOMS
+            || mappings
+                .iter()
+                .any(|(phantom, _)| guard.contains_key(phantom))
+        {
+            return Err(ProxyError::Config(
+                "invalid OAuth response token mappings".into(),
+            ));
+        }
+        let pruned = prune_phantoms(&mut guard, MAX_PERSISTED_PHANTOMS - mappings.len());
+        let keys: Vec<_> = mappings
+            .iter()
+            .map(|(phantom, _)| phantom.clone())
+            .collect();
+        for (phantom, real) in mappings {
+            guard.insert(
+                phantom.clone(),
+                StoredOAuthToken {
+                    real: Zeroizing::new(real.as_bytes().to_vec()),
+                    admitted_consumers: endpoint.admitted_consumers.clone(),
+                    created_at_secs: now_secs(),
+                },
+            );
+        }
+        if let Err(err) = self.persist_locked(&guard) {
+            guard.extend(pruned);
+            for key in keys {
+                guard.remove(&key);
+            }
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -228,22 +329,28 @@ impl OAuthCaptureStore {
     }
 }
 
-fn prune_phantoms(tokens: &mut HashMap<String, StoredOAuthToken>) {
+fn prune_phantoms(
+    tokens: &mut HashMap<String, StoredOAuthToken>,
+    max_entries: usize,
+) -> Vec<(String, StoredOAuthToken)> {
     let now = now_secs();
-    tokens.retain(|_, token| now.saturating_sub(token.created_at_secs) <= PHANTOM_TTL_SECS);
-    if tokens.len() <= MAX_PERSISTED_PHANTOMS {
-        return;
+    let mut pruned: Vec<_> = tokens
+        .extract_if(|_, token| now.saturating_sub(token.created_at_secs) > PHANTOM_TTL_SECS)
+        .collect();
+    let remove_count = tokens.len().saturating_sub(max_entries);
+    if remove_count > 0 {
+        let mut by_age: Vec<_> = tokens
+            .iter()
+            .map(|(phantom, token)| (phantom.clone(), token.created_at_secs))
+            .collect();
+        by_age.sort_unstable_by_key(|(_, created_at_secs)| *created_at_secs);
+        for (phantom, _) in by_age.into_iter().take(remove_count) {
+            if let Some(token) = tokens.remove(&phantom) {
+                pruned.push((phantom, token));
+            }
+        }
     }
-
-    let mut by_age = tokens
-        .iter()
-        .map(|(phantom, token)| (phantom.clone(), token.created_at_secs))
-        .collect::<Vec<_>>();
-    by_age.sort_by_key(|(_, created_at_secs)| *created_at_secs);
-    let remove_count = tokens.len() - MAX_PERSISTED_PHANTOMS;
-    for (phantom, _) in by_age.into_iter().take(remove_count) {
-        tokens.remove(&phantom);
-    }
+    pruned
 }
 
 fn now_secs() -> u64 {
@@ -259,18 +366,29 @@ fn host_from_host_port(host_port: &str) -> Option<&str> {
 
 impl NonceResolver for OAuthCaptureStore {
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
-        let guard = self.phantoms.lock().ok()?;
-        let token = guard.get(nonce)?;
-        if !token.admitted_consumers.contains(consumer) {
-            return None;
-        }
-        self.register_real(&format!("oauth_capture:{consumer}"), &token.real);
+        let local = {
+            let guard = self.phantoms.lock().ok()?;
+            if let Some(token) = guard.get(nonce) {
+                if !token.admitted_consumers.contains(consumer) {
+                    return None;
+                }
+                Some(token.real.clone())
+            } else {
+                None
+            }
+        };
+        let real = local.or_else(|| {
+            self.command_stores
+                .values()
+                .find_map(|store| store.resolve(nonce, consumer, self.audit_log.as_ref()))
+        })?;
+        self.register_real(&format!("oauth_capture:{consumer}"), &real);
         debug!(
             consumer = %consumer,
             phantom = %phantom_fingerprint(nonce),
             "resolved OAuth phantom token for admitted consumer"
         );
-        Some(Zeroizing::new(token.real.to_vec()))
+        Some(real)
     }
 
     fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
@@ -325,8 +443,8 @@ mod tests {
     use serde_json::Value;
     use std::{fs, path::PathBuf};
 
-    fn store() -> OAuthCaptureStore {
-        OAuthCaptureStore::load(&[OAuthCaptureConfig {
+    fn codex_config() -> OAuthCaptureConfig {
+        OAuthCaptureConfig {
             provider: "codex".to_string(),
             token_endpoints: vec![OAuthTokenEndpointConfig {
                 host: "https://auth.openai.com".to_string(),
@@ -337,27 +455,234 @@ mod tests {
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.openai_oauth".to_string()],
-        }])
-        .unwrap()
+        }
+    }
+
+    fn store() -> OAuthCaptureStore {
+        OAuthCaptureStore::load(&[codex_config()]).unwrap()
     }
 
     fn store_with_persistence(path: PathBuf) -> OAuthCaptureStore {
-        OAuthCaptureStore::load_with_persistence(
-            &[OAuthCaptureConfig {
-                provider: "codex".to_string(),
-                token_endpoints: vec![OAuthTokenEndpointConfig {
-                    host: "https://auth.openai.com".to_string(),
-                    path: "/oauth/token".to_string(),
-                    response_fields: opaque_fields(["access_token", "refresh_token"]),
-                    request_body: OAuthTokenRequestBodyFormat::Auto,
-                    response_body: OAuthTokenRequestBodyFormat::Auto,
-                    request_nonce_fields: vec!["refresh_token".to_string()],
-                }],
-                admitted_consumers: vec!["proxy.openai_oauth".to_string()],
-            }],
-            Some(path),
+        OAuthCaptureStore::load_with_persistence(&[codex_config()], Some(path)).unwrap()
+    }
+
+    #[derive(Default)]
+    struct TestCommandStore {
+        tokens: Mutex<HashMap<String, Zeroizing<String>>>,
+        reject_put: std::sync::atomic::AtomicBool,
+        resolve_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::fmt::Debug for TestCommandStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("TestCommandStore")
+        }
+    }
+
+    fn store_phantom(digit: char) -> String {
+        format!("nono_{digit:0>64}")
+    }
+
+    impl OAuthTokenStoreBackend for TestCommandStore {
+        fn credential_name(&self) -> &str {
+            "codex_broker"
+        }
+
+        fn cache_ttl(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(60)
+        }
+
+        fn put(
+            &self,
+            _: &LoadedOAuthEndpoint,
+            fields: &[OAuthCapturedField<'_>],
+        ) -> Result<Vec<String>> {
+            assert_eq!(fields.len(), 2, "put the whole response together");
+            if self.reject_put.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(ProxyError::Credential("test helper refused put".into()));
+            }
+            let mut tokens = self.tokens.lock().unwrap();
+            let phantoms = [store_phantom('a'), store_phantom('b')];
+            for (phantom, field) in phantoms.iter().zip(fields) {
+                tokens.insert(phantom.clone(), Zeroizing::new(field.value.into()));
+            }
+            Ok(phantoms.to_vec())
+        }
+
+        fn resolve(&self, phantom: &str, _: &str) -> Result<Option<Zeroizing<String>>> {
+            self.resolve_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.tokens.lock().unwrap().get(phantom).cloned())
+        }
+
+        fn refresh(&self, _: &LoadedOAuthEndpoint, phantom: &str) -> Result<OAuthRefresh> {
+            assert_eq!(phantom, store_phantom('b'));
+            self.tokens
+                .lock()
+                .unwrap()
+                .insert(store_phantom('a'), Zeroizing::new("rotated-access".into()));
+            Ok(OAuthRefresh {
+                phantoms: [
+                    ("access_token".into(), store_phantom('a')),
+                    ("refresh_token".into(), store_phantom('b')),
+                ]
+                .into(),
+                expires_in: Some(120),
+                refresh_token_expires_in: None,
+                token_type: Some("Bearer".into()),
+                scope: None,
+            })
+        }
+    }
+
+    #[test]
+    fn command_store_delegates_capture_resolution_and_refresh() {
+        use std::sync::atomic::Ordering;
+        let backend = std::sync::Arc::new(TestCommandStore::default());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+        let audit = crate::audit::new_audit_log();
+        let registry = SecretRegistry::new();
+        let start = || {
+            let backend: std::sync::Arc<dyn OAuthTokenStoreBackend> = backend.clone();
+            let mut store = OAuthCaptureStore::load_with_command_stores(
+                &[codex_config()],
+                Some(path.clone()),
+                HashMap::from([("codex".into(), backend)]),
+            )
+            .unwrap();
+            store.set_audit_log(Some(audit.clone()));
+            store.set_secret_registry(Some(registry.clone()));
+            store
+        };
+        let store = start();
+        let endpoint = store.lookup("auth.openai.com:443", "/oauth/token").unwrap();
+        let login = || {
+            store.rewrite_response_body(
+                endpoint,
+                &[],
+                br#"{"access_token":"real-access","refresh_token":"real-refresh"}"#,
+            )
+        };
+        backend.reject_put.store(true, Ordering::Relaxed);
+        assert!(login().is_err());
+        assert!(backend.tokens.lock().unwrap().is_empty());
+        backend.reject_put.store(false, Ordering::Relaxed);
+        let login: Value = serde_json::from_slice(&login().unwrap()).unwrap();
+        let access = login["access_token"].as_str().unwrap();
+        let refresh = login["refresh_token"].as_str().unwrap();
+        assert_eq!(access, store_phantom('a'));
+        assert_eq!(refresh, store_phantom('b'));
+        assert!(!path.exists());
+        drop(store);
+
+        let store = start();
+        let endpoint = store.lookup("auth.openai.com:443", "/oauth/token").unwrap();
+        assert!(store.resolve(access, "proxy.wrong_route").is_none());
+        assert_eq!(backend.resolve_calls.load(Ordering::Relaxed), 0);
+        for _ in 0..2 {
+            assert_eq!(
+                store
+                    .resolve(access, "proxy.openai_oauth")
+                    .unwrap()
+                    .as_slice(),
+                b"real-access"
+            );
+        }
+        assert_eq!(backend.resolve_calls.load(Ordering::Relaxed), 1);
+        let request = format!("grant_type=refresh_token&refresh_token={refresh}");
+        let (content_type, body) = store
+            .command_refresh(endpoint, request.as_bytes(), None, true)
+            .unwrap()
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(content_type, "application/json");
+        assert_eq!(body["refresh_token"], refresh);
+        assert_eq!(body["access_token"], access);
+        assert_eq!(body["expires_in"], 120);
+        assert_eq!(
+            store
+                .resolve(access, "proxy.openai_oauth")
+                .unwrap()
+                .as_slice(),
+            b"rotated-access"
+        );
+        assert_eq!(backend.resolve_calls.load(Ordering::Relaxed), 2);
+        assert!(
+            registry
+                .snapshot()
+                .1
+                .iter()
+                .any(|secret| secret.value.as_str() == "rotated-access")
+        );
+        let events = crate::audit::snapshot_audit_events(&audit);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.credential_capture_action.as_deref())
+                .collect::<Vec<_>>(),
+            ["put", "put", "resolve", "refresh", "resolve"]
+        );
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("real-access")
+        );
+        assert!(!path.exists());
+
+        let mut nested_endpoint = endpoint.clone();
+        nested_endpoint.request_nonce_fields = vec!["credentials.refresh_token".into()];
+        let request = serde_json::json!({
+            "grant_type": "refresh_token",
+            "credentials": { "refresh_token": refresh },
+        });
+        let (_, body) = store
+            .command_refresh(
+                &nested_endpoint,
+                &serde_json::to_vec(&request).unwrap(),
+                Some("application/json"),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["refresh_token"], refresh);
+    }
+
+    #[test]
+    fn command_store_ignores_old_file_mappings_in_mixed_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+        let local = store_with_persistence(path.clone());
+        let endpoint = local.lookup("auth.openai.com:443", "/oauth/token").unwrap();
+        let phantom = store_phantom('d');
+        local
+            .store_local_phantoms(endpoint, &[(phantom.clone(), "old-file-token")])
+            .unwrap();
+        assert!(local.resolve(&phantom, "proxy.openai_oauth").is_some());
+        drop(local);
+
+        let mut local_provider = codex_config();
+        local_provider.provider = "other".into();
+        local_provider.token_endpoints[0].host = "https://other.example".into();
+        local_provider.admitted_consumers = vec!["proxy.other".into()];
+        let broker: std::sync::Arc<dyn OAuthTokenStoreBackend> =
+            std::sync::Arc::new(TestCommandStore::default());
+        let mixed = OAuthCaptureStore::load_with_command_stores(
+            &[codex_config(), local_provider],
+            Some(path.clone()),
+            HashMap::from([("codex".into(), broker)]),
         )
-        .unwrap()
+        .unwrap();
+        assert!(mixed.resolve(&phantom, "proxy.openai_oauth").is_none());
+
+        let other = mixed.lookup("other.example:443", "/oauth/token").unwrap();
+        mixed
+            .store_local_phantoms(other, &[(store_phantom('e'), "other-file-token")])
+            .unwrap();
+        let persisted = fs::read_to_string(path).unwrap();
+        assert!(!persisted.contains(&phantom));
+        assert!(persisted.contains(&store_phantom('e')));
     }
 
     #[test]
@@ -701,12 +1026,7 @@ mod tests {
         let endpoint = store.lookup("auth.openai.com:443", "/oauth/token").unwrap();
         let phantom = generate_phantom().unwrap();
         store
-            .store_phantom(
-                "codex",
-                &phantom,
-                b"real refresh/value",
-                &endpoint.admitted_consumers,
-            )
+            .store_local_phantoms(endpoint, &[(phantom.clone(), "real refresh/value")])
             .unwrap();
         let body = format!("grant_type=refresh_token&refresh_token={phantom}");
 
@@ -790,7 +1110,7 @@ mod tests {
             );
         }
 
-        prune_phantoms(&mut tokens);
+        prune_phantoms(&mut tokens, MAX_PERSISTED_PHANTOMS);
 
         assert_eq!(tokens.len(), MAX_PERSISTED_PHANTOMS);
         assert!(!tokens.contains_key("expired"));

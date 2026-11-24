@@ -14,7 +14,7 @@ pub(crate) const CAPTURE_FAILED_BODY: &str = concat!(
 );
 
 /// Request context for a command-backed credential capture.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CredentialCaptureRequest {
     /// Logical credential name from `cmd://<name>`.
     pub credential_name: String,
@@ -30,6 +30,34 @@ pub struct CredentialCaptureRequest {
     pub session_id: String,
     /// Cache scope derived from request context.
     pub cache_scope: String,
+}
+
+impl CredentialCaptureRequest {
+    /// The common stdin envelope for credential providers.
+    pub fn provider_request<'a, T: serde::Serialize + 'a>(
+        &'a self,
+        config: &'a serde_json::Value,
+        interaction: &'a serde_json::Map<String, serde_json::Value>,
+        operation: Option<T>,
+    ) -> impl serde::Serialize + 'a {
+        #[derive(serde::Serialize)]
+        struct Request<'a, T> {
+            protocol: &'static str,
+            #[serde(flatten)]
+            context: &'a CredentialCaptureRequest,
+            config: &'a serde_json::Value,
+            interaction: &'a serde_json::Map<String, serde_json::Value>,
+            #[serde(flatten)]
+            operation: Option<T>,
+        }
+        Request {
+            protocol: "nono.credential-provider.v1",
+            context: self,
+            config,
+            interaction,
+            operation,
+        }
+    }
 }
 
 /// Metadata about a capture attempt. Secret stdout is intentionally excluded.

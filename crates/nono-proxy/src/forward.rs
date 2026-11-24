@@ -28,6 +28,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
+use zeroize::Zeroizing;
 
 /// Timeout for upstream TCP connect (matches the historical reverse-proxy value).
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -90,6 +91,9 @@ pub struct AuditCtx<'a> {
 pub type ResponseRewrite<'a> =
     &'a (dyn Fn(u16, &[(String, String)], &[u8]) -> Result<Vec<u8>> + Send + Sync);
 
+pub(crate) type OwnedResponseRewrite =
+    Box<dyn Fn(u16, &[(String, String)], &[u8]) -> Result<Vec<u8>> + Send + Sync>;
+
 /// Connect to the upstream, write `request_bytes + body`, stream the
 /// response back into `inbound`, and emit the L7 audit event.
 ///
@@ -149,10 +153,38 @@ where
         body,
         upstream,
         audit,
-        response_rewrite,
+        response_rewrite.map(Rewrite::Inline),
         false,
     )
     .await
+}
+
+pub(crate) async fn forward_request_with_blocking_rewrite<S>(
+    inbound: &mut S,
+    request_bytes: &[u8],
+    body: &[u8],
+    upstream: UpstreamSpec<'_>,
+    audit: AuditCtx<'_>,
+    response_rewrite: Option<OwnedResponseRewrite>,
+) -> Result<u16>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    forward_request_inner(
+        inbound,
+        request_bytes,
+        body,
+        upstream,
+        audit,
+        response_rewrite.map(Rewrite::Blocking),
+        false,
+    )
+    .await
+}
+
+enum Rewrite<'a> {
+    Inline(ResponseRewrite<'a>),
+    Blocking(OwnedResponseRewrite),
 }
 
 async fn forward_request_inner<S>(
@@ -161,7 +193,7 @@ async fn forward_request_inner<S>(
     body: &[u8],
     upstream: UpstreamSpec<'_>,
     audit: AuditCtx<'_>,
-    response_rewrite: Option<ResponseRewrite<'_>>,
+    response_rewrite: Option<Rewrite<'_>>,
     close_inbound: bool,
 ) -> Result<u16>
 where
@@ -197,7 +229,7 @@ where
 async fn stream_or_rewrite_response<U, I>(
     upstream: &mut U,
     inbound: &mut I,
-    response_rewrite: Option<ResponseRewrite<'_>>,
+    response_rewrite: Option<Rewrite<'_>>,
     close_inbound: bool,
 ) -> Result<u16>
 where
@@ -490,16 +522,16 @@ const MAX_REWRITE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 async fn buffer_rewrite_response<U, I>(
     upstream: &mut U,
     inbound: &mut I,
-    rewrite: ResponseRewrite<'_>,
+    rewrite: Rewrite<'_>,
 ) -> Result<u16>
 where
     U: AsyncRead + AsyncWrite + Unpin,
     I: AsyncWrite + Unpin,
 {
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 8192];
+    let mut raw = Zeroizing::new(Vec::new());
+    let mut buf = Zeroizing::new([0u8; 8192]);
     loop {
-        let n = match tokio::time::timeout(UPSTREAM_REWRITE_READ_TIMEOUT, upstream.read(&mut buf))
+        let n = match tokio::time::timeout(UPSTREAM_REWRITE_READ_TIMEOUT, upstream.read(&mut *buf))
             .await
         {
             Ok(Ok(0)) => break,
@@ -534,7 +566,14 @@ where
         }
     }
 
-    let rewritten = rewrite_http1_response(&raw, rewrite)?;
+    let rewritten = match rewrite {
+        Rewrite::Inline(rewrite) => rewrite_http1_response(&raw, rewrite)?,
+        Rewrite::Blocking(rewrite) => {
+            tokio::task::spawn_blocking(move || rewrite_http1_response(&raw, rewrite.as_ref()))
+                .await
+                .map_err(|_| ProxyError::HttpParse("OAuth response rewrite failed".into()))??
+        }
+    };
     let status = parse_response_status(&rewritten);
     inbound.write_all(&rewritten).await?;
     inbound.flush().await?;
@@ -548,7 +587,7 @@ fn rewrite_http1_response(raw: &[u8], rewrite: ResponseRewrite<'_>) -> Result<Ve
         ));
     };
     let head = &raw[..header_end];
-    let mut body = raw[header_end + 4..].to_vec();
+    let mut body = Zeroizing::new(raw[header_end + 4..].to_vec());
     let head_str = std::str::from_utf8(head).map_err(|_| {
         ProxyError::HttpParse("upstream response headers are not UTF-8".to_string())
     })?;
@@ -583,7 +622,7 @@ fn rewrite_http1_response(raw: &[u8], rewrite: ResponseRewrite<'_>) -> Result<Ve
     }
 
     if chunked {
-        body = decode_chunked_body(&body)?;
+        body = Zeroizing::new(decode_chunked_body(&body)?);
     }
     if content_encoded {
         return Err(ProxyError::HttpParse(

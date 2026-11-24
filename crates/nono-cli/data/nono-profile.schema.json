@@ -1406,7 +1406,7 @@
         "extra_params": {
           "type": "object",
           "additionalProperties": { "type": "string" },
-          "description": "Extra parameters merged into the token exchange POST body verbatim.",
+          "description": "Extra parameters appended to the token exchange POST body (client_credentials and client_assertion). Values are sent as-is, not resolved as credential references. Keys nono sets (grant_type, client_id, client_secret, scope, client_assertion, client_assertion_type, assertion) are rejected.",
           "default": {}
         }
       }

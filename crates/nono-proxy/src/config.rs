@@ -1882,9 +1882,52 @@ pub struct OAuth2Config {
     /// Mutually exclusive with `client_id`/`client_secret`.
     #[serde(default)]
     pub client_assertion: Option<ClientAssertionConfig>,
-    /// Extra parameters merged into the token exchange POST body verbatim.
+    /// Extra parameters appended to the token exchange POST body. Keys that
+    /// the grant itself sets are rejected; see [`validate_oauth2_extra_params`].
     #[serde(default)]
     pub extra_params: std::collections::HashMap<String, String>,
+}
+
+/// Token request parameters set by nono's grants, matched case-insensitively.
+const RESERVED_OAUTH2_PARAMS: &[&str] = &[
+    "grant_type",
+    "client_id",
+    "client_secret",
+    "scope",
+    "client_assertion",
+    "client_assertion_type",
+    "assertion",
+];
+
+/// Validate `OAuth2Config::extra_params`, shared by the profile loader and the
+/// proxy route builder so the rules cannot drift.
+///
+/// Rejects empty keys and keys nono already sends: RFC 6749 §3.2 forbids
+/// repeating a request parameter, and a repeated `grant_type` or credential
+/// parameter could make the server read a different value than nono intends.
+///
+/// # Errors
+///
+/// Returns a message describing the first invalid key.
+pub fn validate_oauth2_extra_params(
+    params: &std::collections::HashMap<String, String>,
+) -> std::result::Result<(), String> {
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    for key in keys {
+        if key.is_empty() {
+            return Err("auth.extra_params keys cannot be empty".to_string());
+        }
+        if RESERVED_OAUTH2_PARAMS
+            .iter()
+            .any(|reserved| key.eq_ignore_ascii_case(reserved))
+        {
+            return Err(format!(
+                "auth.extra_params cannot set '{key}': nono sets it for the token request"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3114,6 +3157,44 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("dev-ro"), "{err}");
+    }
+
+    fn extra_params_of(keys: &[&str]) -> std::collections::HashMap<String, String> {
+        keys.iter()
+            .map(|k| (k.to_string(), "v".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_oauth2_extra_params_validation_accepts_extension_params() {
+        assert_eq!(
+            validate_oauth2_extra_params(&extra_params_of(&["audience", "organization"])),
+            Ok(())
+        );
+        assert_eq!(validate_oauth2_extra_params(&extra_params_of(&[])), Ok(()));
+    }
+
+    #[test]
+    fn test_oauth2_extra_params_validation_rejects_reserved_keys() {
+        for key in [
+            "grant_type",
+            "client_id",
+            "client_secret",
+            "scope",
+            "client_assertion",
+            "client_assertion_type",
+            "assertion",
+            "Grant_Type",
+        ] {
+            let err = validate_oauth2_extra_params(&extra_params_of(&[key])).unwrap_err();
+            assert!(err.contains(key), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_oauth2_extra_params_validation_rejects_empty_key() {
+        let err = validate_oauth2_extra_params(&extra_params_of(&[""])).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
     }
 
     #[test]

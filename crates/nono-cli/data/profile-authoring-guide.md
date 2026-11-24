@@ -812,12 +812,16 @@ generated trust bundle.
 | `api_hosts`          | array           | yes      | HTTPS API URL origins where this provider's phantom tokens may be resolved on egress. |
 | `response_fields`    | array           | yes      | Token response fields to rewrite. Each entry declares a `path` and a visible phantom `kind` of `opaque` or `jwt`; use `jwt` only for locally parsed fields, not bearer tokens resent upstream. An optional `format` (e.g. `"sk-ant-oat01-{}"`, `kind: opaque` only) shapes the visible phantom — `{}` is a random body — so a client that classifies a credential by its literal prefix recognises it; the template is stripped on egress. |
 | `request_body`       | string          | no       | Token request body format for refresh/exchange rewriting: `auto`, `json`, or `form`. |
+| `store`              | string          | no       | `cmd://<name>` reference to a `credential_capture` entry with `provider.command` implementing OAuth `put`, `resolve`, and `refresh`. |
 | `credential_store`   | object          | no       | Optional session/logout detection, such as a keychain JSON record or file JSON record with fields expected to contain phantoms. |
 | `helpers`            | object          | no       | Optional status, login, and logout commands for humans or CLI workflows. Commands are arrays and are not run through a shell. |
 
-The OAuth capture store lives under nono's state directory with owner-only
-permissions. It retains real token material for phantom resolution for up to 90
-days, capped at 4096 phantoms.
+The default OAuth capture store lives under nono's state directory with
+owner-only permissions. It retains token material for up to 90 days, capped at
+4096 phantoms. A provider with `store` delegates custody to the host helper.
+Use `cache_ttl_secs` on the capture entry to bound memory caching for resolved
+tokens. See the sandboxed OAuth logins guide for the provider request and reply
+format.
 
 Unmatched capture-host responses are inspected for common OAuth token field
 names as a fail-closed backstop. Providers that use unusual token field names

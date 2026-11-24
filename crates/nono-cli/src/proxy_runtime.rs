@@ -2530,8 +2530,20 @@ pub(crate) fn build_proxy_config_from_flags(
     // when the child curls the real upstream URL (CONNECT + TLS intercept).
     // Use url::Url::parse so credentials embedded in the URL (user:pass@host)
     // don't end up in the allowlist as a garbled "user:pass@host:port" string.
+    //
+    // Command-only (tool sandbox) routes are skipped: this allowlist is the
+    // session proxy's, which never carries those routes (see
+    // remove_tool_sandbox_routes), so their upstream would be a plain
+    // CONNECT tunnel for every session process, with no credential injection
+    // or endpoint policy. Command-scoped proxies build their own allowlist.
     if host_allowlist_active {
         for route in &routes {
+            if proxy
+                .tool_sandbox_proxy_credentials
+                .contains(route.prefix.trim_matches('/'))
+            {
+                continue;
+            }
             if let Ok(parsed) = url::Url::parse(&route.upstream)
                 && let Some(host) = parsed.host_str()
             {
@@ -4284,6 +4296,49 @@ mod tests {
                 .any(|host| host == "bedrock-runtime.us-east-1.amazonaws.com:443"),
             "the credential upstream must remain reachable in allowlist mode"
         );
+    }
+
+    /// A command-only (tool sandbox) credential route must not open its
+    /// upstream to the session proxy: the session never carries the route, so
+    /// the host would be a plain tunnel with no credential or endpoint policy.
+    #[test]
+    fn test_tool_sandbox_route_upstream_is_not_in_session_allowlist() {
+        for strict in [false, true] {
+            let mut proxy = proxy_with_custom_credential(
+                strict,
+                vec![crate::profile::AllowDomainEntry::Plain(
+                    "www.example.com".to_string(),
+                )],
+            );
+            proxy
+                .tool_sandbox_proxy_credentials
+                .insert("bedrock".to_string());
+            let config = build_proxy_config_from_flags(&proxy).expect("build proxy config");
+
+            assert!(
+                !config
+                    .allowed_hosts
+                    .iter()
+                    .any(|host| host.starts_with("bedrock-runtime.")),
+                "a command-only route upstream must not reach the session allowlist: {:?}",
+                config.allowed_hosts
+            );
+            assert!(
+                config
+                    .allowed_hosts
+                    .iter()
+                    .any(|host| host == "www.example.com"),
+                "the explicit allowlist entry must be preserved"
+            );
+            let filter = nono_proxy::filter::ProxyFilter::new_strict(&config.allowed_hosts);
+            assert!(
+                matches!(
+                    filter.check_host_with_ips("bedrock-runtime.us-east-1.amazonaws.com", &[]),
+                    nono::net_filter::FilterResult::DenyNotAllowed { .. },
+                ),
+                "the session filter must refuse a command-only route's host"
+            );
+        }
     }
 
     #[test]

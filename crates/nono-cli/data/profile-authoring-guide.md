@@ -354,10 +354,13 @@ Endpoint policy uses the same decision order as invocation policy: `deny`, then 
 | `signal_mode`         | string          | `"isolated"` | One of: `"isolated"`, `"allow_same_sandbox"`, `"allow_all"`. |
 | `process_info_mode`   | string          | `"isolated"` | One of: `"isolated"`, `"allow_same_sandbox"`, `"allow_all"`. |
 | `ipc_mode`            | string          | `"shared_memory_only"` | One of: `"shared_memory_only"`, `"full"`. Use `"full"` for multiprocessing (enables POSIX semaphores). macOS only. |
+| `session_socket_auth` | boolean         | `false`      | Authenticate callers of named session IPC sockets using kernel peer identity and verified ancestry or protected tool lineage. Requires Linux 6.5+ on Linux; also supported on macOS. Startup fails if the required kernel feature is unavailable. |
 | `capability_elevation`| boolean         | `false`      | Enable runtime capability elevation via seccomp-notify. Linux only. |
 | `approval_backends`   | map of string to backend | `{}` | Named backends that answer supervised-mode file and capability prompts instead of the terminal. Same shape as `network.approval_backends` (see [Network approvals](#network-approvals)). |
 | `approval_defaults`   | object          | `null`       | `{ "backend": "<name>" }`: which `approval_backends` entry answers by default. |
 | `wsl2_proxy_policy`  | string          | `"error"`    | WSL2 only. Controls behavior when proxy-only network mode cannot be kernel-enforced. `"error"`: refuse to run (fail-secure). `"insecure_proxy"`: allow degraded execution where credential proxy runs but child is not prevented from bypassing it. See [WSL2 docs](https://nono.sh/docs/cli/internals/wsl2). |
+
+With `session_socket_auth` enabled, browser helpers must stay alive until authentication completes. Credential-capture browser helpers must retain their ancestry; untracked daemonized helpers are rejected. The option does not change URL or command policies. Regardless of its value, named URL listeners use kernel-derived caller PIDs and the receiving session's ID for attribution. Use `--profile`; capability manifest export rejects profiles with session socket authentication enabled.
 
 ### filesystem
 
@@ -1184,7 +1187,9 @@ preferably, use `unix_socket_dir_bind` with a dedicated directory.
 
 Add `"loopback": true` (requires `network`) to let the command use TCP on the namespace's own loopback, for local dev servers and tests. Egress stays proxy-only and the host's localhost stays unreachable.
 
-Network isolation does not block pathname Unix sockets (such as `/run/docker.sock`); use `linux.af_unix_mediation` for those.
+Add `"mounts": true` to mask host IPC endpoints (`$XDG_RUNTIME_DIR`, the D-Bus system bus, container runtime sockets) and give the session a private `/tmp`. Paths the profile grants beneath a mask, including `unix_socket` grants, stay reachable. `"extra_masks": ["$HOME/.corp/agent.sock"]` adds masks (requires `mounts`); lists merge by deduplicated append, so no layer can remove a mask. `mounts` cannot be combined with `security.capability_elevation`.
+
+Network isolation does not block pathname Unix sockets (such as `/run/docker.sock`); use `mounts` to hide them or `linux.af_unix_mediation` to mediate them. Any filesystem grant beneath a mask is re-bound, so a read grant of a directory under `$XDG_RUNTIME_DIR` makes every socket in it connectable.
 
 #### Linux
 

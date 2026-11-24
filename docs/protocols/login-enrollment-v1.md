@@ -8,11 +8,16 @@ It changes neither sandbox permissions nor audit opt-outs.
 
 ```console
 nono platform login
-nono platform login --url https://nono.acme.example --tenant engineering
+nono platform login --url https://nono.acme.example --tenant engineering --name "Alice laptop"
 nono platform tenant use personal
 nono platform login --no-enroll
 nono platform re-enroll --tenant engineering
 ```
+
+`--name` labels the installation in Fleet and audit views. Repeated login updates
+the label without creating another registration; omitting it retains the saved
+label, falling back to the hostname for a new installation. Re-enrollment accepts
+the same option. It cannot be combined with `--no-enroll`.
 
 `--tenant` replaces `--org`; there is no compatibility alias. `NONO_TENANT`
 replaces `NONO_ORG` for a per-command remote tenant override. The old variable is
@@ -111,16 +116,28 @@ current enrollment permission and applicable fresh MFA. The signed intent binds
 the previous subject to the new device key. The old subject must be a revoked
 device owned by this user in this tenant, and the key must differ. The platform
 creates a new subject with `replaces_subject_id`; the old row remains revoked.
+In the same transaction it copies group memberships, administrator-set attributes,
+device policy overrides and standing grant deltas to the replacement. Session
+approval grants are not copied. Effective policy is resolved normally against
+current group and unit assignments.
 At most one replacement is accepted per old subject. Retrying with the same new
 key returns that replacement; a different competing key is refused. This does
 not prevent a permitted user from registering a new installation independently.
 
 Success returns the existing enrollment-v1 response with `subject_kind=device`
-and `management_mode=audit_only`. OAuth-style errors include `access_denied`,
+and `management_mode=audit_only`. A replacement response also includes
+`replaces_subject_id`, confirming the old subject whose policy context was
+preserved. The client requires that acknowledgement before activating a
+replacement, retains the last verified mode and checks the new assignment.
+Deploy supporting servers before updated clients. Without the acknowledgement,
+the original local enrollment remains active. A server must persist transfer
+completion and refuse to acknowledge an older replacement that lacks it; those
+registrations require administrator review. OAuth-style errors include `access_denied`,
 `invalid_grant`, `invalid_target`, `invalid_dpop_proof`, `insufficient_scope`,
 and `mfa_required`. Neither success nor error responses may be cached.
 Recovery errors include `enrollment_revoked`, `enrollment_active`,
-`enrollment_replaced`, and `reenrollment_authorization_required`.
+`enrollment_replaced`, `reenrollment_authorization_required`, and
+`policy_recovery_unconfirmed`.
 
 ## Local identity and audit provenance
 
@@ -161,7 +178,7 @@ its subject and key reference match the confirmed registration. First enrollment
 and tenant switches name the destination for new session audits.
 Results use a themed heading and aligned fields, with the current tenant
 highlighted and the previous tenant muted on switches. Styling follows the
-existing terminal color handling, including `NO_COLOR`. JSON status is unchanged.
+existing terminal color handling, including `NO_COLOR`.
 
 Local registration records optionally cache the enrolled display name and tenant
 label. Human-readable status uses these names, a UTC enrollment date and the

@@ -870,6 +870,7 @@ mod tests {
 
         fn running_session(rollback_session: Option<&str>) -> SessionRecord {
             SessionRecord {
+                policy: None,
                 session_id: "abc123".to_string(),
                 name: Some("brave-otter".to_string()),
                 supervisor_pid: 41,

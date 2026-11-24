@@ -34,8 +34,8 @@ zeroize = { version = "1", features = ["alloc", "serde"] }
 # Sigstore signing and verification. Keep these on the same release line;
 # Dependabot groups sigstore-* updates so API and dependency-graph migrations
 # arrive together.
-sigstore-sign = "0.15.0"
-sigstore-verify = { version = "0.15.0", default-features = false }
+sigstore-sign = "0.16.0"
+sigstore-verify = { version = "0.16.0", default-features = false }
 
 # Hashing
 sha2 = "0.11"
@@ -50,7 +50,7 @@ globset = "0.4"
 # Shared system dependencies
 nix = "0.31.3"
 landlock = "0.4.7"
-url = "2"
+url = "2.5.9"
 idna = "1"
 getrandom = "0.4"
 base64 = "0.23"

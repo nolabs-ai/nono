@@ -25,6 +25,7 @@ struct SessionRuntimeState {
 }
 
 pub(crate) struct SupervisedRuntimeContext<'a> {
+    pub(crate) session_socket_auth: bool,
     pub(crate) config: &'a exec_strategy::ExecConfig<'a>,
     pub(crate) caps: &'a CapabilitySet,
     /// Resolved deny paths; the supervisor never grants beneath them.
@@ -40,7 +41,7 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) redaction_policy: &'a nono::ScrubPolicy,
     /// Approval backend for supervised-mode filesystem/capability traps,
     /// resolved from the profile `security.approval_backends`. `None` falls
-    /// back to the interactive terminal prompt (no behavior change).
+    /// back to the terminal in local/advisory mode and denies in enforced mode.
     pub(crate) approval_backend: Option<Arc<dyn nono::ApprovalBackend>>,
     /// Budget for recording denied network syscalls individually.
     #[cfg(target_os = "linux")]
@@ -113,6 +114,7 @@ fn create_session_runtime_state(
         })
         .unwrap_or_else(session::generate_session_id);
     let session_record = session::SessionRecord {
+        policy: session.policy.clone(),
         session_id: short_session_id.clone(),
         name: Some(
             session
@@ -221,6 +223,7 @@ fn should_open_supervised_pty(
 
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
     let SupervisedRuntimeContext {
+        session_socket_auth,
         config,
         caps,
         deny_paths,
@@ -248,6 +251,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         rollback.destination.as_ref(),
         session.session_id.as_deref(),
     )?;
+    if let Some(state) = &audit_state {
+        crate::audit_client::capture_profile(&state.session_dir, config.profile_save_base)?;
+    }
     warn_if_rollback_flags_ignored(rollback, silent);
 
     // Create the session guard (writes session file) and PTY pair BEFORE
@@ -300,6 +306,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             .lock()
             .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
         recorder.record_session_started(started.clone(), command.to_vec())?;
+        if let Some(policy) = &session.policy {
+            recorder.record_extension_event("platform_policy", policy)?;
+        }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(tool_sandbox_runtime) = config.tool_sandbox_runtime {
             #[cfg(target_os = "linux")]
@@ -343,17 +352,25 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     }
 
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
-    // Pick who answers the file/capability approval prompts in supervised mode.
-    // If the profile set up a backend (e.g. a webhook), it answers; otherwise we
-    // ask at the terminal, exactly as before. Both live in locals that outlast
-    // `supervisor_cfg`, which only borrows the backend it uses.
+    // These backends outlive the supervisor config that borrows them. Enforced
+    // sessions must never reach a terminal prompt when no backend is configured.
     let terminal_approval_fallback = terminal_approval::TerminalApproval;
-    let approval_backend: &dyn nono::ApprovalBackend = configured_approval_backend
-        .as_deref()
-        .unwrap_or(&terminal_approval_fallback);
+    let platform_required = crate::platform_policy::enforced::PlatformApprovalRequired;
+    let fallback: &dyn nono::ApprovalBackend = if session
+        .policy
+        .as_ref()
+        .is_some_and(|policy| policy.management_mode == "enforced")
+    {
+        &platform_required
+    } else {
+        &terminal_approval_fallback
+    };
+    let approval_backend: &dyn nono::ApprovalBackend =
+        configured_approval_backend.as_deref().unwrap_or(fallback);
     let supervisor_session_id = build_supervisor_session_id(audit_state.as_ref());
     let supervisor_deny_paths = exec_strategy::supervisor_deny_paths(deny_paths);
     let supervisor_cfg = exec_strategy::SupervisorConfig {
+        session_socket_auth,
         protected_roots: protected_roots.as_paths(),
         deny_paths: &supervisor_deny_paths,
         approval_backend,
@@ -466,11 +483,18 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         });
     }
 
+    let mut audit_delivery = None;
     let exit_code = {
         // Runs in the parent the instant the child is forked, with the child's pid;
         // records it on the session. The cgroup attach is the child's own job (see
         // `resource_procs_fd` above), so there's no parent-side escape window here.
         let mut on_fork = |child_pid: u32| {
+            if audit_state.is_some() {
+                match crate::audit_client::DeliveryWorker::start() {
+                    Ok(worker) => audit_delivery = worker,
+                    Err(error) => tracing::warn!("Automatic audit retries unavailable: {error}"),
+                }
+            }
             if let Some(ref mut guard) = session_guard {
                 guard.set_child_pid(child_pid);
             }
@@ -523,6 +547,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         )?
     };
 
+    drop(audit_delivery);
     if let Some(ref mut guard) = session_guard {
         guard.set_exited(exit_code);
     }

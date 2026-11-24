@@ -57,6 +57,10 @@ struct EnrollmentExchangeRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct EnrollmentExchangeResponse {
+    #[serde(default)]
+    pub replaces_subject_id: Option<String>,
+    #[serde(default)]
+    pub policy_trust_root: Option<crate::platform_policy::protocol::PolicyTrustRoot>,
     pub protocol_version: String,
     pub tenant_id: String,
     pub subject_id: String,
@@ -111,6 +115,7 @@ fn enroll(args: PlatformEnrollArgs) -> Result<()> {
     validate_wire_identifier("tenant id", &response.tenant_id)?;
     validate_wire_identifier("subject id", &response.subject_id)?;
 
+    let policy_trust_root = response.policy_trust_root;
     let state = PlatformState {
         protocol_version: response.protocol_version,
         platform_url,
@@ -128,8 +133,10 @@ fn enroll(args: PlatformEnrollArgs) -> Result<()> {
         display_name: request.display_name.clone(),
         tenant: None,
         revoked: false,
+        last_policy_mode: None,
     };
     write_json_secure(&state_path, &stored)?;
+    crate::platform_policy::pin_enrollment_key(&stored.state, policy_trust_root)?;
     print!(
         "{}",
         enrollment_text_with_heading(
@@ -143,7 +150,41 @@ fn enroll(args: PlatformEnrollArgs) -> Result<()> {
             None,
         )
     );
-    Ok(())
+    check_enrollment_policy(&stored.state)
+}
+
+pub(crate) fn check_enrollment_policy(state: &PlatformState) -> Result<()> {
+    let checked = crate::platform_policy::refresh(state).and_then(|policy| {
+        policy.ok_or_else(|| {
+            NonoError::ActionRequired("platform returned no verified assignment".into())
+        })
+    });
+    match checked {
+        Ok(policy) => {
+            print!(
+                "{}",
+                crate::platform_policy::display::enrollment_summary(&policy)
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::warn!("Post-enrollment policy check failed; enrollment remains saved");
+            let mut text = summary_heading("Policy check failed", SummaryKind::Attention);
+            text.push_str(&summary_row("Enrollment", "Saved"));
+            text.push_str(&summary_row("Policy", "Not verified"));
+            text.push_str(&summary_row("Next step", "nono platform status --refresh"));
+            println!("{text}");
+            let subject = if state.subject_kind == "workload" {
+                "Workload"
+            } else {
+                "Device"
+            };
+            Err(NonoError::ActionRequired(format!(
+                "{subject} enrolled; policy check failed: {}\nEnrollment remains saved. Retry `nono platform status --refresh`; do not enrol again. Default startup still requires a successful policy check.",
+                safe_text(&error.to_string())
+            )))
+        }
+    }
 }
 
 fn status(args: PlatformStatusArgs) -> Result<()> {
@@ -152,7 +193,34 @@ fn status(args: PlatformStatusArgs) -> Result<()> {
         Some(context) => load_for_session(context)?,
         None => read_state(&state_path()?)?,
     };
+    // Old cache contents only inform the refresh message; a fresh reply can repair them.
+    let previous = if args.refresh {
+        stored
+            .as_ref()
+            .and_then(|stored| crate::platform_policy::cached(&stored.state).ok().flatten())
+    } else {
+        None
+    };
+    let policy = match &stored {
+        Some(stored) if args.refresh => crate::platform_policy::refresh(&stored.state)?,
+        Some(stored) => crate::platform_policy::cached(&stored.state)?,
+        None if args.refresh => {
+            return Err(NonoError::ActionRequired(
+                "enrol this device before refreshing policy".into(),
+            ));
+        }
+        None => None,
+    };
     if args.json {
+        let last_verified_mode = policy
+            .as_ref()
+            .filter(|_| args.refresh)
+            .map(|policy| policy.management_mode.as_str())
+            .or_else(|| {
+                stored
+                    .as_ref()
+                    .and_then(|stored| stored.last_policy_mode.as_deref())
+            });
         let mut output = match &stored {
             Some(stored) => serde_json::json!({
                 "enrolled": !stored.revoked,
@@ -160,11 +228,18 @@ fn status(args: PlatformStatusArgs) -> Result<()> {
                 "tenant_id": stored.state.tenant_id,
                 "subject_id": stored.state.subject_id,
                 "subject_kind": stored.state.subject_kind,
-                "management_mode": stored.state.management_mode,
+                "management_mode": policy.as_ref().map(|policy| policy.management_mode.as_str())
+                    .or(last_verified_mode),
+                "last_verified_management_mode": last_verified_mode,
                 "enrolled_at": stored.state.enrolled_at,
             }),
             None => serde_json::json!({"enrolled": false}),
         };
+        if stored.is_some() {
+            output["policy_assignment"] =
+                serde_json::to_value(&policy).map_err(|e| NonoError::ConfigParse(e.to_string()))?;
+            output["policy_refreshed"] = serde_json::json!(args.refresh && policy.is_some());
+        }
         if let Some(context) = &context {
             output["context"] = serde_json::json!({
                 "platform_url": context.platform_url,
@@ -181,54 +256,107 @@ fn status(args: PlatformStatusArgs) -> Result<()> {
             serde_json::to_string_pretty(&output)
                 .map_err(|error| NonoError::ConfigParse(error.to_string()))?
         );
-    } else if let Some(context) = &context {
-        print!("{}", context_text(context, stored.as_ref()));
-    } else if let Some(stored) = &stored {
-        print!("{}", enrollment_text(stored));
     } else {
-        println!("Not enrolled with a platform.");
+        print!(
+            "{}",
+            status_text(
+                context.as_ref(),
+                stored.as_ref(),
+                policy.as_ref(),
+                previous.as_ref(),
+                args.refresh
+            )
+        );
     }
     Ok(())
 }
 
-fn context_text(
-    context: &crate::platform_oauth::session::SessionRecord,
+fn status_text(
+    context: Option<&crate::platform_oauth::session::SessionRecord>,
     stored: Option<&StoredEnrollment>,
+    policy: Option<&crate::platform_policy::protocol::AssignmentClaims>,
+    previous: Option<&crate::platform_policy::protocol::AssignmentClaims>,
+    refreshed: bool,
 ) -> String {
+    let t = crate::theme::current();
     let mut text = summary_heading("Platform", SummaryKind::Info);
-    text.push_str(&summary_row("User", &safe_text(&context.user_display)));
-    text.push_str(&summary_row("URL", &safe_text(&context.platform_url)));
-    let tenant = if context.tenant_selection_pending {
-        "Not selected".into()
-    } else {
-        context
-            .active_organization()
-            .map(tenant_label)
-            .unwrap_or_else(|| "Not selected".into())
+    text.push_str(&summary_row(
+        "User",
+        &context
+            .map(|context| safe_text(&context.user_display))
+            .unwrap_or_else(|| "Not signed in".into()),
+    ));
+    let platform = context
+        .map(|context| context.platform_url.as_str())
+        .or_else(|| stored.map(|stored| stored.state.platform_url.as_str()));
+    if let Some(platform) = platform {
+        text.push_str(&summary_row("Server", &safe_text(platform)));
+    }
+    let tenant = match context {
+        Some(context) if context.tenant_selection_pending => None,
+        Some(context) => context.active_organization(),
+        None => stored.and_then(|stored| stored.tenant.as_ref()),
     };
-    text.push_str(&summary_row("Current tenant", &tenant));
-    text.push_str(&summary_row("CLI sign-in", "Stored locally"));
+    let tenant = tenant
+        .map(|tenant| {
+            if tenant.kind == "personal" {
+                "Personal".into()
+            } else {
+                tenant_label(tenant)
+            }
+        })
+        .unwrap_or_else(|| "Not selected".into());
+    text.push_str(&summary_row("Tenant", &tenant));
     if let Some(stored) = stored {
-        text.push_str(&summary_row(
-            "Enrollment",
+        let kind = if stored.state.subject_kind == "workload" {
+            "Workload"
+        } else {
+            "Device"
+        };
+        let name = stored
+            .display_name
+            .as_deref()
+            .map(safe_text)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "Name not recorded".into());
+        let device = format!(
+            "{name} · {}",
             if stored.revoked {
-                "Revoked"
+                "revoked"
             } else {
-                "Registered locally"
-            },
-        ));
+                "enrolled"
+            }
+        );
         text.push_str(&summary_row(
-            "Audit delivery",
-            if stored.revoked {
-                "Unavailable: enrollment revoked"
-            } else {
-                "Automatic when sessions finish"
-            },
+            kind,
+            &crate::theme::fg(&device, if stored.revoked { t.yellow } else { t.text }).to_string(),
         ));
-        text.push_str(&enrollment_details(stored));
+        text.push_str(&crate::platform_policy::display::status_rows(
+            policy,
+            previous,
+            refreshed,
+            stored.last_policy_mode.as_deref(),
+        ));
+        let audit = if stored.revoked {
+            Some("Unavailable · enrollment revoked".into())
+        } else {
+            match crate::audit_client::queued_count() {
+                Ok(0) => None,
+                Ok(count) => Some(format!("{count} pending uploads · all local queues")),
+                Err(_) => Some("Queue status unavailable · run nono audit status".into()),
+            }
+        };
+        if let Some(audit) = audit {
+            text.push_str(&summary_row(
+                "Audit",
+                &crate::theme::fg(&audit, t.yellow).to_string(),
+            ));
+        }
     } else {
-        text.push_str(&summary_row("Enrollment", "Not enrolled"));
-        text.push_str(&summary_row("Audit delivery", "Local only"));
+        text.push_str(&summary_row(
+            "Device",
+            &crate::theme::fg("Not enrolled", t.yellow).to_string(),
+        ));
     }
     text.push('\n');
     text
@@ -243,10 +371,6 @@ pub(crate) fn tenant_label(tenant: &Organization) -> String {
     } else {
         format!("{name} ({})", safe_text(&tenant.slug))
     }
-}
-
-fn enrollment_text(stored: &StoredEnrollment) -> String {
-    enrollment_text_with_heading(stored, "Platform", SummaryKind::Info, Some("Not signed in"))
 }
 
 fn enrollment_text_with_heading(
@@ -425,6 +549,8 @@ struct StoredEnrollment {
     tenant: Option<Organization>,
     #[serde(default)]
     revoked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_policy_mode: Option<String>,
 }
 
 pub(crate) fn enrollment_scope_id(platform: &str, tenant: &str, user: &str) -> Result<String> {
@@ -456,6 +582,10 @@ fn read_state(path: &Path) -> Result<Option<StoredEnrollment>> {
     if state.protocol_version != ENROLLMENT_PROTOCOL_V1
         || state.key_algorithm != KEY_ALGORITHM
         || state.management_mode != "audit_only"
+        || stored
+            .last_policy_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "audit_only" | "advisory" | "enforced"))
     {
         return Err(NonoError::ConfigParse(
             "unsupported local platform enrollment state".into(),
@@ -473,7 +603,24 @@ pub(crate) fn save_login_enrollment(
     display_name: &str,
 ) -> Result<()> {
     let path = scoped_state_path(&state.platform_url, &state.tenant_id, &session.user_subject)?;
-    let stored = StoredEnrollment {
+    let last_policy_mode = if enforced_identity_is_active(&state)? {
+        Some("enforced".into())
+    } else {
+        read_state(&path)?
+            .filter(|stored| same_enrollment(&stored.state, &state))
+            .and_then(|stored| stored.last_policy_mode)
+    };
+    let stored = login_enrollment(state, session, display_name, last_policy_mode);
+    write_enrollment(&stored)
+}
+
+fn login_enrollment(
+    state: PlatformState,
+    session: &SessionRecord,
+    display_name: &str,
+    last_policy_mode: Option<String>,
+) -> StoredEnrollment {
+    StoredEnrollment {
         tenant: session
             .organizations
             .iter()
@@ -483,9 +630,111 @@ pub(crate) fn save_login_enrollment(
         login_user_id: Some(session.user_subject.clone()),
         display_name: Some(display_name.to_string()),
         revoked: false,
-    };
-    write_json_secure(&path, &stored)?;
+        last_policy_mode,
+    }
+}
+
+pub(crate) fn save_login_replacement(
+    state: PlatformState,
+    session: &SessionRecord,
+    display_name: &str,
+    previous: &PlatformState,
+    confirmed_previous: Option<&str>,
+) -> Result<()> {
+    if confirmed_previous != Some(previous.subject_id.as_str()) {
+        return Err(NonoError::ActionRequired(
+            "platform did not confirm policy-preserving replacement; upgrade the platform before recovery, or ask its administrator to review an existing replacement".into(),
+        ));
+    }
+    if state.platform_url != previous.platform_url
+        || state.tenant_id != previous.tenant_id
+        || state.subject_id == previous.subject_id
+        || state.key_ref == previous.key_ref
+        || session.platform_url != state.platform_url
+        || session.tenant_id != state.tenant_id
+    {
+        return Err(NonoError::ConfigParse(
+            "replacement does not match the original enrollment scope".into(),
+        ));
+    }
+    let old = current_enrollment(previous)?;
+    if old
+        .login_user_id
+        .as_deref()
+        .is_some_and(|user| user != session.user_subject)
+    {
+        return Err(NonoError::ActionRequired(
+            "replacement must be authorized by the enrolled user".into(),
+        ));
+    }
+    let stored = login_enrollment(state, session, display_name, old.last_policy_mode);
+    // Only the authenticated recovery response may replace an enforced identity.
+    write_json_secure(
+        &scoped_state_path(
+            &stored.state.platform_url,
+            &stored.state.tenant_id,
+            &session.user_subject,
+        )?,
+        &stored,
+    )?;
     write_json_secure(&state_path()?, &stored)
+}
+
+fn same_enrollment(left: &PlatformState, right: &PlatformState) -> bool {
+    left.platform_url == right.platform_url
+        && left.tenant_id == right.tenant_id
+        && left.subject_id == right.subject_id
+        && left.key_ref == right.key_ref
+}
+
+pub(crate) fn enrollment_display_name() -> Result<Option<String>> {
+    Ok(load_enrollment()?.and_then(|stored| stored.display_name))
+}
+
+fn current_enrollment(state: &PlatformState) -> Result<StoredEnrollment> {
+    load_enrollment()?
+        .filter(|stored| same_enrollment(&stored.state, state))
+        .ok_or_else(|| {
+            NonoError::ConfigParse("platform enrollment changed during policy refresh".into())
+        })
+}
+
+pub(crate) fn last_policy_mode(state: &PlatformState) -> Result<Option<String>> {
+    Ok(current_enrollment(state)?.last_policy_mode)
+}
+
+pub(crate) fn remember_policy_mode(state: &PlatformState, mode: &str) -> Result<()> {
+    let mut stored = current_enrollment(state)?;
+    if stored.last_policy_mode.as_deref() != Some(mode) {
+        stored.last_policy_mode = Some(mode.into());
+        write_enrollment(&stored)?;
+    }
+    Ok(())
+}
+
+fn write_enrollment(stored: &StoredEnrollment) -> Result<()> {
+    let state = &stored.state;
+    enforced_identity_is_active(state)?;
+    if let Some(user) = &stored.login_user_id {
+        write_json_secure(
+            &scoped_state_path(&state.platform_url, &state.tenant_id, user)?,
+            stored,
+        )?;
+    }
+    write_json_secure(&state_path()?, stored)
+}
+
+fn enforced_identity_is_active(next: &PlatformState) -> Result<bool> {
+    let active = read_state(&state_path()?)?;
+    if let Some(active) = active
+        && active.last_policy_mode.as_deref() == Some("enforced")
+    {
+        if !same_enrollment(&active.state, next) {
+            return Err(NonoError::ActionRequired("enforced platform policy: changing the active enrollment requires a verified platform mode change first".into()));
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn selected_enrollment(
@@ -512,7 +761,9 @@ fn selected_enrollment(
 pub(crate) fn activate_login_enrollment(
     session: &crate::platform_oauth::session::SessionRecord,
 ) -> Result<()> {
-    if let Some(stored) = selected_enrollment(session)? {
+    if let Some(stored) = selected_enrollment(session)?
+        && !enforced_identity_is_active(&stored.state)?
+    {
         write_json_secure(&state_path()?, &stored)?;
     }
     Ok(())
@@ -528,6 +779,17 @@ pub(crate) fn load_active_state() -> Result<Option<PlatformState>> {
         .map(|stored| stored.state))
 }
 
+pub(crate) fn load_policy_state() -> Result<Option<PlatformState>> {
+    let stored = load_enrollment()?;
+    if stored.as_ref().is_some_and(|stored| stored.revoked) {
+        return Err(NonoError::ActionRequired(
+            "device enrollment was revoked; recover the enrollment before starting a session"
+                .into(),
+        ));
+    }
+    Ok(stored.map(|stored| stored.state))
+}
+
 pub(crate) fn enrollment_revoked() -> Result<bool> {
     Ok(load_enrollment()?.is_some_and(|stored| stored.revoked))
 }
@@ -540,13 +802,7 @@ pub(crate) fn mark_revoked(state: &PlatformState) -> Result<()> {
         return Ok(());
     }
     stored.revoked = true;
-    if let Some(user) = &stored.login_user_id {
-        write_json_secure(
-            &scoped_state_path(&state.platform_url, &state.tenant_id, user)?,
-            &stored,
-        )?;
-    }
-    write_json_secure(&state_path()?, &stored)
+    write_enrollment(&stored)
 }
 
 fn with_tenant_label(mut stored: StoredEnrollment, session: &SessionRecord) -> StoredEnrollment {
@@ -560,10 +816,17 @@ fn with_tenant_label(mut stored: StoredEnrollment, session: &SessionRecord) -> S
 }
 
 fn load_enrollment() -> Result<Option<StoredEnrollment>> {
+    let active = read_state(&state_path()?)?;
+    if active
+        .as_ref()
+        .is_some_and(|stored| stored.last_policy_mode.as_deref() == Some("enforced"))
+    {
+        return Ok(active);
+    }
     if let Some(session) = crate::platform_oauth::session::load_record()? {
         return load_for_session(&session);
     }
-    read_state(&state_path()?)
+    Ok(active)
 }
 
 pub(crate) fn enrollment_for_login(session: &SessionRecord) -> Result<Option<PlatformState>> {
@@ -909,6 +1172,13 @@ mod tests {
             enrolled_at: "2026-11-10T00:00:00Z".into(),
         };
         save_login_enrollment(first.clone(), &login, "Laptop").unwrap();
+        assert_eq!(last_policy_mode(&first).expect("mode"), None);
+        remember_policy_mode(&first, "advisory").expect("remember advisory");
+        save_login_enrollment(first.clone(), &login, "Laptop").expect("repeat login");
+        assert_eq!(
+            last_policy_mode(&first).expect("retained mode").as_deref(),
+            Some("advisory")
+        );
         mark_revoked(&first).unwrap();
         assert!(enrollment_revoked().unwrap());
         assert!(load_active_state().unwrap().is_none());
@@ -921,11 +1191,51 @@ mod tests {
             subject_id: "device-two".into(),
             ..first.clone()
         };
-        save_login_enrollment(second, &login, "Laptop").unwrap();
+        save_login_enrollment(second.clone(), &login, "Laptop").unwrap();
+        assert_eq!(last_policy_mode(&second).expect("other tenant mode"), None);
+        remember_policy_mode(&second, "enforced").unwrap();
+        fs::remove_file(
+            scoped_state_path(&second.platform_url, &second.tenant_id, &login.user_subject)
+                .unwrap(),
+        )
+        .unwrap();
+        save_login_enrollment(second.clone(), &login, "Laptop").unwrap();
+        assert_eq!(
+            last_policy_mode(&second).unwrap().as_deref(),
+            Some("enforced"),
+            "refreshing the same identity preserves enforcement even if its scoped copy was lost"
+        );
+        login.tenant_id = "t-1".into();
+        login.tenant_selection_pending = true;
+        session::save_record(&lock, &login).unwrap();
+        assert_eq!(
+            load_state().unwrap().unwrap().subject_id,
+            "device-two",
+            "enforced enrollment wins over changed or pending human context"
+        );
+        assert!(
+            activate_login_enrollment(&login).is_err(),
+            "lazy remote sign-in cannot activate another enrollment"
+        );
+        assert!(
+            save_login_enrollment(first.clone(), &login, "Laptop").is_err(),
+            "enrollment writes cannot bypass the identity guard"
+        );
+        assert_eq!(load_state().unwrap().unwrap().subject_id, "device-two");
+        login.tenant_id = "t-2".into();
+        login.tenant_selection_pending = false;
+        session::save_record(&lock, &login).unwrap();
+        remember_policy_mode(&second, "audit_only").expect("remember local");
         assert!(!enrollment_revoked().unwrap());
         login.tenant_id = "t-1".into();
         session::save_record(&lock, &login).unwrap();
         assert_eq!(load_state().unwrap().unwrap().subject_id, "device-one");
+        assert_eq!(
+            last_policy_mode(&first)
+                .expect("original tenant mode")
+                .as_deref(),
+            Some("advisory")
+        );
         assert!(enrollment_revoked().unwrap());
         login.user_subject = "another-user".into();
         session::save_record(&lock, &login).unwrap();
@@ -945,6 +1255,109 @@ mod tests {
         login.tenant_id = "t-2".into();
         session::save_record(&lock, &login).unwrap();
         assert_eq!(load_state().unwrap().unwrap().subject_id, "device-two");
+    }
+
+    #[test]
+    fn replacement_requires_server_confirmation_and_preserves_enforcement() {
+        use crate::platform_oauth::session;
+        use crate::test_env::{ENV_LOCK, EnvVarGuard};
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config");
+        fs::create_dir(&config).unwrap();
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", config.to_str().unwrap()),
+            (
+                "XDG_STATE_HOME",
+                home.path().join("state").to_str().unwrap(),
+            ),
+        ]);
+        let login = session::tests::record();
+        let lock = session::lock().unwrap();
+        session::save_record(&lock, &login).unwrap();
+        let old = PlatformState {
+            protocol_version: "1".into(),
+            platform_url: login.platform_url.clone(),
+            tenant_id: login.tenant_id.clone(),
+            subject_id: "old-device".into(),
+            subject_kind: "device".into(),
+            management_mode: "audit_only".into(),
+            key_algorithm: KEY_ALGORITHM.into(),
+            key_ref: "keystore://old-device".into(),
+            enrolled_at: "2026-11-23T00:00:00Z".into(),
+        };
+        save_login_enrollment(old.clone(), &login, "Laptop").unwrap();
+        remember_policy_mode(&old, "enforced").unwrap();
+        mark_revoked(&old).unwrap();
+        let original = fs::read(state_path().unwrap()).unwrap();
+        let replacement = PlatformState {
+            subject_id: "new-device".into(),
+            key_ref: "keystore://replacement".into(),
+            ..old.clone()
+        };
+        for confirmation in [None, Some("wrong-device")] {
+            assert!(
+                save_login_replacement(replacement.clone(), &login, "Laptop", &old, confirmation)
+                    .is_err()
+            );
+            assert_eq!(fs::read(state_path().unwrap()).unwrap(), original);
+        }
+        let wrong_tenant = PlatformState {
+            tenant_id: "another-tenant".into(),
+            ..replacement.clone()
+        };
+        assert!(
+            save_login_replacement(wrong_tenant, &login, "Laptop", &old, Some(&old.subject_id))
+                .is_err()
+        );
+        let wrong_origin = PlatformState {
+            platform_url: "https://other.example".into(),
+            ..replacement.clone()
+        };
+        assert!(
+            save_login_replacement(wrong_origin, &login, "Laptop", &old, Some(&old.subject_id))
+                .is_err()
+        );
+        let wrong_key = PlatformState {
+            key_ref: old.key_ref.clone(),
+            ..replacement.clone()
+        };
+        assert!(
+            save_login_replacement(wrong_key, &login, "Laptop", &old, Some(&old.subject_id))
+                .is_err()
+        );
+        let mut wrong_user = login.clone();
+        wrong_user.user_subject = "another-user".into();
+        assert!(
+            save_login_replacement(
+                replacement.clone(),
+                &wrong_user,
+                "Laptop",
+                &old,
+                Some(&old.subject_id)
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(state_path().unwrap()).unwrap(), original);
+        save_login_replacement(
+            replacement.clone(),
+            &login,
+            "Laptop",
+            &old,
+            Some(&old.subject_id),
+        )
+        .unwrap();
+        assert_eq!(
+            load_state().unwrap().unwrap().subject_id,
+            replacement.subject_id
+        );
+        assert_eq!(
+            last_policy_mode(&replacement).unwrap().as_deref(),
+            Some("enforced")
+        );
+        assert!(!enrollment_revoked().unwrap());
+        assert!(load_policy_state().unwrap().is_some());
     }
 
     #[test]

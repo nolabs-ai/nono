@@ -1,4 +1,4 @@
-//! Opt-in Linux namespace isolation mechanism (NEP-0004, Phase 1).
+//! Opt-in Linux namespace isolation mechanism (NEP-0004).
 //!
 //! This module is mechanism only. It applies exactly the namespace set a
 //! caller supplies and never decides whether isolation should be used, which
@@ -11,6 +11,10 @@
 //! `CAP_NET_ADMIN` the child holds inside its own user namespace. Optionally a
 //! loopback TCP listener is created inside the new network namespace and
 //! handed to the supervisor, which serves it from outside the namespace.
+//!
+//! A new mount namespace is created when requested; the masks applied inside
+//! it are prepared separately (see `linux_mount_mask`), because they must be
+//! applied after the parent has written the id maps.
 //!
 //! Child-side operations (`NamespaceSpec::enter_raw`) use raw syscalls only and
 //! never allocate, so they are safe in a `clone(2)` child of a multi-threaded
@@ -37,6 +41,7 @@ pub struct NamespaceSpec {
     network: bool,
     ipc: bool,
     uts: bool,
+    mounts: bool,
     bridge_port: Option<u16>,
     loopback_tcp: bool,
 }
@@ -66,6 +71,14 @@ impl NamespaceSpec {
     #[must_use]
     pub fn uts(mut self, enabled: bool) -> Self {
         self.uts = enabled;
+        self
+    }
+
+    /// Request a new mount namespace. Masks are applied in it separately,
+    /// with a `PreparedMountMask`, once the id maps are written.
+    #[must_use]
+    pub fn mounts(mut self, enabled: bool) -> Self {
+        self.mounts = enabled;
         self
     }
 
@@ -104,7 +117,7 @@ impl NamespaceSpec {
     /// Whether any namespace is requested.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        !self.network && !self.ipc && !self.uts
+        !self.network && !self.ipc && !self.uts && !self.mounts
     }
 
     /// Whether a new network namespace is requested.
@@ -123,6 +136,12 @@ impl NamespaceSpec {
     #[must_use]
     pub fn has_uts(&self) -> bool {
         self.uts
+    }
+
+    /// Whether a new mount namespace is requested.
+    #[must_use]
+    pub fn has_mounts(&self) -> bool {
+        self.mounts
     }
 
     /// The loopback bridge port, when a bridge listener is requested.
@@ -170,6 +189,9 @@ impl NamespaceSpec {
         }
         if self.uts {
             flags |= libc::CLONE_NEWUTS;
+        }
+        if self.mounts {
+            flags |= libc::CLONE_NEWNS;
         }
         flags
     }
@@ -290,7 +312,8 @@ fn loopback_sockaddr(port: u16) -> libc::sockaddr_in {
     }
 }
 
-fn bridge_listener_raw(port: u16) -> std::result::Result<RawFd, RawSandboxError> {
+/// Create a close-on-exec TCP listener on `127.0.0.1:port` in the caller's network namespace, allocation-free.
+pub fn bridge_listener_raw(port: u16) -> std::result::Result<RawFd, RawSandboxError> {
     let fail = |errno| RawSandboxError::new(RawSandboxStage::BridgeListener, errno);
     // SAFETY: scalar raw syscall.
     let fd = unsafe {
@@ -451,6 +474,9 @@ pub enum NamespaceProbeStage {
     LoopbackUp,
     /// A loopback listener could not be created inside the new namespace.
     BridgeListener,
+    /// A filesystem could not be mounted inside the new mount namespace
+    /// (for example, a security module denies mounting in user namespaces).
+    Mount,
     /// The scratch child died or timed out without reporting.
     Child,
 }
@@ -477,8 +503,9 @@ const PROBE_GO: u8 = 0x53;
 /// operations in a scratch child process.
 ///
 /// The probe creates the namespaces, has the parent write the id maps, brings
-/// up loopback, and (when a bridge is requested) binds an ephemeral loopback
-/// listener. It does not read sysctls: AppArmor, seccomp, and sysctl denials
+/// up loopback, (when a bridge is requested) binds an ephemeral loopback
+/// listener, and (when a mount namespace is requested) creates a tmpfs. It
+/// does not read sysctls: AppArmor, seccomp, and sysctl denials
 /// all surface only when the operation is attempted.
 ///
 /// # Errors
@@ -564,6 +591,7 @@ fn decode_failure((code, errno): (u8, i32)) -> Option<NamespaceProbe> {
         1 => NamespaceProbeStage::Unshare,
         2 => NamespaceProbeStage::LoopbackUp,
         3 => NamespaceProbeStage::BridgeListener,
+        4 => NamespaceProbeStage::Mount,
         _ => return None,
     };
     Some(NamespaceProbe::Unavailable { stage, errno })
@@ -653,6 +681,12 @@ fn probe_child(spec: &NamespaceSpec, wants_listener: bool, report: RawFd, go: Ra
             }
         }
     }
+    if spec.mounts
+        && let Err(errno) = super::linux_mount_mask::probe_tmpfs_raw()
+    {
+        send(4, errno);
+        exit(1);
+    }
     send(PROBE_DONE, 0);
     exit(0)
 }
@@ -710,6 +744,10 @@ mod tests {
             spec.clone_flags(),
             libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWIPC
         );
+        let spec = NamespaceSpec::new().mounts(true);
+        assert!(!spec.is_empty());
+        assert!(spec.validate().is_ok());
+        assert_eq!(spec.clone_flags(), libc::CLONE_NEWUSER | libc::CLONE_NEWNS);
     }
 
     #[test]

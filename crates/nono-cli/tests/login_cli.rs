@@ -66,6 +66,54 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
+fn login_rejects_empty_names_and_names_without_enrollment() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = nono(home.path(), &["platform", "login", "--name", " \n\t "], &[]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("device name must contain visible characters"));
+    assert_not_enrolled(home.path());
+    let output = nono(
+        home.path(),
+        &["platform", "login", "--name", "Laptop", "--no-enroll"],
+        &[],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("cannot be used with"));
+    assert_not_enrolled(home.path());
+}
+
+#[test]
+fn login_name_conflicts_only_with_an_enabled_enrollment_opt_out() {
+    let home = tempfile::tempdir().expect("tempdir");
+    for value in ["true", "1", "yes", "false", "0", "no"] {
+        let output = nono(
+            home.path(),
+            &[
+                "platform",
+                "login",
+                "--name",
+                "Pilot laptop",
+                "--url",
+                "http://nono.example.com",
+            ],
+            &[("NONO_NO_ENROLL", value)],
+        );
+        assert!(!output.status.success());
+        let expected = if ["true", "1", "yes"].contains(&value) {
+            "--name cannot be used with"
+        } else {
+            "HTTPS"
+        };
+        assert!(
+            stderr(&output).contains(expected),
+            "{value}: {}",
+            stderr(&output)
+        );
+        assert_not_enrolled(home.path());
+    }
+}
+
+#[test]
 fn login_inside_a_sandbox_fails_closed() {
     let home = tempfile::tempdir().expect("tempdir");
     let output = nono(
@@ -460,10 +508,9 @@ fn enrollment_status_uses_labels_and_keeps_ids_in_json_only() {
     for label in [
         "Acme (acme)",
         "Alice laptop",
-        "Audit tenant     Acme (acme)",
-        "Registered locally",
-        "Automatic when sessions finish",
-        "11 Nov 2026, 11:28 UTC",
+        "Tenant           Acme (acme)",
+        "Alice laptop · enrolled",
+        "Not checked · use --refresh",
     ] {
         assert!(text.contains(label), "{text}");
     }
@@ -480,7 +527,10 @@ fn enrollment_status_uses_labels_and_keeps_ids_in_json_only() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
     assert_eq!(json["tenant_id"], "tenant-private-uuid");
     assert_eq!(json["subject_id"], "device-private-uuid");
-    assert_eq!(json.as_object().expect("object").len(), 7);
+    assert!(json["management_mode"].is_null());
+    assert!(json["last_verified_management_mode"].is_null());
+    assert!(json["policy_assignment"].is_null());
+    assert_eq!(json["policy_refreshed"], false);
     assert!(json.get("key_ref").is_none());
     assert!(json.get("key_algorithm").is_none());
     record.as_object_mut().expect("object").remove("tenant");
@@ -531,6 +581,54 @@ fn enrollment_environment_boolean_is_validated_and_conflicts_with_recovery() {
 }
 
 #[test]
+fn status_without_a_policy_cache_reports_only_verified_mode_history() {
+    for mode in [None, Some("audit_only"), Some("advisory"), Some("enforced")] {
+        for revoked in [false, true] {
+            let home = tempfile::tempdir().expect("home");
+            let dir = home.path().join("config/nono");
+            std::fs::create_dir_all(&dir).expect("config");
+            let record = serde_json::json!({
+                "protocol_version": "1", "platform_url": "https://nono.example.com",
+                "tenant_id": "tenant-private", "subject_id": "device-private",
+                "subject_kind": "device", "management_mode": "audit_only",
+                "key_algorithm": "ecdsa_p256_sha256_fixed", "key_ref": "file:///private/key",
+                "enrolled_at": "2026-11-11T11:28:00Z", "last_policy_mode": mode,
+                "revoked": revoked,
+            });
+            let path = dir.join("platform.json");
+            let original = record.to_string();
+            std::fs::write(&path, &original).expect("registration");
+            let output = nono(home.path(), &["platform", "status", "--json"], &[]);
+            assert!(output.status.success(), "{}", stderr(&output));
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+            assert_eq!(json["management_mode"], serde_json::json!(mode));
+            assert_eq!(
+                json["last_verified_management_mode"],
+                serde_json::json!(mode)
+            );
+            assert!(json["policy_assignment"].is_null());
+            assert_eq!(json["policy_refreshed"], false);
+            assert_eq!(json["enrolled"], !revoked);
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("private/key"));
+            let output = nono(home.path(), &["platform", "status"], &[]);
+            assert!(output.status.success(), "{}", stderr(&output));
+            let text = String::from_utf8(output.stdout).expect("text");
+            if mode.is_some() {
+                assert!(text.contains("last verified"), "{text}");
+                assert!(text.contains("Cached assignment unavailable"), "{text}");
+            } else {
+                assert!(text.contains("Not checked"), "{text}");
+                assert!(!text.contains("last verified"), "{text}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(path).expect("retained registration"),
+                original
+            );
+        }
+    }
+}
+
+#[test]
 fn remote_only_status_reports_context_without_claiming_device_enrollment() {
     let home = tempfile::tempdir().expect("home");
     let dir = write_session(home.path(), &[]);
@@ -546,10 +644,8 @@ fn remote_only_status_reports_context_without_claiming_device_enrollment() {
     let text = String::from_utf8(status.stdout).expect("text");
     for label in [
         "User             Alice",
-        "Current tenant   Alice (personal)",
-        "CLI sign-in      Stored locally",
-        "Enrollment       Not enrolled",
-        "Local only",
+        "Tenant           Personal",
+        "Device           Not enrolled",
     ] {
         assert!(text.contains(label), "{text}");
     }

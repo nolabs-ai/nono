@@ -231,6 +231,7 @@
           "/etc/locale.gen",
           "/etc/alternatives",
           "/etc/os-release",
+          "/etc/debian_version",
           "/etc/passwd",
           "/etc/services",
           "/etc/mime.types",
@@ -421,6 +422,7 @@
           "~/.local/bin/mise",
           "~/.config/mise",
           "~/.local/share/mise",
+          "~/.local/state/mise",
           "~/.tool-versions"
         ]
       }

@@ -142,6 +142,7 @@ impl CaptureErrorDetails {
 
 #[derive(Debug)]
 struct ProxyCredentialCaptureBackend {
+    session_socket_auth: bool,
     session_id: String,
     entries: HashMap<String, ResolvedCredentialCaptureEntry>,
     cache: Mutex<HashMap<String, CachedCapturedCredential>>,
@@ -219,6 +220,7 @@ impl ProxyCredentialCaptureBackend {
         entries: &HashMap<String, crate::profile::CredentialCaptureEntry>,
         session_id: String,
         outer_caps: CapabilitySet,
+        session_socket_auth: bool,
     ) -> Result<Self> {
         let mut resolved = HashMap::new();
         for (name, entry) in entries {
@@ -317,6 +319,7 @@ impl ProxyCredentialCaptureBackend {
         }
         Ok(Self {
             session_id,
+            session_socket_auth,
             entries: resolved,
             cache: Mutex::new(HashMap::new()),
             active: Mutex::new(HashSet::new()),
@@ -413,15 +416,20 @@ impl ProxyCredentialCaptureBackend {
         } else {
             Stdio::piped()
         };
-        let browser_bridge = prepare_capture_browser_bridge(entry, request, &self.outer_caps)
-            .map_err(|err| {
-                self.capture_error(
-                    entry,
-                    CaptureErrorDetails::new("browser_setup_failed", start.elapsed()).reason(
-                        format!("failed to prepare credential capture browser support: {err}"),
-                    ),
-                )
-            })?;
+        let browser_bridge = prepare_capture_browser_bridge(
+            entry,
+            request,
+            &self.outer_caps,
+            self.session_socket_auth,
+        )
+        .map_err(|err| {
+            self.capture_error(
+                entry,
+                CaptureErrorDetails::new("browser_setup_failed", start.elapsed()).reason(format!(
+                    "failed to prepare credential capture browser support: {err}"
+                )),
+            )
+        })?;
         command
             .args(entry.source.args())
             .stdin(stdin)
@@ -813,6 +821,7 @@ fn prepare_capture_browser_bridge(
     entry: &ResolvedCredentialCaptureEntry,
     request: &nono_proxy::capture::CredentialCaptureRequest,
     outer_caps: &CapabilitySet,
+    session_socket_auth: bool,
 ) -> Result<Option<CaptureBrowserBridge>> {
     let Some(policy) = entry.open_urls.clone() else {
         return Ok(None);
@@ -850,6 +859,7 @@ fn prepare_capture_browser_bridge(
                         &route_id,
                         &session_id,
                         &outer_caps,
+                        session_socket_auth,
                     );
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(25)),
@@ -876,7 +886,17 @@ fn handle_capture_url_connection(
     route_id: &str,
     session_id: &str,
     outer_caps: &CapabilitySet,
+    session_socket_auth: bool,
 ) {
+    let peer_pid =
+        match crate::session_auth::authenticate(socket.as_raw_fd(), session_socket_auth, |_| false)
+        {
+            Ok(pid) => pid,
+            Err(err) => {
+                warn!("Rejected credential capture URL connection: {err}");
+                return;
+            }
+        };
     let msg = match socket.recv_message() {
         Ok(msg) => msg,
         Err(err) => {
@@ -888,9 +908,8 @@ fn handle_capture_url_connection(
         warn!("credential capture URL listener received non-OpenUrl request");
         return;
     };
-    if request.session_id.is_empty() {
-        request.session_id = session_id.to_string();
-    }
+    request.child_pid = peer_pid;
+    request.session_id = session_id.to_string();
     let request_id = request.request_id.clone();
     let (success, error) = match validate_capture_url(&request.url, policy)
         .and_then(|()| crate::url_open::open_url_in_browser(&request.url, outer_caps))
@@ -1632,6 +1651,7 @@ pub(crate) fn prepare_proxy_launch_options(
     };
 
     let opts = ProxyLaunchOptions {
+        session_socket_auth: prepared.session_socket_auth,
         domain_filter,
         endpoint_filter,
         credentials: credentials_intent,
@@ -2301,7 +2321,7 @@ fn endpoint_rule_to_proxy(
 ) -> ProxyEndpointPolicyRule {
     ProxyEndpointPolicyRule {
         method: rule.method.clone(),
-        path: rule.path.clone(),
+        path: rule.path.as_str().into(),
         backend: rule.backend.clone(),
         reason: rule.reason.clone(),
         timeout_secs: resolve_approval_timeout(config, rule.backend.as_deref(), rule.timeout_secs),
@@ -2349,7 +2369,7 @@ pub(crate) fn parse_allow_domain_arg(input: &str) -> crate::profile::AllowDomain
                 domain,
                 endpoints: vec![nono_proxy::config::EndpointRule {
                     method: "*".to_string(),
-                    path: path.to_string(),
+                    path: path.into(),
                 }],
                 endpoint_policy: None,
             }
@@ -2397,7 +2417,7 @@ pub(crate) fn parse_allow_endpoint_arg(
         service.to_string(),
         nono_proxy::config::EndpointRule {
             method: method.to_string(),
-            path: path.to_string(),
+            path: path.into(),
         },
     ))
 }
@@ -2598,8 +2618,15 @@ pub(crate) fn build_credential_capture_backend(
     credential_capture: &HashMap<String, crate::profile::CredentialCaptureEntry>,
     session_id: String,
     outer_caps: CapabilitySet,
+    session_socket_auth: bool,
 ) -> Result<Option<Arc<dyn nono_proxy::capture::CredentialCaptureBackend>>> {
-    build_credential_capture_backend_with_registry(credential_capture, session_id, outer_caps, None)
+    build_credential_capture_backend_with_registry(
+        credential_capture,
+        session_id,
+        outer_caps,
+        session_socket_auth,
+        None,
+    )
 }
 
 /// Like [`build_credential_capture_backend`], registering every captured
@@ -2608,15 +2635,21 @@ fn build_credential_capture_backend_with_registry(
     credential_capture: &HashMap<String, crate::profile::CredentialCaptureEntry>,
     session_id: String,
     outer_caps: CapabilitySet,
+    session_socket_auth: bool,
     secret_registry: Option<nono_proxy::SecretRegistry>,
 ) -> Result<Option<Arc<dyn nono_proxy::capture::CredentialCaptureBackend>>> {
     if credential_capture.is_empty() {
         return Ok(None);
     }
-    Ok(Some(Arc::new(
-        ProxyCredentialCaptureBackend::new(credential_capture, session_id, outer_caps)?
-            .with_secret_registry(secret_registry),
-    )))
+    crate::session_auth::validate_support(session_socket_auth)?;
+    let backend = ProxyCredentialCaptureBackend::new(
+        credential_capture,
+        session_id,
+        outer_caps,
+        session_socket_auth,
+    )?
+    .with_secret_registry(secret_registry);
+    Ok(Some(Arc::new(backend)))
 }
 
 fn synthesize_credential_provider_proxy_config(
@@ -2674,7 +2707,7 @@ fn synthesize_credential_provider_proxy_config(
                 endpoint_rules: if endpoint_policy.is_none() {
                     vec![nono_proxy::config::EndpointRule {
                         method: "*".to_string(),
-                        path: "/**".to_string(),
+                        path: "/**".into(),
                     }]
                 } else {
                     Vec::new()
@@ -3125,6 +3158,7 @@ pub(crate) fn start_proxy_runtime(
         &proxy.credential_capture,
         proxy.session_id.clone(),
         caps.clone(),
+        proxy.session_socket_auth,
         Some(secret_registry.clone()),
     )?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4385,10 +4419,12 @@ mod tests {
         );
 
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
+            session_socket_auth: false,
             command_policies: None,
             resolved_command_binaries: None,
             approval_backends: std::collections::BTreeMap::new(),
@@ -4467,10 +4503,12 @@ mod tests {
         use std::collections::HashMap;
 
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
+            session_socket_auth: false,
             command_policies: None,
             resolved_command_binaries: None,
             approval_backends: std::collections::BTreeMap::new(),
@@ -4544,10 +4582,12 @@ mod tests {
         use std::collections::HashMap;
 
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
+            session_socket_auth: false,
             command_policies: None,
             resolved_command_binaries: None,
             approval_backends: std::collections::BTreeMap::new(),
@@ -5116,6 +5156,7 @@ mod tests {
             &entries,
             "sess-test".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "github".to_string(),
@@ -5156,12 +5197,14 @@ mod tests {
             ]),
         );
         let registry = nono_proxy::SecretRegistry::new();
-        let backend = ProxyCredentialCaptureBackend::new(
+        let backend = build_credential_capture_backend_with_registry(
             &entries,
             "sess-test".to_string(),
             nono::CapabilitySet::default(),
+            false,
+            Some(registry.clone()),
         )?
-        .with_secret_registry(Some(registry.clone()));
+        .expect("configured capture backend");
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "github".to_string(),
             route_id: "github".to_string(),
@@ -5172,7 +5215,8 @@ mod tests {
             cache_scope: String::new(),
         };
         assert!(registry.is_empty());
-        let response = nono_proxy::capture::CredentialCaptureBackend::capture(&backend, request)
+        let response = backend
+            .capture(request)
             .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
         assert_capture_secret(&response, "ghp_registry_capture_1234");
         let (_, entries) = registry.snapshot();
@@ -5304,6 +5348,7 @@ mod tests {
                         &entries,
                         "sess-reaper".to_string(),
                         CapabilitySet::default(),
+                        false,
                     )
                     .expect("capture backend");
                     let reaper = Reaper::start();
@@ -5406,6 +5451,7 @@ mod tests {
             &entries,
             "sess-timeout".to_string(),
             CapabilitySet::default(),
+            false,
         )?;
         backend.entries.get_mut("test").expect("test entry").timeout = Duration::from_millis(200);
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -5457,6 +5503,7 @@ mod tests {
             &entries,
             "sess-parallel".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
 
@@ -5518,6 +5565,7 @@ mod tests {
             &entries,
             "sess-test".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "empty".to_string(),
@@ -5551,6 +5599,7 @@ mod tests {
             &entries,
             "sess-test".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "github".to_string(),
@@ -5591,6 +5640,7 @@ mod tests {
             &entries,
             "sess-test".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "github".to_string(),
@@ -5632,6 +5682,7 @@ mod tests {
             &entries,
             "sess-test".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -5690,6 +5741,7 @@ mod tests {
             &entries,
             "sess-provider".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -5752,6 +5804,7 @@ mod tests {
             &entries,
             "sess-provider".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -5794,6 +5847,7 @@ mod tests {
             &entries,
             "sess-stdin".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -5827,7 +5881,8 @@ mod tests {
         let mut entry = test_capture_entry_no_cache(vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            r#"test -n "$BROWSER" && test -x "$BROWSER" && test -S "$NONO_SUPERVISOR_PATH" && printf browser-ok"#.to_string(),
+            // Braced names stay literal for the shell; capture args expand `$VAR` from the test process env.
+            r#"test -n "${BROWSER}" && test -x "${BROWSER}" && test -S "${NONO_SUPERVISOR_PATH}" && printf browser-ok"#.to_string(),
         ]);
         entry.interaction = Some(crate::profile::CredentialCaptureInteraction {
             stdio: false,
@@ -5844,6 +5899,7 @@ mod tests {
             &entries,
             "sess-browser".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -5873,6 +5929,7 @@ mod tests {
             &entries,
             "sess-ghost".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -5907,6 +5964,7 @@ mod tests {
             &entries,
             "sess-mixed".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -5954,6 +6012,7 @@ mod tests {
             &entries,
             "sess-ghost-provider".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -6243,6 +6302,7 @@ mod tests {
             &entries,
             "sess-not-exec".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -6277,6 +6337,7 @@ mod tests {
             &entries,
             "sess-dangling".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -6306,6 +6367,7 @@ mod tests {
             &entries,
             "sess-directory".to_string(),
             nono::CapabilitySet::default(),
+            false,
         )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
@@ -6415,7 +6477,7 @@ mod tests {
             service.to_string(),
             nono_proxy::config::EndpointRule {
                 method: method.to_string(),
-                path: path.to_string(),
+                path: path.into(),
             },
         )
     }
@@ -6693,6 +6755,7 @@ mod tests {
                 &entries,
                 "sess-stdio-stdin".to_string(),
                 nono::CapabilitySet::default(),
+                false,
             )?;
             let response = nono_proxy::capture::CredentialCaptureBackend::capture(
                 &backend,
@@ -6775,6 +6838,7 @@ mod tests {
                 &entries,
                 "sess-inherit-stdin".to_string(),
                 nono::CapabilitySet::default(),
+                false,
             )?;
             let response = nono_proxy::capture::CredentialCaptureBackend::capture(
                 &backend,

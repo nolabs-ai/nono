@@ -157,6 +157,10 @@ pub(crate) fn register_relay() -> RelayRegistration<'static> {
     GATE.register()
 }
 
+pub(crate) fn relay_active() -> bool {
+    GATE.lock().owner.is_some()
+}
+
 /// Run a terminal prompt with the PTY relay paused. See
 /// [`RelayPromptGate::run_paused`].
 pub(crate) fn run_with_relay_paused<T>(deadline: Instant, prompt: impl FnOnce() -> T) -> Option<T> {

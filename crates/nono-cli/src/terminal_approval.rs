@@ -269,6 +269,103 @@ impl TerminalApproval {
     }
 }
 
+/// Tell the user that a non-interactive approval backend (a webhook or the
+/// platform) is deciding `request`, so a stalled agent is not a mystery.
+///
+/// Best effort: returns false without printing when an interactive prompt
+/// currently holds the terminal, so the notice never lands inside another
+/// request's prompt. The caller pairs a true return with
+/// [`announce_backend_decision`].
+pub(crate) fn announce_backend_query(
+    backend: &str,
+    request: &ApprovalRequest,
+    timeout: Duration,
+) -> bool {
+    let Ok(_guard) = APPROVAL_PROMPT_LOCK.try_lock() else {
+        return false;
+    };
+    prompt_line!();
+    for line in backend_query_lines(backend, request, timeout) {
+        prompt_line!("{line}");
+    }
+    true
+}
+
+/// Report the outcome of a query announced with [`announce_backend_query`].
+pub(crate) fn announce_backend_decision(backend: &str, decision: &Result<ApprovalDecision>) {
+    let Ok(_guard) = APPROVAL_PROMPT_LOCK.try_lock() else {
+        return;
+    };
+    prompt_line!("{}", backend_decision_line(backend, decision));
+}
+
+fn backend_query_lines(backend: &str, request: &ApprovalRequest, timeout: Duration) -> [String; 2] {
+    [
+        format!(
+            "[nono] Waiting for approval backend '{}' (up to {}s)...",
+            sanitize_for_terminal(backend),
+            timeout.as_secs()
+        ),
+        format!("[nono]   Request: {}", request_summary(request)),
+    ]
+}
+
+fn backend_decision_line(backend: &str, decision: &Result<ApprovalDecision>) -> String {
+    let backend = sanitize_for_terminal(backend);
+    match decision {
+        Ok(ApprovalDecision::Granted) => {
+            format!("[nono] Approval backend '{backend}' granted the request.")
+        }
+        Ok(ApprovalDecision::GrantedForSession) => {
+            format!("[nono] Approval backend '{backend}' granted the request for this session.")
+        }
+        Ok(ApprovalDecision::Denied { reason }) => format!(
+            "[nono] Approval backend '{backend}' denied the request: {}",
+            sanitize_for_terminal(reason)
+        ),
+        Ok(ApprovalDecision::DeniedForSession) => {
+            format!("[nono] Approval backend '{backend}' denied the request for this session.")
+        }
+        Ok(ApprovalDecision::Timeout) => {
+            format!("[nono] Approval backend '{backend}' timed out; access denied.")
+        }
+        Err(_) => format!("[nono] Approval backend '{backend}' failed; access denied."),
+    }
+}
+
+/// One-line, terminal-safe description of what `request` asks for. Omits
+/// free-text reasons and endpoint paths (which may carry query strings).
+pub(crate) fn request_summary(request: &ApprovalRequest) -> String {
+    match request {
+        ApprovalRequest::Capability { path, access, .. } => format!(
+            "{} access to {}",
+            format_access_mode(access),
+            sanitize_for_terminal(&path.display().to_string())
+        ),
+        ApprovalRequest::Network { host, port, .. } => {
+            format!("connection to {}:{port}", sanitize_for_terminal(host))
+        }
+        ApprovalRequest::Command { command, .. } => {
+            format!("launch of {}", sanitize_for_terminal(command))
+        }
+        ApprovalRequest::UnixSocket { path, op, .. } => format!(
+            "unix socket {op} on {}",
+            sanitize_for_terminal(&path.display().to_string())
+        ),
+        ApprovalRequest::Endpoint {
+            method,
+            upstream,
+            route_id,
+            ..
+        } => format!(
+            "{} {} (route {})",
+            sanitize_for_terminal(method),
+            sanitize_for_terminal(upstream),
+            sanitize_for_terminal(route_id)
+        ),
+    }
+}
+
 fn acquire_prompt_slot(lock: &Mutex<()>, deadline: Instant) -> Result<Option<MutexGuard<'_, ()>>> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -398,6 +495,87 @@ mod tests {
 
     fn prompt_test_guard() -> std::sync::MutexGuard<'static, ()> {
         PROMPT_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn backend_query_notice_names_backend_timeout_and_request() {
+        let lines = backend_query_lines("platform", &network_request(), Duration::from_secs(60));
+        assert_eq!(
+            lines[0],
+            "[nono] Waiting for approval backend 'platform' (up to 60s)..."
+        );
+        assert_eq!(
+            lines[1],
+            "[nono]   Request: connection to api.example.com:443"
+        );
+
+        let cases = [
+            (capability_request(), "read+write access to /tmp/test"),
+            (command_request(), "launch of git"),
+            (
+                unix_socket_request(),
+                "unix socket connect on /tmp/test.sock",
+            ),
+            (
+                endpoint_request(),
+                "POST https://api.internal.example (route internal-api)",
+            ),
+        ];
+        for (request, expected) in cases {
+            assert_eq!(request_summary(&request), expected);
+        }
+    }
+
+    #[test]
+    fn backend_notices_strip_terminal_escapes() {
+        let hostile = ApprovalRequest::Network {
+            request_id: "net-002".to_string(),
+            host: "evil\x1b]0;pwned\x07.example\n[nono] Access granted.".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+            resolved_ips: Vec::new(),
+            reason: None,
+            child_pid: 42,
+            session_id: "sess-001".to_string(),
+        };
+        let lines = backend_query_lines("hook\x1b[2J", &hostile, Duration::from_secs(5));
+        let denied = backend_decision_line(
+            "hook",
+            &Ok(ApprovalDecision::Denied {
+                reason: "no\x1b[31m\nway".to_string(),
+            }),
+        );
+        for line in lines.iter().chain(std::iter::once(&denied)) {
+            assert!(!line.contains('\x1b') && !line.contains('\x07') && !line.contains('\n'));
+        }
+    }
+
+    #[test]
+    fn backend_decision_line_covers_every_outcome() {
+        let line = |d| backend_decision_line("b", &d);
+        assert!(line(Ok(ApprovalDecision::Granted)).ends_with("granted the request."));
+        assert!(line(Ok(ApprovalDecision::GrantedForSession)).contains("for this session"));
+        assert!(line(Ok(ApprovalDecision::DeniedForSession)).contains("denied"));
+        assert!(line(Ok(ApprovalDecision::Timeout)).contains("timed out"));
+        assert!(
+            line(Err(NonoError::SandboxInit("secret detail".to_string())))
+                .ends_with("failed; access denied."),
+            "errors are summarized, not echoed"
+        );
+    }
+
+    #[test]
+    fn backend_query_notice_yields_to_an_active_prompt() {
+        let _guard = prompt_test_guard();
+        let held = APPROVAL_PROMPT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(!announce_backend_query(
+            "platform",
+            &network_request(),
+            Duration::from_secs(1)
+        ));
+        drop(held);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

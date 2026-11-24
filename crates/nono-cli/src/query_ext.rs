@@ -236,6 +236,48 @@ pub fn query_path(
 /// `denied_by_filesystem_policy` matters on macOS because nono translates a
 /// filesystem deny for a socket path into a Seatbelt `network-outbound` deny.
 /// Linux Landlock filesystem denies do not mediate AF_UNIX operations.
+/// Answer a pathname socket query for a path hidden by the Linux mount mask
+/// (`linux.isolate.mounts`), from the paths the applied plan masks and
+/// re-binds. The deepest of those at or above the path decides what the
+/// sandbox sees there, exactly as the mounts stack: a mask hides the path,
+/// and a re-bind (of the socket, or of any directory above it, whichever
+/// grant caused it) shows the host's. Returns `None` when the path is not
+/// hidden; the regular socket query then decides.
+#[must_use]
+pub fn query_masked_unix_socket(
+    path: &Path,
+    masked_paths: &[std::path::PathBuf],
+    rebound_paths: &[std::path::PathBuf],
+) -> Option<QueryResult> {
+    let resolved = try_canonicalize(path);
+    let deepest = |paths: &[std::path::PathBuf]| {
+        paths
+            .iter()
+            .filter(|candidate| resolved.starts_with(candidate))
+            .max_by_key(|candidate| candidate.components().count())
+            .cloned()
+    };
+    let mask = deepest(masked_paths)?;
+    if deepest(rebound_paths)
+        .is_some_and(|rebind| rebind.components().count() > mask.components().count())
+    {
+        return None;
+    }
+    Some(QueryResult::Denied {
+        reason: "isolation_mount_masked".to_string(),
+        details: Some(format!(
+            "{} is hidden by the linux.isolate.mounts mask over {}; only explicitly granted \
+             paths are re-bound through the mask",
+            resolved.display(),
+            mask.display()
+        )),
+        policy_source: Some("linux.isolate.mounts".to_string()),
+        matching_capability: None,
+        suggested_flag: Some(format!("--allow-unix-socket {}", resolved.display())),
+        endpoint_rules: None,
+    })
+}
+
 pub fn query_unix_socket(
     path: &Path,
     op: nono::UnixSocketOp,
@@ -359,6 +401,7 @@ pub fn query_network(
     allowed_domains: &[String],
     denied_domains: &[String],
     domain_endpoints: &[crate::sandbox_state::DomainEndpointState],
+    network_approvals: bool,
 ) -> QueryResult {
     let (domain, url_path) = parse_host_input(host);
 
@@ -374,11 +417,26 @@ pub fn query_network(
             suggested_flag: Some(format!("--allow-domain {}", domain)),
             endpoint_rules: None,
         },
-        nono::NetworkMode::ProxyOnly { .. } => {
-            let filter = if allowed_domains.is_empty() {
+        nono::NetworkMode::AllowAll
+            if allowed_domains.is_empty() && denied_domains.is_empty() && !network_approvals =>
+        {
+            QueryResult::Allowed {
+                reason: "network_allowed".to_string(),
+                granted_path: None,
+                access: Some(format!(
+                    "Connection to {}:{} would be allowed",
+                    domain, port
+                )),
+                source: None,
+                endpoint_rules: None,
+                warning: None,
+            }
+        }
+        nono::NetworkMode::ProxyOnly { .. } | nono::NetworkMode::AllowAll => {
+            let filter = if allowed_domains.is_empty() && !network_approvals {
                 nono::net_filter::HostFilter::allow_all()
             } else {
-                nono::net_filter::HostFilter::new(allowed_domains)
+                nono::net_filter::HostFilter::new_strict(allowed_domains)
             }
             .with_denied_hosts(denied_domains);
             // Pass empty IPs: DNS resolution happens at proxy time, not query time.
@@ -442,6 +500,15 @@ pub fn query_network(
                         endpoint_rules: None,
                     }
                 }
+                nono::net_filter::FilterResult::DenyNotAllowed { .. } if network_approvals => {
+                    QueryResult::ApprovalRequired {
+                        reason: "network_approval_required".into(),
+                        details: Some(format!(
+                            "Connection to {domain}:{port} requires the configured network approval backend"
+                        )),
+                        policy_source: Some("network.approval_backends".into()),
+                    }
+                }
                 deny => QueryResult::Denied {
                     reason: "proxy_filtered".to_string(),
                     details: Some(format!("Domain filtering is active. {}", deny.reason())),
@@ -450,87 +517,6 @@ pub fn query_network(
                     suggested_flag: Some(format!("--allow-domain {}", domain)),
                     endpoint_rules: None,
                 },
-            }
-        }
-        nono::NetworkMode::AllowAll => {
-            // OS-level network is unrestricted, but a domain filter is active
-            // whenever either list is non-empty — check it like ProxyOnly does.
-            if !allowed_domains.is_empty() || !denied_domains.is_empty() {
-                let filter = if allowed_domains.is_empty() {
-                    nono::net_filter::HostFilter::allow_all()
-                } else {
-                    nono::net_filter::HostFilter::new(allowed_domains)
-                }
-                .with_denied_hosts(denied_domains);
-                let check_result = check_domain_deny(&filter, &domain, port)
-                    .unwrap_or_else(|| filter.check_host(&domain, &[]));
-                match check_result {
-                    nono::net_filter::FilterResult::Allow => {
-                        let matching_endpoints = domain_endpoints
-                            .iter()
-                            .find(|de| de.domain.eq_ignore_ascii_case(&domain));
-
-                        match (matching_endpoints, &url_path) {
-                            (Some(de), Some(path)) => endpoint_path_result(de, &domain, port, path),
-                            (Some(de), None) => QueryResult::Allowed {
-                                reason: "proxy_allowed".to_string(),
-                                granted_path: None,
-                                access: Some(format!(
-                                    "Connection to {}:{} allowed via proxy \
-                                     (restricted to {} endpoint rules)",
-                                    domain,
-                                    port,
-                                    de.endpoints.len(),
-                                )),
-                                source: Some("domain allowlist".to_string()),
-                                endpoint_rules: Some(de.endpoints.clone()),
-                                warning: None,
-                            },
-                            (None, _) => QueryResult::Allowed {
-                                reason: "proxy_allowed".to_string(),
-                                granted_path: None,
-                                access: Some(format!(
-                                    "Connection to {}:{} would be allowed via proxy",
-                                    domain, port,
-                                )),
-                                source: Some("domain allowlist".to_string()),
-                                endpoint_rules: None,
-                                warning: None,
-                            },
-                        }
-                    }
-                    nono::net_filter::FilterResult::DenyHost { .. } => QueryResult::Denied {
-                        reason: "domain_deny".to_string(),
-                        details: Some(format!(
-                            "Host is blocked by network.deny_domain. {}",
-                            check_result.reason()
-                        )),
-                        policy_source: Some("proxy domain filter (deny_domain)".to_string()),
-                        matching_capability: None,
-                        suggested_flag: None,
-                        endpoint_rules: None,
-                    },
-                    deny => QueryResult::Denied {
-                        reason: "proxy_filtered".to_string(),
-                        details: Some(format!("Domain filtering is active. {}", deny.reason())),
-                        policy_source: Some("proxy domain filter".to_string()),
-                        matching_capability: None,
-                        suggested_flag: Some(format!("--allow-domain {}", domain)),
-                        endpoint_rules: None,
-                    },
-                }
-            } else {
-                QueryResult::Allowed {
-                    reason: "network_allowed".to_string(),
-                    granted_path: None,
-                    access: Some(format!(
-                        "Connection to {}:{} would be allowed",
-                        domain, port
-                    )),
-                    source: None,
-                    endpoint_rules: None,
-                    warning: None,
-                }
             }
         }
     }
@@ -651,8 +637,7 @@ fn path_matches_endpoint_rules(
     }
     let normalized = normalize_path(path);
     rules.iter().any(|r| {
-        let pattern = nono_proxy::config::normalize_rule_path(&r.path);
-        let Ok(glob) = globset::GlobBuilder::new(pattern)
+        let Ok(glob) = globset::GlobBuilder::new(&r.path)
             .literal_separator(true)
             .build()
         else {
@@ -1058,6 +1043,47 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    #[test]
+    fn test_query_masked_unix_socket_denies_unless_granted() {
+        let dir = tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical");
+        let socket = root.join("agent.sock");
+        let _listener = UnixListener::bind(&socket).expect("bind");
+        let masked = vec![root.clone()];
+        let is_masked = |result: Option<QueryResult>| matches!(&result, Some(QueryResult::Denied { reason, .. }) if reason == "isolation_mount_masked");
+
+        assert!(is_masked(query_masked_unix_socket(&socket, &masked, &[])));
+        assert!(
+            query_masked_unix_socket(&socket, &masked, std::slice::from_ref(&socket)).is_none(),
+            "a re-bound socket is reachable"
+        );
+        assert!(query_masked_unix_socket(Path::new("/elsewhere.sock"), &masked, &[]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_query_masked_unix_socket_follows_the_mount_stack() {
+        let dir = tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical");
+        let granted_dir = root.join("app");
+        let inner_mask = granted_dir.join("private");
+        std::fs::create_dir_all(&inner_mask).expect("mkdir");
+        let socket = granted_dir.join("agent.sock");
+        let _listener = UnixListener::bind(&socket).expect("bind");
+        let hidden = inner_mask.join("x.sock");
+
+        // A read grant of the directory re-binds it, so its sockets connect.
+        let masked = vec![root.clone(), inner_mask.clone()];
+        let rebound = vec![granted_dir.clone()];
+        assert!(query_masked_unix_socket(&socket, &masked, &rebound).is_none());
+        // A mask beneath the re-bound directory hides its subtree again.
+        assert!(query_masked_unix_socket(&hidden, &masked, &rebound).is_some());
+        // A grant exactly at a directory mask is not re-bound by the plan, so
+        // the path stays masked even though a grant names it.
+        assert!(query_masked_unix_socket(&socket, std::slice::from_ref(&root), &[]).is_some());
+    }
+
     #[test]
     fn test_query_unix_socket_linux_unmediated_is_not_reported_allowed() {
         let path = PathBuf::from("/run/example.sock");
@@ -1400,14 +1426,14 @@ mod tests {
     #[test]
     fn test_query_network_allowed() {
         let caps = CapabilitySet::new();
-        let result = query_network("example.com", 443, &caps, &[], &[], &[]);
+        let result = query_network("example.com", 443, &caps, &[], &[], &[], false);
         assert!(matches!(result, QueryResult::Allowed { .. }));
     }
 
     #[test]
     fn test_query_network_blocked() {
         let caps = CapabilitySet::new().block_network();
-        let result = query_network("example.com", 443, &caps, &[], &[], &[]);
+        let result = query_network("example.com", 443, &caps, &[], &[], &[], false);
         assert!(matches!(result, QueryResult::Denied { .. }));
     }
 
@@ -1439,10 +1465,10 @@ mod tests {
         });
         let allowed = vec!["api.example.com".to_string()];
 
-        let result = query_network("api.example.com", 443, &caps, &allowed, &[], &[]);
+        let result = query_network("api.example.com", 443, &caps, &allowed, &[], &[], false);
         assert!(matches!(result, QueryResult::Allowed { .. }));
 
-        match query_network("evil.com", 443, &caps, &allowed, &[], &[]) {
+        match query_network("evil.com", 443, &caps, &allowed, &[], &[], false) {
             QueryResult::Denied {
                 reason,
                 suggested_flag,
@@ -1464,12 +1490,12 @@ mod tests {
         let allowed = vec!["*.example.com".to_string()];
 
         assert!(matches!(
-            query_network("sub.example.com", 443, &caps, &allowed, &[], &[]),
+            query_network("sub.example.com", 443, &caps, &allowed, &[], &[], false),
             QueryResult::Allowed { .. }
         ));
         // *.example.com must NOT match bare example.com (mirrors HostFilter)
         assert!(matches!(
-            query_network("example.com", 443, &caps, &allowed, &[], &[]),
+            query_network("example.com", 443, &caps, &allowed, &[], &[], false),
             QueryResult::Denied { .. }
         ));
     }
@@ -1481,7 +1507,7 @@ mod tests {
             bind_ports: vec![],
         });
         assert!(matches!(
-            query_network("anything.com", 443, &caps, &[], &[], &[]),
+            query_network("anything.com", 443, &caps, &[], &[], &[], false),
             QueryResult::Allowed { .. }
         ));
     }
@@ -1494,13 +1520,13 @@ mod tests {
         });
         // Cloud metadata endpoints are denied even with an empty allowlist
         assert!(matches!(
-            query_network("169.254.169.254", 80, &caps, &[], &[], &[]),
+            query_network("169.254.169.254", 80, &caps, &[], &[], &[], false),
             QueryResult::Denied { .. }
         ));
         // Also denied even if explicitly in the allowlist
         let allowed = vec!["169.254.169.254".to_string()];
         assert!(matches!(
-            query_network("169.254.169.254", 80, &caps, &allowed, &[], &[]),
+            query_network("169.254.169.254", 80, &caps, &allowed, &[], &[], false),
             QueryResult::Denied { .. }
         ));
     }
@@ -1516,12 +1542,12 @@ mod tests {
         let allowed = vec!["*".to_string()];
         let denied = vec!["[::1]:8975".to_string()];
         assert!(matches!(
-            query_network("::1", 8975, &caps, &allowed, &denied, &[]),
+            query_network("::1", 8975, &caps, &allowed, &denied, &[], false),
             QueryResult::Denied { reason, .. } if reason == "domain_deny"
         ));
         // Different port on the same host is unaffected by a port-scoped deny.
         assert!(matches!(
-            query_network("::1", 8787, &caps, &allowed, &denied, &[]),
+            query_network("::1", 8787, &caps, &allowed, &denied, &[], false),
             QueryResult::Allowed { .. }
         ));
     }
@@ -1541,7 +1567,8 @@ mod tests {
                 &caps,
                 &allowed,
                 &[],
-                &[]
+                &[],
+                false
             ),
             QueryResult::Allowed { .. }
         ));
@@ -1560,11 +1587,11 @@ mod tests {
             endpoints: vec![
                 crate::sandbox_state::EndpointRuleState {
                     method: "*".to_string(),
-                    path: "/atko-cic/**".to_string(),
+                    path: "/atko-cic/**".into(),
                 },
                 crate::sandbox_state::EndpointRuleState {
                     method: "*".to_string(),
-                    path: "/nolabs-ai/**".to_string(),
+                    path: "/nolabs-ai/**".into(),
                 },
             ],
         }];
@@ -1576,6 +1603,7 @@ mod tests {
             &allowed,
             &[],
             &endpoints,
+            false,
         );
         assert!(matches!(result, QueryResult::Allowed { .. }));
     }
@@ -1592,7 +1620,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![crate::sandbox_state::EndpointRuleState {
                 method: "*".to_string(),
-                path: "/atko-cic/**".to_string(),
+                path: "/atko-cic/**".into(),
             }],
         }];
         // Path that does NOT match any rule
@@ -1603,6 +1631,7 @@ mod tests {
             &allowed,
             &[],
             &endpoints,
+            false,
         );
         match result {
             QueryResult::Denied {
@@ -1652,6 +1681,7 @@ mod tests {
             &allowed,
             &[],
             &endpoints,
+            false,
         );
         assert!(matches!(result, QueryResult::Allowed { .. }), "{result:?}");
 
@@ -1663,6 +1693,7 @@ mod tests {
             &allowed,
             &[],
             &endpoints,
+            false,
         ) {
             QueryResult::Denied { reason, .. } => assert_eq!(reason, "endpoint_restricted"),
             other => panic!("expected endpoint_restricted, got {other:?}"),
@@ -1675,6 +1706,7 @@ mod tests {
             &allowed,
             &[],
             &endpoints,
+            false,
         );
         match result {
             QueryResult::Denied {
@@ -1706,7 +1738,7 @@ mod tests {
         let endpoints = vec![
             crate::sandbox_state::DomainEndpointState::from_allow_domain(&entry).expect("state"),
         ];
-        let query = |url: &str| query_network(url, 443, &caps, &allowed, &[], &endpoints);
+        let query = |url: &str| query_network(url, 443, &caps, &allowed, &[], &endpoints, false);
 
         // A deny rule wins over a matching allow rule.
         match query("https://github.com/acme/secret/x") {
@@ -1753,6 +1785,7 @@ mod tests {
             &allowed,
             &[],
             &endpoints,
+            false,
         );
         assert!(matches!(result, QueryResult::Denied { .. }), "{result:?}");
     }
@@ -1769,11 +1802,11 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![crate::sandbox_state::EndpointRuleState {
                 method: "*".to_string(),
-                path: "/atko-cic/**".to_string(),
+                path: "/atko-cic/**".into(),
             }],
         }];
         // Bare domain (no path) shows allowed with endpoint rules
-        let result = query_network("github.com", 443, &caps, &allowed, &[], &endpoints);
+        let result = query_network("github.com", 443, &caps, &allowed, &[], &endpoints, false);
         match result {
             QueryResult::Allowed {
                 endpoint_rules,
@@ -1818,11 +1851,11 @@ mod tests {
         let rules = vec![
             crate::sandbox_state::EndpointRuleState {
                 method: "*".to_string(),
-                path: "/atko-cic/**".to_string(),
+                path: "/atko-cic/**".into(),
             },
             crate::sandbox_state::EndpointRuleState {
                 method: "GET".to_string(),
-                path: "/public/*".to_string(),
+                path: "/public/*".into(),
             },
         ];
         assert!(path_matches_endpoint_rules(
@@ -1845,7 +1878,7 @@ mod tests {
     fn test_path_matches_endpoint_rules_single_wildcard_rejects_multi_segment() {
         let rules = vec![crate::sandbox_state::EndpointRuleState {
             method: "*".to_string(),
-            path: "/repos/*".to_string(),
+            path: "/repos/*".into(),
         }];
         assert!(path_matches_endpoint_rules("/repos/one", &rules));
         assert!(!path_matches_endpoint_rules("/repos/one/two", &rules));
@@ -1858,7 +1891,7 @@ mod tests {
     fn test_path_matches_endpoint_rules_trailing_slash() {
         let rules = vec![crate::sandbox_state::EndpointRuleState {
             method: "*".to_string(),
-            path: "/3322/".to_string(),
+            path: "/3322/".into(),
         }];
         assert!(path_matches_endpoint_rules("/3322/", &rules));
         assert!(path_matches_endpoint_rules("/3322", &rules));

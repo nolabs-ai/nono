@@ -351,7 +351,11 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         &domain_endpoints,
         &flags,
     );
-    let cap_file_path = cap_file.unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut cap_file = cap_file;
+    let cap_file_path = cap_file
+        .as_ref()
+        .map_or_else(|| std::path::PathBuf::from("/dev/null"), |f| f.path.clone());
     if cap_file_path != Path::new("/dev/null") {
         caps.add_fs(FsCapability::new_file(&cap_file_path, AccessMode::Read)?);
     }
@@ -458,6 +462,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: command_policies,
+                session_socket_auth: flags.session_socket_auth,
                 initial_program: &resolved_program,
                 resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
                 audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
@@ -491,6 +496,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: command_policies,
+                session_socket_auth: flags.session_socket_auth,
                 resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
                 audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
                     flags.profile_display_name.clone(),
@@ -711,7 +717,31 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let namespaces = if flags.isolate.is_empty() {
         None
     } else {
-        Some(crate::isolation::prepare_namespaces(flags.isolate, &caps)?)
+        Some(crate::isolation::prepare_namespaces(&flags.isolate, &caps)?)
+    };
+    // The mount mask is built from the final capability set, so every grant
+    // (including the sandbox state file) is re-bound through the masks.
+    #[cfg(target_os = "linux")]
+    let mount_mask = if namespaces
+        .as_ref()
+        .is_some_and(nono::NamespaceSpec::has_mounts)
+    {
+        let plan = crate::isolation::prepare_mount_mask(&flags.isolate, &caps, &requested_workdir)?;
+        crate::output::print_mount_mask(&plan, flags.silent);
+        crate::isolation::reject_hidden_workdir(&plan, &current_dir)?;
+        // Record exactly what this plan masks and re-binds, so `nono why
+        // --self` answers from the applied plan rather than recomputing it.
+        if let Some(CapabilityStateFile { path, file, state }) = cap_file.as_mut()
+            && let Some(isolation) = state.isolation.as_mut()
+        {
+            (isolation.masked_paths, isolation.rebound_paths) = crate::isolation::mount_view(&plan);
+            if let Err(error) = state.rewrite(file, path) {
+                warn!("cannot record the mount mask in the sandbox state file: {error}");
+            }
+        }
+        Some(plan)
+    } else {
+        None
     };
 
     // With `linux.isolate.loopback` the validated network namespace confines
@@ -792,6 +822,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         sandbox_policy: flags.sandbox_policy,
         #[cfg(target_os = "linux")]
         namespaces,
+        #[cfg(target_os = "linux")]
+        mount_mask: mount_mask.as_ref(),
+        #[cfg(target_os = "linux")]
+        scoped_proxy_handles: &scoped_proxy_handles,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         case_insensitive_env_vars: flags.case_insensitive_env_vars,
@@ -827,6 +861,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                     .and_then(|d| d.backend.clone()),
             )?;
             let exit_result = execute_supervised_runtime(SupervisedRuntimeContext {
+                session_socket_auth: flags.session_socket_auth,
                 config: &config,
                 caps: &caps,
                 deny_paths: &deny_paths,
@@ -898,6 +933,17 @@ fn validate_command_policy_execution_support() -> Result<()> {
     }
 }
 
+/// A written sandbox state file, kept open so launch-time facts decided after
+/// it was granted (the applied mount mask) can still be recorded in it.
+struct CapabilityStateFile {
+    path: std::path::PathBuf,
+    // Only the Linux mount mask is recorded after the file is written.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    file: std::fs::File,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    state: sandbox_state::SandboxState,
+}
+
 fn write_capability_state_file(
     caps: &CapabilitySet,
     bypass_protection_paths: &[crate::policy::AppliedBypass],
@@ -906,7 +952,7 @@ fn write_capability_state_file(
     denied_domains: &[String],
     domain_endpoints: &[sandbox_state::DomainEndpointState],
     flags: &ExecutionFlags,
-) -> Option<std::path::PathBuf> {
+) -> Option<CapabilityStateFile> {
     let mut state = sandbox_state::SandboxState::from_caps_with_denies(
         caps,
         bypass_protection_paths,
@@ -915,17 +961,41 @@ fn write_capability_state_file(
         denied_domains,
         domain_endpoints,
     );
+    state.network_approvals = flags
+        .network
+        .proxy_options()
+        .is_some_and(|proxy| !proxy.network_approval_backends.is_empty());
     #[cfg(target_os = "linux")]
     let linux_af_unix_mediation = flags.af_unix_mediation.is_pathname();
     #[cfg(not(target_os = "linux"))]
     let linux_af_unix_mediation = false;
     state.pathname_socket_enforcement =
         sandbox_state::pathname_socket_enforcement(linux_af_unix_mediation);
+    #[cfg(target_os = "linux")]
+    if !flags.isolate.is_empty() {
+        state.isolation = Some(sandbox_state::IsolationState {
+            namespaces: flags
+                .isolate
+                .labels()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            // Filled in from the applied plan once it is built.
+            masked_paths: Vec::new(),
+            rebound_paths: Vec::new(),
+        });
+    }
 
     for _ in 0..8 {
         let cap_file = next_capability_state_file_path();
-        match state.write_to_file(&cap_file) {
-            Ok(()) => return Some(cap_file),
+        match state.create_file(&cap_file) {
+            Ok(file) => {
+                return Some(CapabilityStateFile {
+                    path: cap_file,
+                    file,
+                    state,
+                });
+            }
             Err(NonoError::ConfigWrite { source, .. })
                 if source.kind() == std::io::ErrorKind::AlreadyExists =>
             {

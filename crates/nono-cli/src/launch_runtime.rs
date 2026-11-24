@@ -43,6 +43,7 @@ pub(crate) struct LaunchPlan {
 
 #[derive(Clone, Default)]
 pub(crate) struct SessionLaunchOptions {
+    pub(crate) policy: Option<crate::platform_policy::PolicySession>,
     pub(crate) session_id: Option<String>,
     pub(crate) detached_start: bool,
     pub(crate) session_name: Option<String>,
@@ -131,6 +132,7 @@ pub(crate) struct OpenUrlIntent {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProxyLaunchOptions {
+    pub(crate) session_socket_auth: bool,
     pub(crate) domain_filter: Option<DomainFilterIntent>,
     pub(crate) endpoint_filter: Option<EndpointFilterIntent>,
     pub(crate) credentials: Option<CredentialProxyIntent>,
@@ -237,6 +239,7 @@ fn mark_network_audit_disabled(network: &mut NetworkIntent) {
 
 #[derive(Clone)]
 pub(crate) struct ExecutionFlags {
+    pub(crate) session_socket_auth: bool,
     pub(crate) strategy: exec_strategy::ExecStrategy,
     pub(crate) workdir: PathBuf,
     pub(crate) no_diagnostics: bool,
@@ -309,6 +312,7 @@ impl ExecutionFlags {
         )?;
         Ok(Self {
             strategy: exec_strategy::ExecStrategy::Supervised,
+            session_socket_auth: prepared.session_socket_auth,
             workdir: cwd.clone(),
             no_diagnostics: false,
             diagnostics_json: false,
@@ -321,7 +325,7 @@ impl ExecutionFlags {
             #[cfg(target_os = "linux")]
             af_unix_mediation: prepared.af_unix_mediation,
             #[cfg(target_os = "linux")]
-            isolate: prepared.isolate,
+            isolate: prepared.isolate.clone(),
             #[cfg(target_os = "linux")]
             sandbox_policy: prepared.sandbox_policy,
             #[cfg(target_os = "linux")]
@@ -487,6 +491,7 @@ pub(crate) fn prepare_run_launch_plan(
         diagnostics_json,
         diagnostic_verbosity: args.verbose,
         session: SessionLaunchOptions {
+            policy: prepared.policy_session.clone(),
             session_id: Some(session_id),
             detached_start: run_args.detached,
             session_name: run_args.name,

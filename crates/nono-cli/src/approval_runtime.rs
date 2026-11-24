@@ -250,14 +250,18 @@ impl ApprovalBackend for NamedTerminalApproval {
 
 /// Path of the platform's enrolled approval ingest, relative to the enrolled
 /// platform URL. The poll route is `<this>/{request_id}`.
-const PLATFORM_APPROVALS_PATH: &str = "/api/v1/approvals";
+pub(crate) const PLATFORM_APPROVALS_PATH: &str = "/api/v1/approvals";
 /// Pause between polls when the server answers `pending` immediately instead
 /// of holding the request open.
 const PLATFORM_POLL_BACKOFF: Duration = Duration::from_millis(250);
+/// Longest a webhook query waits for the PTY relay to pause so it can print a
+/// status notice. Past this the notice is skipped.
+const BACKEND_NOTICE_PAUSE_WAIT: Duration = Duration::from_secs(1);
 /// Header carrying the client's remaining patience so the server-side hold and
 /// deadline match this backend's `timeout_secs`.
 const HEADER_TIMEOUT_SECS: &str = "X-Nono-Timeout-Secs";
 
+#[derive(Clone)]
 struct WebhookApproval {
     name: String,
     url: String,
@@ -452,22 +456,46 @@ impl WebhookApproval {
             })
     }
 
+    /// Print a status notice for the user, pausing the PTY relay only for
+    /// the print itself so the agent's terminal stays live while the backend
+    /// decides. Waiting for the pause is bounded by [`BACKEND_NOTICE_PAUSE_WAIT`]
+    /// and the caller's deadline. Completion notices get their own deadline.
+    /// Returns whether the notice was shown. Never affects the decision.
+    fn show_notice(deadline: Instant, print: impl FnOnce() -> bool) -> bool {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let deadline = now
+            .checked_add(BACKEND_NOTICE_PAUSE_WAIT)
+            .unwrap_or(now)
+            .min(deadline);
+        crate::relay_prompt_gate::run_with_relay_paused(deadline, print).unwrap_or(false)
+    }
+
     /// Unsigned contract: one blocking POST, the response body is the
     /// decision. Any approval endpoint that does not verify enrolled
     /// identities speaks this (`docs/protocols/approval-webhook-v1.md`).
+    /// The request gets only what is left of this backend's timeout, both as
+    /// its HTTP timeout and as the server hold hint.
     fn request_unsigned(&self, body: &[u8], started: Instant) -> Result<ApprovalDecision> {
+        let remaining = self.timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(ApprovalDecision::Timeout);
+        }
         let mut response = self
             .http
             .post(&self.url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(Some(remaining))
             .build()
             .header("Content-Type", "application/json")
             .header(
                 "User-Agent",
                 &format!("nono-cli/{}", env!("CARGO_PKG_VERSION")),
             )
-            .header(HEADER_TIMEOUT_SECS, &self.timeout.as_secs().to_string())
+            .header(HEADER_TIMEOUT_SECS, &remaining.as_secs().max(1).to_string())
             .send(body)
             .map_err(|e| {
                 NonoError::SandboxInit(format!("approval webhook '{}' failed: {e}", self.name))
@@ -661,6 +689,22 @@ impl WebhookApproval {
 }
 
 impl ApprovalBackend for WebhookApproval {
+    fn request_approval_with_deadline(
+        &self,
+        request: &ApprovalRequest,
+        deadline: Instant,
+    ) -> Result<ApprovalDecision> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(ApprovalDecision::Timeout);
+        }
+        Self {
+            timeout: self.timeout.min(remaining),
+            ..self.clone()
+        }
+        .request_approval(request)
+    }
+
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
         let body = serde_json::to_vec(&WebhookApprovalRequest {
             backend: &self.name,
@@ -673,7 +717,20 @@ impl ApprovalBackend for WebhookApproval {
             ))
         })?;
         let started = Instant::now();
-        match &self.platform {
+        let deadline = started.checked_add(self.timeout).unwrap_or(started);
+        let progress = crate::relay_prompt_gate::relay_active().then(|| {
+            crate::approval_status::PendingNotice::start(
+                &self.name,
+                request,
+                self.timeout,
+                self.platform.is_some(),
+            )
+        });
+        let announced = progress.is_none()
+            && Self::show_notice(deadline, || {
+                crate::terminal_approval::announce_backend_query(&self.name, request, self.timeout)
+            });
+        let decision = match &self.platform {
             None => self.request_unsigned(&body, started),
             Some(state) => self.drive_platform_approval(
                 request.request_id(),
@@ -681,7 +738,16 @@ impl ApprovalBackend for WebhookApproval {
                 started,
                 |step, remaining| self.send_platform(state, step, remaining),
             ),
+        };
+        if announced {
+            let now = Instant::now();
+            let deadline = now.checked_add(BACKEND_NOTICE_PAUSE_WAIT).unwrap_or(now);
+            Self::show_notice(deadline, || {
+                crate::terminal_approval::announce_backend_decision(&self.name, &decision);
+                true
+            });
         }
+        decision
     }
 
     fn backend_name(&self) -> &str {
@@ -1383,6 +1449,43 @@ mod tests {
             http: ureq::Agent::new_with_defaults(),
             platform: None,
             poll_backoff: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn unsigned_webhook_times_out_without_sending_once_budget_is_spent() {
+        // The URL is unreachable; returning Timeout proves no request was made.
+        let backend = test_webhook(Duration::from_secs(1));
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now);
+        assert!(matches!(
+            backend.request_unsigned(b"{}", started).unwrap(),
+            ApprovalDecision::Timeout
+        ));
+        // An initial notice cannot consume time after the query deadline.
+        assert!(!WebhookApproval::show_notice(started, || panic!(
+            "notice must be skipped"
+        )));
+    }
+
+    #[test]
+    fn completion_notices_have_a_fresh_deadline_after_the_query_expires() {
+        let backend = test_webhook(Duration::from_secs(1));
+        let started = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+        let timeout = backend.request_unsigned(b"{}", started).unwrap();
+        for decision in [
+            timeout,
+            ApprovalDecision::Granted,
+            ApprovalDecision::DeniedForSession,
+        ] {
+            let now = Instant::now();
+            let deadline = now.checked_add(BACKEND_NOTICE_PAUSE_WAIT).unwrap();
+            assert!(WebhookApproval::show_notice(deadline, || {
+                assert!(started.elapsed() >= backend.timeout);
+                crate::terminal_approval::announce_backend_decision("test", &Ok(decision));
+                true
+            }));
         }
     }
 

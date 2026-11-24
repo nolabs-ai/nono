@@ -86,12 +86,16 @@ pub(crate) fn run_detached_launch(args: RunArgs, silent: bool) -> Result<()> {
             cleanup_startup_log(&startup_log_path);
             // The supervisor's own notice went to the startup log; repeat it
             // here, whatever `--silent` says (§7).
-            if let Some(notice) = session::load_session(&session_id)
-                .ok()
-                .as_ref()
-                .and_then(crate::terminal_capture::session_notice)
-            {
-                eprintln!("{notice}");
+            if let Ok(record) = session::load_session(&session_id) {
+                if let Some(notice) = crate::terminal_capture::session_notice(&record) {
+                    eprintln!("{notice}");
+                }
+                if !silent && let Some(policy) = &record.policy {
+                    eprint!(
+                        "{}",
+                        crate::platform_policy::display::session_summary(policy)
+                    );
+                }
             }
             print_detached_launch_banner(&session_id, args.name.as_deref(), silent);
             return Ok(());

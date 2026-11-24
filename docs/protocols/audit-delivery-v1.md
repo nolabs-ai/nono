@@ -3,7 +3,8 @@
 This document specifies the open client contract used by `nono` to enroll an
 audit-only device or workload and deliver a completed session to a compatible
 control plane. Enrollment does not imply mandatory fleet policy or session
-conformance.
+conformance. Optional managed startup policy is specified in
+[managed policy delivery v2](managed-policy-v2.md).
 
 ## Enrollment
 
@@ -51,6 +52,18 @@ The final envelope is posted to `/api/v1/audit/ingest`:
   "events_ndjson": "<complete audit event log>"
 }
 ```
+
+`profile_ref` is the explicit profile selector, otherwise the executable's
+recommended pack reference, otherwise `null`. The client captures this analytics
+label at launch in `platform-audit-profile.json` beside the session audit files.
+Uploads and outbox reconstruction use that saved value; retries preserve the
+queued envelope. Older sessions without the file continue to report `null`.
+
+The label may contain a user-supplied profile name or path. It is sent to the
+enrolled platform, which can map known pack references to agent-family enums
+without forwarding custom names to product analytics. A recommendation does not
+mean that pack was applied. The request signature covers `profile_ref`, but the
+canonical session digest does not; it is not evidence of enforced policy.
 
 The client sends these authentication headers:
 
@@ -127,3 +140,19 @@ After enrollment, `nono audit sync` also discovers finalized local sessions
 that have neither an outbox entry nor a platform receipt and reconstructs the
 missing outbox item. Sessions completed before enrollment are not backfilled
 automatically.
+
+While an audited session runs, its supervisor retries pending completed-session
+uploads in the background. Attempts start immediately, back off from 30 seconds
+to five minutes on failure, and process bounded batches. Concurrent supervisors
+and manual sync coordinate through a local lock. Each item uses its original
+enrollment and unchanged envelope; it is removed only after a matching acceptance
+receipt is saved. Accepted evidence remains pending verification on the platform.
+No delivery worker remains after the supervisor exits; `nono audit sync` remains
+the explicit retry and recovery command. Running sessions are not uploaded in
+parts by this protocol.
+
+HTTP 401/403 delivery errors identify the original platform, tenant and
+enrollment and require administrator attention. Authentication refusal alone
+does not establish revocation. The client retains the evidence and its identity;
+re-enrollment cannot transfer old sessions to a new subject. Manual sync reports
+these per-upload failures and exits nonzero while evidence remains undelivered.

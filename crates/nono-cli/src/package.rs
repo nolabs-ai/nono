@@ -120,6 +120,8 @@ pub struct LockedPackage {
     pub version: String,
     pub installed_at: String,
     #[serde(default)]
+    pub fetch_only: bool,
+    #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
     pub provenance: Option<PackageProvenance>,
@@ -157,6 +159,7 @@ impl Default for LockedPackage {
         Self {
             version: String::new(),
             installed_at: Utc::now().to_rfc3339(),
+            fetch_only: false,
             pinned: false,
             provenance: None,
             artifacts: BTreeMap::new(),

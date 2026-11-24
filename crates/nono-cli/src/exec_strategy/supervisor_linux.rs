@@ -681,7 +681,7 @@ fn handle_received_filesystem_notification(
     };
     let decision_started: Instant = Instant::now();
 
-    let decision = match super::request_approval_with_relay_paused(config, &request, pty) {
+    let decision = match super::request_approval_with_relay(config, &request, child, pty) {
         Ok(d) => {
             if d.is_denied() {
                 record_denial(
@@ -1107,9 +1107,10 @@ fn request_unix_socket_approval(
         session_id: config.session_id.to_string(),
     };
     let decision_started = Instant::now();
-    let decision = match super::request_approval_with_relay_paused(
+    let decision = match super::request_approval_with_relay(
         config,
         &request,
+        approval.child,
         approval.pty.as_deref_mut(),
     ) {
         Ok(decision) => decision,
@@ -2160,6 +2161,7 @@ mod tests {
             static EMPTY_CAPS: std::sync::LazyLock<nono::CapabilitySet> =
                 std::sync::LazyLock::new(nono::CapabilitySet::default);
             SupervisorConfig {
+                session_socket_auth: false,
                 protected_roots: &[],
                 deny_paths: &[],
                 approval_backend: backend,

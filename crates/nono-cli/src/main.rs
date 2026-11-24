@@ -4,6 +4,7 @@
 
 mod app_runtime;
 mod approval_runtime;
+mod approval_status;
 mod audit_attestation;
 mod audit_client;
 mod audit_commands;
@@ -53,6 +54,7 @@ mod package_status;
 mod platform;
 mod platform_client;
 mod platform_oauth;
+mod platform_policy;
 mod policy;
 mod profile;
 mod profile_cmd;
@@ -79,6 +81,8 @@ mod sandbox_log;
 mod sandbox_prepare;
 mod sandbox_state;
 mod session;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod session_auth;
 mod session_commands;
 mod setup;
 mod startup_prompt;
@@ -89,6 +93,7 @@ mod temp_keepalive;
 mod tenant_selector;
 mod terminal_approval;
 mod terminal_capture;
+mod terminal_modes;
 mod terminal_prompt;
 mod terminal_selector;
 mod theme;
@@ -138,14 +143,16 @@ fn main() {
     // keeps it. `Err` means a default is already installed, which is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let matches = Cli::command().get_matches();
-    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    let mut command = Cli::command();
+    let matches = command.get_matches_mut();
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     init_tracing(&cli);
     init_theme(&cli);
     let command_blocking_warnings = collect_cli_warnings(&cli);
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
-    let cli_result = run_cli(cli);
+    let cli_result =
+        platform_policy::inputs::capture(&mut cli, &command, &matches).and_then(|()| run_cli(cli));
     tool_sandbox::log_main_total();
     #[cfg(unix)]
     if cli_result.is_ok()
@@ -298,10 +305,12 @@ mod tests {
             ..sandbox_args()
         };
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
+            session_socket_auth: false,
             command_policies: None,
             resolved_command_binaries: None,
             approval_backends: std::collections::BTreeMap::new(),
@@ -382,10 +391,12 @@ mod tests {
             ..sandbox_args()
         };
         let prepared = PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
+            session_socket_auth: false,
             command_policies: None,
             resolved_command_binaries: None,
             approval_backends: std::collections::BTreeMap::new(),

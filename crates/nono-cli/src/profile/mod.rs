@@ -5,6 +5,7 @@
 //! packs (e.g. nolabs-ai/claude), or user-defined (in `$XDG_CONFIG_HOME/nono/profiles/`).
 
 pub(crate) mod builtin;
+pub(crate) mod bundle;
 mod credential_provider;
 
 pub use credential_provider::{
@@ -1364,7 +1365,7 @@ fn custom_credential_from_manifest_entry(cred: &nono::manifest::Credential) -> C
         .iter()
         .map(|rule| nono_proxy::config::EndpointRule {
             method: rule.method.as_str().to_string(),
-            path: rule.path.as_str().to_string(),
+            path: rule.path.as_str().into(),
         })
         .collect();
 
@@ -2583,10 +2584,11 @@ pub struct LinuxConfig {
 
 /// Opt-in Linux namespace isolation (NEP-0004).
 ///
-/// Every field defaults off and is permanently opt-in. Fields merge by logical
-/// OR across profile layers and the CLI, like `network.block`: any layer can
-/// turn a namespace on, and no layer can turn one off.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Every field defaults off and is permanently opt-in. Boolean fields merge by
+/// logical OR across profile layers and the CLI, like `network.block`: any
+/// layer can turn a namespace on, and no layer can turn one off.
+/// `extra_masks` merges by deduplicated append, so no layer can remove a mask.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinuxIsolateConfig {
     /// New user + network namespace containing only loopback. Egress is
@@ -2603,16 +2605,32 @@ pub struct LinuxIsolateConfig {
     /// New UTS namespace (hostname and domain name).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub uts: bool,
+    /// New mount namespace with nono's default masks over host IPC endpoints
+    /// (`$XDG_RUNTIME_DIR`, the D-Bus system bus, container runtime sockets)
+    /// and a private, per-session `/tmp`. Granted paths are re-bound through
+    /// the masks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mounts: bool,
+    /// Additional paths to mask. Additive only: no layer can remove a default
+    /// or inherited mask. Requires `mounts`. Paths support variable expansion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_masks: Vec<String>,
 }
 
 impl LinuxIsolateConfig {
     /// Whether no namespace is requested.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        !self.network && !self.loopback && !self.ipc && !self.uts
+        !self.network
+            && !self.loopback
+            && !self.ipc
+            && !self.uts
+            && !self.mounts
+            && self.extra_masks.is_empty()
     }
 
-    /// OR-merge: the result requests every namespace either side requests.
+    /// OR-merge: the result requests every namespace either side requests,
+    /// and every mask either side lists.
     #[must_use]
     pub fn merge(self, other: Self) -> Self {
         Self {
@@ -2620,6 +2638,8 @@ impl LinuxIsolateConfig {
             loopback: self.loopback || other.loopback,
             ipc: self.ipc || other.ipc,
             uts: self.uts || other.uts,
+            mounts: self.mounts || other.mounts,
+            extra_masks: dedup_append(&self.extra_masks, &other.extra_masks),
         }
     }
 
@@ -2632,6 +2652,7 @@ impl LinuxIsolateConfig {
             (self.loopback, "loopback"),
             (self.ipc, "ipc"),
             (self.uts, "uts"),
+            (self.mounts, "mounts"),
         ]
         .into_iter()
         .filter_map(|(on, label)| on.then_some(label))
@@ -2670,6 +2691,10 @@ pub struct WorkdirConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
+    /// Authenticate named IPC callers against the owning nono session.
+    /// Opt-in; requires SO_PEERPIDFD on Linux (kernel 6.5+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_socket_auth: Option<bool>,
     /// Signal isolation mode. Controls whether the sandboxed process can signal
     /// other processes. When `None`, inherits from the base profile during merge
     /// (defaults to `Isolated` if no base sets it).
@@ -3531,6 +3556,7 @@ pub(crate) fn is_registry_ref(s: &str) -> bool {
         && !s.starts_with('~')
         && !s.starts_with('/')
         && !s.ends_with(".json")
+        && !s.ends_with(".jsonc")
         && parts.iter().all(|p| !p.is_empty())
 }
 
@@ -3649,8 +3675,15 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
 }
 
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
+pub(crate) fn finalize_profile(profile: Profile) -> Result<Profile> {
+    finalize_profile_with_policy(profile, &crate::policy::load_embedded_policy()?)
+}
+
 #[allow(deprecated)]
-pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
+pub(crate) fn finalize_profile_with_policy(
+    mut profile: Profile,
+    policy: &crate::policy::Policy,
+) -> Result<Profile> {
     profile = apply_platform_overrides(profile)?;
     // apply_platform_overrides merges platform-specific custom_credentials,
     // env_credentials, and environment.set_vars into the profile, so those
@@ -3668,7 +3701,7 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     validate_profile_network_denial_audit(&profile)?;
     validate_profile_session_recording(&profile)?;
     validate_profile_domain_patterns(&profile)?;
-    merge_implicit_default_groups(&mut profile)?;
+    merge_implicit_default_groups(&mut profile, policy)?;
     // Re-run after extends/platform overrides: base and child profiles can
     // independently add no_proxy and allow_domain entries that only conflict
     // once the final effective profile has been assembled.
@@ -3714,13 +3747,19 @@ pub(crate) fn resolve_and_finalize_profile(profile: Profile) -> Result<Profile> 
 ///
 /// The built-in `default` profile is now the canonical source of implicit
 /// groups. The `default` profile itself does not inherit any additional groups.
-fn implicit_default_groups(profile: &Profile) -> Result<Vec<String>> {
+fn implicit_default_groups(
+    profile: &Profile,
+    policy: &crate::policy::Policy,
+) -> Result<Vec<String>> {
     if profile.meta.name == "default" {
         return Ok(Vec::new());
     }
 
-    let default = crate::policy::get_policy_profile("default")?
+    let default = policy
+        .profiles
+        .get("default")
         .ok_or_else(|| NonoError::ProfileNotFound("default".to_string()))?;
+    let default = finalize_profile_with_policy(default.to_raw_profile(), policy)?;
     Ok(default.groups.include)
 }
 
@@ -3734,12 +3773,14 @@ fn implicit_default_groups(profile: &Profile) -> Result<Vec<String>> {
 ///
 /// This means exclusions win even if the same group is also added explicitly in
 /// `groups.include`.
-fn merge_implicit_default_groups(profile: &mut Profile) -> Result<()> {
-    let policy = crate::policy::load_embedded_policy()?;
+fn merge_implicit_default_groups(
+    profile: &mut Profile,
+    policy: &crate::policy::Policy,
+) -> Result<()> {
     let exclusions = &profile.groups.exclude;
-    crate::policy::validate_group_exclusions(&policy, exclusions)?;
+    crate::policy::validate_group_exclusions(policy, exclusions)?;
 
-    let mut merged = implicit_default_groups(profile)?;
+    let mut merged = implicit_default_groups(profile, policy)?;
     // Append profile-specific groups (avoiding duplicates)
     let mut seen: std::collections::HashSet<String> = merged.iter().cloned().collect();
     for g in &profile.groups.include {
@@ -3895,6 +3936,27 @@ fn resolve_extends(
     context_dir: Option<&Path>,
     source_file: Option<&Path>,
 ) -> Result<Profile> {
+    resolve_extends_with(
+        child,
+        visited,
+        depth,
+        context_dir,
+        source_file,
+        &mut load_base_profile_raw,
+    )
+}
+
+fn resolve_extends_with<F>(
+    child: Profile,
+    visited: &mut Vec<String>,
+    depth: usize,
+    context_dir: Option<&Path>,
+    source_file: Option<&Path>,
+    loader: &mut F,
+) -> Result<Profile>
+where
+    F: FnMut(&str, Option<&Path>, Option<&Path>) -> Result<ResolvedBase>,
+{
     let base_names = match child.extends {
         Some(ref names) => names.clone(),
         None => return Ok(child),
@@ -3921,16 +3983,19 @@ fn resolve_extends(
 
         visited.push(base_name.clone());
 
-        let resolved = load_base_profile_raw(base_name, context_dir, source_file)?;
+        let resolved = loader(base_name, context_dir, source_file)?;
         let resolved_base = match resolved {
-            ResolvedBase::Sibling(base, source_path) => resolve_extends(
+            ResolvedBase::Sibling(base, source_path) => resolve_extends_with(
                 base,
                 visited,
                 depth + 1,
                 source_path.parent(),
                 Some(&source_path),
+                loader,
             )?,
-            ResolvedBase::Global(base) => resolve_extends(base, visited, depth + 1, None, None)?,
+            ResolvedBase::Global(base) => {
+                resolve_extends_with(base, visited, depth + 1, None, None, loader)?
+            }
         };
         // Pop to restore the stack to the pre-base state. On the error path
         // above (? propagation), visited is abandoned so the missing pop is harmless.
@@ -3977,12 +4042,15 @@ fn load_base_profile_raw(
         )));
     }
 
-    // 0. Sibling in the same directory as the child profile.
-    //    Skip if the sibling path is the source file itself to avoid
+    // 0. Sibling in the same directory as the child profile, `.jsonc` first
+    //    like user profiles. Skip the source file itself to avoid
     //    self-references (e.g. `.nono/codex.json` extending "codex").
     if let Some(dir) = context_dir {
-        let sibling_path = dir.join(format!("{name}.json"));
-        if sibling_path.is_file() {
+        for ext in ["jsonc", "json"] {
+            let sibling_path = dir.join(format!("{name}.{ext}"));
+            if !sibling_path.is_file() {
+                continue;
+            }
             let (profile, source_path) = parse_file_backed_profile(&sibling_path)?;
             let is_self = source_file.is_some_and(|src| source_path == src);
             if !is_self {
@@ -4135,6 +4203,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         ),
         meta: child.meta,
         security: SecurityConfig {
+            session_socket_auth: child
+                .security
+                .session_socket_auth
+                .or(base.security.session_socket_auth),
             signal_mode: child.security.signal_mode.or(base.security.signal_mode),
             process_info_mode: child
                 .security
@@ -4279,7 +4351,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .or(base.linux.af_unix_mediation),
             sandbox_policy: child.linux.sandbox_policy.or(base.linux.sandbox_policy),
             // OR-merge: an extending profile can add isolation, never remove it.
-            isolate: base.linux.isolate.merge(child.linux.isolate),
+            isolate: base.linux.isolate.clone().merge(child.linux.isolate),
         },
         diagnostics: DiagnosticsConfig {
             redaction: RedactionConfig {
@@ -6006,7 +6078,11 @@ mod tests {
             ..Default::default()
         };
 
-        merge_implicit_default_groups(&mut profile).expect("merge should succeed");
+        merge_implicit_default_groups(
+            &mut profile,
+            &crate::policy::load_embedded_policy().expect("policy"),
+        )
+        .expect("merge should succeed");
 
         // Should contain base groups
         assert!(
@@ -6053,7 +6129,11 @@ mod tests {
             ..Default::default()
         };
 
-        merge_implicit_default_groups(&mut profile).expect("merge should succeed");
+        merge_implicit_default_groups(
+            &mut profile,
+            &crate::policy::load_embedded_policy().expect("policy"),
+        )
+        .expect("merge should succeed");
 
         assert!(
             !profile
@@ -6580,7 +6660,7 @@ mod tests {
         nono_proxy::config::EndpointPolicyConfig {
             allow: vec![nono_proxy::config::EndpointPolicyRule {
                 method: "POST".to_string(),
-                path: "/".to_string(),
+                path: "/".into(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -7736,13 +7816,34 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_rejects_unimplemented_isolate_fields() {
-        // Phase 2 mount masking is not implemented; accepting the field would
-        // let a profile believe it is masked when it is not.
+    fn test_profile_rejects_unknown_isolate_fields() {
+        // An unknown field must not let a profile believe it is isolated.
         let result = serde_json::from_str::<Profile>(
-            r#"{"meta":{"name":"iso"},"linux":{"isolate":{"mounts":true}}}"#,
+            r#"{"meta":{"name":"iso"},"linux":{"isolate":{"pid":true}}}"#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_profile_parses_and_merges_isolate_mounts() {
+        let base: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"base"},"linux":{"isolate":{"mounts":true,"extra_masks":["/opt/a.sock","/opt/b.sock"]}}}"#,
+        )
+        .expect("parse");
+        assert!(base.linux.isolate.mounts);
+        #[cfg(target_os = "linux")]
+        assert_eq!(base.linux.isolate.labels(), vec!["mounts"]);
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"linux":{"isolate":{"mounts":false,"extra_masks":["/opt/b.sock","/opt/c.sock"]}}}"#,
+        )
+        .expect("parse");
+        let merged = merge_profiles(base, child);
+        assert!(merged.linux.isolate.mounts, "child cannot drop mounts");
+        assert_eq!(
+            merged.linux.isolate.extra_masks,
+            vec!["/opt/a.sock", "/opt/b.sock", "/opt/c.sock"],
+            "extra_masks is a deduplicated append; no layer removes a mask"
+        );
     }
 
     #[test]
@@ -9527,6 +9628,71 @@ mod tests {
     }
 
     #[test]
+    fn test_extends_resolves_jsonc_sibling() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("shared.jsonc"),
+            r#"{
+                // comment
+                "meta": { "name": "shared" },
+                "filesystem": { "allow": ["/tmp/shared"] },
+            }"#,
+        )
+        .expect("write");
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{ "extends": "shared", "meta": { "name": "child" } }"#,
+        )
+        .expect("write");
+
+        let profile = match load_from_file(&child_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("resolve: {err}"),
+        };
+        assert!(
+            profile
+                .filesystem
+                .allow
+                .contains(&"/tmp/shared".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extends_jsonc_self_still_resolves_json_sibling() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{ "meta": { "name": "base" }, "filesystem": { "allow": ["/tmp/base"] } }"#,
+        )
+        .expect("write");
+        let self_path = dir.path().join("base.jsonc");
+        std::fs::write(
+            &self_path,
+            r#"{ "extends": "base", "meta": { "name": "my-base" } }"#,
+        )
+        .expect("write");
+
+        let profile = match load_from_file(&self_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("resolve: {err}"),
+        };
+        assert!(profile.filesystem.allow.contains(&"/tmp/base".to_string()));
+    }
+
+    #[test]
+    fn test_profile_file_paths_are_not_registry_refs() {
+        for path in ["profiles/foo.json", "profiles/foo.jsonc"] {
+            assert!(!is_registry_ref(path), "{path} is not a registry ref");
+            assert!(is_file_path_ref(path), "{path} is a file path");
+        }
+        for pkg in ["acme/claude", "acme/claude@1.0.0"] {
+            assert!(is_registry_ref(pkg), "{pkg} is a registry ref");
+            assert!(!is_file_path_ref(pkg), "{pkg} is not a file path");
+        }
+    }
+
+    #[test]
     fn test_network_profile_deserialization_distinguishes_absent_null_and_value() {
         let absent: Profile = serde_json::from_str(r#"{ "meta": { "name": "absent" } }"#)
             .expect("parse absent profile");
@@ -9890,7 +10056,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
-                path: "/repos/my-org/**".to_string(),
+                path: "/repos/my-org/**".into(),
             }],
         }];
         let child = vec![AllowDomainEntry::WithEndpoints {
@@ -9898,7 +10064,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "POST".to_string(),
-                path: "/repos/my-org/*/issues".to_string(),
+                path: "/repos/my-org/*/issues".into(),
             }],
         }];
 
@@ -9926,7 +10092,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
-                path: "/repos/**".to_string(),
+                path: "/repos/**".into(),
             }],
         }];
 
@@ -10166,7 +10332,7 @@ mod tests {
             endpoint_policy: None,
             endpoints: vec![nono_proxy::config::EndpointRule {
                 method: "GET".to_string(),
-                path: "/repos/**".to_string(),
+                path: "/repos/**".into(),
             }],
         }];
 
@@ -10249,6 +10415,30 @@ mod tests {
         std::fs::write(&path, json).expect("write profile");
         let profile = load_profile_from_path(&path).expect("parse profile");
         assert!(profile.security.process_info_mode.is_none());
+    }
+
+    #[test]
+    fn session_socket_auth_defaults_off_and_inherits_explicit_settings() {
+        let unset: Profile = serde_json::from_value(serde_json::json!({})).expect("profile");
+        assert_eq!(unset.security.session_socket_auth, None);
+        let mut base = base_profile();
+        base.security.session_socket_auth = Some(true);
+        let merged = merge_profiles(base.clone(), unset);
+        assert_eq!(merged.security.session_socket_auth, Some(true));
+        let disabled: Profile = serde_json::from_value(serde_json::json!({
+            "security": {"session_socket_auth": false}
+        }))
+        .expect("disabled profile");
+        assert_eq!(
+            merge_profiles(base, disabled).security.session_socket_auth,
+            Some(false)
+        );
+        assert!(
+            serde_json::from_value::<Profile>(serde_json::json!({
+                "security": {"session_socket_auth": "true"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

@@ -527,6 +527,7 @@ struct PendingCwdAccessRequest {
 
 /// Result of sandbox preparation.
 pub(crate) struct PreparedSandbox {
+    pub(crate) policy_session: Option<crate::platform_policy::PolicySession>,
     pub(crate) caps: CapabilitySet,
     /// Resolved filesystem deny paths (groups + profile `filesystem.deny`).
     /// Threaded to command mediation so a mediated command's live cwd can be
@@ -534,6 +535,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) deny_paths: Vec<PathBuf>,
     pub(crate) secrets: Vec<nono::LoadedSecret>,
     pub(crate) profile_display_name: Option<String>,
+    pub(crate) session_socket_auth: bool,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Command binaries already resolved while validating `command_policies`.
     /// Reused by the command-mediation plan build so every controlled binary is
@@ -711,7 +713,11 @@ pub(crate) fn resolve_detached_cwd_prompt_response(
     args: &SandboxArgs,
     silent: bool,
 ) -> Result<Option<DetachedCwdPromptResponse>> {
-    if silent || args.allow_cwd || args.config.is_some() {
+    if silent
+        || args.allow_cwd
+        || args.config.is_some()
+        || crate::platform_policy::enforced::active(args)
+    {
         return Ok(None);
     }
 
@@ -749,6 +755,7 @@ fn finalize_prepared_sandbox(
     args: &SandboxArgs,
     silent: bool,
 ) -> Result<PreparedSandbox> {
+    crate::session_auth::validate_support(prepared.session_socket_auth)?;
     // Attach resource limits from CLI flags. The manifest path already set caps via
     // `CapabilitySet::try_from`, and flags conflict with `--config`, so this only
     // runs on the flag path. Enforcement is later, in the supervised runtime; here
@@ -760,6 +767,11 @@ fn finalize_prepared_sandbox(
         args.memory.as_deref(),
         args.max_processes,
     )? {
+        if crate::platform_policy::enforced::active(args)
+            && let Some(existing) = prepared.caps.resource_limits()
+        {
+            crate::platform_policy::enforced::validate_resource_limits(existing, &limits)?;
+        }
         prepared.caps = prepared.caps.with_resource_limits(limits);
     }
 
@@ -798,7 +810,7 @@ fn finalize_prepared_sandbox(
     #[cfg(target_os = "linux")]
     output::print_landlock_scope_policy(&prepared.caps, args.verbose, silent);
     #[cfg(target_os = "linux")]
-    output::print_isolation(prepared.isolate, silent);
+    output::print_isolation(&prepared.isolate, silent);
 
     if !Sandbox::is_supported() {
         return Err(NonoError::SandboxInit(Sandbox::support_info().details));
@@ -1560,10 +1572,15 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
 
         return finalize_prepared_sandbox(
             PreparedSandbox {
+                policy_session: crate::platform_policy::with_effective_profile(
+                    args.policy_session.as_ref(),
+                    Some(&manifest),
+                )?,
                 caps,
                 deny_paths: Vec::new(),
                 secrets: Vec::new(),
                 profile_display_name: None,
+                session_socket_auth: false,
                 command_policies: None,
                 resolved_command_binaries: None,
                 approval_backends: std::collections::BTreeMap::new(),
@@ -1857,8 +1874,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     #[cfg(target_os = "linux")]
     let proc_comm_notify = gpu_activation.proc_comm_notify;
 
-    if let Some(request) =
-        pending_cwd_access_request(&caps, &workdir, profile_workdir_access.as_ref())?
+    if !crate::platform_policy::enforced::active(args)
+        && let Some(request) =
+            pending_cwd_access_request(&caps, &workdir, profile_workdir_access.as_ref())?
     {
         if args.allow_cwd
             || matches!(
@@ -1981,13 +1999,22 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .map(|profile| profile.credential_capture.clone())
         .unwrap_or_default();
     let loaded_secrets = load_env_credentials(args, &profile_secrets, silent, &caps)?;
+    let session_socket_auth = loaded_profile
+        .as_ref()
+        .and_then(|profile| profile.security.session_socket_auth)
+        .unwrap_or(false);
 
     finalize_prepared_sandbox(
         PreparedSandbox {
+            policy_session: crate::platform_policy::with_effective_profile(
+                args.policy_session.as_ref(),
+                loaded_profile.as_ref(),
+            )?,
             caps,
             deny_paths: prepared_deny_paths,
             secrets: loaded_secrets,
             profile_display_name,
+            session_socket_auth,
             command_policies,
             resolved_command_binaries: profile_resolved_command_binaries,
             approval_backends: profile_approval_backends,
@@ -3045,10 +3072,12 @@ mod tests {
 
     fn empty_prepared() -> PreparedSandbox {
         PreparedSandbox {
+            policy_session: None,
             caps: CapabilitySet::default(),
             deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
+            session_socket_auth: false,
             command_policies: None,
             resolved_command_binaries: None,
             approval_backends: std::collections::BTreeMap::new(),

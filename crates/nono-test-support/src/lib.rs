@@ -73,12 +73,12 @@ impl NonoTest {
         &self.home
     }
 
-    /// `$XDG_STATE_HOME` for runs launched through [`NonoTest::cmd`].
+    /// `$XDG_STATE_HOME` for runs launched through [`NonoTest::command`].
     pub fn state(&self) -> &Path {
         &self.state
     }
 
-    /// The default working directory for [`NonoTest::cmd`].
+    /// The default working directory for [`NonoTest::command`].
     pub fn workspace(&self) -> &Path {
         &self.workspace
     }
@@ -105,8 +105,8 @@ impl NonoTest {
         cli::RollbackCmd::new(self)
     }
 
-    /// A `nono` invocation with a hermetic environment and no arguments.
-    fn hermetic_command(&self) -> Command {
+    /// A raw invocation for parser-level tests, with the same isolated environment as the builders.
+    pub fn command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
 
         // Fail secure: strip the whole `NONO_*` / `XDG_*` namespace.

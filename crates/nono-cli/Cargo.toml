@@ -96,6 +96,7 @@ regex = "1"
 urlencoding = "2"
 tempfile.workspace = true
 vt100 = "0.18.1"
+vte = "0.15"
 shlex = "2"
 jsonc-parser = { version = "0.34", features = ["serde"] }
 zstd = "0.14"
@@ -122,7 +123,7 @@ serde.workspace = true
 # dev-dependency, so publishing nono-cli does not require this crate on
 # crates.io.
 nono-test-support = { path = "../nono-test-support" }
-jsonschema = "0.60"
+jsonschema = "0.61"
 proptest = "1"
 
 [lints]

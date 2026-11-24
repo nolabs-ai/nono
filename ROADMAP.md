@@ -48,3 +48,5 @@ _Under active authoring; not yet ready for a decision._
   Extend the Tool Sandbox policy model so that a sandboxed command can request a narrowly scoped filesystem capability for one invocation without escaping the filesystem policy selected for that invocation.
 - **[NEP-0005: Windows enforcement backend](neps/0005-windows-enforcement-backend.md)** — _Non-breaking_
   Add a third OS enforcement backend to nono for Windows, alongside Linux (Landlock) and macOS (Seatbelt).
+- **[NEP-0011: macOS Endpoint Security layer for runtime approvals and kernel-enforced policy](neps/0011-macos-endpoint-security-gate.md)** — _Non-breaking_
+  Give macOS the runtime approvals and kernel-enforced policy it lacks today.

@@ -62,6 +62,16 @@ struct Authorized {
 
 pub(crate) fn run_login(mut args: LoginArgs) -> Result<()> {
     reject_if_sandboxed("platform login")?;
+    if args.name.is_some() && args.no_enroll {
+        return Err(NonoError::ActionRequired(
+            "--name cannot be used with --no-enroll or NONO_NO_ENROLL=true".into(),
+        ));
+    }
+    if let Some(name) = &args.name {
+        args.name = Some(device_name(Some(name)).ok_or_else(|| {
+            NonoError::ActionRequired("device name must contain visible characters".into())
+        })?);
+    }
     if args.re_enroll && args.no_enroll {
         return Err(NonoError::ActionRequired(
             "re-enroll cannot be used with --no-enroll or NONO_NO_ENROLL=true; disable the opt-out before recovery".into(),
@@ -166,7 +176,7 @@ pub(crate) fn run_login(mut args: LoginArgs) -> Result<()> {
     }
     let new_key = session::create_key()?;
     let key = &new_key.key;
-    let device_name = device_name(None);
+    let device_name = device_name(args.name.as_deref());
     let mut scope = platform_oauth::login_scope();
     if !args.no_enroll && server.enrollment_endpoint.is_some() {
         scope.push(' ');
@@ -240,7 +250,7 @@ fn finish_login(args: &LoginArgs, select: bool) -> Result<()> {
     let enrollment = if args.no_enroll {
         Ok(EnrollmentResult::Skipped)
     } else {
-        enroll_device(&record, args.re_enroll)
+        enroll_device(&record, args.re_enroll, args.name.as_deref())
     };
     print!(
         "{}",
@@ -255,6 +265,14 @@ fn finish_login(args: &LoginArgs, select: bool) -> Result<()> {
         eprintln!(
             "Device enrollment could not be confirmed: {error}\nRetry `{retry}` to enroll, or use `nono platform login --no-enroll` to sign in only."
         );
+    } else if matches!(
+        enrollment,
+        Ok(EnrollmentResult::Enrolled | EnrollmentResult::Reenrolled | EnrollmentResult::Reused)
+    ) {
+        let state = platform_client::load_active_state()?.ok_or_else(|| {
+            NonoError::ActionRequired("device enrollment was saved but is unavailable for the policy check; run `nono platform status`".into())
+        })?;
+        platform_client::check_enrollment_policy(&state)?;
     }
     Ok(())
 }
@@ -269,7 +287,11 @@ enum EnrollmentResult {
     Active,
 }
 
-fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<EnrollmentResult> {
+fn enroll_device(
+    record: &session::SessionRecord,
+    re_enroll: bool,
+    name: Option<&str>,
+) -> Result<EnrollmentResult> {
     use crate::login_enrollment::{EnrollmentIntent, LoginEnrollmentRequest};
     let server = client::discover(&record.platform_url)?;
     if server.enrollment_endpoint.is_none() {
@@ -283,6 +305,15 @@ fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<Enr
     let previous = platform_client::load_state()?;
     if re_enroll && previous.is_none() {
         return Ok(EnrollmentResult::NotEnrolled);
+    }
+    if re_enroll
+        && previous.as_ref().is_some_and(|previous| {
+            previous.platform_url != record.platform_url || previous.tenant_id != record.tenant_id
+        })
+    {
+        return Err(NonoError::ActionRequired(
+            "recovery must use the original platform and tenant".into(),
+        ));
     }
     let (key_ref, key) = match (&previous, re_enroll) {
         (Some(previous), true) => crate::device_key::replacement(
@@ -301,7 +332,9 @@ fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<Enr
             &record.user_subject,
         )?,
     };
-    let display_name = device_name(None).unwrap_or_else(|| "nono device".into());
+    let previous_name = platform_client::enrollment_display_name()?;
+    let display_name =
+        device_name(name.or(previous_name.as_deref())).unwrap_or_else(|| "nono device".into());
     let intent = EnrollmentIntent {
         protocol_version: "1".into(),
         issuer: record.issuer.clone(),
@@ -380,6 +413,8 @@ fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<Enr
         ));
     }
     platform_client::validate_wire_identifier("subject id", &response.subject_id)?;
+    let policy_trust_root = response.policy_trust_root;
+    let confirmed_previous = response.replaces_subject_id;
     let state = platform_client::PlatformState {
         protocol_version: response.protocol_version,
         platform_url: record.platform_url.clone(),
@@ -394,7 +429,21 @@ fn enroll_device(record: &session::SessionRecord, re_enroll: bool) -> Result<Enr
     let reused = previous.as_ref().is_some_and(|previous| {
         previous.subject_id == state.subject_id && previous.key_ref == state.key_ref
     });
-    platform_client::save_login_enrollment(state, record, &display_name)?;
+    crate::platform_policy::pin_enrollment_key(&state, policy_trust_root)?;
+    if re_enroll {
+        let previous = previous
+            .as_ref()
+            .ok_or_else(|| NonoError::ActionRequired("no enrollment to replace".into()))?;
+        platform_client::save_login_replacement(
+            state,
+            record,
+            &display_name,
+            previous,
+            confirmed_previous.as_deref(),
+        )?;
+    } else {
+        platform_client::save_login_enrollment(state, record, &display_name)?;
+    }
     Ok(if re_enroll {
         EnrollmentResult::Reenrolled
     } else if reused {
@@ -411,6 +460,7 @@ pub(crate) fn run_tenant(args: TenantArgs) -> Result<()> {
             let record = platform_oauth::refresh_memberships()?;
             record.find_organization(&args.tenant)?;
             let login = LoginArgs {
+                name: None,
                 url: None,
                 tenant: Some(args.tenant),
                 no_enroll: args.no_enroll,
@@ -1030,6 +1080,7 @@ mod tests {
 
     fn args(browser: bool, device_code: bool) -> LoginArgs {
         LoginArgs {
+            name: None,
             help: None,
             url: None,
             tenant: None,

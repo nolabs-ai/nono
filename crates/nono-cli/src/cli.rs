@@ -718,6 +718,10 @@ pub struct PullArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub init: bool,
 
+    /// Fetch verified pack files without applying wiring or project installation
+    #[arg(long, conflicts_with = "init", help_heading = "OPTIONS")]
+    pub fetch_only: bool,
+
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
@@ -984,7 +988,7 @@ pub struct ProfileShowArgs {
     /// Show raw paths before expansion (e.g., $HOME instead of /Users/luke)
     #[arg(long)]
     pub raw: bool,
-    /// Output format: 'profile' (default) or 'manifest' (capability manifest JSON)
+    /// Output format: profile, manifest, or bundle (self-contained files)
     #[arg(long, value_enum, value_name = "FORMAT")]
     pub format: Option<ProfileShowFormat>,
 }
@@ -993,6 +997,8 @@ pub struct ProfileShowArgs {
 pub enum ProfileShowFormat {
     Profile,
     Manifest,
+    /// File inventory and contents for platform signing; no files are executed.
+    Bundle,
 }
 
 #[derive(Parser, Debug)]
@@ -1059,6 +1065,12 @@ pub struct ProfileGroupsArgs {
 
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SandboxArgs {
+    #[arg(skip)]
+    pub(crate) policy_inputs: crate::platform_policy::inputs::PolicyInputs,
+    #[arg(skip)]
+    pub(crate) managed_profile: Option<crate::profile::bundle::ManagedProfile>,
+    #[arg(skip)]
+    pub(crate) policy_session: Option<crate::platform_policy::PolicySession>,
     // ── Filesystem ───────────────────────────────────────────────────────
     /// Allow read+write access to a directory (recursive)
     #[arg(
@@ -1368,9 +1380,12 @@ pub struct SandboxArgs {
 
     /// Run the command in new Linux namespaces (opt-in, NEP-0004).
     ///
-    /// Comma-separated list of: net, loopback, ipc, uts. Always adds a user
-    /// namespace. `loopback` (requires `net`) allows TCP bind/connect on any
-    /// port of the namespace's own loopback, for local dev servers and tests.
+    /// Comma-separated list of: net, loopback, ipc, uts, mounts. Always adds a
+    /// user namespace. `loopback` (requires `net`) allows TCP bind/connect on
+    /// any port of the namespace's own loopback, for local dev servers and
+    /// tests. `mounts` masks host IPC endpoints ($XDG_RUNTIME_DIR, the D-Bus
+    /// system bus, container runtime sockets) and gives the session a private
+    /// /tmp; granted paths stay reachable through the masks.
     /// `net` leaves only loopback; egress is possible only through the session
     /// proxy, so it requires --block-net or a proxied network policy and cannot
     /// be combined with direct-access grants (--open-port, --listen-port,
@@ -1668,6 +1683,8 @@ pub struct ProxyArgs {
 
 #[derive(Parser, Debug, Clone, Default)]
 pub struct WrapSandboxArgs {
+    #[arg(skip)]
+    pub(crate) policy_inputs: crate::platform_policy::inputs::PolicyInputs,
     // ── Filesystem ───────────────────────────────────────────────────────
     /// Allow read+write access to a directory (recursive)
     #[arg(
@@ -1889,6 +1906,8 @@ pub enum IsolateNamespace {
     Ipc,
     /// UTS namespace.
     Uts,
+    /// Mount namespace masking host IPC endpoints, with a private /tmp.
+    Mounts,
 }
 
 #[cfg(target_os = "linux")]
@@ -1901,6 +1920,8 @@ impl SandboxArgs {
             loopback: has(IsolateNamespace::Loopback),
             ipc: has(IsolateNamespace::Ipc),
             uts: has(IsolateNamespace::Uts),
+            mounts: has(IsolateNamespace::Mounts),
+            extra_masks: Vec::new(),
         }
     }
 }
@@ -1908,6 +1929,9 @@ impl SandboxArgs {
 impl From<WrapSandboxArgs> for SandboxArgs {
     fn from(args: WrapSandboxArgs) -> Self {
         Self {
+            policy_inputs: args.policy_inputs,
+            managed_profile: None,
+            policy_session: None,
             allow: args.allow,
             read: args.read,
             write: args.write,
@@ -2848,6 +2872,10 @@ pub struct PlatformEnrollArgs {
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct LoginArgs {
+    /// Operator-facing label for this installation
+    #[arg(long)]
+    pub name: Option<String>,
+
     /// Platform origin for a self-hosted platform; defaults to the platform
     /// you last signed in to, else https://app.nolabs.ai
     #[arg(long, env = "NONO_PLATFORM_URL")]
@@ -2893,6 +2921,9 @@ pub struct LogoutArgs {
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct PlatformStatusArgs {
+    /// Fetch and verify the current platform policy assignment
+    #[arg(long)]
+    pub refresh: bool,
     /// Print status as JSON
     #[arg(long)]
     pub json: bool,

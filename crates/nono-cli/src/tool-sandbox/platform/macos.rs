@@ -14,15 +14,15 @@ use crate::tool_sandbox::env::{
     split_env_entry,
 };
 use crate::tool_sandbox::launch::{
-    exit_status_code, prepare_launcher_command, remove_launch_spec, write_launch_spec,
+    LauncherCommand, exit_status_code, prepare_launcher_command, receive_launch_spec,
 };
 use crate::tool_sandbox::protocol::{
     ChildCapsSpec, FsGrantSpec, StdioFds, StdioLimitActionSpec, StdioLimitSpec,
-    StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT,
-    ToolSandboxChildLaunchSpec, ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse,
-    ToolSandboxShimRequest, ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame,
-    recv_frame_ack, recv_stdio_fds, send_frame_ack, send_stdio_fds, validate_ipc_request,
-    write_frame, write_response,
+    StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_FD_ENV, TOOL_SANDBOX_LAUNCH_SPEC_ENV,
+    TOOL_SANDBOX_URL_IO_TIMEOUT, ToolSandboxChildLaunchSpec, ToolSandboxOpenUrlRequest,
+    ToolSandboxOpenUrlResponse, ToolSandboxShimRequest, ToolSandboxShimResponse,
+    UnixSocketGrantSpec, read_frame, recv_frame_ack, recv_stdio_fds, send_frame_ack,
+    send_stdio_fds, validate_ipc_request, write_frame, write_response,
 };
 use nix::libc;
 use nix::sys::signal::{self, Signal};
@@ -140,6 +140,7 @@ struct ChildLaunchResult {
 }
 
 struct ToolSandboxState {
+    session_socket_auth: bool,
     runtime_dir: PathBuf,
     socket_path: PathBuf,
     /// Dedicated URL-open listener socket path, present only when at least one
@@ -285,6 +286,7 @@ impl PreparedToolSandboxRuntime {
 
     pub(crate) fn prepare(input: super::ToolSandboxPrepare<'_>) -> Result<Self> {
         let super::ToolSandboxPrepare {
+            session_socket_auth,
             config,
             resolved_command_binaries,
             audit_context,
@@ -365,6 +367,7 @@ impl PreparedToolSandboxRuntime {
         let lineage = LineageMarker::build(&plan.config, plan.daemon_pid_source_helpers.clone());
         let runtime = Self {
             inner: Arc::new(ToolSandboxState {
+                session_socket_auth,
                 runtime_dir,
                 socket_path,
                 url_socket_path,
@@ -521,6 +524,10 @@ impl PreparedToolSandboxRuntime {
         ))
     }
 
+    pub(crate) fn owns_orphan(&self, pid: u32) -> bool {
+        owns_orphan(&self.inner, pid)
+    }
+
     /// Starts the IPC accept loop in a background thread. Returns immediately;
     /// connections are served by the background thread until the listener is dropped.
     pub(crate) fn handle_listener(
@@ -624,7 +631,9 @@ impl PreparedToolSandboxRuntime {
 // ── Shim / child launcher entrypoints ────────────────────────────────────
 
 pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
-    if std::env::var_os(TOOL_SANDBOX_LAUNCH_SPEC_ENV).is_some() {
+    if std::env::var_os(TOOL_SANDBOX_LAUNCH_SPEC_ENV).is_some()
+        || std::env::var_os(TOOL_SANDBOX_LAUNCH_FD_ENV).is_some()
+    {
         exit_from_result(run_child_launcher());
         return true;
     }
@@ -738,20 +747,7 @@ fn run_child_launcher() -> Result<()> {
     // is what surfaces the library's generated-Seatbelt-profile debug log for
     // the brokered child. No-op unless RUST_LOG is set.
     crate::cli_bootstrap::init_internal_entrypoint_tracing();
-    let spec_path = std::env::var_os(TOOL_SANDBOX_LAUNCH_SPEC_ENV)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            NonoError::SandboxInit("command-mediation launch spec env missing".to_string())
-        })?;
-    let bytes = fs::read(&spec_path).map_err(|source| NonoError::ConfigRead {
-        path: spec_path.clone(),
-        source,
-    })?;
-    let spec: ToolSandboxChildLaunchSpec = serde_json::from_slice(&bytes).map_err(|err| {
-        NonoError::ConfigParse(format!(
-            "failed to parse command-mediation launch spec: {err}"
-        ))
-    })?;
+    let spec = receive_launch_spec()?;
     if spec.stdio_mode != "direct_fds" {
         return Err(NonoError::ConfigParse(format!(
             "invalid command-mediation stdio mode '{}'",
@@ -850,10 +846,14 @@ fn handle_url_open_stream(
         return;
     }
 
-    let peer_pid = match peer_pid_from_stream(&stream) {
+    let peer_pid = match crate::session_auth::authenticate(
+        stream.as_raw_fd(),
+        state.session_socket_auth,
+        |pid| owns_orphan(state, pid),
+    ) {
         Ok(pid) => pid,
         Err(err) => {
-            debug!("command-mediation URL open: peer pid resolution failed: {err}");
+            warn!("Rejected command-mediation URL connection: socket authentication failed: {err}");
             return;
         }
     };
@@ -996,7 +996,14 @@ fn handle_shim_stream_inner(
     session_id: &str,
     audit_recorder: Option<Arc<Mutex<crate::audit_integrity::AuditRecorder>>>,
 ) -> Result<(i32, Vec<u8>)> {
-    let auth = authenticate_shim(stream, state)?;
+    let peer_pid =
+        crate::session_auth::authenticate(stream.as_raw_fd(), state.session_socket_auth, |pid| {
+            owns_orphan(state, pid)
+        })
+        .inspect_err(|err| {
+            warn!("Rejected command-mediation connection: socket authentication failed: {err}");
+        })?;
+    let auth = authenticate_shim(peer_pid, state)?;
     let request: ToolSandboxShimRequest = read_frame(stream)?;
     // Ack before receiving stdio FDs: on macOS, sendmsg with SCM_RIGHTS ancillary
     // data returns EMSGSIZE if the peer's receive buffer still holds unread frame
@@ -1818,8 +1825,7 @@ struct ShimAuth {
     command: String,
 }
 
-fn authenticate_shim(stream: &UnixStream, state: &ToolSandboxState) -> Result<ShimAuth> {
-    let peer_pid = peer_pid_from_stream(stream)?;
+fn authenticate_shim(peer_pid: u32, state: &ToolSandboxState) -> Result<ShimAuth> {
     let exe_path = exe_path_for_pid(peer_pid)?;
     let command = state.shims_by_path.get(&exe_path).cloned().ok_or_else(|| {
         NonoError::SandboxInit(format!(
@@ -1843,28 +1849,6 @@ fn authenticate_shim(stream: &UnixStream, state: &ToolSandboxState) -> Result<Sh
         )));
     }
     Ok(ShimAuth { peer_pid, command })
-}
-
-fn peer_pid_from_stream(stream: &UnixStream) -> Result<u32> {
-    // SAFETY: getsockopt with LOCAL_PEERPID is stable on macOS.
-    let mut pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            &mut pid as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if ret != 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "command-mediation: getsockopt(LOCAL_PEERPID) failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(pid as u32)
 }
 
 fn exe_path_for_pid(pid: u32) -> Result<PathBuf> {
@@ -1893,6 +1877,19 @@ fn exe_path_for_pid(pid: u32) -> Result<PathBuf> {
 enum Caller {
     Session,
     Command { name: String },
+}
+
+fn owns_orphan(state: &ToolSandboxState, pid: u32) -> bool {
+    session_id_of(pid)
+        .and_then(|sid| state.session_lineage.resolve_sid(sid))
+        .is_some()
+        || (!matches!(&state.lineage, LineageMarker::Disabled)
+            && crate::session_auth::verify_reparented_ancestry(pid, |daemon_pid| {
+                state
+                    .lineage
+                    .resolve_severed_command(daemon_pid, &state.plan.config, &state.policy_root)
+                    .is_some()
+            }))
 }
 
 fn resolve_caller(
@@ -3134,6 +3131,7 @@ fn build_child_launch_spec_for_binary(
         stdio_mode: selected_stdio_mode(request).to_string(),
         stdio_limits: stdio_limits_from_policy(policy),
         caps: caps_to_spec(&caps),
+        session_netns: false,
         allowed_exec_paths: Vec::new(),
         expected_dev: binary.dev,
         expected_ino: binary.ino,
@@ -4121,8 +4119,8 @@ fn kill_mediated_child_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-fn prepare_mediated_command(spec_path: &Path) -> Result<Command> {
-    let mut command = prepare_launcher_command(spec_path)?;
+fn prepare_mediated_command(spec: &ToolSandboxChildLaunchSpec) -> Result<LauncherCommand> {
+    let mut command = prepare_launcher_command(spec)?;
     install_session_lineage(&mut command);
     Ok(command)
 }
@@ -4135,18 +4133,14 @@ fn launch_child(
     spec: ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
-    let spec_path = write_launch_spec(&state.runtime_dir, &spec)?;
-    let result = launch_child_with_direct_fds(
+    launch_child_with_direct_fds(
         state,
         command_name,
         launch_caller,
         requester_pid,
-        &spec_path,
         &spec,
         stdio,
-    );
-    remove_launch_spec(&spec_path);
-    result
+    )
 }
 
 fn launch_child_with_direct_fds(
@@ -4154,7 +4148,6 @@ fn launch_child_with_direct_fds(
     command_name: &str,
     launch_caller: &Caller,
     requester_pid: u32,
-    spec_path: &Path,
     spec: &ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
@@ -4164,12 +4157,11 @@ fn launch_child_with_direct_fds(
             command_name,
             launch_caller,
             requester_pid,
-            spec_path,
             spec,
             stdio,
         );
     }
-    let mut command = prepare_mediated_command(spec_path)?;
+    let mut command = prepare_mediated_command(spec)?;
     command
         .stdin(Stdio::from(File::from(stdio.stdin)))
         .stdout(Stdio::from(File::from(stdio.stdout)))
@@ -4194,7 +4186,6 @@ fn launch_child_with_brokered_stdio(
     command_name: &str,
     launch_caller: &Caller,
     requester_pid: u32,
-    spec_path: &Path,
     spec: &ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
@@ -4209,7 +4200,7 @@ fn launch_child_with_brokered_stdio(
         stderr,
     } = stdio;
 
-    let mut command = prepare_mediated_command(spec_path)?;
+    let mut command = prepare_mediated_command(spec)?;
     command
         .stdin(Stdio::from(File::from(stdin)))
         .stdout(Stdio::from(File::from(stdout_write)))
@@ -4469,8 +4460,7 @@ fn launch_child_with_capture(
     let pipe_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
     let pipe_write = unsafe { File::from_raw_fd(pipe_fds[1]) };
 
-    let spec_path = write_launch_spec(&state.runtime_dir, &spec)?;
-    let mut command = prepare_mediated_command(&spec_path)?;
+    let mut command = prepare_mediated_command(&spec)?;
     command
         .stdin(Stdio::from(File::from(stdio.stdin)))
         .stdout(Stdio::from(pipe_write))
@@ -4495,7 +4485,6 @@ fn launch_child_with_capture(
 
     let status = child.wait().map_err(NonoError::CommandExecution);
     untrack_child(state, child.id())?;
-    remove_launch_spec(&spec_path);
 
     read_result.map_err(|err| {
         NonoError::SandboxInit(format!(
@@ -5800,6 +5789,7 @@ mod tests {
         let runtime_dir = PathBuf::from("/tmp/nono-tool-sandbox-test");
         let shim_dir = runtime_dir.join("shims");
         ToolSandboxState {
+            session_socket_auth: false,
             runtime_dir: runtime_dir.clone(),
             socket_path: runtime_dir.join("supervisor.sock"),
             url_socket_path: None,

@@ -52,6 +52,9 @@ pub struct SandboxState {
     /// Proxy domain allowlist at sandbox creation time
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+    /// Unlisted hosts require a network approval, including with an empty allowlist.
+    #[serde(default)]
+    pub network_approvals: bool,
     /// Proxy domain denylist (`network.deny_domain`) at sandbox creation time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_domains: Vec<String>,
@@ -63,6 +66,24 @@ pub struct SandboxState {
     /// nono builds; `#[serde(default)]` keeps those loadable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimits>,
+    /// Effective Linux namespace isolation (NEP-0004). Absent when no
+    /// isolation was requested, and in states written by older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<IsolationState>,
+}
+
+/// Linux namespace isolation in effect for a sandbox (NEP-0004).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolationState {
+    /// Requested namespaces, as `--isolate` names them (`net`, `mounts`, ...).
+    pub namespaces: Vec<String>,
+    /// Host paths hidden by the mount mask, as the applied plan masks them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub masked_paths: Vec<PathBuf>,
+    /// Host paths bound back over the masks, as the applied plan re-binds
+    /// them. Everything beneath a re-bound directory is reachable again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rebound_paths: Vec<PathBuf>,
 }
 
 /// Enforcement applied to pathname AF_UNIX operations for a running sandbox.
@@ -164,8 +185,8 @@ impl DomainEndpointState {
 pub struct EndpointRuleState {
     /// HTTP method ("GET", "POST", "*", etc.)
     pub method: String,
-    /// URL path glob pattern
-    pub path: String,
+    /// URL path glob pattern, normalized like the proxy's rule paths
+    pub path: nono_proxy::config::EndpointPath,
 }
 
 /// Serializable filesystem capability state
@@ -272,9 +293,11 @@ impl SandboxState {
             applied_bypasses: bypass_protection_paths.to_vec(),
             deny_paths: deny_paths.iter().map(|p| p.display().to_string()).collect(),
             allowed_domains: allowed_domains.to_vec(),
+            network_approvals: false,
             denied_domains: denied_domains.to_vec(),
             domain_endpoints: domain_endpoints.to_vec(),
             resource_limits: caps.resource_limits().copied(),
+            isolation: None,
         }
     }
 
@@ -314,7 +337,7 @@ impl SandboxState {
             caps.add_unix_socket(restore_unix_socket_capability(stored)?);
         }
 
-        if !self.allowed_domains.is_empty() {
+        if !self.allowed_domains.is_empty() || self.network_approvals {
             caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
                 port: 0,
                 bind_ports: vec![],
@@ -336,14 +359,39 @@ impl SandboxState {
         Ok(caps)
     }
 
-    /// Write sandbox state to a file with secure permissions
+    /// Write sandbox state to a new file; see [`create_file`](Self::create_file).
+    #[cfg(test)]
+    pub fn write_to_file(&self, path: &std::path::Path) -> Result<()> {
+        self.create_file(path).map(drop)
+    }
+
+    /// Replace the contents of a state file created by
+    /// [`create_file`](Self::create_file), through its open handle, so the
+    /// path is never re-resolved.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn rewrite(&self, file: &mut std::fs::File, path: &std::path::Path) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let json = serde_json::to_string_pretty(self).map_err(|e| {
+            NonoError::ConfigParse(format!("Failed to serialize sandbox state: {}", e))
+        })?;
+        let io = |source| NonoError::ConfigWrite {
+            path: path.to_path_buf(),
+            source,
+        };
+        file.set_len(0).map_err(io)?;
+        file.seek(SeekFrom::Start(0)).map_err(io)?;
+        file.write_all(json.as_bytes()).map_err(io)
+    }
+
+    /// Write sandbox state to a new file with secure permissions and return
+    /// its open handle.
     ///
     /// # Security
     /// This function implements multiple defenses against temp file attacks:
     /// - Uses `create_new(true)` to fail if file exists (prevents symlink attacks)
     /// - Sets `mode(0o600)` for owner-only read/write permissions (Unix)
-    /// - Atomic write operation (no TOCTOU window)
-    pub fn write_to_file(&self, path: &std::path::Path) -> Result<()> {
+    /// - Later updates go through the returned handle, never the path
+    pub fn create_file(&self, path: &std::path::Path) -> Result<std::fs::File> {
         let json = serde_json::to_string_pretty(self).map_err(|e| {
             NonoError::ConfigParse(format!("Failed to serialize sandbox state: {}", e))
         })?;
@@ -376,7 +424,7 @@ impl SandboxState {
                 source: e,
             })?;
 
-        Ok(())
+        Ok(file)
     }
 }
 
@@ -1118,12 +1166,14 @@ mod tests {
             }],
             unix_sockets: vec![],
             pathname_socket_enforcement: None,
+            isolation: None,
             net_blocked: false,
             allowed_commands: vec![],
             blocked_commands: vec![],
             applied_bypasses: vec![],
             deny_paths: vec![],
             allowed_domains: vec![],
+            network_approvals: false,
             denied_domains: vec![],
             domain_endpoints: vec![],
             resource_limits: None,

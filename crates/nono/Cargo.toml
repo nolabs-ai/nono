@@ -54,14 +54,14 @@ nix = { workspace = true, features = ["fs", "user"] }
 nix = { workspace = true, features = ["fs", "user"] }
 
 [build-dependencies]
-typify = "0.8"
+typify = "0.10"
 serde_json.workspace = true
 syn = "3"
 prettyplease = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true
-jsonschema = "0.60"
+jsonschema = "0.61"
 
 [lints]
 workspace = true

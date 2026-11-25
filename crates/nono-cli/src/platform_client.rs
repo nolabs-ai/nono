@@ -133,6 +133,8 @@ fn enroll(args: PlatformEnrollArgs) -> Result<()> {
         display_name: request.display_name.clone(),
         tenant: None,
         revoked: false,
+        unenrolled: false,
+        unenrollment_confirmed: false,
         last_policy_mode: None,
     };
     write_json_secure(&state_path, &stored)?;
@@ -202,6 +204,12 @@ fn status(args: PlatformStatusArgs) -> Result<()> {
         None
     };
     let policy = match &stored {
+        Some(stored) if stored.unenrolled && args.refresh => {
+            return Err(NonoError::ActionRequired(
+                "device is unenrolled; run `nono platform login` before refreshing policy".into(),
+            ));
+        }
+        Some(stored) if stored.unenrolled => None,
         Some(stored) if args.refresh => crate::platform_policy::refresh(&stored.state)?,
         Some(stored) => crate::platform_policy::cached(&stored.state)?,
         None if args.refresh => {
@@ -223,7 +231,9 @@ fn status(args: PlatformStatusArgs) -> Result<()> {
             });
         let mut output = match &stored {
             Some(stored) => serde_json::json!({
-                "enrolled": !stored.revoked,
+                "enrolled": !stored.revoked && !stored.unenrolled,
+                "enrollment_status": if stored.revoked { "revoked" } else if stored.unenrolled { "unenrolled" } else { "active" },
+                "platform_unenrollment_confirmed": stored.unenrolled && stored.unenrollment_confirmed,
                 "platform_url": stored.state.platform_url,
                 "tenant_id": stored.state.tenant_id,
                 "subject_id": stored.state.subject_id,
@@ -323,6 +333,8 @@ fn status_text(
             "{name} · {}",
             if stored.revoked {
                 "revoked"
+            } else if stored.unenrolled {
+                "unenrolled"
             } else {
                 "enrolled"
             }
@@ -331,13 +343,26 @@ fn status_text(
             kind,
             &crate::theme::fg(&device, if stored.revoked { t.yellow } else { t.text }).to_string(),
         ));
-        text.push_str(&crate::platform_policy::display::status_rows(
-            policy,
-            previous,
-            refreshed,
-            stored.last_policy_mode.as_deref(),
-        ));
-        let audit = if stored.revoked {
+        if stored.unenrolled {
+            text.push_str(&summary_row(
+                "Enrollment",
+                if stored.unenrollment_confirmed {
+                    "Platform confirmed · use platform login to reactivate"
+                } else {
+                    "Local only · platform not notified"
+                },
+            ));
+        } else {
+            text.push_str(&crate::platform_policy::display::status_rows(
+                policy,
+                previous,
+                refreshed,
+                stored.last_policy_mode.as_deref(),
+            ));
+        }
+        let audit = if stored.unenrolled {
+            Some("Unavailable · device unenrolled".into())
+        } else if stored.revoked {
             Some("Unavailable · enrollment revoked".into())
         } else {
             match crate::audit_client::queued_count() {
@@ -388,11 +413,15 @@ fn enrollment_text_with_heading(
         .unwrap_or_else(|| "Name not recorded (see --json)".into());
     let enrollment = if stored.revoked {
         "Revoked"
+    } else if stored.unenrolled {
+        "Unenrolled"
     } else {
         "Registered locally"
     };
     let delivery = if stored.revoked {
         "Unavailable: enrollment revoked"
+    } else if stored.unenrolled {
+        "Unavailable: device unenrolled"
     } else {
         "Automatic when sessions finish"
     };
@@ -431,55 +460,58 @@ fn enrollment_details(stored: &StoredEnrollment) -> String {
     format!(
         "{}{}",
         summary_row(kind, &name),
-        summary_row("Enrolled", &enrolled)
+        summary_row("First enrolled", &enrolled)
     )
 }
 
-/// Remove the local enrollment. Local-only by design: the platform-side
-/// subject stays active until a human revokes it in the console, because the
-/// device key must not be able to erase its own registration.
+/// Deactivate without erasing identity/history. Keep the key and an inactive
+/// local record so human-authorized login can reactivate the same device.
 fn unenroll(args: PlatformUnenrollArgs) -> Result<()> {
-    let state_path = state_path()?;
     let Some(state) = load_state()? else {
         println!("Not enrolled with a platform.");
         return Ok(());
     };
     let queued = crate::audit_client::queued_count()?;
+    let stored = current_enrollment(&state)?;
+    let confirmed = if args.local_only {
+        stored.unenrolled && stored.unenrollment_confirmed
+    } else {
+        confirm_unenrollment(&state)?;
+        true
+    };
 
-    // Delete the key before the state file: the state holds the only key_ref,
-    // so removing it first would orphan the key in the keystore if deletion
-    // failed. Key removal is idempotent, so a failure here is retryable.
+    // Persist deactivation before optional key removal, so a keystore failure
+    // cannot leave an active local registration. Retain the reference so login
+    // requests authorized replacement rather than silently minting an identity.
+    let mut stored = current_enrollment(&state)?;
+    stored.unenrolled = true;
+    stored.unenrollment_confirmed = confirmed;
+    write_enrollment(&stored)?;
     if args.delete_key {
         let key_ref = TrustKeyRef::parse(&state.key_ref)?;
         let key_label = key_ref.key_id()?;
-        trust_keystore::remove_secret_for_ref(&key_ref, PLATFORM_KEY_SERVICE, &key_label)?;
+        trust_keystore::remove_secret_for_ref(&key_ref, PLATFORM_KEY_SERVICE, &key_label)
+            .map_err(|error| NonoError::ActionRequired(format!(
+                "local enrollment is disabled, but the signing key could not be deleted: {error}"
+            )))?;
     }
-    let active = read_state(&state_path)?;
-    let user = crate::platform_oauth::session::load_record()?
-        .map(|session| session.user_subject)
-        .or_else(|| {
-            active
-                .as_ref()
-                .and_then(|stored| stored.login_user_id.clone())
-        });
-    if let Some(user) = user {
-        let path = scoped_state_path(&state.platform_url, &state.tenant_id, &user)?;
-        if path.exists() {
-            fs::remove_file(&path).map_err(|source| NonoError::ConfigWrite { path, source })?;
-        }
-    }
-    if active
-        .as_ref()
-        .is_some_and(|stored| stored.state.subject_id == state.subject_id)
-    {
-        fs::remove_file(&state_path).map_err(|source| NonoError::ConfigWrite {
-            path: state_path.clone(),
-            source,
-        })?;
-    }
-    let mut text = summary_heading("Device unenrolled locally", SummaryKind::Success);
+    let mut text = summary_heading(
+        if confirmed {
+            "Device unenrolled"
+        } else {
+            "Device unenrolled locally"
+        },
+        SummaryKind::Success,
+    );
     text.push_str(&summary_row("Platform", &safe_text(&state.platform_url)));
-    text.push_str(&summary_row("Platform record", "Unchanged"));
+    text.push_str(&summary_row(
+        "Platform record",
+        if confirmed {
+            "Unenrolled · platform access disabled"
+        } else {
+            "Not notified · remote enrollment unchanged"
+        },
+    ));
     text.push_str(&summary_row(
         "Signing key",
         if args.delete_key {
@@ -496,6 +528,66 @@ fn unenroll(args: PlatformUnenrollArgs) -> Result<()> {
         ));
     }
     println!("{text}");
+    Ok(())
+}
+
+/// Remote confirmation precedes local deactivation/key deletion. A failed
+/// request never claims that the server stopped accepting the device key.
+fn confirm_unenrollment(state: &PlatformState) -> Result<()> {
+    const PATH: &str = "/api/v1/enrollment/unenroll";
+    #[derive(Deserialize)]
+    struct Confirmation {
+        protocol_version: String,
+        tenant_id: String,
+        subject_id: String,
+        unenrolled_at: chrono::DateTime<chrono::Utc>,
+    }
+    let body = br#"{"protocol_version":"1"}"#;
+    let url = endpoint_url(&state.platform_url, PATH)?;
+    let target =
+        url::Url::parse(&url).map_err(|error| NonoError::ConfigParse(error.to_string()))?;
+    let signed = sign_request_v1(state, "POST", target.path(), Uuid::new_v4(), body)?;
+    let mut response = http_agent(Duration::from_secs(15)).post(&url).config()
+        .http_status_as_error(false).max_redirects(0).build()
+        .header("x-nono-protocol-version", "1")
+        .header("x-nono-subject-id", &state.subject_id)
+        .header("x-nono-timestamp", &signed.timestamp)
+        .header("x-nono-request-id", &signed.request_id)
+        .header("x-nono-content-sha256", &signed.body_digest)
+        .header("x-nono-signature", &signed.signature)
+        .header("content-type", "application/json")
+        .send(body).map_err(|_| NonoError::ActionRequired("platform could not confirm unenrollment; local enrollment was retained. Retry, or use `nono platform unenroll --local-only` for an abandoned platform".into()))?;
+    if !response.status().is_success() {
+        return Err(NonoError::ActionRequired(format!(
+            "platform did not confirm unenrollment (HTTP {}); local enrollment was retained. Retry, or use `nono platform unenroll --local-only` to disable it only on this installation",
+            response.status()
+        )));
+    }
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(RESPONSE_LIMIT_BYTES)
+        .read_to_vec()
+        .map_err(|_| {
+            NonoError::ConfigParse(
+                "could not read unenrollment confirmation; retry unenrollment".into(),
+            )
+        })?;
+    let confirmation: Confirmation = serde_json::from_slice(&bytes).map_err(|_| {
+        NonoError::ConfigParse(
+            "invalid unenrollment confirmation; local enrollment retained".into(),
+        )
+    })?;
+    if confirmation.protocol_version != "1"
+        || confirmation.tenant_id != state.tenant_id
+        || confirmation.subject_id != state.subject_id
+        || confirmation.unenrolled_at > chrono::Utc::now() + chrono::Duration::minutes(5)
+    {
+        return Err(NonoError::ConfigParse(
+            "unenrollment confirmation does not match this enrollment; local enrollment retained"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -549,6 +641,10 @@ struct StoredEnrollment {
     tenant: Option<Organization>,
     #[serde(default)]
     revoked: bool,
+    #[serde(default)]
+    unenrolled: bool,
+    #[serde(default)]
+    unenrollment_confirmed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_policy_mode: Option<String>,
 }
@@ -630,6 +726,8 @@ fn login_enrollment(
         login_user_id: Some(session.user_subject.clone()),
         display_name: Some(display_name.to_string()),
         revoked: false,
+        unenrolled: false,
+        unenrollment_confirmed: false,
         last_policy_mode,
     }
 }
@@ -775,12 +873,15 @@ pub(crate) fn load_state() -> Result<Option<PlatformState>> {
 
 pub(crate) fn load_active_state() -> Result<Option<PlatformState>> {
     Ok(load_enrollment()?
-        .filter(|stored| !stored.revoked)
+        .filter(|stored| !stored.revoked && !stored.unenrolled)
         .map(|stored| stored.state))
 }
 
 pub(crate) fn load_policy_state() -> Result<Option<PlatformState>> {
     let stored = load_enrollment()?;
+    if stored.as_ref().is_some_and(|stored| stored.unenrolled) {
+        return Err(NonoError::ActionRequired("device is unenrolled; run `nono platform login` to enroll it again before starting a session".into()));
+    }
     if stored.as_ref().is_some_and(|stored| stored.revoked) {
         return Err(NonoError::ActionRequired(
             "device enrollment was revoked; recover the enrollment before starting a session"
@@ -792,6 +893,10 @@ pub(crate) fn load_policy_state() -> Result<Option<PlatformState>> {
 
 pub(crate) fn enrollment_revoked() -> Result<bool> {
     Ok(load_enrollment()?.is_some_and(|stored| stored.revoked))
+}
+
+pub(crate) fn enrollment_unenrolled() -> Result<bool> {
+    Ok(load_enrollment()?.is_some_and(|stored| stored.unenrolled))
 }
 
 pub(crate) fn mark_revoked(state: &PlatformState) -> Result<()> {
@@ -1247,11 +1352,13 @@ mod tests {
         login.tenant_selection_pending = false;
         session::save_record(&lock, &login).unwrap();
         unenroll(PlatformUnenrollArgs {
+            local_only: true,
             delete_key: false,
             help: None,
         })
         .unwrap();
-        assert!(load_state().unwrap().is_none());
+        assert!(enrollment_unenrolled().unwrap());
+        assert!(load_active_state().unwrap().is_none());
         login.tenant_id = "t-2".into();
         session::save_record(&lock, &login).unwrap();
         assert_eq!(load_state().unwrap().unwrap().subject_id, "device-two");

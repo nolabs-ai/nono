@@ -160,6 +160,10 @@ pub(crate) fn guard_command(command: &Commands, silent: bool) -> Result<()> {
         Commands::Platform(args) => !matches!(
             &args.command,
             PlatformCommands::Status(_)
+                // Human sign-in is separate from device authority. Enrollment
+                // checks ownership/status on the platform and preserves the
+                // pinned enforced identity and mode locally.
+                | PlatformCommands::Login(_)
                 | PlatformCommands::ReEnroll(_)
                 | PlatformCommands::Tenant(crate::cli::TenantArgs {
                     command: TenantCommands::List(_),
@@ -202,6 +206,19 @@ pub(crate) fn guard_command(command: &Commands, silent: bool) -> Result<()> {
         return Ok(());
     };
     let remembered = platform_client::last_policy_mode(&state)?;
+    if enrollment_recovery && platform_client::enrollment_unenrolled()? {
+        if remembered.as_deref() == Some("enforced")
+            || super::cached(&state)?.is_some_and(|claims| claims.management_mode == "enforced")
+        {
+            return Err(denied(
+                "this command needs a fresh platform release from enforced mode",
+            ));
+        }
+        // Disabled identities cannot refresh policy, and --delete-key may
+        // already have removed their key. Login still proves human authority
+        // and device ownership before the platform reactivates anything.
+        return Ok(());
+    }
     let enforced = match super::refresh_inner(&state, false) {
         Ok(Some(claims)) => claims.management_mode == "enforced",
         Ok(None) => {

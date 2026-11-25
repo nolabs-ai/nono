@@ -32,10 +32,13 @@ Subsequent logins reuse a completed selection unless another tenant is requested
 
 Enrollment failure does not invalidate a successful human login. The CLI reports
 the failure and how to retry. `--no-enroll` leaves existing registrations intact;
-logout revokes only the human session. Unenrollment is explicit and local;
-platform revocation retains historical attribution and refuses subsequent use.
+logout revokes only the human session. Voluntary unenrollment disables the
+platform identity and retains its history; login can reactivate the same key.
+Administrative revocation blocks both ordinary login enrollment and key
+replacement until a platform operator restores eligibility.
 
-`nono platform re-enroll` is explicit recovery for an owned, revoked device registration.
+`nono platform re-enroll` replaces a key for an owned, unenrolled device registration.
+A revoked registration requires platform operator restoration first.
 It conflicts with `--no-enroll` and `NONO_NO_ENROLL=true`. A missing local registration directs the user
 to normal login without starting sign-in or creating a device key. An active
 registration is refused by the server with guidance to use normal login.
@@ -85,7 +88,7 @@ contains `refresh_token`, `intent`, and `signature`. Never log this body.
 | `display_name` | Untrusted label, 1–64 characters, no controls |
 | `timestamp_ms` | Unix milliseconds, within five minutes |
 | `request_id` | Fresh random UUID |
-| `replaces_subject_id` | Optional revoked subject UUID; omitted for ordinary enrollment |
+| `replaces_subject_id` | Optional eligible inactive subject UUID; omitted for ordinary enrollment |
 
 The independent device key signs the UTF-8 compact JSON serialization of:
 
@@ -108,14 +111,17 @@ does not raise human assurance or fleet policy assurance.
 The platform derives ownership and default group placement itself. It atomically
 creates the subject and group membership, with the acting human recorded. The
 same public key, user and tenant return the same subject, including concurrent
-retries and retries after a lost response. A revoked registration is refused,
-never reactivated. Distinct device keys create independently revocable subjects.
+retries and retries after a lost response. An unenrolled registration can be
+reactivated with the same key after checking current permission and MFA. A
+revoked registration is refused until operator restoration. Distinct device keys
+create independently revocable subjects.
 
 Replacement requires `nono:reenroll`, a CLI session created within five minutes,
 current enrollment permission and applicable fresh MFA. The signed intent binds
-the previous subject to the new device key. The old subject must be a revoked
-device owned by this user in this tenant, and the key must differ. The platform
-creates a new subject with `replaces_subject_id`; the old row remains revoked.
+the previous subject to the new device key. The old subject must be an unenrolled
+device owned by this user in this tenant, and the key must differ. Fresh human
+consent cannot override revocation. The platform creates a new subject with
+`replaces_subject_id` and retires the old row as revoked.
 In the same transaction it copies group memberships, administrator-set attributes,
 device policy overrides and standing grant deltas to the replacement. Session
 approval grants are not copied. Effective policy is resolved normally against
@@ -138,6 +144,36 @@ and `mfa_required`. Neither success nor error responses may be cached.
 Recovery errors include `enrollment_revoked`, `enrollment_active`,
 `enrollment_replaced`, `reenrollment_authorization_required`, and
 `policy_recovery_unconfirmed`.
+
+## Unenrollment and restoration
+
+`POST /api/v1/enrollment/unenroll` uses enrollment-authenticated request signing
+with body `{"protocol_version":"1"}`. The server derives tenant and subject from
+the verified key, refuses enforced-device unenrollment, and atomically consumes
+the request ID and changes the subject to `unenrolled`. It retains the key,
+policy membership and historical evidence. Temporary session grants are invalidated.
+The response contains `protocol_version`, `tenant_id`, `subject_id` and
+`unenrolled_at` (RFC 3339). Ordinary signed APIs accept only active subjects.
+
+An inactive key may authenticate only its own unenrollment retry. Repeating a
+request while unenrolled returns confirmation; replaying it after reactivation
+cannot disable the identity again. Revoked keys cannot authenticate this endpoint.
+
+The CLI requires platform confirmation before marking its local registration
+inactive or deleting a key. Network errors and unsupported servers retain the
+local enrollment and report the failure. `unenroll --local-only` explicitly
+marks it inactive only on this installation and reports that the platform was
+not notified. Local inactive records retain key references for login, but cannot
+start sessions or supply an active platform identity. `--delete-key` requires
+explicit replacement authorization to enroll again; normal login never silently
+mints a new installation key to bypass a revoked registration.
+
+Only a human operator with `enrollment_token:create` and applicable fresh MFA
+can call `POST /api/v1/tenants/{tenant}/enrollment/subjects/{subject}/restore`.
+It returns 204 and changes a revoked device to `unenrolled`, preserving policy
+and history. It does not activate the old key: the device must complete
+login-authorized enrollment. Replaced historical registrations cannot be restored;
+the operator must restore the current replacement instead.
 
 ## Local identity and audit provenance
 

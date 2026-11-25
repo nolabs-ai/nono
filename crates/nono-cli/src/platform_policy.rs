@@ -93,7 +93,7 @@ impl RefreshFailure {
     fn error(self) -> NonoError {
         let message = match self {
             Self::Unauthorized(message) => format!(
-                "{message}; device authentication was refused. Run `nono platform re-enroll` to authorize recovery; the existing enrollment and policy remain in place."
+                "{message}; device authentication was refused. Check its enrollment on the platform. A revoked device must be restored by a platform operator before `nono platform login` can enroll it again; the existing enrollment and policy remain in place."
             ),
             Self::Unavailable(message)
             | Self::ServiceUnavailable(message)

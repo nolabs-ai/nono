@@ -256,7 +256,7 @@ fn finish_login(args: &LoginArgs, select: bool) -> Result<()> {
         "{}",
         login_summary(&record, (!select).then_some(&previous), &enrollment)
     );
-    if let Err(error) = enrollment {
+    if let Err(ref error) = enrollment {
         let retry = if args.re_enroll {
             "nono platform re-enroll"
         } else {
@@ -267,17 +267,26 @@ fn finish_login(args: &LoginArgs, select: bool) -> Result<()> {
         );
     } else if matches!(
         enrollment,
-        Ok(EnrollmentResult::Enrolled | EnrollmentResult::Reenrolled | EnrollmentResult::Reused)
+        Ok(EnrollmentResult::Enrolled
+            | EnrollmentResult::Reenrolled
+            | EnrollmentResult::Reused
+            | EnrollmentResult::Reactivated)
     ) {
         let state = platform_client::load_active_state()?.ok_or_else(|| {
             NonoError::ActionRequired("device enrollment was saved but is unavailable for the policy check; run `nono platform status`".into())
         })?;
         platform_client::check_enrollment_policy(&state)?;
     }
+    if matches!(enrollment, Ok(EnrollmentResult::Revoked)) {
+        return Err(NonoError::ActionRequired(
+            "device is revoked; a platform operator must restore it before re-enrollment".into(),
+        ));
+    }
     Ok(())
 }
 
 enum EnrollmentResult {
+    Reactivated,
     Enrolled,
     Reenrolled,
     Reused,
@@ -303,6 +312,7 @@ fn enroll_device(
     let login_key = session::load_key()?.ok_or_else(not_signed_in)?;
     let refresh = session::load_refresh_token()?.ok_or_else(not_signed_in)?;
     let previous = platform_client::load_state()?;
+    let was_unenrolled = platform_client::enrollment_unenrolled()?;
     if re_enroll && previous.is_none() {
         return Ok(EnrollmentResult::NotEnrolled);
     }
@@ -324,7 +334,9 @@ fn enroll_device(
         )?,
         (Some(previous), false) => (
             previous.key_ref.clone(),
-            platform_client::load_signing_key(previous)?,
+            platform_client::load_signing_key(previous).map_err(|error| if was_unenrolled {
+                NonoError::ActionRequired(format!("the existing installation key could not be loaded ({error}); use `nono platform re-enroll` to authorize a replacement. A revoked registration must first be restored by a platform operator"))
+            } else { error })?,
         ),
         (None, _) => crate::device_key::load_or_create(
             &record.issuer,
@@ -446,6 +458,8 @@ fn enroll_device(
     }
     Ok(if re_enroll {
         EnrollmentResult::Reenrolled
+    } else if reused && was_unenrolled {
+        EnrollmentResult::Reactivated
     } else if reused {
         EnrollmentResult::Reused
     } else {
@@ -644,7 +658,7 @@ fn missing_enrollment_summary(args: &LoginArgs, record: Option<&session::Session
     text.push_str(&summary_row("Enrollment", "Not recorded"));
     text.push_str(&summary_row(
         "Recovery",
-        "re-enroll is only for revoked device enrollments",
+        "re-enroll replaces a key for an unenrolled device; revoked devices need platform operator restoration first",
     ));
     text.push_str(&summary_row(
         "Next step",
@@ -689,6 +703,10 @@ fn login_summary(
     ));
     let (label, color) = match enrollment {
         Ok(EnrollmentResult::Enrolled) => ("Device enrolled", t.green),
+        Ok(EnrollmentResult::Reactivated) => (
+            "Device enrolled again · existing identity restored",
+            t.green,
+        ),
         Ok(EnrollmentResult::Reenrolled) => ("Device re-enrolled with a new key", t.green),
         Ok(EnrollmentResult::Reused) => ("Using existing device enrollment", t.text),
         Ok(EnrollmentResult::Skipped) => ("Skipped (no-enroll enabled)", t.subtext),
@@ -700,12 +718,17 @@ fn login_summary(
     text.push_str(&summary_row("Enrollment", &fg(label, color).to_string()));
     if matches!(
         enrollment,
-        Ok(EnrollmentResult::Enrolled | EnrollmentResult::Reenrolled | EnrollmentResult::Reused)
+        Ok(EnrollmentResult::Enrolled
+            | EnrollmentResult::Reenrolled
+            | EnrollmentResult::Reused
+            | EnrollmentResult::Reactivated)
     ) && (switched
         || previous.is_none()
         || matches!(
             enrollment,
-            Ok(EnrollmentResult::Enrolled | EnrollmentResult::Reenrolled)
+            Ok(EnrollmentResult::Enrolled
+                | EnrollmentResult::Reenrolled
+                | EnrollmentResult::Reactivated)
         ))
     {
         text.push_str(&summary_row(
@@ -725,7 +748,7 @@ fn login_summary(
         .unwrap_or_else(|| clean(&record.tenant_id));
     let hint = match enrollment {
         Ok(EnrollmentResult::Revoked) => Some(format!(
-            "nono platform re-enroll --tenant {tenant_selector}"
+            "Ask a platform operator to restore this device, then run nono platform login --tenant {tenant_selector}"
         )),
         Ok(EnrollmentResult::NotEnrolled | EnrollmentResult::Active) => Some(format!(
             "Use normal login: nono platform tenant use {tenant_selector}"
@@ -738,7 +761,7 @@ fn login_summary(
     if matches!(enrollment, Ok(EnrollmentResult::NotEnrolled)) {
         text.push_str(&summary_row(
             "Recovery",
-            "re-enroll is only for revoked device enrollments",
+            "re-enroll replaces a key for an unenrolled device; revoked devices need platform operator restoration first",
         ));
     }
     text.push('\n');

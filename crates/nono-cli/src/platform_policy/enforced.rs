@@ -143,7 +143,11 @@ pub(crate) fn validate_resource_limits(
     Ok(())
 }
 
-pub(crate) fn guard_command(command: &Commands) -> Result<()> {
+pub(crate) fn guard_command(command: &Commands, silent: bool) -> Result<()> {
+    let enrollment_recovery = matches!(command, Commands::Platform(args) if matches!(
+        args.command,
+        PlatformCommands::Login(_) | PlatformCommands::Logout(_) | PlatformCommands::Unenroll(_)
+    ));
     let restricted = match command {
         Commands::Profile(args) => matches!(
             args.command,
@@ -204,6 +208,32 @@ pub(crate) fn guard_command(command: &Commands) -> Result<()> {
             return Err(denied(
                 "a fresh assignment is required before changing local policy or enrollment",
             ));
+        }
+        Err(error)
+            if enrollment_recovery
+                && remembered.as_deref() != Some("enforced")
+                && matches!(
+                    error,
+                    super::RefreshFailure::Unavailable(_)
+                        | super::RefreshFailure::ServiceUnavailable(_)
+                        | super::RefreshFailure::Unauthorized(_)
+                ) =>
+        {
+            // Cleanup is not launch authority. An enrollment whose first
+            // policy check failed must remain recoverable; a previously
+            // enforced device still needs a fresh signed release. Check old
+            // signed caches too, including enrollments predating mode history.
+            if super::cached(&state)?.is_some_and(|claims| claims.management_mode == "enforced") {
+                return Err(denied(
+                    "this command needs a fresh platform release from enforced mode",
+                ));
+            }
+            if !silent {
+                eprintln!(
+                    "Policy could not be checked; continuing with account management only. Session startup still requires its normal policy check."
+                );
+            }
+            false
         }
         Err(error) if error.allows_local_fallback(true, None, remembered.as_deref()) => false,
         Err(error @ super::RefreshFailure::Unauthorized(_)) => return Err(error.error()),

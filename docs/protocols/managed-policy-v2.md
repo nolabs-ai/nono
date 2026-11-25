@@ -192,6 +192,15 @@ changes every applicable enforced assignment on the platform; a fresh signed
 response must confirm the less restrictive mode. Offline checks cannot authorize
 the change. A dedicated management-approval lease is not implemented.
 
+For an enrollment with no verified enforced history, login, logout and explicit
+unenrollment remain available when policy delivery is missing, unreachable or
+rejects the old device credentials. A fresh signed enforced response still
+blocks these commands. Invalid signatures and damaged caches remain errors.
+This recovery path grants no session startup authority: a failed first policy
+check continues to block launches, including explicit local profiles. A missing
+policy endpoint reports the enrolled URL and the two routes to check at the
+deployment edge; retry policy verification with `nono platform status --refresh`.
+
 ## Scope
 
 This implements startup delivery and verification. Running sessions retain their

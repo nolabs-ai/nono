@@ -54,7 +54,7 @@ nono platform tenant use acme
 registrations are retained; an existing registration for the chosen tenant can
 still deliver audits. If no registration exists there, audits remain local.
 This setting does not disable audit creation or replace `--no-audit`.
-`nono platform re-enroll` is explicit recovery for a revoked registration and conflicts with
+`nono platform re-enroll` replaces an eligible inactive installation key and conflicts with
 these opt-outs; unset `NONO_NO_ENROLL` or set it to `false` before recovery.
 
 ## Remote sessions
@@ -100,7 +100,8 @@ checking membership. It reuses the chosen tenant's enrollment or creates one
 unless opted out. Listing tenants refreshes memberships without changing the
 saved tenant or enrolling. Enrollment failure does not undo a successful tenant
 switch; with no matching registration, new audits stay local. A revoked
-registration requires explicit `nono platform re-enroll`.
+registration requires a platform operator to restore eligibility before login
+can enroll it again.
 
 ## Audit attribution and status
 
@@ -117,3 +118,9 @@ signed in, without exposing tokens, private key locations or key fingerprints.
 
 `nono platform logout` revokes the human CLI session and retains device registration.
 Enrollment revocation is independent of human sign-in and preserves history.
+
+Voluntary `nono platform unenroll` confirms deactivation on the platform and
+retains an inactive local record and signing key. `nono platform login` enrolls
+the same identity again; `--name` updates its label. Inactive registrations cannot
+start sessions. For an abandoned server, `unenroll --local-only` disables this
+installation without claiming that the platform was notified.

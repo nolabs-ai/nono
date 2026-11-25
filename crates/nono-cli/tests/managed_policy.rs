@@ -203,13 +203,16 @@ impl Client {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let (path, request_id) = read_request(&mut stream);
-                        if path == REFRESH_PATH && status.load(Ordering::SeqCst) != 200 {
+                        if matches!(path.as_str(), REFRESH_PATH | "/api/v1/enrollment/unenroll")
+                            && status.load(Ordering::SeqCst) != 200
+                        {
                             write!(stream,"HTTP/1.1 {} Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",status.load(Ordering::SeqCst)).expect("refresh unavailable");
                             continue;
                         }
                         if path != TRUST_PATH
                             && path != REFRESH_PATH
                             && path != "/api/v1/enrollment/exchange"
+                            && path != "/api/v1/enrollment/unenroll"
                         {
                             stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("audit unavailable");
                             continue;
@@ -221,6 +224,8 @@ impl Client {
                                 "enrolled_at":"2026-01-01T00:00:00Z","policy_trust_root":trust
                             }))
                             .expect("enrollment response")
+                        } else if path == "/api/v1/enrollment/unenroll" {
+                            serde_json::to_vec(&json!({"protocol_version":"1","tenant_id":"tenant","subject_id":"device","unenrolled_at":chrono::Utc::now()})).expect("unenrollment confirmation")
                         } else if path == TRUST_PATH {
                             serde_json::to_vec(&trust).expect("trust response")
                         } else {
@@ -645,7 +650,6 @@ fn enforced_shell_wrap_and_management_commands_cannot_bypass_assignment() {
         vec!["trust", "init"],
         vec!["platform", "unenroll"],
         vec!["platform", "logout"],
-        vec!["platform", "login", "--no-enroll"],
         vec!["platform", "tenant", "use", "personal", "--no-enroll"],
     ] {
         let output = client.test.command().args(&args).output().expect("command");
@@ -726,6 +730,290 @@ fn signed_platform_downgrade_restores_advisory_overrides() {
         .exec(Argv::new("/bin/echo").arg("ADVISORY"))
         .assert_success("fresh signed advisory mode allows an override")
         .assert_stderr_contains("Advisory");
+}
+
+#[test]
+fn enrollment_recovery_survives_missing_policy_and_rejected_device_credentials() {
+    for mode in [None, Some("audit_only"), Some("advisory")] {
+        for status in [401, 404, 503, 0] {
+            let mut client = Client::new(None);
+            let enrollment = client.test.home().join(".config/nono/platform.json");
+            let mut state: serde_json::Value =
+                serde_json::from_slice(&fs::read(&enrollment).expect("state")).expect("JSON");
+            state["last_policy_mode"] = mode.into();
+            fs::write(&enrollment, state.to_string()).expect("state");
+            if status == 0 {
+                client.platform.stop();
+            } else {
+                client
+                    .platform
+                    .refresh_status
+                    .store(status, Ordering::SeqCst);
+            }
+
+            // A failed first check still cannot authorize a session.
+            if mode.is_none() {
+                client
+                    .test
+                    .run()
+                    .profile_name("default")
+                    .exec(Argv::new("/bin/echo").arg("MUST_NOT_RUN"))
+                    .assert_failure("recovery does not grant launch authority")
+                    .assert_stdout_lacks("MUST_NOT_RUN");
+            }
+
+            let login = client
+                .test
+                .command()
+                .args([
+                    "platform",
+                    "login",
+                    "--name",
+                    "Aleks Device",
+                    "--device-code",
+                    "--no-open",
+                    "--url",
+                ])
+                .arg(state["platform_url"].as_str().expect("origin"))
+                .output()
+                .expect("login");
+            // This fixture has no OAuth server. Reaching discovery proves the
+            // policy guard no longer prevents the requested login from running.
+            assert!(
+                String::from_utf8_lossy(&login.stderr).contains("authorization server"),
+                "{mode:?}, HTTP {status}: {}",
+                String::from_utf8_lossy(&login.stderr)
+            );
+            assert!(enrollment.exists());
+
+            let logout = client
+                .test
+                .command()
+                .args(["platform", "logout"])
+                .output()
+                .expect("logout");
+            assert!(
+                logout.status.success(),
+                "{}",
+                String::from_utf8_lossy(&logout.stderr)
+            );
+            assert!(String::from_utf8_lossy(&logout.stdout).contains("Not signed in"));
+            assert!(
+                enrollment.exists(),
+                "logout must retain the device enrollment"
+            );
+
+            let unenroll = client
+                .test
+                .command()
+                .args(["platform", "unenroll"])
+                .output()
+                .expect("unenroll");
+            assert!(
+                !unenroll.status.success(),
+                "the platform must confirm default unenrollment"
+            );
+            assert!(
+                String::from_utf8_lossy(&unenroll.stderr).contains("local enrollment was retained")
+            );
+            let local = client
+                .test
+                .command()
+                .args(["platform", "unenroll", "--local-only"])
+                .output()
+                .expect("local cleanup");
+            assert!(
+                local.status.success(),
+                "{}",
+                String::from_utf8_lossy(&local.stderr)
+            );
+            assert!(String::from_utf8_lossy(&local.stdout).contains("Not notified"));
+            let stored: serde_json::Value =
+                serde_json::from_slice(&fs::read(&enrollment).expect("inactive state"))
+                    .expect("JSON");
+            assert_eq!(stored["unenrolled"], true);
+            assert_eq!(stored["unenrollment_confirmed"], false);
+            assert!(
+                client.test.root().join("device-key").exists(),
+                "default unenrollment retains its key"
+            );
+        }
+    }
+}
+
+#[test]
+fn enrollment_recovery_never_releases_verified_enforcement_or_invalid_policy() {
+    for status in [401, 404, 503, 0] {
+        let mut client = Client::new(Some(static_profile()));
+        client.platform.mode.store(2, Ordering::SeqCst);
+        let refresh = client
+            .test
+            .command()
+            .args(["platform", "status", "--refresh"])
+            .output()
+            .expect("refresh");
+        assert!(refresh.status.success());
+        if status == 0 {
+            client.platform.stop();
+        } else {
+            client
+                .platform
+                .refresh_status
+                .store(status, Ordering::SeqCst);
+        }
+        for args in [
+            vec!["platform", "logout"],
+            vec!["platform", "unenroll"],
+            vec!["platform", "unenroll", "--local-only"],
+        ] {
+            let output = client.test.command().args(&args).output().expect("command");
+            assert!(!output.status.success(), "{args:?}, HTTP {status}");
+            assert!(
+                client
+                    .test
+                    .home()
+                    .join(".config/nono/platform.json")
+                    .exists()
+            );
+        }
+    }
+    let client = Client::new(Some(static_profile()));
+    client
+        .platform
+        .corrupt_response
+        .store(true, Ordering::SeqCst);
+    for args in [
+        vec!["platform", "logout"],
+        vec!["platform", "unenroll"],
+        vec!["platform", "unenroll", "--local-only"],
+    ] {
+        let output = client.test.command().args(&args).output().expect("command");
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("invalid platform policy signature")
+        );
+        assert!(
+            client
+                .test
+                .home()
+                .join(".config/nono/platform.json")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn recovery_checks_signed_enforced_history_even_without_remembered_mode() {
+    let client = Client::new(Some(static_profile()));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    let refresh = client
+        .test
+        .command()
+        .args(["platform", "status", "--refresh"])
+        .output()
+        .expect("refresh");
+    assert!(refresh.status.success());
+    let enrollment = client.test.home().join(".config/nono/platform.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&enrollment).expect("state")).expect("JSON");
+    state
+        .as_object_mut()
+        .expect("object")
+        .remove("last_policy_mode");
+    fs::write(&enrollment, state.to_string()).expect("legacy state");
+    client.platform.refresh_status.store(404, Ordering::SeqCst);
+    for args in [vec!["platform", "logout"], vec!["platform", "unenroll"]] {
+        let output = client.test.command().args(&args).output().expect("command");
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("fresh platform release from enforced mode")
+        );
+        assert!(enrollment.exists());
+    }
+}
+
+#[test]
+fn logout_clears_local_human_credentials_when_policy_and_revocation_are_unavailable() {
+    let client = Client::new(None);
+    client.platform.refresh_status.store(404, Ordering::SeqCst);
+    let enrollment = client.test.home().join(".config/nono/platform.json");
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&enrollment).expect("state")).expect("JSON");
+    let origin = state["platform_url"].as_str().expect("origin");
+    let directory = client.test.state().join("nono");
+    let record = json!({
+        "protocol_version":"1", "platform_url":origin, "issuer":origin,
+        "key_thumbprint":"test", "user_subject":"user", "user_display":"Test user",
+        "tenant_id":"tenant", "organizations":[], "console_url":null,
+        "signed_in_at":"2026-11-25T00:00:00Z"
+    });
+    nono::store_secret_file(&directory.join("platform-login.json"), &record.to_string())
+        .expect("record");
+    nono::store_secret_file(
+        &directory.join("platform-login-key"),
+        &fs::read_to_string(client.test.root().join("device-key")).expect("test key"),
+    )
+    .expect("login key");
+    nono::store_secret_file(
+        &directory.join("platform-login-refresh-token"),
+        "test-refresh-token",
+    )
+    .expect("token");
+    let logout = client
+        .test
+        .command()
+        .args(["platform", "logout"])
+        .output()
+        .expect("logout");
+    assert!(
+        !logout.status.success(),
+        "remote revocation must not be reported as successful"
+    );
+    assert!(String::from_utf8_lossy(&logout.stderr).contains("signed out locally"));
+    assert!(enrollment.exists(), "logout must retain device enrollment");
+    for name in [
+        "platform-login.json",
+        "platform-login-key",
+        "platform-login-refresh-token",
+    ] {
+        assert!(
+            !directory.join(name).exists(),
+            "{name} must be removed locally"
+        );
+    }
+}
+
+#[test]
+fn missing_policy_endpoint_explains_deployment_routing_and_does_not_weaken_other_commands() {
+    let client = Client::new(None);
+    client.platform.refresh_status.store(404, Ordering::SeqCst);
+    let output = client
+        .test
+        .command()
+        .args(["platform", "status", "--refresh"])
+        .output()
+        .expect("refresh");
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    for text in [
+        "HTTP 404",
+        "/api/v1/policy/refresh",
+        "/api/v1/policy/trust-root",
+        "platform-server",
+        "nono platform status --refresh",
+    ] {
+        assert!(error.contains(text), "{error}");
+    }
+    client.platform.refresh_status.store(401, Ordering::SeqCst);
+    let output = client
+        .test
+        .command()
+        .args(["profile", "init", "must-not-exist"])
+        .output()
+        .expect("profile init");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("device authentication was refused"));
 }
 
 #[test]
@@ -1670,4 +1958,109 @@ fn wrap_keeps_advisory_offline_rules_and_audit_only_local_operation() {
             offline.assert_success("audit-only local operation remains available offline");
         }
     }
+}
+
+#[test]
+fn confirmed_unenrollment_disables_startup_and_retains_identity_for_reactivation() {
+    let client = Client::new(None);
+    let enrollment = client.test.home().join(".config/nono/platform.json");
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(&enrollment).expect("state")).expect("JSON");
+    for _ in 0..2 {
+        let output = client
+            .test
+            .command()
+            .args(["platform", "unenroll"])
+            .output()
+            .expect("unenroll");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("platform access disabled"));
+    }
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&enrollment).expect("state")).expect("JSON");
+    assert_eq!(stored["unenrolled"], true);
+    assert_eq!(stored["unenrollment_confirmed"], true);
+    assert_eq!(stored["subject_id"], before["subject_id"]);
+    assert_eq!(stored["key_ref"], before["key_ref"]);
+    let output = client
+        .test
+        .command()
+        .args(["platform", "status", "--json"])
+        .output()
+        .expect("status");
+    assert!(output.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(status["enrolled"], false);
+    assert_eq!(status["enrollment_status"], "unenrolled");
+    assert!(status["policy_assignment"].is_null());
+    let deleted = client
+        .test
+        .command()
+        .args(["platform", "unenroll", "--delete-key"])
+        .output()
+        .expect("delete key after confirmed unenrollment");
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(!client.test.root().join("device-key").exists());
+    let retained: serde_json::Value =
+        serde_json::from_slice(&fs::read(&enrollment).expect("retained state")).expect("JSON");
+    assert_eq!(retained["unenrolled"], true);
+    assert_eq!(retained["key_ref"], before["key_ref"]);
+    for kind in ["run", "wrap"] {
+        let output = client
+            .test
+            .command()
+            .args([
+                kind,
+                "--profile",
+                "default",
+                "--",
+                "/bin/echo",
+                "MUST_NOT_RUN",
+            ])
+            .output()
+            .expect("launch");
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("MUST_NOT_RUN"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("device is unenrolled"));
+    }
+}
+
+#[test]
+fn human_login_does_not_remove_or_downgrade_an_enforced_device() {
+    let client = Client::new(Some(static_profile()));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    let refresh = client
+        .test
+        .command()
+        .args(["platform", "status", "--refresh"])
+        .output()
+        .expect("refresh");
+    assert!(refresh.status.success());
+    let path = client.test.home().join(".config/nono/platform.json");
+    let before = fs::read(&path).expect("state");
+    let login = client
+        .test
+        .command()
+        .args(["platform", "login", "--no-enroll", "--url"])
+        .arg(
+            serde_json::from_slice::<serde_json::Value>(&before).expect("JSON")["platform_url"]
+                .as_str()
+                .expect("origin"),
+        )
+        .output()
+        .expect("login");
+    assert!(String::from_utf8_lossy(&login.stderr).contains("authorization server"));
+    assert_eq!(fs::read(&path).expect("state"), before);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&before).expect("JSON")["last_policy_mode"],
+        "enforced"
+    );
 }

@@ -93,7 +93,7 @@ impl RefreshFailure {
     fn error(self) -> NonoError {
         let message = match self {
             Self::Unauthorized(message) => format!(
-                "{message}; device authentication was refused. Run `nono platform re-enroll` to authorize recovery; the existing enrollment and policy remain in place."
+                "{message}; device authentication was refused. Check its enrollment on the platform. A revoked device must be restored by a platform operator before `nono platform login` can enroll it again; the existing enrollment and policy remain in place."
             ),
             Self::Unavailable(message)
             | Self::ServiceUnavailable(message)
@@ -332,7 +332,15 @@ fn request<T: serde::de::DeserializeOwned>(
         .map_err(|error| RefreshFailure::Unavailable(error.to_string()))?;
     tracing::debug!(endpoint = path, request_id = %id, status = response.status().as_u16(), "Received platform policy response");
     if !response.status().is_success() {
-        let message = format!("policy endpoint returned HTTP {}", response.status());
+        let mut message = format!(
+            "policy endpoint {method} {url} returned HTTP {}",
+            response.status()
+        );
+        if response.status().as_u16() == 404 {
+            message.push_str(
+                "; the policy API is unavailable at the enrolled origin. Check that the deployment routes /api/v1/policy/refresh and /api/v1/policy/trust-root to platform-server, then retry `nono platform status --refresh`",
+            );
+        }
         if response.status().as_u16() == 401 {
             return Err(RefreshFailure::Unauthorized(message));
         }

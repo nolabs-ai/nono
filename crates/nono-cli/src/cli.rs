@@ -2766,7 +2766,7 @@ pub enum PlatformCommands {
         after_help = "EXAMPLES:\n  nono platform tenant list\n  nono platform tenant use acme --no-enroll"
     )]
     Tenant(TenantArgs),
-    /// Replace a revoked device enrollment after fresh authorization
+    /// Replace an unenrolled device key after fresh authorization; revocation requires operator restoration
     #[command(name = "re-enroll", help_template = COMMAND_HELP, next_help_heading = "OPTIONS", mut_arg("no_enroll", |arg| arg.hide(true)))]
     #[command(
         after_help = "EXAMPLES:\n  nono platform re-enroll\n  nono platform re-enroll --tenant acme"
@@ -2783,10 +2783,10 @@ pub enum PlatformCommands {
     #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
     #[command(after_help = "EXAMPLES:\n  nono platform status\n  nono platform status --json")]
     Status(PlatformStatusArgs),
-    /// Remove the local platform enrollment
+    /// Unenroll this device on the platform and disable its local enrollment
     #[command(help_template = COMMAND_HELP, next_help_heading = "OPTIONS")]
     #[command(
-        after_help = "EXAMPLES:\n  nono platform unenroll\n  nono platform unenroll --delete-key"
+        after_help = "EXAMPLES:\n  nono platform unenroll\n  nono platform unenroll --delete-key\n  nono platform unenroll --local-only"
     )]
     Unenroll(PlatformUnenrollArgs),
 }
@@ -2936,6 +2936,10 @@ pub struct PlatformStatusArgs {
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct PlatformUnenrollArgs {
+    /// Disable this installation locally without notifying the platform
+    #[arg(long)]
+    pub local_only: bool,
+
     /// Also delete the local signing key (the next enrollment mints a new one)
     #[arg(long)]
     pub delete_key: bool,

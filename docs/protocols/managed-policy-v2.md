@@ -43,7 +43,7 @@ default session startup still requires its normal fresh policy check.
 
 A locally recorded revocation blocks session startup, including explicit local
 profile overrides. Revoked enrollment is not treated as an unenrolled device;
-the enrollment must be recovered or explicitly removed first.
+an operator must restore enrollment eligibility before login can reactivate it.
 
 `POST /api/v1/policy/refresh` accepts only body `protocol_version: "2"`, with
 client `platform`, `home` and `workdir`. The enrolled request-authentication
@@ -64,7 +64,8 @@ silently replaces a previously advisory policy with local defaults. An advisory
 user may explicitly select a local profile or capability manifest when the
 platform is unavailable; invalid signatures, unsupported formats and rejected
 assignments remain errors. An enrollment with no verified mode cannot use an
-explicit override to bypass its first check. Enforced devices have no offline
+explicit override to bypass its first check. Locally unenrolled registrations
+remain inactive until login-authorized reactivation, including for explicit profiles. Enforced devices have no offline
 fallback, including explicit profiles. Previously local and unenrolled clients keep local
 offline operation.
 
@@ -130,8 +131,9 @@ evidence, and advisory wrap launches explain that limitation.
 ## Enforced startup
 
 Explicit `nono platform re-enroll` can start fresh human consent even when the
-old device key is refused. Activation requires the server to confirm an owned,
-revoked replacement with preserved policy context. The client carries its
+old device key is refused. A revoked registration requires platform operator
+restoration first. Replacement then requires the server to confirm an owned,
+eligible inactive registration with preserved policy context. The client carries its
 remembered mode into the replacement and verifies the fresh assignment;
 failed recovery does not release enforcement. Other enrollment changes retain
 their normal fresh-assignment guard.
@@ -185,12 +187,23 @@ host. Static allows still pass, and explicit domain and metadata-IP denies stay
 denied. The platform uses this same query for its approval precheck.
 
 Local setup, standalone proxy, profile creation/promotion, trust mutation,
-unenrollment, login/logout and tenant selection are refused while enforced.
+unenrollment, logout and tenant selection are refused while enforced. Human
+login remains available: the server checks device eligibility and ownership, and
+local enrollment writes retain the pinned enforced identity and remembered mode.
 Read-only inspection, cache refresh, session controls and rollback restoration
 remain available. To change enrollment through the CLI, an administrator first
 changes every applicable enforced assignment on the platform; a fresh signed
 response must confirm the less restrictive mode. Offline checks cannot authorize
 the change. A dedicated management-approval lease is not implemented.
+
+For an enrollment with no verified enforced history, login, logout and explicit
+unenrollment remain available when policy delivery is missing, unreachable or
+rejects the old device credentials. A fresh signed enforced response still
+blocks these commands. Invalid signatures and damaged caches remain errors.
+This recovery path grants no session startup authority: a failed first policy
+check continues to block launches, including explicit local profiles. A missing
+policy endpoint reports the enrolled URL and the two routes to check at the
+deployment edge; retry policy verification with `nono platform status --refresh`.
 
 ## Scope
 

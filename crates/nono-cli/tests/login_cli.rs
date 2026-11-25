@@ -179,7 +179,7 @@ fn reenrollment_without_local_registration_directs_to_normal_login() {
     let text = String::from_utf8(output.stdout).expect("text");
     assert!(text.contains("No enrollment to replace"), "{text}");
     assert!(
-        text.contains("re-enroll is only for revoked device enrollments"),
+        text.contains("revoked devices need platform operator restoration first"),
         "{text}"
     );
     assert!(

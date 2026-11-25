@@ -21,7 +21,7 @@ use crate::why_runtime::run_why;
 use crate::{DETACHED_LAUNCH_ENV, Result};
 
 pub(crate) fn run(cli: Cli) -> Result<()> {
-    crate::platform_policy::enforced::guard_command(&cli.command)?;
+    crate::platform_policy::enforced::guard_command(&cli.command, cli.silent)?;
     let mut update_handle = start_update_check_handle(&cli);
     dispatch_command(cli.command, cli.silent, &mut update_handle)
 }

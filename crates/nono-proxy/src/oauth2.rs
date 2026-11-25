@@ -52,6 +52,8 @@ pub struct OAuth2ExchangeConfig {
     pub client_id: Zeroizing<String>,
     pub client_secret: Zeroizing<String>,
     pub scope: String,
+    /// Extra form parameters appended to the token request body.
+    pub extra_params: Vec<(String, String)>,
 }
 
 /// Custom Debug that redacts secrets.
@@ -62,6 +64,14 @@ impl std::fmt::Debug for OAuth2ExchangeConfig {
             .field("client_id", &"[REDACTED]")
             .field("client_secret", &"[REDACTED]")
             .field("scope", &self.scope)
+            .field(
+                "extra_params",
+                &self
+                    .extra_params
+                    .iter()
+                    .map(|(k, _)| k.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -293,7 +303,12 @@ async fn exchange_token(
     let path_with_query = token_request_target(&parsed);
 
     // ── Build form body ──────────────────────────────────────────────────
-    let body = build_token_request_body(&config.client_id, &config.client_secret, &config.scope);
+    let body = build_token_request_body(
+        &config.client_id,
+        &config.client_secret,
+        &config.scope,
+        &config.extra_params,
+    );
 
     // ── Build HTTP/1.1 request ───────────────────────────────────────────
     let request = Zeroizing::new(format!(
@@ -435,6 +450,7 @@ fn build_token_request_body(
     client_id: &str,
     client_secret: &str,
     scope: &str,
+    extra_params: &[(String, String)],
 ) -> Zeroizing<String> {
     let mut body = Zeroizing::new(format!(
         "grant_type=client_credentials&client_id={}&client_secret={}",
@@ -444,7 +460,37 @@ fn build_token_request_body(
     if !scope.is_empty() {
         body.push_str(&format!("&scope={}", urlencoding::encode(scope)));
     }
+    append_form_params(&mut body, extra_params);
     body
+}
+
+/// Build the `jwt-bearer` token request body. `scope` is omitted when empty.
+fn build_jwt_bearer_request_body(
+    assertion: &str,
+    scope: &str,
+    extra_params: &[(String, String)],
+) -> Zeroizing<String> {
+    let mut body = Zeroizing::new(format!(
+        "grant_type={}&client_assertion_type={}&assertion={}",
+        urlencoding::encode("urn:ietf:params:oauth:grant-type:jwt-bearer"),
+        urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        urlencoding::encode(assertion),
+    ));
+    if !scope.is_empty() {
+        body.push_str(&format!("&scope={}", urlencoding::encode(scope)));
+    }
+    append_form_params(&mut body, extra_params);
+    body
+}
+
+fn append_form_params(body: &mut Zeroizing<String>, params: &[(String, String)]) {
+    for (k, v) in params {
+        body.push_str(&format!(
+            "&{}={}",
+            urlencoding::encode(k),
+            urlencoding::encode(v)
+        ));
+    }
 }
 
 /// Parse a standard OAuth2 token response JSON.
@@ -486,6 +532,7 @@ pub struct SpiffeAssertionTokenCache {
     jwt_source: Arc<crate::spiffe::SpiffeJwtSource>,
     token_url: String,
     assertion_audience: Vec<String>,
+    scope: String,
     extra_params: Vec<(String, String)>,
     tls_connector: TlsConnector,
     pub workload_spiffe_id: String,
@@ -505,6 +552,7 @@ impl SpiffeAssertionTokenCache {
         token_url: String,
         jwt_source: Arc<crate::spiffe::SpiffeJwtSource>,
         assertion_audience: Vec<String>,
+        scope: String,
         extra_params: Vec<(String, String)>,
         tls_connector: TlsConnector,
     ) -> Result<Self> {
@@ -512,6 +560,7 @@ impl SpiffeAssertionTokenCache {
             &token_url,
             &jwt_source,
             &assertion_audience,
+            &scope,
             &extra_params,
             &tls_connector,
         )
@@ -525,6 +574,7 @@ impl SpiffeAssertionTokenCache {
             jwt_source,
             token_url,
             assertion_audience,
+            scope,
             extra_params,
             tls_connector,
             workload_spiffe_id,
@@ -566,6 +616,7 @@ impl SpiffeAssertionTokenCache {
             &self.token_url,
             &self.jwt_source,
             &self.assertion_audience,
+            &self.scope,
             &self.extra_params,
             &self.tls_connector,
         )
@@ -601,24 +652,12 @@ async fn exchange_jwt_assertion(
     token_url: &str,
     jwt_source: &crate::spiffe::SpiffeJwtSource,
     audience: &[String],
+    scope: &str,
     extra_params: &[(String, String)],
     tls_connector: &TlsConnector,
 ) -> Result<(Zeroizing<String>, Duration, String)> {
     let (assertion, spiffe_id) = jwt_source.fetch_token(audience).await?;
-
-    let mut body = Zeroizing::new(format!(
-        "grant_type={}&client_assertion_type={}&assertion={}",
-        urlencoding::encode("urn:ietf:params:oauth:grant-type:jwt-bearer"),
-        urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
-        urlencoding::encode(assertion.as_str()),
-    ));
-    for (k, v) in extra_params {
-        body.push_str(&format!(
-            "&{}={}",
-            urlencoding::encode(k),
-            urlencoding::encode(v)
-        ));
-    }
+    let body = build_jwt_bearer_request_body(assertion.as_str(), scope, extra_params);
 
     let parsed = url::Url::parse(token_url)
         .map_err(|e| ProxyError::OAuth2Exchange(format!("invalid token_url '{token_url}': {e}")))?;
@@ -862,7 +901,7 @@ mod tests {
 
     #[test]
     fn test_build_token_request_body() {
-        let body = build_token_request_body("my-client", "s3cret!", "read write");
+        let body = build_token_request_body("my-client", "s3cret!", "read write", &[]);
         assert!(body.contains("grant_type=client_credentials"));
         assert!(body.contains("client_id=my-client"));
         assert!(body.contains("client_secret=s3cret%21"));
@@ -871,11 +910,60 @@ mod tests {
 
     #[test]
     fn test_build_token_request_body_no_scope() {
-        let body = build_token_request_body("cid", "csec", "");
+        let body = build_token_request_body("cid", "csec", "", &[]);
         assert!(body.contains("grant_type=client_credentials"));
         assert!(body.contains("client_id=cid"));
         assert!(body.contains("client_secret=csec"));
         assert!(!body.contains("scope="), "empty scope should be omitted");
+    }
+
+    #[test]
+    fn test_build_token_request_body_appends_extra_params() {
+        let extra = vec![
+            (
+                "audience".to_string(),
+                "https://tenant.example.com/api/v2/".to_string(),
+            ),
+            ("organization".to_string(), "org_123".to_string()),
+        ];
+        let body = build_token_request_body("cid", "csec", "read", &extra);
+        assert_eq!(
+            body.as_str(),
+            "grant_type=client_credentials&client_id=cid&client_secret=csec&scope=read\
+             &audience=https%3A%2F%2Ftenant.example.com%2Fapi%2Fv2%2F&organization=org_123"
+        );
+    }
+
+    #[test]
+    fn test_build_jwt_bearer_request_body_sends_scope_and_extra_params() {
+        let extra = vec![("tenant".to_string(), "t1".to_string())];
+        let body = build_jwt_bearer_request_body("a.b.c", "read write", &extra);
+        assert_eq!(
+            body.as_str(),
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer\
+             &client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer\
+             &assertion=a.b.c&scope=read%20write&tenant=t1"
+        );
+    }
+
+    #[test]
+    fn test_build_jwt_bearer_request_body_no_scope() {
+        let body = build_jwt_bearer_request_body("a.b.c", "", &[]);
+        assert!(!body.contains("scope="), "empty scope should be omitted");
+    }
+
+    #[test]
+    fn test_exchange_config_debug_omits_extra_param_values() {
+        let config = OAuth2ExchangeConfig {
+            token_url: "https://auth.example.com/oauth/token".to_string(),
+            client_id: Zeroizing::new("cid".to_string()),
+            client_secret: Zeroizing::new("csec".to_string()),
+            scope: String::new(),
+            extra_params: vec![("audience".to_string(), "aud-value".to_string())],
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("audience"));
+        assert!(!debug.contains("aud-value"));
     }
 
     // ── parse_status_code ────────────────────────────────────────────────
@@ -972,6 +1060,7 @@ mod tests {
             client_id: Zeroizing::new("test-client".to_string()),
             client_secret: Zeroizing::new("test-secret".to_string()),
             scope: String::new(),
+            extra_params: Vec::new(),
         };
         let result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1022,6 +1111,7 @@ mod tests {
             client_id: Zeroizing::new("test-client".to_string()),
             client_secret: Zeroizing::new("test-secret".to_string()),
             scope: String::new(),
+            extra_params: Vec::new(),
         };
         let registry = SecretRegistry::new();
         // Already expired, so the next use refreshes.
@@ -1050,6 +1140,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_refresh_sends_extra_params() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+            let json = r#"{"access_token":"refreshed-token","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            reader
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+            reader.get_mut().shutdown().await.unwrap();
+            body
+        });
+
+        let config = OAuth2ExchangeConfig {
+            token_url: format!("http://{addr}/oauth/token"),
+            client_id: Zeroizing::new("test-client".to_string()),
+            client_secret: Zeroizing::new("test-secret".to_string()),
+            scope: String::new(),
+            extra_params: vec![(
+                "audience".to_string(),
+                "https://api.example.com/".to_string(),
+            )],
+        };
+        // Already expired, so the next use refreshes.
+        let cache = TokenCache::new_from_parts(
+            config,
+            make_test_tls_connector(),
+            "initial-token",
+            Duration::ZERO,
+        );
+
+        let token = tokio::time::timeout(Duration::from_secs(5), cache.get_or_refresh())
+            .await
+            .unwrap();
+        let body = server.await.unwrap();
+        assert_eq!(token.as_str(), "refreshed-token");
+        assert_eq!(
+            body,
+            b"grant_type=client_credentials&client_id=test-client&client_secret=test-secret\
+              &audience=https%3A%2F%2Fapi.example.com%2F"
+        );
+    }
+
+    #[tokio::test]
     async fn test_cache_without_registry_is_unchanged() {
         let cache = make_test_cache("plain-token", Duration::from_secs(3600));
         assert_eq!(cache.get_or_refresh().await.as_str(), "plain-token");
@@ -1064,6 +1219,7 @@ mod tests {
             client_id: Zeroizing::new("test-client".to_string()),
             client_secret: Zeroizing::new("test-secret".to_string()),
             scope: String::new(),
+            extra_params: Vec::new(),
         };
 
         TokenCache::new_from_parts(config, make_test_tls_connector(), token, ttl)

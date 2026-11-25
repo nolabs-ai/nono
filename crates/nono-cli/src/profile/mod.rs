@@ -943,9 +943,12 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
 /// - `client_id` must not be empty
 /// - `client_secret` must not be empty and must be a credential reference
 ///   (env://, file://, op://, bw://, apple-password://) or plain value
+/// - `extra_params` must not repeat a parameter nono sets
 fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
     // Validate token_url — same rules as upstream URL (HTTPS or loopback HTTP)
     validate_upstream_url(&auth.token_url, &format!("{}/auth.token_url", name))?;
+    nono_proxy::config::validate_oauth2_extra_params(&auth.extra_params)
+        .map_err(|e| NonoError::ProfileParse(format!("custom credential '{}': {}", name, e)))?;
 
     // When using client_assertion, client_id/client_secret are not required,
     // but the assertion config itself must have valid fields.
@@ -7371,6 +7374,40 @@ mod tests {
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("client_secret with client_assertion should be rejected");
         assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn test_validate_oauth2_extra_params_reserved_key_rejected() {
+        let mut cred = oauth2_cred_builder();
+        cred.auth = Some(OAuth2Config {
+            token_url: "https://auth.example.com/oauth/token".to_string(),
+            client_id: "my-client".to_string(),
+            client_secret: "env://SECRET".to_string(),
+            scope: String::new(),
+            client_assertion: None,
+            extra_params: [("client_secret".to_string(), "other".to_string())].into(),
+        });
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("reserved extra_params key should be rejected");
+        assert!(err.to_string().contains("client_secret"));
+    }
+
+    #[test]
+    fn test_validate_oauth2_extra_params_extension_allowed() {
+        let mut cred = oauth2_cred_builder();
+        cred.auth = Some(OAuth2Config {
+            token_url: "https://auth.example.com/oauth/token".to_string(),
+            client_id: "my-client".to_string(),
+            client_secret: "env://SECRET".to_string(),
+            scope: String::new(),
+            client_assertion: None,
+            extra_params: [(
+                "audience".to_string(),
+                "https://tenant.example.com/api/v2/".to_string(),
+            )]
+            .into(),
+        });
+        assert!(validate_custom_credential("test", &cred).is_ok());
     }
 
     #[test]

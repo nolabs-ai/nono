@@ -480,17 +480,14 @@ impl CredentialStore {
                         }
                     };
 
-                    let extra_params: Vec<(String, String)> = oauth2
-                        .extra_params
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
+                    let extra_params = sorted_extra_params(&oauth2.extra_params);
 
                     match tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(SpiffeAssertionTokenCache::new(
                             oauth2.token_url.clone(),
                             jwt_source,
                             audience.clone(),
+                            oauth2.scope.clone(),
                             extra_params,
                             tls_connector.clone(),
                         ))
@@ -569,6 +566,7 @@ impl CredentialStore {
                         client_id,
                         client_secret,
                         scope: oauth2.scope.clone(),
+                        extra_params: sorted_extra_params(&oauth2.extra_params),
                     };
 
                     match TokenCache::new(config, tls_connector.clone()).await {
@@ -791,6 +789,16 @@ const KEYRING_SERVICE: &str = nono::keystore::DEFAULT_SERVICE;
 
 const KEYRING_TIMEOUT_HINT: &str = " Set NONO_KEYRING_TIMEOUT_SECS=N (default 120) to wait longer for keychain unlock; 0 disables the timeout.";
 
+/// Token-request extra params in key order, so the request body is deterministic.
+fn sorted_extra_params(
+    params: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut sorted: Vec<(String, String)> =
+        params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    sorted.sort();
+    sorted
+}
+
 /// Redact a credential reference for safe display in warnings.
 ///
 /// Delegates to the appropriate URI-specific redaction helper so that
@@ -971,6 +979,27 @@ mod tests {
         .with_root_certificates(root_store)
         .with_no_client_auth();
         TlsConnector::from(Arc::new(tls_config))
+    }
+
+    #[test]
+    fn test_sorted_extra_params_orders_by_key() {
+        let params = std::collections::HashMap::from([
+            ("organization".to_string(), "org_123".to_string()),
+            (
+                "audience".to_string(),
+                "https://api.example.com/".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            sorted_extra_params(&params),
+            vec![
+                (
+                    "audience".to_string(),
+                    "https://api.example.com/".to_string()
+                ),
+                ("organization".to_string(), "org_123".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1507,6 +1536,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_oauth2_sends_extra_params() {
+        use crate::config::OAuth2Config;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let _env = {
+            let _lock = ENV_LOCK.lock().unwrap();
+            EnvVarGuard::set_all(&[
+                ("TEST_OAUTH2_EXTRA_CLIENT_ID", "test-client"),
+                ("TEST_OAUTH2_EXTRA_CLIENT_SECRET", "test-secret"),
+            ])
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+            let json = r#"{"access_token":"extra-params-token","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            reader
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+            reader.get_mut().shutdown().await.unwrap();
+            body
+        });
+
+        let routes = vec![RouteConfig {
+            prefix: "my-api".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            oauth2: Some(OAuth2Config {
+                token_url: format!("http://{addr}/oauth/token"),
+                client_id: "env://TEST_OAUTH2_EXTRA_CLIENT_ID".to_string(),
+                client_secret: "env://TEST_OAUTH2_EXTRA_CLIENT_SECRET".to_string(),
+                scope: "api.read".to_string(),
+                client_assertion: None,
+                extra_params: std::collections::HashMap::from([
+                    ("resource".to_string(), "urn:example:api".to_string()),
+                    (
+                        "audience".to_string(),
+                        "https://api.example.com/".to_string(),
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        }];
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            CredentialStore::load_with_diagnostics(&routes, &test_tls_connector(), None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = server.await.unwrap();
+
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "grant_type=client_credentials&client_id=test-client&client_secret=test-secret\
+             &scope=api.read&audience=https%3A%2F%2Fapi.example.com%2F&resource=urn%3Aexample%3Aapi"
+        );
+        let route = outcome.store.get_oauth2("my-api").unwrap();
+        assert_eq!(
+            route.cache.get_or_refresh().await.as_str(),
+            "extra-params-token"
+        );
+    }
+
+    #[tokio::test]
     async fn test_load_oauth2_unreachable_endpoint_skips_route() {
         use crate::config::OAuth2Config;
 
@@ -1726,6 +1841,7 @@ mod tests {
             client_id: Zeroizing::new("test-client".to_string()),
             client_secret: Zeroizing::new("test-secret".to_string()),
             scope: String::new(),
+            extra_params: Vec::new(),
         };
 
         TokenCache::new_from_parts(config, test_tls_connector(), token, ttl)

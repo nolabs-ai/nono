@@ -365,6 +365,12 @@ impl RouteStore {
                 )));
             }
 
+            if let Some(oauth2) = &route.oauth2 {
+                crate::config::validate_oauth2_extra_params(&oauth2.extra_params).map_err(|e| {
+                    ProxyError::Config(format!("route '{}': {}", normalized_prefix, e))
+                })?;
+            }
+
             // A session phantom is only validated on routes that inject a
             // credential; elsewhere the field would be silently ignored.
             let phantom_template = match route.phantom_format.as_deref() {
@@ -1658,6 +1664,26 @@ mod tests {
                 "{aws_auth}: expected config error, got {err:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn oauth2_reserved_extra_params_rejected_by_route_store() {
+        let route: RouteConfig = serde_json::from_value(serde_json::json!({
+            "prefix": "api",
+            "upstream": "https://api.example.com",
+            "oauth2": {
+                "token_url": "https://auth.example.com/oauth/token",
+                "client_id": "cid",
+                "client_secret": "env://SECRET",
+                "extra_params": {"grant_type": "password"},
+            },
+        }))
+        .unwrap();
+        let err = RouteStore::load(&[route]).await.err();
+        assert!(
+            matches!(err, Some(ProxyError::Config(ref m)) if m.contains("grant_type")),
+            "expected config error, got {err:?}"
+        );
     }
 
     #[tokio::test]

@@ -85,8 +85,10 @@ Use `auth.client_assertion` instead of the `spiffe` block for this flow:
 ```
 
 When `client_assertion` is set, `client_id` and `client_secret` are not required — the JWT-SVID
-is the credential. Any extra parameters required by the token endpoint (such as federation rule IDs
-or workspace identifiers) can be passed via `auth.extra_params`:
+is the credential. `auth.scope` is sent when set. Any extra parameters required by the token
+endpoint (such as federation rule IDs or workspace identifiers) can be passed via
+`auth.extra_params` (see [OAuth2 token request parameters](/cli/features/credential-injection#oauth2-token-request-parameters)
+for the rules):
 
 ```json
 "auth": {

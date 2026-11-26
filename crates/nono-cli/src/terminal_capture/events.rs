@@ -11,6 +11,7 @@ use serde_json::json;
 pub(crate) enum OutputStream {
     Pty,
     Stderr,
+    Stdout,
 }
 
 impl OutputStream {
@@ -19,6 +20,7 @@ impl OutputStream {
         match self {
             Self::Pty => 0,
             Self::Stderr => 1,
+            Self::Stdout => 2,
         }
     }
 
@@ -26,12 +28,16 @@ impl OutputStream {
         match self {
             Self::Pty => "pty",
             Self::Stderr => "stderr",
+            Self::Stdout => "stdout",
         }
     }
 }
 
-/// Redactor slot for input.
-pub(crate) const INPUT_STREAM: usize = 2;
+/// Redactor slot for input (matches `Writer::carries[3]`).
+pub(crate) const INPUT_STREAM: usize = 3;
+
+/// Total independent capture streams (`Pty`, `Stderr`, `Stdout`, `Input`).
+pub(crate) const STREAM_COUNT: usize = 4;
 
 /// Terminal notifications seen by the screen model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

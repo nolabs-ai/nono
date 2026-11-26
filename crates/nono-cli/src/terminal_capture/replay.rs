@@ -14,7 +14,7 @@
 //! screen out of step with the model; the top-left part that fits is shown.
 //! Resizing the terminal during a replay redraws the screen at the new size.
 
-use super::recording::{CastEvent, Recording, parse_marker};
+use super::recording::{CastEvent, Recording, normalize_lf_for_vt100, parse_marker};
 use nono::{NonoError, Result};
 use std::io::Write;
 use std::num::NonZeroU16;
@@ -238,6 +238,8 @@ struct Replayer<'a> {
     /// The recorded terminal was resized since the last draw.
     resized: bool,
     shown_any: bool,
+    normalize_lf: bool,
+    prev_cr: bool,
 }
 
 impl<'a> Replayer<'a> {
@@ -253,12 +255,21 @@ impl<'a> Replayer<'a> {
             last_time: None,
             resized: false,
             shown_any: false,
+            normalize_lf: !recording.is_pty(),
+            prev_cr: false,
         })
     }
 
     fn apply(&mut self, event: &CastEvent) {
         match event {
-            CastEvent::Output { data, .. } => self.parser.process(data.as_bytes()),
+            CastEvent::Output { data, .. } => {
+                if self.normalize_lf {
+                    let normalized = normalize_lf_for_vt100(data, &mut self.prev_cr);
+                    self.parser.process(normalized.as_bytes());
+                } else {
+                    self.parser.process(data.as_bytes());
+                }
+            }
             CastEvent::Resize { cols, rows, .. } => {
                 self.parser.set_size(size(*rows), size(*cols));
                 self.resized = true;
@@ -631,5 +642,23 @@ mod tests {
         );
         assert!(ReplayStart::parse("1::x").is_ok_and(|s| matches!(s, ReplayStart::Marker(_))));
         assert!(ReplayStart::parse("1:.:").is_err());
+    }
+
+    #[test]
+    fn non_pty_replay_normalizes_bare_lf() {
+        let rec = Recording {
+            header: serde_json::json!({ "nono": { "pty": false } }),
+            cols: 20,
+            rows: 4,
+            events: vec![out(0.0, "alpha\nbeta\n")],
+            report: Default::default(),
+        };
+        let rendered = frames(&rec, &options(ReplayStart::Beginning), Some((20, 4))).unwrap();
+        let mut viewer = vt100::Parser::new(size(4), size(20), 0);
+        viewer.process(rendered[0].1.as_bytes());
+        assert_eq!(
+            viewer.screen().rows(0, 20).take(2).collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
     }
 }

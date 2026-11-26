@@ -103,7 +103,7 @@ refuses to start, and an optional one is skipped with a warning.
 |-------|---------|
 | `enabled` | Record the session's terminal. |
 | `required` | Stop the session rather than run it unrecorded. Implies `enabled`. |
-| `input` | `on` records typed input; `off` records only that input happened. Defaults to `on`. |
+| `input` | `on` records typed input; `off` records only that input happened. Defaults to `on` for terminal sessions and `off` for non-terminal (pipe) sessions. |
 | `max_bytes` | Uncompressed size at which the recording stops. Defaults to 256 MiB. |
 | `file` | Also write the recording to this file (see below). Implies `enabled`. |
 | `delivery` | Upload the recording as it is made (see below). Implies `enabled`. |
@@ -190,5 +190,5 @@ The wire format is specified in the
 
 ## Current limits
 
-- Only sessions with a terminal are recorded.
+- Sessions without a terminal (piped or headless stdio) record `stdout` and `stderr` only by default (`input` defaults to `off`); password-mode suppression requires a terminal (`termios`), so enabling `input: "on"` on pipe sessions captures forwarded stdin without password-prompt detection.
 - Input from `nono attach` clients is attributed as `attach:<n>`.

@@ -26,7 +26,7 @@ pub(crate) use settings::RecordingSettings;
 
 use events::{
     CaptureEvent, INPUT_STREAM, Lifecycle, NotificationKind, OutputStream, ProtectedEvent,
-    SessionEnd,
+    STREAM_COUNT, SessionEnd,
 };
 use nono::{NonoError, Result};
 use nono_proxy::SecretRegistry;
@@ -149,10 +149,13 @@ pub(crate) fn start_for_session(ctx: SessionCaptureContext<'_>) -> Result<Option
     let Some((audit_session_id, audit_session_dir, audit)) = ctx.audit else {
         return fail("the audit log is disabled".to_string());
     };
-    let Some(initial_size) = ctx.pty_size else {
-        return fail("the session has no terminal".to_string());
-    };
-    let input = ctx.settings.input.unwrap_or(InputCapture::On);
+    let pty = ctx.pty_size.is_some();
+    let initial_size = ctx.pty_size.flatten();
+    let input = ctx.settings.input.unwrap_or(if pty {
+        InputCapture::On
+    } else {
+        InputCapture::Off
+    });
     let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
     let mut files = Vec::new();
     for path in &ctx.settings.files {
@@ -198,7 +201,7 @@ pub(crate) fn start_for_session(ctx: SessionCaptureContext<'_>) -> Result<Option
         session_id: ctx.session_id.to_string(),
         audit_session_id: audit_session_id.to_string(),
         audit_session_dir: audit_session_dir.to_path_buf(),
-        pty: true,
+        pty,
         input,
         required,
         max_bytes: ctx.settings.max_bytes,
@@ -319,7 +322,7 @@ impl TerminalCapture {
         audit: SharedAuditRecorder,
         extra_sinks: Vec<Box<dyn Sink>>,
     ) -> Result<Self> {
-        let redactor = Redactor::new(registry, 3)?;
+        let redactor = Redactor::new(registry, STREAM_COUNT)?;
         let fatal: FatalSlot = Arc::new(Mutex::new(None));
         let mut sinks: Vec<Box<dyn Sink>> =
             vec![Box::new(AuditLinkSink::new(audit.clone(), config.required))];
@@ -634,12 +637,15 @@ impl TerminalCapture {
                 bytes: protected.bytes,
             }
         } else {
+            let stream = if stream == OutputStream::Stderr.index() {
+                OutputStream::Stderr
+            } else if stream == OutputStream::Stdout.index() {
+                OutputStream::Stdout
+            } else {
+                OutputStream::Pty
+            };
             CaptureEvent::Output {
-                stream: if stream == OutputStream::Stderr.index() {
-                    OutputStream::Stderr
-                } else {
-                    OutputStream::Pty
-                },
+                stream,
                 bytes: protected.bytes,
             }
         };
@@ -675,7 +681,7 @@ impl TerminalCapture {
         if let Err(e) = self.activate() {
             tracing::warn!("{e}");
         }
-        for stream in 0..3 {
+        for stream in 0..STREAM_COUNT {
             self.end_stream(stream);
         }
         self.emit(
@@ -1110,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn required_recording_without_audit_or_terminal_refuses_to_start() {
+    fn required_recording_without_audit_refuses_to_start() {
         let h = Harness::new();
         let required = settings(true, Vec::new());
         let no_audit = start_for_session(SessionCaptureContext {
@@ -1121,14 +1127,6 @@ mod tests {
             registry: &h.registry,
         });
         assert!(no_audit.is_err());
-        let no_pty = start_for_session(SessionCaptureContext {
-            settings: &required,
-            session_id: "s",
-            audit: Some(("a", h.dir.path(), &h.audit)),
-            pty_size: None,
-            registry: &h.registry,
-        });
-        assert!(no_pty.is_err());
 
         let optional = settings(false, Vec::new());
         let skipped = start_for_session(SessionCaptureContext {
@@ -1143,6 +1141,60 @@ mod tests {
         assert!(check_unsupervised(Some(&required)).is_err());
         assert!(check_unsupervised(Some(&optional)).is_ok());
         assert!(check_unsupervised(None).is_ok());
+    }
+
+    #[test]
+    fn pipe_session_starts_with_pty_false_and_input_off_by_default() {
+        let h = Harness::new();
+        let optional = settings(false, Vec::new());
+        let mut capture = start_for_session(SessionCaptureContext {
+            settings: &optional,
+            session_id: "s-pipe",
+            audit: Some(("a", h.dir.path(), &h.audit)),
+            pty_size: None,
+            registry: &h.registry,
+        })
+        .unwrap()
+        .expect("pipe capture starts");
+        assert_eq!(capture.input_mode(), InputCapture::Off);
+        capture.activate().unwrap();
+        capture.output(OutputStream::Stdout, b"hello stdout\n");
+        capture.output(OutputStream::Stderr, b"hello stderr\n");
+        capture.finish("exited:0".to_string());
+
+        let recording = h.recording();
+        let header: serde_json::Value =
+            serde_json::from_str(recording.lines().next().unwrap()).unwrap();
+        assert_eq!(header["nono"]["pty"], false);
+        assert_eq!(header["nono"]["capture"]["input"], "off");
+        assert_eq!(
+            data_of(&lines(&recording), "o"),
+            "hello stdout\nhello stderr\n"
+        );
+    }
+
+    #[test]
+    fn interleaved_stdout_and_stderr_redact_independently() {
+        let h = Harness::new();
+        let mut config = h.config();
+        config.pty = false;
+        config.initial_size = None;
+        config.input = InputCapture::Off;
+        let mut capture = h.start(config);
+
+        let (a, b) = SECRET.split_at(12);
+        capture.output(OutputStream::Stdout, format!("out: {a}").as_bytes());
+        capture.output(OutputStream::Stderr, b"err: unrelated\n");
+        capture.output(OutputStream::Stdout, format!("{b}\n").as_bytes());
+        let summary = capture.finish("exited:0".to_string());
+
+        let recording = h.recording();
+        assert!(!recording.contains(SECRET));
+        assert!(!recording.contains(a));
+        assert!(!recording.contains(b));
+        assert!(recording.contains("[redacted:credential:GITHUB_TOKEN]"));
+        assert!(recording.contains("err: unrelated"));
+        assert_eq!(summary.writer.redactions, 1);
     }
 
     #[test]

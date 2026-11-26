@@ -232,6 +232,47 @@ pub(crate) struct Recording {
     pub(crate) report: RecordingReport,
 }
 
+impl Recording {
+    /// Whether the recorded session ran under a PTY (`true` when absent for
+    /// compatibility with external asciicast headers).
+    pub(crate) fn is_pty(&self) -> bool {
+        self.header["nono"]["pty"].as_bool().unwrap_or(true)
+    }
+}
+
+/// Expand bare `\n` to `\r\n` for non-PTY recordings before feeding `vt100::Parser`,
+/// which otherwise treats LF as line-feed without carriage return.
+pub(crate) fn normalize_lf_for_vt100<'a>(
+    data: &'a str,
+    prev_cr: &mut bool,
+) -> std::borrow::Cow<'a, str> {
+    let mut needs_rewrite = false;
+    let mut scan_prev_cr = *prev_cr;
+    for b in data.bytes() {
+        if b == b'\n' && !scan_prev_cr {
+            needs_rewrite = true;
+            break;
+        }
+        scan_prev_cr = b == b'\r';
+    }
+    if !needs_rewrite {
+        if let Some(last) = data.bytes().last() {
+            *prev_cr = last == b'\r';
+        }
+        return std::borrow::Cow::Borrowed(data);
+    }
+
+    let mut out = String::with_capacity(data.len() + 8);
+    for ch in data.chars() {
+        if ch == '\n' && !*prev_cr {
+            out.push('\r');
+        }
+        out.push(ch);
+        *prev_cr = ch == '\r';
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Load a recording for replay or transcript. Refuses a recording that
 /// fails verification, so nothing is shown from altered chunks.
 pub(crate) fn load(session_dir: &Path) -> Result<Recording> {

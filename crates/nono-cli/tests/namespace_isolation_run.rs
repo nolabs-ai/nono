@@ -155,6 +155,94 @@ for label, headers in [("anonymous", {}), ("authenticated", auth)]:
     assert!(stdout.contains("authenticated 403"), "{stdout}");
 }
 
+/// Tries UDP egress, then a request through the process's own proxy. Prints `UDP <result>` and `PROXY <status>`.
+const UDP_PROXY_PROBE: &str = r#"
+import base64, errno, http.client, os, socket, urllib.parse
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("192.0.2.1", 53)); print("UDP sent")
+except OSError as e:
+    print("UDP", errno.errorcode.get(e.errno, str(e.errno)))
+u = urllib.parse.urlparse(os.environ["HTTP_PROXY"])
+auth = {"Proxy-Authorization": "Basic " + base64.b64encode(f"{u.username}:{u.password}".encode()).decode()}
+c = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
+c.request("GET", "http://denied.invalid/", headers=auth)
+print("PROXY", c.getresponse().status)
+"#;
+
+#[test]
+fn proxied_session_creates_udp_sockets_only_when_isolated() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+    for (profile, udp) in [
+        (PROXIED_ISOLATED, "UDP EACCES"),
+        (
+            r#"{"meta":{"name":"iso-proxied"},"network":{"allow_domain":["example.com"]}}"#,
+            "UDP EPERM",
+        ),
+    ] {
+        let t = nono_test!("iso-session-udp");
+        let profile = t.write_profile("iso-proxied", profile);
+        let completed = t
+            .run()
+            .profile(&profile)
+            .exec(Argv::new(&py).arg("-c").arg(UDP_PROXY_PROBE));
+        if host_unsupported(&completed) {
+            return;
+        }
+        let completed = completed.assert_success("proxied session runs");
+        let stdout = completed.stdout();
+        assert!(stdout.contains(udp), "{stdout}");
+        assert!(
+            stdout.contains("PROXY 403"),
+            "session proxy reachable: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn isolated_command_sandbox_gets_namespace_confined_udp() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+    for (isolate, udp) in [
+        (
+            r#""linux":{"isolate":{"network":true}},"#,
+            "UDP ENETUNREACH",
+        ),
+        ("", "UDP EPERM"),
+    ] {
+        let t = nono_test!("iso-command");
+        let profile = t.write_profile(
+            "iso-command",
+            &format!(
+                r#"{{"meta":{{"name":"iso-command"}},"workdir":{{"access":"read"}},
+                "network":{{"allow_domain":["example.com"]}},{isolate}
+                "command_policies":{{"commands":{{"python3":{{"executable":"{py}",
+                "sandbox":{{"fs_read":["/usr"],"network":{{"allow_domain":["example.org"]}}}}}}}}}}}}"#
+            ),
+        );
+        let completed = t
+            .run()
+            .profile(&profile)
+            .allow_cwd()
+            .no_rollback()
+            .exec(Argv::new("python3").arg("-c").arg(UDP_PROXY_PROBE));
+        if host_unsupported(&completed) {
+            return;
+        }
+        let completed = completed.assert_success("mediated command runs");
+        let stdout = completed.stdout();
+        assert!(stdout.contains(udp), "{stdout}");
+        assert!(
+            stdout.contains("PROXY 403"),
+            "scoped proxy reachable: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn isolated_network_rejects_unrestricted_network() {
     let t = nono_test!("iso-allow-all");
@@ -217,7 +305,7 @@ try:
 except OSError as e:
     print("EGRESS", name(e))
 try:
-    socket.socket(socket.AF_INET, socket.SOCK_DGRAM); print("UDP open")
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("192.0.2.1", 53)); print("UDP sent")
 except OSError as e:
     print("UDP", name(e))
 proxy = os.environ.get("HTTP_PROXY")
@@ -252,7 +340,10 @@ fn isolated_loopback_allows_local_tcp_without_egress() {
         !stdout.contains("EGRESS open"),
         "no route out of the namespace: {stdout}"
     );
-    assert!(stdout.contains("UDP EPERM"), "UDP stays denied: {stdout}");
+    assert!(
+        stdout.contains("UDP EPERM"),
+        "UDP stays denied in loopback mode: {stdout}"
+    );
 }
 
 #[test]
@@ -879,4 +970,78 @@ fn isolated_network_rejects_command_callback_ports() {
         .exec(Argv::new("/bin/true"))
         .assert_failure("command callback ports are a configuration error under isolation")
         .assert_stderr_contains("host localhost ports are unreachable: vault");
+}
+
+const UDP_CONFINEMENT_PROBE: &str = r#"
+import errno, socket, sys
+def attempt(label, action):
+    try:
+        print(label, action())
+    except OSError as e:
+        print(label, errno.errorcode.get(e.errno, str(e.errno)))
+def round_trip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.bind(("127.0.0.1", 0)); s.settimeout(5)
+    s.sendto(b"ping", s.getsockname())
+    return s.recvfrom(16)[0].decode()
+attempt("LOCAL", round_trip)
+attempt("HOST", lambda: socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"escape", ("127.0.0.1", int(sys.argv[1]))))
+"#;
+
+#[test]
+fn isolated_udp_stays_in_the_namespace() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+    let host = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind host UDP listener");
+    host.set_nonblocking(true)
+        .expect("nonblocking host listener");
+    let port = host
+        .local_addr()
+        .expect("host listener address")
+        .port()
+        .to_string();
+    let t = nono_test!("iso-udp-confined");
+    let profile = t.write_profile(
+        "iso-command",
+        &format!(
+            r#"{{"meta":{{"name":"iso-command"}},"workdir":{{"access":"read"}},
+            "network":{{"allow_domain":["example.com"]}},"linux":{{"isolate":{{"network":true}}}},
+            "command_policies":{{"commands":{{"python3":{{"executable":"{py}",
+            "sandbox":{{"fs_read":["/usr"],"network":{{"allow_domain":["example.org"]}}}}}}}}}}}}"#
+        ),
+    );
+    let script = format!(
+        "{py} -c '{UDP_CONFINEMENT_PROBE}' {port} | sed 's/^/AGENT /'; python3 -c '{UDP_CONFINEMENT_PROBE}' {port} | sed 's/^/COMMAND /'"
+    );
+    let completed = t
+        .run()
+        .profile(&profile)
+        .allow_cwd()
+        .no_rollback()
+        .exec(Argv::new("/bin/sh").arg("-c").arg(script));
+    if host_unsupported(&completed) {
+        return;
+    }
+    let stdout = completed
+        .assert_success("isolated UDP probes run")
+        .stdout()
+        .to_string();
+    for expected in [
+        "AGENT LOCAL EACCES",
+        "AGENT HOST EACCES",
+        "COMMAND LOCAL ping",
+        "COMMAND HOST 6",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l == expected),
+            "{expected}: {stdout}"
+        );
+    }
+    let mut buf = [0u8; 16];
+    assert!(
+        host.recv_from(&mut buf).is_err(),
+        "datagram reached the host: {stdout}"
+    );
 }

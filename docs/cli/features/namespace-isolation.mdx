@@ -132,7 +132,7 @@ With `loopback`, the command can bind, listen, and connect on any TCP port on `1
 
 - Nothing on the host can connect to these listeners, and the command still cannot reach host localhost services.
 - Egress is unchanged: the only way out is still the nono proxy, with the same filtering and authentication.
-- UDP, raw sockets, and netlink stay denied.
+- UDP sockets, raw sockets and netlink stay denied.
 - The proxy port is already held by nono's bridge listener, so the command cannot take it over.
 
 `loopback` requires `net`; on its own it is a startup error, because without the namespace it would reach the host's localhost. `--open-port`, `--listen-port`, and `--allow-connect-port` stay rejected under isolation, because they refer to the host's localhost, not the namespace's.
@@ -144,6 +144,8 @@ The isolated network has no route to the host or the internet. The only way out 
 - **Network blocking:**`--block-net` results in no proxy and no bridge - loopback only.
 - **Proxied networking:** `--allow-domain`, `--network-profile`, credentials etc: A loopback listener *inside* the namespace on the proxy's port which is served from the supervisor.
 
+Without `loopback`, proxied networking lets the command create UDP sockets, for example for JVM interface discovery, but no datagram leaves the namespace. Without isolation, proxied mode denies UDP sockets.
+
 Because the namespace has no other way out, the following combinations produce **startup errors** for safe informative failure, rather than silent.
 
 | Combination | Why it fails |
@@ -153,6 +155,18 @@ Because the namespace has no other way out, the following combinations produce *
 | `--allow-connect-port` / `network.connect_port` | Direct outbound TCP has no route. |
 | `--listen-port` / `network.listen_port` | Listeners inside the namespace cannot be reached from the host. |
 | `network.no_proxy` | Hosts that bypass the proxy cannot be reached directly. |
+
+## Mediated commands
+
+With `network` isolation, a [`command_policies`](/cli/features/tool-sandbox) command whose network is its [command-scoped proxy](/cli/features/tool-sandbox#command-scoped-proxy-policy) runs inside the session's network namespace. Before the session starts, nono bridges each command proxy into the namespace on that proxy's port.
+
+- The command can create UDP sockets, for example for JVM interface discovery. Datagrams reach only the namespace's own loopback.
+- The session shares that loopback, so the session and the command can exchange UDP datagrams.
+- Its `open_port` listeners exist only inside the namespace, so the host cannot reach them.
+- A command with `allow_all`, `tcp_connect_ports`, or `tcp_bind_ports` keeps the host network. There UDP stays denied unless the command has `allow_all`.
+- With `loopback`, every command keeps the host network, because the session could otherwise reach the command proxy bridges.
+
+If nono cannot join the namespace, the command does not run.
 
 ## Merging and precedence
 

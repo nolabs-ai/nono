@@ -890,8 +890,11 @@ fn prepare_launcher_command(
     let binary_fd = open_and_verify_binary(binary, spec)?;
     let caps = caps_from_spec(&spec.caps)?;
     let abi = Sandbox::detect_abi()?;
-    let sandbox =
-        Sandbox::prepare_seccomp_with_abi(&caps, &abi, nono::SeccompOpts::network_baseline())?;
+    let sandbox = Sandbox::prepare_seccomp_with_abi(
+        &caps,
+        &abi,
+        nono::SeccompOpts::network_baseline().with_mediated_udp(spec.session_netns),
+    )?;
     let exec_paths: Vec<PathBuf> = spec
         .allowed_exec_paths
         .iter()

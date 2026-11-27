@@ -1,0 +1,95 @@
+---
+title: Running nono on Kubernetes
+description: Run sandboxed agents as pods with restricted security settings, credential injection, and a network allow-list
+---
+
+nono runs inside a pod with no privileged mode and no added capabilities, so it works under the `restricted` Pod Security Standard. Kubernetes isolates the agent from the cluster and node. nono limits what the agent can touch inside the pod.
+
+<Note>
+  The example manifests are provided as a starting point and are not a supported deployment. A Helm chart is not available yet.
+</Note>
+
+## Pod settings
+
+nono needs only the following from the pod:
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| `allowPrivilegeEscalation` | `false` | Sets `no_new_privs`, which Landlock requires |
+| `seccompProfile` | `RuntimeDefault` | The runtime default allows the `landlock_*` syscalls |
+| `capabilities.drop` | `["ALL"]` | nono needs none |
+| `runAsNonRoot` | `true` | The image runs as a non-root user |
+| `readOnlyRootFilesystem` | `true` | Optional; give the agent writable `emptyDir` volumes instead |
+| `automountServiceAccountToken` | `false` | Agents rarely need cluster API access |
+
+Mount writable `emptyDir` volumes for the working directory, `HOME`, and `/tmp`, and set `HOME` explicitly.
+
+## Quick start
+
+The manifests live in `deploy/kubernetes/` in the repository.
+
+```bash
+kubectl apply -f 00-namespace.yaml -f 10-smoke-test-job.yaml
+kubectl -n nono-agents logs job/nono-smoke-test
+```
+
+The smoke test checks that a write inside the granted path succeeds and a write outside it is denied. A `PASS: sandbox enforced` line means nono can apply Landlock in your cluster.
+
+If it fails with a permission error when applying the sandbox, see [Troubleshooting](#troubleshooting).
+
+## Run an agent
+
+`20-agent-pod.yaml` runs an agent with a filesystem scope, a network allow-list, and credential injection:
+
+```yaml
+command: ["nono"]
+args:
+  - run
+  - --allow-cwd
+  - --network-profile
+  - claude-code
+  - --credential
+  - anthropic
+  - --
+  - claude
+  - -p
+  - "Summarize the repository in /work"
+```
+
+- `--allow-cwd` limits read and write access to the working directory.
+- `--network-profile claude-code` limits outbound traffic to the domains in that profile. Add domains with `--allow-domain`.
+- `--credential anthropic` makes nono's proxy inject the API key. The agent only sees a local proxy address.
+
+## Secrets
+
+Create the credential as a Kubernetes Secret and expose it to the nono process as an environment variable:
+
+```bash
+kubectl -n nono-agents create secret generic llm-credentials \
+  --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+```
+
+The built-in `anthropic` route reads `ANTHROPIC_API_KEY` from the environment, and the proxy injects it into upstream requests. The sandboxed agent does not receive it. See [Credential Injection](/cli/features/credential-injection) for other routes and sources such as `file://`.
+
+<Tip>
+  Mounting the Secret as a file and referencing it with `file://` keeps it out of the process environment entirely.
+</Tip>
+
+## Network policy
+
+nono's allow-list restricts egress from the agent process. A Kubernetes `NetworkPolicy` independently restricts the pod. Use both: nono limits where the agent may connect, and `NetworkPolicy` limits the pod if something outside nono's scope misbehaves.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---------|--------------|
+| Sandbox fails to apply, with a permission or "operation not permitted" error | The seccomp profile blocks `landlock_*` syscalls, or `allowPrivilegeEscalation` is not `false` |
+| Sandbox reports Landlock unsupported | The node kernel has no Landlock; check the node OS and kernel version |
+| Network filtering not enforced | The node kernel is older than 6.7; see [Landlock](/cli/internals/landlock) |
+| Agent cannot write its config | `HOME` is not set to a writable volume |
+
+## Next steps
+
+- [Credential Injection](/cli/features/credential-injection)
+- [Networking](/cli/features/networking)
+- [Profiles & Groups](/cli/features/profiles-groups)

@@ -1,0 +1,64 @@
+# A coding agent run under nono with an API allow-list and credential
+# injection. Replace the command with your agent.
+#
+# - Filesystem: read/write limited to /work (--allow-cwd).
+# - Network: only the domains in the claude-code network profile.
+# - Credentials: ANTHROPIC_API_KEY is injected by nono's proxy and is not
+#   visible to the agent process.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: claude-agent
+  namespace: nono-agents
+  labels:
+    app.kubernetes.io/name: nono-agent
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: agent
+      image: ghcr.io/nolabs-ai/nono:latest # pin a version or digest in production
+      workingDir: /work
+      command: ["nono"]
+      args:
+        - run
+        - --allow-cwd
+        - --network-profile
+        - claude-code
+        - --credential
+        - anthropic
+        - --
+        - claude
+        - -p
+        - "Summarize the repository in /work"
+      env:
+        - name: HOME
+          value: /home/agent
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: llm-credentials
+              key: ANTHROPIC_API_KEY
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { cpu: 250m, memory: 512Mi }
+        limits: { cpu: "2", memory: 2Gi }
+      volumeMounts:
+        - { name: work, mountPath: /work }
+        - { name: home, mountPath: /home/agent }
+        - { name: tmp, mountPath: /tmp }
+  volumes:
+    - { name: work, emptyDir: {} }
+    - { name: home, emptyDir: {} }
+    - { name: tmp, emptyDir: {} }

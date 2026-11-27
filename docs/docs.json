@@ -104,6 +104,14 @@
         ]
       },
       {
+        "group": "Operations",
+        "pages": [
+          "cli/operations/overview",
+          "cli/operations/containers",
+          "cli/operations/kubernetes"
+        ]
+      },
+      {
         "group": "Architecture",
         "pages": [
           "cli/internals/overview",

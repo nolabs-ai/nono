@@ -1,0 +1,70 @@
+---
+title: Running nono in Containers
+description: Use the official nono container image, verify its signature, and run agents with restricted container settings
+---
+
+The official image runs `nono` as a non-root user and is published for `linux/amd64` and `linux/arm64`.
+
+```
+ghcr.io/nolabs-ai/nono
+```
+
+## Tags
+
+| Tag | Meaning |
+|-----|---------|
+| `X.Y.Z` | An exact release |
+| `X.Y` | The latest patch of a minor release |
+| `latest` | The latest stable release |
+
+Pre-release versions (alpha, beta, rc) are published only under their exact tag. In production, pin to an exact version or, better, an image digest.
+
+## Verify the image
+
+Release images are signed with Cosign using keyless signing from the release workflow.
+
+```bash
+cosign verify ghcr.io/nolabs-ai/nono:X.Y.Z \
+  --certificate-identity-regexp '^https://github.com/nolabs-ai/nono/\.github/workflows/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+## Run an agent
+
+The image's entrypoint is `nono`, so arguments go straight to it. The working directory is `/work`.
+
+```bash
+docker run --rm \
+  --user 10001:10001 \
+  --read-only --tmpfs /tmp --tmpfs /home/agent -e HOME=/home/agent \
+  --cap-drop ALL --security-opt no-new-privileges \
+  -v "$PWD":/work \
+  ghcr.io/nolabs-ai/nono:latest \
+  run --allow-cwd --block-net -- my-agent
+```
+
+The container flags harden the container itself. The `nono run` arguments after the image name restrict what the agent can reach inside it. Both apply.
+
+## Build from source
+
+The repository includes Dockerfiles for custom builds. These variants are not published as images.
+
+| Dockerfile | Purpose |
+|------------|---------|
+| `docker/Dockerfile` | Standard multi-stage build |
+| `docker/Dockerfile-headless` | No D-Bus or Secret Service dependency |
+| `docker/Dockerfile-musl` | Static musl build |
+| `docker/Dockerfile.chainguard` | Chainguard (Wolfi) runtime base |
+
+```bash
+docker buildx build -f docker/Dockerfile -t nono .
+```
+
+## Credentials in containers
+
+A container usually has no system keyring. Supply credentials through `env://`, `file://`, or `op://` references. With `--credential`, nono's proxy injects the value into upstream requests so the agent process never receives it. See [Credential Injection](/cli/features/credential-injection).
+
+## Next steps
+
+- [Run agents on Kubernetes](/cli/operations/kubernetes)
+- [nono and containers](/cli/internals/containers)

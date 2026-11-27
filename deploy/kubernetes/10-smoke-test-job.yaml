@@ -1,0 +1,59 @@
+# Verifies that nono can apply its sandbox inside a restricted pod.
+#
+#   kubectl apply -f 00-namespace.yaml -f 10-smoke-test-job.yaml
+#   kubectl -n nono-agents logs job/nono-smoke-test
+#
+# Expected: the write inside /work succeeds, the write outside it is
+# denied, and the job completes successfully.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nono-smoke-test
+  namespace: nono-agents
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: ghcr.io/nolabs-ai/nono:latest # pin a version or digest in production
+          workingDir: /work
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              nono run --allow-cwd --block-net -- sh -c 'echo ok > /work/inside.txt' \
+                || { echo "FAIL: write inside granted path was denied"; exit 1; }
+              if nono run --allow-cwd --block-net -- sh -c 'echo no > /tmp/outside.txt' 2>/dev/null; then
+                echo "FAIL: write outside granted path was allowed"; exit 1
+              fi
+              echo "PASS: sandbox enforced"
+          env:
+            - name: HOME
+              value: /home/agent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: home, mountPath: /home/agent }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: work, emptyDir: {} }
+        - { name: home, emptyDir: {} }
+        - { name: tmp, emptyDir: {} }

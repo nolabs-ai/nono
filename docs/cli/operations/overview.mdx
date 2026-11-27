@@ -1,0 +1,37 @@
+---
+title: Operations Overview
+description: Where nono runs in practice and how to choose between a workstation, CI, a container, or Kubernetes
+---
+
+nono applies its sandbox to a single process using kernel features. There is no daemon to deploy and no privileged component, so the same binary works on a laptop, in a CI job, in a container, and in a Kubernetes pod. This section covers running it somewhere other than your own terminal.
+
+## Where nono runs
+
+| Environment | Typical use | Guide |
+|-------------|-------------|-------|
+| Workstation | Interactive coding agents | [Quickstart](/cli/getting_started/quickstart) |
+| Container | Reproducible agent environments, defense in depth | [Containers](/cli/operations/containers) |
+| Kubernetes | Agents scheduled as pods | [Kubernetes](/cli/operations/kubernetes) |
+
+## What nono does and does not replace
+
+nono restricts what one process can access: paths, network destinations, and credentials. It does not provide a separate filesystem, a PID namespace, or resource scheduling. In a cluster, the pod and the node still provide those. The two layers address different risks, so they are designed to be combined. See [nono and containers](/cli/internals/containers) for the full comparison.
+
+| Concern | Provided by |
+|---------|-------------|
+| Which files the agent can read or write | nono |
+| Which hosts the agent can reach | nono (and optionally NetworkPolicy) |
+| Keeping API keys out of the agent process | nono credential injection |
+| Isolating the agent from other workloads | Pod, node, and runtime class |
+| CPU and memory scheduling | Kubernetes |
+
+## Requirements
+
+- **Linux:** a kernel with Landlock enabled. Network filtering needs Landlock ABI v4 or newer (kernel 6.7+); see [Landlock](/cli/internals/landlock).
+- **No privileges:** nono does not need root, `CAP_SYS_ADMIN`, or a privileged container.
+- **Seccomp:** the runtime's seccomp profile must allow the `landlock_*` syscalls. The default profiles of current container runtimes all allow them.
+
+## Next steps
+
+- [Run the official container image](/cli/operations/containers)
+- [Run agents on Kubernetes](/cli/operations/kubernetes)

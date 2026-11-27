@@ -1,0 +1,10 @@
+# Namespace for sandboxed agents. Enforces the "restricted" Pod Security
+# Standard: nono needs no privileged mode, no added capabilities, and no
+# host access, so the strictest standard works.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nono-agents
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

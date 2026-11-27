@@ -1305,6 +1305,20 @@ where
         None => return Ok(()),
     };
     let body = if let Some(endpoint) = oauth_endpoint {
+        // The rewrite parses the body as JSON or form. A compressed body is
+        // opaque to it, so a phantom inside would be forwarded unresolved
+        // instead of failing. Refuse rather than pass it through.
+        if endpoint.redeems_request_body_phantoms()
+            && !body.is_empty()
+            && has_unreadable_body_coding(&req.header_bytes)
+        {
+            warn!(
+                "tls_intercept: rejecting encoded request body to OAuth token endpoint {}",
+                ctx.host
+            );
+            reverse::send_error_generic(tls_stream, 415, "Unsupported Media Type").await?;
+            return Ok(());
+        }
         ctx.oauth_capture_store
             .rewrite_request_body(endpoint, &body)?
     } else {
@@ -2405,6 +2419,32 @@ fn build_websocket_upstream_request(
     }
     request.push_str("\r\n");
     Ok(request)
+}
+
+/// `true` when the request headers name a body coding the proxy cannot read:
+/// a `Content-Encoding` other than `identity`, or a `Transfer-Encoding` coding
+/// other than `chunked`/`identity` (e.g. `gzip, chunked`, which the proxy
+/// de-chunks but leaves compressed). Lists and repeated headers are checked,
+/// on the raw header block because `Transfer-Encoding` is stripped from the
+/// forwarded set.
+fn has_unreadable_body_coding(header_bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(header_bytes) else {
+        return false;
+    };
+    text.lines()
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| {
+            let name = name.trim();
+            let is_transfer = name.eq_ignore_ascii_case("transfer-encoding");
+            if !is_transfer && !name.eq_ignore_ascii_case("content-encoding") {
+                return false;
+            }
+            value.split(',').map(str::trim).any(|coding| {
+                !coding.is_empty()
+                    && !coding.eq_ignore_ascii_case("identity")
+                    && !(is_transfer && coding.eq_ignore_ascii_case("chunked"))
+            })
+        })
 }
 
 /// Parse a request line into (method, path, version).
@@ -5422,6 +5462,65 @@ mod tests {
             !upstream_received.contains(&client_secret_phantom),
             "the phantom must not reach the upstream, got: {upstream_received}"
         );
+    }
+
+    /// Some HTTP clients compress every request body. The rewrite cannot read
+    /// a compressed body, so a refresh phantom inside it would reach the
+    /// upstream unresolved. It must be refused instead.
+    #[tokio::test]
+    async fn token_endpoint_request_rejects_encoded_body_that_may_hide_a_phantom() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (port, _upstream_rx) = spawn_mock_https_upstream(&ca, r#"{"ok":true}"#).await;
+        let store = Arc::new(OAuthCaptureStore::load(&[oauth_capture_config(port)]).unwrap());
+        let (access_phantom, _refresh_phantom) = mint_oauth_phantoms(&store, port);
+
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(
+            Arc::clone(&ca),
+            &connector,
+            &filter,
+            &session_token,
+            Arc::clone(&store),
+            port,
+        );
+
+        // Opaque bytes with the gzip magic number: the proxy must refuse on the
+        // header alone and never try to interpret them.
+        let body = "\u{1f}\u{8b}\u{8}\u{0}opaque-compressed-payload";
+        let request = format!(
+            "POST /copilot_internal/v2/token HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer {access_phantom}\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = drive_token_endpoint_request(&ctx, request).await;
+        assert!(
+            response.starts_with("HTTP/1.1 415"),
+            "an encoded body to a redeeming endpoint must fail closed, got: {response}"
+        );
+        assert!(
+            !response.contains(&access_phantom),
+            "the phantom must not be echoed to the client, got: {response}"
+        );
+    }
+
+    #[test]
+    fn body_coding_check_only_flags_codings_the_proxy_cannot_read() {
+        let flags = |headers: &str| has_unreadable_body_coding(headers.as_bytes());
+        // Unencoded: no headers, `identity` in any case, and plain chunked
+        // framing (which the proxy de-chunks itself) must all pass.
+        assert!(!flags("Host: x\r\n\r\n"));
+        assert!(!flags("Content-Encoding: Identity\r\n\r\n"));
+        assert!(!flags("Transfer-Encoding: chunked\r\n\r\n"));
+        // A real coding hidden in a list, a repeated header, or behind chunked
+        // framing is caught.
+        assert!(flags("content-encoding: identity, gzip\r\n\r\n"));
+        assert!(flags(
+            "Content-Encoding: identity\r\ncontent-encoding: br\r\n\r\n"
+        ));
+        assert!(flags("Transfer-Encoding: gzip, chunked\r\n\r\n"));
+        // The proxy accepts a space before the colon, so the check must too.
+        assert!(flags("Content-Encoding : gzip\r\n\r\n"));
     }
 
     /// A phantom in the user-id slot of Basic credentials has no redemption

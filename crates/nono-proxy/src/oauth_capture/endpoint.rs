@@ -105,6 +105,12 @@ fn push_response_field(
 }
 
 impl LoadedOAuthEndpoint {
+    /// Whether request bodies to this endpoint are scanned for phantoms to
+    /// redeem. A body the proxy cannot read would bypass that redemption.
+    pub fn redeems_request_body_phantoms(&self) -> bool {
+        !self.request_nonce_fields.is_empty()
+    }
+
     /// Distinct phantom templates declared by this endpoint's response fields.
     pub(super) fn templates(&self) -> impl Iterator<Item = &PhantomTemplate> {
         self.response_fields

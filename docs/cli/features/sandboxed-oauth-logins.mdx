@@ -228,6 +228,12 @@ a token refresh or exchange request.
 For JSON bodies, dotted paths are supported. For form bodies, use top-level
 field names.
 
+nono can only look for phantoms in a body it can read. When an endpoint declares
+`request_nonce_fields`, a request body that is compressed (for example
+`Content-Encoding: gzip`) is refused with `415 Unsupported Media Type` instead
+of being forwarded with its phantom unresolved. A client that compresses its
+token requests must send them uncompressed through nono.
+
 Optional. A *capture-only* endpoint — where the token arrives in the response
 and is never re-sent in a request body — leaves this empty. For example, the
 HashiCorp Vault CLI's `vault login -method=oidc` flow GETs

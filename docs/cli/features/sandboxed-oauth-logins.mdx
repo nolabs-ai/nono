@@ -689,3 +689,67 @@ the primary control.
 That means a successful login should not give the agent a transferable bearer
 token. The agent can keep working through the nono-mediated route, but it cannot
 take `nono_<64hex>` and authenticate directly with the provider.
+
+## Command-backed token store
+
+To persist or share a login with a helper, set `"store": "cmd://oauth_vault"`
+on the `oauth_capture` provider and add this profile entry.
+
+```json
+{
+  "credential_capture": {
+    "oauth_vault": {
+      "provider": {
+        "command": ["/usr/local/bin/oauth-vault"],
+        "config": { "namespace": "my_agent" }
+      },
+      "timeout_secs": 5,
+      "cache_ttl_secs": 30
+    }
+  }
+}
+```
+
+Omit `store` to use the host-side file. Sign in again after switching stores.
+`cache_ttl_secs` defaults to 900, and `0` disables the in-memory cache. Login
+and refresh attempts invalidate it. Use a short TTL for shared logins.
+
+The helper receives real credentials outside the sandbox. Use a trusted
+executable and keep its storage, configuration, and dependencies outside the
+sandbox's reach. It runs from its executable directory with the host `HOME`
+if set, `PATH=/dev/null`, and stderr discarded. Use absolute paths for
+interpreters and child commands. Keep subprocesses in the helper's process
+group so the proxy can terminate them on failure. The timeout covers the
+entire exchange.
+
+### Provider request and reply
+
+Read one JSON request to EOF on stdin and write one JSON reply to stdout.
+The `nono.credential-provider.v1` request includes `provider`, `operation`,
+`payload`, `config`, and an opaque `cache_scope`. Match provider settings,
+expanded commands and arguments, and effective route policy across machines
+that share a login.
+
+Echo `operation` and return a `payload`. A nonzero exit, timeout, or invalid
+reply fails the request. Capture failures keep upstream tokens out of the
+sandbox and leave the file store unused.
+
+| Operation | Request payload | Reply payload |
+| --- | --- | --- |
+| `put` | `{"fields":[{"path":"access_token","value":"<real token>"}]}` | `{"phantoms":["<visible phantom>"]}` after committing the batch. Return phantoms in field order. |
+| `resolve` | `{"phantom":"<phantom>"}` | `{"value":"<real token>"}` or `{"value":null}` for a missing mapping. Only admitted consumers trigger lookup. |
+| `refresh` | `{"phantom":"<refresh phantom>"}` | `{"phantoms":{"access_token":"<visible phantom>","refresh_token":"<visible phantom>"},"expires_in":3600,"token_type":"Bearer"}` after committing rotated credentials. |
+
+Add `refresh_token` to the endpoint's `request_nonce_fields`. For
+`grant_type=refresh_token` POSTs that carry a phantom in that field, the
+helper handles upstream refresh and coordinates rotation across callers.
+Optional reply fields are `refresh_token_expires_in` and `scope`. Use integer
+seconds for lifetimes and `Bearer` or `DPoP` for `token_type` (case-insensitive).
+The client response uses the endpoint's encoding (JSON by default).
+
+Opaque phantoms use `nono_<64hex>` or replace `{}` in `format` with 64 hex
+characters. JWT phantoms use the bare phantom as both signature and lookup
+key. Encode the compact JSON header `{"alg":"none","typ":"JWT"}` and payload
+`{"iss":"nono","sub":"<bare phantom>","aud":"nono","iat":0,"exp":4102444800}`
+as unpadded base64url, preserving field order. The proxy validates each field's
+shape.

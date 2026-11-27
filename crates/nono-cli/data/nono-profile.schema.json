@@ -379,6 +379,11 @@
           ],
           "description": "Format applied to the resolved credential before injection; {} is replaced by the token. Defaults to \"Bearer {}\". Use \"{}\" alone for a raw token (e.g. Vault)."
         },
+        "store": {
+          "type": ["string", "null"],
+          "pattern": "^cmd://[A-Za-z0-9_]+$",
+          "description": "Credential capture provider that handles OAuth token capture, resolution, and refresh."
+        },
         "credential_store": {
           "oneOf": [
             { "$ref": "#/$defs/CredentialProviderStore" },

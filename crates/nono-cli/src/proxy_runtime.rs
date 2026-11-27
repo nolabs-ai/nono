@@ -1,4 +1,7 @@
 use crate::cli::SandboxArgs;
+
+pub(crate) mod oauth_store;
+
 use crate::command_policy::{
     CommandCredentialGrantConfig, CommandCredentialType, CommandFromConfig, CommandPoliciesConfig,
     CommandSandboxConfig, EndpointPolicyConfig, PolicyDecision, PolicyDecisionConfig,
@@ -1124,18 +1127,11 @@ fn capture_stdin_payload(
                     serde_json::Value::String(bridge.socket_path.to_string_lossy().into_owned()),
                 );
             }
-            Some(serde_json::json!({
-                "protocol": "nono.credential-provider.v1",
-                "session_id": request.session_id,
-                "credential_name": request.credential_name,
-                "route_id": request.route_id,
-                "request_host": request.request_host,
-                "request_path": request.request_path,
-                "request_method": request.request_method,
-                "cache_scope": request.cache_scope,
-                "config": config,
-                "interaction": interaction,
-            }))
+            Some(serde_json::json!(request.provider_request(
+                config,
+                &interaction,
+                None::<()>,
+            )))
         }
         ResolvedCredentialCaptureSource::Command { .. }
             if entry.stdin_mode == crate::profile::CredentialCaptureStdinMode::RequestJson =>
@@ -1384,8 +1380,18 @@ fn resolve_capture_command_with_path(
     path_var: Option<&std::ffi::OsStr>,
     outer_caps: &CapabilitySet,
 ) -> Result<CaptureCommandResolution> {
-    let expanded = crate::policy::expand_env_vars(command);
-    let command = expanded.as_str();
+    resolve_expanded_capture_command_with_path(
+        &crate::policy::expand_env_vars(command),
+        path_var,
+        outer_caps,
+    )
+}
+
+fn resolve_expanded_capture_command_with_path(
+    command: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    outer_caps: &CapabilitySet,
+) -> Result<CaptureCommandResolution> {
     let path = PathBuf::from(command);
     if path.is_absolute() {
         return validate_capture_command_path(path);
@@ -3137,6 +3143,7 @@ pub(crate) fn start_proxy_runtime(
         &mut session_proxy_config,
         &proxy.tool_sandbox_proxy_credentials,
     );
+    oauth_store::configure(&mut session_proxy_config, proxy, caps)?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -3150,7 +3157,7 @@ pub(crate) fn start_proxy_runtime(
             proxy
                 .network_approval_defaults
                 .as_ref()
-                .and_then(|defaults| defaults.backend.clone()),
+                .and_then(|defaults| defaults.backend.as_deref()),
         )),
         &proxy.session_id,
     )?;
@@ -6650,6 +6657,7 @@ mod tests {
                 api_hosts: vec!["https://api.openai.com".to_string()],
                 inject_header: None,
                 credential_format: None,
+                store: None,
                 credential_store: None,
                 helpers: None,
             },
@@ -6726,6 +6734,7 @@ mod tests {
                 api_hosts: vec!["https://vault.us1.ddbuild.io".to_string()],
                 inject_header: Some("X-Vault-Token".to_string()),
                 credential_format: Some("{}".to_string()),
+                store: None,
                 credential_store: None,
                 helpers: None,
             },

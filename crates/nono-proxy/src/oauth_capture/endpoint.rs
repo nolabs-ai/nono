@@ -16,6 +16,18 @@ pub struct LoadedOAuthEndpoint {
     pub(super) admitted_consumers: HashSet<String>,
 }
 
+impl LoadedOAuthEndpoint {
+    /// Token endpoint authority used by the credential provider request.
+    pub fn host_port(&self) -> &str {
+        &self.host_port
+    }
+
+    /// Configured token endpoint path, without caller-supplied query data.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ResponseFieldFormat {
     Opaque,

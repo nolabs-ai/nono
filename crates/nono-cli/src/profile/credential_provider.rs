@@ -24,6 +24,9 @@ pub struct CredentialProviderDef {
     /// token. Defaults to `Bearer {}`. Use `{}` for a raw token (e.g. Vault).
     #[serde(default)]
     pub credential_format: Option<String>,
+    /// cmd:// credential provider that owns token capture, resolution, and refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
     /// Optional provider-specific logout/session detection.
     #[serde(default)]
     pub credential_store: Option<CredentialProviderStore>,
@@ -323,7 +326,49 @@ fn validate_credential_provider_references(profile: &Profile) -> Result<()> {
 
 pub(super) fn validate_credential_provider_resolved(profile: &Profile) -> Result<()> {
     validate_credential_provider_entries(profile)?;
-    validate_credential_provider_references(profile)
+    validate_credential_provider_references(profile)?;
+    for (provider, config) in &profile.credential_providers {
+        if let Some(reference) = &config.store {
+            let name = oauth_store_name(reference)?;
+            let entry = profile.credential_capture.get(name).ok_or_else(|| {
+                NonoError::ProfileParse(format!(
+                    "credential_providers.{provider}.store references unknown credential_capture entry '{name}'"
+                ))
+            })?;
+            validate_token_store_entry(name, entry)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn oauth_store_name(reference: &str) -> Result<&str> {
+    nono::keystore::validate_cmd_uri(reference).map_err(|_| {
+        NonoError::ProfileParse(
+            "OAuth store must be a valid cmd:// credential_capture reference".into(),
+        )
+    })?;
+    reference
+        .strip_prefix("cmd://")
+        .ok_or_else(|| NonoError::ProfileParse("OAuth store must use cmd://".into()))
+}
+
+pub(crate) fn validate_token_store_entry<'a>(
+    name: &str,
+    entry: &'a super::CredentialCaptureEntry,
+) -> Result<&'a super::CredentialCaptureProvider> {
+    if let Some(provider) = &entry.provider
+        && !provider.command.is_empty()
+        && entry.command.is_empty()
+        && entry.interaction.is_none()
+        && entry.stdin == super::CredentialCaptureStdinMode::Null
+        && entry.output == super::CredentialCaptureOutput::default()
+        && entry.cache_path_regex.is_none()
+    {
+        return Ok(provider);
+    }
+    Err(NonoError::ProfileParse(format!(
+        "OAuth store credential_capture.{name} requires provider.command and supports timeout and cache TTL settings"
+    )))
 }
 
 fn validate_credential_provider_store(
@@ -520,6 +565,7 @@ mod tests {
                 api_hosts: vec!["https://vault.example.com".to_string()],
                 inject_header: inject_header.map(str::to_string),
                 credential_format: credential_format.map(str::to_string),
+                store: None,
                 credential_store: None,
                 helpers: None,
             },

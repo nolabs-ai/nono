@@ -1,4 +1,5 @@
 use super::OAuthCaptureStore;
+use super::command_store::{OAuthRefresh, invalid_reply, valid_visible_phantom};
 use super::endpoint::{LoadedOAuthEndpoint, ResponseField, ResponseFieldFormat, provider_consumer};
 use crate::config::OAuthTokenRequestBodyFormat;
 use crate::error::{ProxyError, Result};
@@ -7,7 +8,6 @@ use crate::token::NonceResolver;
 use base64::Engine as _;
 use serde_json::Value;
 use std::collections::HashSet;
-use tracing::debug;
 use zeroize::Zeroizing;
 
 impl OAuthCaptureStore {
@@ -318,53 +318,42 @@ impl OAuthCaptureStore {
                 endpoint.provider
             ))
         })?;
-        let configured_paths = endpoint
+        let fields: Vec<_> = endpoint
             .response_fields
             .iter()
-            .map(|field| field.path.as_str())
-            .collect::<HashSet<_>>();
-        let mut changed = false;
-        let mut rewritten_fields = 0usize;
-        for field in &endpoint.response_fields {
-            let Some(value) = value_at_path_mut(&mut json, &field.path) else {
-                continue;
-            };
-            let Some(real) = value.as_str() else {
-                continue;
-            };
-            if real.is_empty() {
-                continue;
-            }
-            let (key, visible) = mint_response_phantom(&endpoint.provider, field, real)?;
-            self.store_phantom(
-                &endpoint.provider,
-                &key,
-                real.as_bytes(),
-                &endpoint.admitted_consumers,
-            )?;
-            *value = Value::String(visible);
-            changed = true;
-            rewritten_fields += 1;
-        }
+            .filter(|field| {
+                value_at_path(&json, &field.path)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            })
+            .collect();
+        let configured_paths = fields.iter().map(|field| field.path.as_str()).collect();
         reject_unrewritten_token_fields(
             &json,
             &configured_paths,
             &format!("provider '{}'", endpoint.provider),
         )?;
-
-        if !changed {
-            debug!(
-                "OAuth token response for provider '{}' did not contain configured token fields",
-                endpoint.provider
-            );
+        if fields.is_empty() {
             return Ok(body.to_vec());
         }
 
-        debug!(
-            provider = %endpoint.provider,
-            fields = rewritten_fields,
-            "rewrote OAuth token response fields to phantoms"
-        );
+        let mut real_tokens = Vec::with_capacity(fields.len());
+        for field in &fields {
+            let Some(Value::String(real)) = value_at_path_mut(&mut json, &field.path) else {
+                return Err(invalid_reply());
+            };
+            real_tokens.push(Zeroizing::new(std::mem::take(real)));
+        }
+        let capture: Vec<_> = fields
+            .iter()
+            .zip(&real_tokens)
+            .map(|(&field, real)| (field, real.as_str()))
+            .collect();
+        let phantoms = self.capture_fields(endpoint, &capture)?;
+        for (field, phantom) in fields.into_iter().zip(phantoms) {
+            let value = value_at_path_mut(&mut json, &field.path).ok_or_else(invalid_reply)?;
+            *value = Value::String(phantom);
+        }
 
         serde_json::to_vec(&json).map_err(|err| {
             ProxyError::HttpParse(format!(
@@ -395,31 +384,21 @@ impl OAuthCaptureStore {
             .collect::<std::collections::HashMap<_, _>>();
 
         let parsed = url::form_urlencoded::parse(body).collect::<Vec<_>>();
-        let mut changed = false;
-        let mut rewritten_fields = 0usize;
-        let mut rewritten_names = HashSet::new();
-
-        // Phase 1: mint phantoms for the whole body before storing anything,
-        // so a body the marker check below rejects leaves no orphaned,
-        // unreachable secrets in the store.
-        enum Slot {
-            Plain,
-            Phantom { key: String, visible: String },
-        }
-        let mut slots = Vec::with_capacity(parsed.len());
-        for (name, value) in &parsed {
-            if let Some(field) = response_fields.get(name.as_ref())
-                && !value.is_empty()
-            {
-                let (key, visible) = mint_response_phantom(&endpoint.provider, field, value)?;
-                slots.push(Slot::Phantom { key, visible });
-                changed = true;
-                rewritten_fields += 1;
-                rewritten_names.insert(name.to_string());
-                continue;
-            }
-            slots.push(Slot::Plain);
-        }
+        let slots: Vec<_> = parsed
+            .iter()
+            .map(|(name, value)| {
+                if value.is_empty() {
+                    None
+                } else {
+                    response_fields.get(name.as_ref()).copied()
+                }
+            })
+            .collect();
+        let fields: Vec<_> = parsed
+            .iter()
+            .zip(&slots)
+            .filter_map(|((_, value), field)| Some(((*field)?, value.as_ref())))
+            .collect();
 
         let mut marker_names: Vec<String> = vec![
             "access_token".to_string(),
@@ -439,8 +418,8 @@ impl OAuthCaptureStore {
                 .iter()
                 .any(|marker| field.contains(marker.as_str()))
         };
-        for (name, value) in &parsed {
-            if rewritten_names.contains(name.as_ref()) {
+        for ((name, value), field) in parsed.iter().zip(&slots) {
+            if field.is_some() {
                 continue;
             }
             let lname = name.to_ascii_lowercase();
@@ -468,41 +447,114 @@ impl OAuthCaptureStore {
             }
         }
 
-        if !changed {
-            debug!(
-                "OAuth token response for provider '{}' did not contain configured form token fields",
-                endpoint.provider
-            );
+        if fields.is_empty() {
             return Ok(body.to_vec());
         }
-
-        // Phase 2: the body passed every check, so the minted phantoms can
-        // now be committed and the response serialized.
+        let mut phantoms = self.capture_fields(endpoint, &fields)?.into_iter();
         let mut serialized = url::form_urlencoded::Serializer::new(String::new());
-        for ((name, value), slot) in parsed.iter().zip(&slots) {
-            match slot {
-                Slot::Plain => {
-                    serialized.append_pair(name, value);
-                }
-                Slot::Phantom { key, visible } => {
-                    self.store_phantom(
-                        &endpoint.provider,
-                        key,
-                        value.as_bytes(),
-                        &endpoint.admitted_consumers,
-                    )?;
-                    serialized.append_pair(name, visible);
-                }
+        for ((name, value), field) in parsed.iter().zip(&slots) {
+            if field.is_some() {
+                let phantom = phantoms.next().ok_or_else(invalid_reply)?;
+                serialized.append_pair(name, &phantom);
+            } else {
+                serialized.append_pair(name, value);
             }
         }
 
-        debug!(
-            provider = %endpoint.provider,
-            fields = rewritten_fields,
-            "rewrote OAuth token response form fields to phantoms"
-        );
-
         Ok(serialized.finish().into_bytes())
+    }
+
+    /// Intercept a refresh carrying a phantom before opening an upstream connection.
+    pub(crate) fn command_refresh(
+        &self,
+        endpoint: &LoadedOAuthEndpoint,
+        body: &[u8],
+        content_type: Option<&str>,
+        is_post: bool,
+    ) -> Result<Option<(&'static str, Vec<u8>)>> {
+        let Some(store) = self.command_stores.get(&endpoint.provider) else {
+            return Ok(None);
+        };
+        let refresh_paths = endpoint
+            .request_nonce_fields
+            .iter()
+            .map(String::as_str)
+            .filter(|path| path.rsplit('.').next() == Some("refresh_token"));
+        if body.is_empty() || refresh_paths.clone().next().is_none() {
+            return Ok(None);
+        }
+        let json = match endpoint.request_body {
+            OAuthTokenRequestBodyFormat::Json => true,
+            OAuthTokenRequestBodyFormat::Form => false,
+            OAuthTokenRequestBodyFormat::Auto => {
+                content_type.is_some_and(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+                }) || looks_like_json(body)
+            }
+        };
+        let (phantom, is_refresh_grant) = if json {
+            let request: Value = serde_json::from_slice(body).map_err(|_| {
+                ProxyError::HttpParse("invalid OAuth command store request JSON".into())
+            })?;
+            let is_refresh_grant =
+                request.get("grant_type").and_then(Value::as_str) == Some("refresh_token");
+            let mut found = None;
+            for value in refresh_paths
+                .filter_map(|path| value_at_path(&request, path).and_then(Value::as_str))
+            {
+                if self.contains_phantom(value.as_bytes())
+                    && found.replace(Zeroizing::new(value.to_owned())).is_some()
+                {
+                    return Err(ProxyError::Credential(
+                        "ambiguous OAuth refresh token".into(),
+                    ));
+                }
+            }
+            (found, is_refresh_grant)
+        } else {
+            if !refresh_paths.clone().any(|path| path == "refresh_token") {
+                return Ok(None);
+            }
+            let mut refresh = None;
+            let mut is_refresh_grant = None;
+            for (name, value) in url::form_urlencoded::parse(body) {
+                match name.as_ref() {
+                    "grant_type" => {
+                        is_refresh_grant =
+                            Some(is_refresh_grant.is_none() && value == "refresh_token");
+                    }
+                    "refresh_token" if refresh.is_some() => {
+                        return Err(ProxyError::Credential(
+                            "ambiguous OAuth refresh token".into(),
+                        ));
+                    }
+                    "refresh_token" => refresh = Some(Zeroizing::new(value.into_owned())),
+                    _ => {}
+                }
+            }
+            (
+                refresh.filter(|value| self.contains_phantom(value.as_bytes())),
+                is_refresh_grant == Some(true),
+            )
+        };
+        let Some(phantom) = phantom else {
+            return Ok(None);
+        };
+        // Reject an invalid refresh here so normal request rewriting cannot
+        // substitute the real credential and send it upstream.
+        if !is_post || !is_refresh_grant || !store.accepts_phantom(&phantom) {
+            return Err(ProxyError::Credential(
+                "invalid OAuth refresh phantom".into(),
+            ));
+        }
+        store
+            .refresh(endpoint, &phantom, self.audit_log.as_ref(), |reply| {
+                encode_command_refresh(endpoint, reply)
+            })
+            .map(Some)
     }
 
     pub fn inspect_capture_host_response(
@@ -539,6 +591,95 @@ impl OAuthCaptureStore {
     }
 }
 
+fn encode_command_refresh(
+    endpoint: &LoadedOAuthEndpoint,
+    reply: OAuthRefresh,
+) -> Result<(&'static str, Vec<u8>)> {
+    if reply.phantoms.is_empty()
+        || reply.token_type.as_ref().is_some_and(|kind| {
+            !kind.eq_ignore_ascii_case("bearer") && !kind.eq_ignore_ascii_case("dpop")
+        })
+    {
+        return Err(invalid_reply());
+    }
+
+    let mut response = Value::Object(serde_json::Map::new());
+    for (name, value) in [
+        ("expires_in", reply.expires_in.map(Value::from)),
+        (
+            "refresh_token_expires_in",
+            reply.refresh_token_expires_in.map(Value::from),
+        ),
+        ("token_type", reply.token_type.map(Value::String)),
+        (
+            "scope",
+            reply.scope.map(|scope| Value::String(scope.to_string())),
+        ),
+    ] {
+        if let Some(value) = value {
+            response[name] = value;
+        }
+    }
+    let field_paths = reply.phantoms.keys().cloned().collect::<Vec<_>>();
+    for (path, phantom) in reply.phantoms {
+        let field = endpoint
+            .response_fields
+            .iter()
+            .find(|field| field.path == path)
+            .ok_or_else(invalid_reply)?;
+        if !valid_visible_phantom(&phantom, field) {
+            return Err(invalid_reply());
+        }
+        let mut current = &mut response;
+        for segment in path.split('.') {
+            current = current
+                .as_object_mut()
+                .ok_or_else(invalid_reply)?
+                .entry(segment)
+                .or_insert(Value::Null);
+            if current.is_null() {
+                *current = Value::Object(serde_json::Map::new());
+            }
+        }
+        if !current.as_object().is_some_and(serde_json::Map::is_empty) {
+            return Err(invalid_reply());
+        }
+        *current = Value::String(phantom);
+    }
+    reject_unrewritten_token_fields(
+        &response,
+        &field_paths.iter().map(String::as_str).collect(),
+        "command refresh",
+    )?;
+    if endpoint.response_body == OAuthTokenRequestBodyFormat::Form {
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        for (name, value) in response.as_object().ok_or_else(invalid_reply)? {
+            match value {
+                Value::String(value) => {
+                    form.append_pair(name, value);
+                }
+                Value::Number(value) => {
+                    form.append_pair(name, &value.to_string());
+                }
+                _ => return Err(invalid_reply()),
+            }
+        }
+        return Ok((
+            "application/x-www-form-urlencoded",
+            form.finish().into_bytes(),
+        ));
+    }
+    let body = serde_json::to_vec(&response).map_err(|_| invalid_reply())?;
+    Ok(("application/json", body))
+}
+
+fn value_at_path<'a>(mut root: &'a Value, path: &str) -> Option<&'a Value> {
+    for part in path.split('.') {
+        root = root.as_object()?.get(part)?;
+    }
+    Some(root)
+}
+
 fn value_at_path_mut<'a>(root: &'a mut Value, path: &str) -> Option<&'a mut Value> {
     let mut current = root;
     for part in path.split('.') {
@@ -570,7 +711,9 @@ fn reject_unrewritten_token_fields_inner(
             for (key, child) in object {
                 path.push(key.clone());
                 if is_sensitive_token_field(key)
-                    && !configured_paths.contains(path.join(".").as_str())
+                    && !configured_paths
+                        .iter()
+                        .any(|configured| configured.split('.').eq(path.iter().map(String::as_str)))
                     && child.as_str().is_some_and(|token| !token.is_empty())
                 {
                     return Err(ProxyError::HttpParse(format!(
@@ -584,7 +727,7 @@ fn reject_unrewritten_token_fields_inner(
         }
         Value::Array(items) => {
             for child in items {
-                reject_unrewritten_token_fields_inner(child, configured_paths, context, path)?;
+                reject_unrewritten_token_fields_inner(child, &HashSet::new(), context, path)?;
             }
         }
         _ => {}
@@ -678,7 +821,7 @@ fn content_type_hint(headers: &[(String, String)]) -> Option<ContentTypeHint> {
 /// per the field's configured template or opaque/JWT shape. Shared by the
 /// JSON and form-urlencoded response paths so a token is classified
 /// identically regardless of the wire encoding it arrived in.
-fn mint_response_phantom(
+pub(super) fn mint_response_phantom(
     provider: &str,
     field: &ResponseField,
     real: &str,

@@ -71,7 +71,7 @@ keyring = { version = "4", features = ["v1"], optional = true, default-features 
 
 # Keyless (Sigstore/Fulcio/Rekor) signing for instruction file attestation
 sigstore-sign.workspace = true
-tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["io-std", "macros", "process", "rt-multi-thread", "signal"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 # Explicit provider for the terminal WebSocket: both rustls providers are in
 # the graph, so rustls has no process default (see connect_client.rs).

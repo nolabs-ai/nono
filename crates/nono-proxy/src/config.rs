@@ -116,6 +116,13 @@ pub struct ProxyConfig {
     #[serde(default, skip)]
     pub oauth_capture_store_path: Option<PathBuf>,
 
+    /// Host-only command store overrides.
+    #[serde(skip)]
+    pub oauth_capture_command_stores: std::collections::HashMap<
+        String,
+        std::sync::Arc<dyn crate::oauth_capture::OAuthTokenStoreBackend>,
+    >,
+
     /// External (enterprise) proxy URL for passthrough mode.
     /// When set, CONNECT requests are chained to this proxy.
     #[serde(default)]
@@ -275,6 +282,7 @@ impl Default for ProxyConfig {
             routes: Vec::new(),
             oauth_capture: Vec::new(),
             oauth_capture_store_path: None,
+            oauth_capture_command_stores: Default::default(),
             external_proxy: None,
             direct_connect_ports: Vec::new(),
             no_proxy: Vec::new(),

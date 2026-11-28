@@ -342,6 +342,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .iter()
         .filter_map(|e| sandbox_state::DomainEndpointState::from_allow_domain(e))
         .collect();
+    if let Ok(tag) = std::env::var("NONO_SEATBELT_LOG_TAG")
+        && !tag.is_empty()
+    {
+        caps.set_seatbelt_log_tag(tag)
+            .map_err(|e| NonoError::ConfigParse(format!("NONO_SEATBELT_LOG_TAG: {e}")))?;
+    }
     let cap_file = write_capability_state_file(
         &caps,
         &flags.bypass_protection_paths,

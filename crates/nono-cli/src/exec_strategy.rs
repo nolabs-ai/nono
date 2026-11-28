@@ -13,6 +13,7 @@
 #[cfg(target_os = "linux")]
 mod clone_files;
 pub(crate) mod env_sanitization;
+mod pipe_relay;
 #[cfg(target_os = "linux")]
 mod supervisor_linux;
 
@@ -587,7 +588,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     pty_session_id: Option<&str>,
     // Session terminal capture (NEP-0010), started before fork so a required
     // recording that cannot start never runs the agent.
-    terminal_capture: Option<crate::terminal_capture::TerminalCapture>,
+    mut terminal_capture: Option<crate::terminal_capture::TerminalCapture>,
     // Write fd of the resource cgroup's `cgroup.procs`. The forked child attaches
     // itself through it before sandboxing or exec'ing. None off Linux.
     resource_procs_fd: Option<std::os::fd::RawFd>,
@@ -949,10 +950,28 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // reattached independently of capability elevation.
     let pty_slave_fd = pty_pair.as_ref().map(|p| p.slave.as_raw_fd());
 
-    // Compute child's FD keep list: PTY slave (if elevation) + supervisor socket fd
+    // When recording without a PTY, create stdio pipes before spawning so the
+    // child writes/reads through the supervisor's capture relay.
+    let mut pipe_relay = if pty_pair.is_none() {
+        terminal_capture
+            .take()
+            .map(pipe_relay::PipeCaptureRelay::new)
+            .transpose()?
+    } else {
+        None
+    };
+    let pipe_child_fds = pipe_relay
+        .as_ref()
+        .and_then(pipe_relay::PipeCaptureRelay::child_fds);
+
+    // Compute child's FD keep list: PTY slave (if elevation), capture pipes,
+    // and supervisor socket fd.
     let mut child_keep_fds: Vec<i32> = Vec::new();
     if let Some(fd) = pty_slave_fd {
         child_keep_fds.push(fd);
+    }
+    if let Some(fds) = pipe_child_fds {
+        fds.push_keep_fds(&mut child_keep_fds);
     }
     if let Some(fd) = child_sock_fd {
         child_keep_fds.push(fd);
@@ -1000,6 +1019,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 cwd: &current_dir_c,
                 supervisor_fd: child_sock_fd,
                 pty_slave: pty_slave_fd,
+                stdio_pipes: pipe_child_fds,
                 resource_procs: resource_procs_fd,
                 #[cfg(test)]
                 fault: clone_files::Fault::None,
@@ -1093,6 +1113,10 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             // SAFETY: We are in the child after fork, slave_fd is valid.
             if let Some(slave_fd) = pty_slave_fd {
                 unsafe { crate::pty_proxy::setup_child_pty(slave_fd) };
+            }
+            if let Some(pipes) = pipe_child_fds {
+                // SAFETY: pipes are valid descriptors >= 3 owned by this launch.
+                unsafe { pipes.setup_child_pipes() };
             }
 
             // Resource cgroup self-attach: before sandboxing or exec'ing, the child
@@ -1362,6 +1386,15 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
         Ok(ForkResult::Parent { child }) => {
             if let Some(callback) = on_fork {
                 callback(child.as_raw() as u32);
+            }
+
+            if let Some(ref mut relay) = pipe_relay {
+                relay.release_child_ends();
+                if let Err(e) = relay.activate_capture() {
+                    let _ = signal::kill(child, Signal::SIGKILL);
+                    let _ = waitpid(child, None);
+                    return Err(e);
+                }
             }
 
             let mut pty_proxy = if let Some(pty) = pty_pair {
@@ -1654,6 +1687,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                             &initial_caps,
                             trust_interceptor,
                             pty_proxy.as_mut(),
+                            pipe_relay.as_mut(),
                             url_listener.as_ref().map(|(l, _)| l),
                             &mut killed_by_timeout,
                         )?;
@@ -1668,6 +1702,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                             config.startup_timeout,
                             trust_interceptor,
                             pty_proxy.as_mut(),
+                            pipe_relay.as_mut(),
                             url_listener.as_ref().map(|(l, _)| l),
                             &mut killed_by_timeout,
                         )?;
@@ -1677,6 +1712,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     let status = wait_for_child_with_pty(
                         child,
                         pty_proxy.as_mut(),
+                        pipe_relay.as_mut(),
                         config.startup_timeout,
                         &mut killed_by_timeout,
                     )?;
@@ -1696,12 +1732,20 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 p.shutdown_attach_listener();
                 p.release_terminal_for_prompt();
             }
+            if let Some(ref mut relay) = pipe_relay {
+                relay.drain_output(timeouts::pty_drain_timeout());
+            }
 
             // Close the recording before the audit log records the session
             // end, so every chunk record precedes `session_ended`.
             let capture_summary = pty_proxy
                 .as_mut()
-                .and_then(|p| p.finish_capture(capture_exit_status(&status)));
+                .and_then(|p| p.finish_capture(capture_exit_status(&status)))
+                .or_else(|| {
+                    pipe_relay
+                        .take()
+                        .and_then(|relay| relay.finish_capture(capture_exit_status(&status)))
+                });
             if let Some(summary) = capture_summary.as_ref() {
                 info!(
                     "Terminal recording closed: {} events, {} chunks, {} bytes raw, {} stored, \
@@ -2217,23 +2261,25 @@ fn get_max_fd() -> i32 {
     }
 }
 
-/// Wait for child process while proxying PTY I/O.
+/// Wait for child process while proxying PTY or capture pipe I/O.
 fn wait_for_child_with_pty(
     child: Pid,
-    pty: Option<&mut crate::pty_proxy::PtyProxy>,
+    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
+    mut pipe_relay: Option<&mut pipe_relay::PipeCaptureRelay>,
     startup_timeout: Option<StartupTimeoutConfig<'_>>,
     killed_by_timeout: &mut bool,
 ) -> Result<WaitStatus> {
-    let pty = match pty {
-        Some(pty) => pty,
-        None => {
-            return wait_for_child(child);
-        }
-    };
+    if pty.is_none() && pipe_relay.is_none() {
+        return wait_for_child(child);
+    }
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
 
     loop {
-        let (master_fd, client_fd, attach_fd, resize_fd) = pty.poll_fds();
+        let (master_fd, client_fd, attach_fd, resize_fd) =
+            pty.as_ref().map_or((-1, -1, -1, -1), |p| p.poll_fds());
+        let (pipe_out_fd, pipe_err_fd, pipe_in_fd, pipe_in_out_fd) = pipe_relay
+            .as_ref()
+            .map_or((-1, -1, -1, -1), |r| r.poll_fds());
         let mut pfds = [
             libc::pollfd {
                 fd: master_fd,
@@ -2255,20 +2301,50 @@ fn wait_for_child_with_pty(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: pipe_out_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pipe_err_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pipe_in_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pipe_in_out_fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            },
         ];
 
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 4, 200) };
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 8, 200) };
 
         if ret > 0 {
-            if !handle_pty_poll_events(
-                pty,
-                pfds[0].revents,
-                pfds[1].revents,
-                pfds[2].revents,
-                pfds[3].revents,
-                "PTY wait loop",
-            ) {
+            if let Some(ref mut p) = pty
+                && !handle_pty_poll_events(
+                    p,
+                    pfds[0].revents,
+                    pfds[1].revents,
+                    pfds[2].revents,
+                    pfds[3].revents,
+                    "PTY wait loop",
+                )
+            {
                 break;
+            }
+            if let Some(ref mut relay) = pipe_relay {
+                relay.handle_poll_events(
+                    pfds[4].revents,
+                    pfds[5].revents,
+                    pfds[6].revents,
+                    pfds[7].revents,
+                );
             }
         } else if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -2279,26 +2355,33 @@ fn wait_for_child_with_pty(
         }
 
         let pause_requested = drain_pause_pipe();
-        if pause_requested {
-            pty.sync_current_terminal_winsize();
+        if let Some(ref mut p) = pty
+            && pause_requested
+        {
+            p.sync_current_terminal_winsize();
         }
-        let in_band_detach_requested = pty.take_detach_request();
-        handle_pty_detach_request(Some(pty), pause_requested, in_band_detach_requested);
-        handle_pty_signal_relay(Some(pty));
-        handle_pty_suspension(Some(pty), child);
-        handle_pty_capture(Some(pty), child);
-        service_off_thread_prompts(Some(pty));
+        let in_band_detach_requested = pty.as_mut().is_some_and(|p| p.take_detach_request());
+        handle_pty_detach_request(
+            pty.as_deref_mut(),
+            pause_requested,
+            in_band_detach_requested,
+        );
+        handle_pty_signal_relay(pty.as_deref_mut());
+        handle_pty_suspension(pty.as_deref_mut(), child);
+        handle_pty_capture(pty.as_deref_mut(), child);
+        handle_pipe_capture(pipe_relay.as_deref_mut(), child);
+        service_off_thread_prompts(pty.as_deref_mut());
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline
                     && Instant::now() >= deadline
-                    && startup_timeout_should_terminate(Some(pty.is_interactive()))
+                    && startup_timeout_should_terminate(pty.as_ref().map(|p| p.is_interactive()))
                 {
                     notify_startup_termination_for_child(
                         timeout_cfg,
-                        pty.has_visible_output(),
-                        Some(pty),
+                        pty.as_ref().is_some_and(|p| p.has_visible_output()),
+                        pty.as_deref_mut(),
                     );
                     *killed_by_timeout = true;
                     let _ = signal::kill(child, Signal::SIGKILL);
@@ -2669,6 +2752,21 @@ fn handle_pty_capture(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pid) 
     let _ = signal::kill(child, Signal::SIGKILL);
 }
 
+/// Service pipe-mode session recording and stop the child on required failure.
+fn handle_pipe_capture(pipe_relay: Option<&mut pipe_relay::PipeCaptureRelay>, child: Pid) {
+    let Some(relay) = pipe_relay else {
+        return;
+    };
+    let Some(reason) = relay.service_capture() else {
+        return;
+    };
+    print_terminal_safe_stderr(&format!(
+        "[nono] Required session recording failed ({reason}); stopping the session."
+    ));
+    warn!("stopping session: required terminal recording failed: {reason}");
+    let _ = signal::kill(child, Signal::SIGKILL);
+}
+
 fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pid) {
     let pty = match pty {
         Some(p) => p,
@@ -2846,6 +2944,7 @@ fn run_supervisor_loop(
     startup_timeout: Option<StartupTimeoutConfig<'_>>,
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
+    mut pipe_relay: Option<&mut pipe_relay::PipeCaptureRelay>,
     url_listener: Option<&SupervisorListener>,
     killed_by_timeout: &mut bool,
 ) -> Result<(WaitStatus, Vec<DenialRecord>, Vec<UrlDenialRecord>)> {
@@ -2872,6 +2971,9 @@ fn run_supervisor_loop(
     loop {
         let (pty_master, pty_client, pty_attach, pty_resize) =
             pty.as_ref().map_or((-1, -1, -1, -1), |p| p.poll_fds());
+        let (pipe_out_fd, pipe_err_fd, pipe_in_fd, pipe_in_out_fd) = pipe_relay
+            .as_ref()
+            .map_or((-1, -1, -1, -1), |r| r.poll_fds());
         let mut pfds = [
             libc::pollfd {
                 fd: sock_fd,
@@ -2903,10 +3005,29 @@ fn run_supervisor_loop(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: pipe_out_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pipe_err_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pipe_in_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pipe_in_out_fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            },
         ];
 
-        let nfds: libc::nfds_t = if listener_fd >= 0 { 6 } else { 5 };
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 200) };
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 10, 200) };
 
         if ret > 0 {
             // When the child closes its end of the direct IPC socket (common for
@@ -2959,6 +3080,14 @@ fn run_supervisor_loop(
             {
                 break;
             }
+            if let Some(ref mut relay) = pipe_relay {
+                relay.handle_poll_events(
+                    pfds[6].revents,
+                    pfds[7].revents,
+                    pfds[8].revents,
+                    pfds[9].revents,
+                );
+            }
         } else if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() != std::io::ErrorKind::Interrupted {
@@ -2982,6 +3111,7 @@ fn run_supervisor_loop(
         handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
         handle_pty_capture(pty.as_deref_mut(), child);
+        handle_pipe_capture(pipe_relay.as_deref_mut(), child);
         service_off_thread_prompts(pty.as_deref_mut());
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -3123,6 +3253,7 @@ fn run_supervisor_loop(
     initial_caps: &[supervisor_linux::InitialCapability],
     trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     pty: Option<&mut crate::pty_proxy::PtyProxy>,
+    pipe_relay: Option<&mut pipe_relay::PipeCaptureRelay>,
     url_listener: Option<&SupervisorListener>,
     killed_by_timeout: &mut bool,
 ) -> Result<SupervisorLoopResult> {
@@ -3138,6 +3269,7 @@ fn run_supervisor_loop(
         initial_caps,
         trust_interceptor,
         pty,
+        pipe_relay,
         url_listener,
         killed_by_timeout,
         &mut network_throttle,
@@ -3161,6 +3293,7 @@ fn run_supervisor_loop_inner(
     initial_caps: &[supervisor_linux::InitialCapability],
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
+    mut pipe_relay: Option<&mut pipe_relay::PipeCaptureRelay>,
     url_listener: Option<&SupervisorListener>,
     killed_by_timeout: &mut bool,
     network_throttle: &mut supervisor_linux::NetworkDenialThrottle,
@@ -3286,6 +3419,30 @@ fn run_supervisor_loop_inner(
             events: libc::POLLIN,
             revents: 0,
         });
+        let pipe_base_idx = pfds.len();
+        let (pipe_out_fd, pipe_err_fd, pipe_in_fd, pipe_in_out_fd) = pipe_relay
+            .as_ref()
+            .map_or((-1, -1, -1, -1), |r| r.poll_fds());
+        pfds.push(libc::pollfd {
+            fd: pipe_out_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        pfds.push(libc::pollfd {
+            fd: pipe_err_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        pfds.push(libc::pollfd {
+            fd: pipe_in_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        pfds.push(libc::pollfd {
+            fd: pipe_in_out_fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        });
 
         let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
 
@@ -3297,9 +3454,10 @@ fn run_supervisor_loop_inner(
                         || listener_raw_fd.is_some()
                         || tool_sandbox_listener_fd.is_some()
                         || pty.is_some()
+                        || pipe_relay.as_ref().is_some_and(|r| r.has_active_output())
                     {
                         debug!(
-                            "Supervisor socket closed, continuing for seccomp/proxy/PTY/URL/command-mediation listener"
+                            "Supervisor socket closed, continuing for seccomp/proxy/PTY/pipe/URL/command-mediation listener"
                         );
                         sock_fd_active = false;
                         loop_timer.sock_inactive_at.get_or_insert(Instant::now());
@@ -3330,6 +3488,7 @@ fn run_supervisor_loop_inner(
                                 && tool_sandbox_listener_fd.is_none()
                                 && listener_raw_fd.is_none()
                                 && pty.is_none()
+                                && !pipe_relay.as_ref().is_some_and(|r| r.has_active_output())
                             {
                                 break;
                             }
@@ -3425,6 +3584,14 @@ fn run_supervisor_loop_inner(
                 {
                     break;
                 }
+                if let Some(ref mut relay) = pipe_relay {
+                    relay.handle_poll_events(
+                        pfds[pipe_base_idx].revents,
+                        pfds[pipe_base_idx + 1].revents,
+                        pfds[pipe_base_idx + 2].revents,
+                        pfds[pipe_base_idx + 3].revents,
+                    );
+                }
             }
             std::cmp::Ordering::Less => {
                 let err = std::io::Error::last_os_error();
@@ -3451,6 +3618,7 @@ fn run_supervisor_loop_inner(
         handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
         handle_pty_capture(pty.as_deref_mut(), child);
+        handle_pipe_capture(pipe_relay.as_deref_mut(), child);
         service_off_thread_prompts(pty.as_deref_mut());
 
         // Drain reparented orphans; if the primary child was among them,
@@ -5932,6 +6100,7 @@ mod tests {
                     &[],  // no initial caps
                     None, // no trust interceptor
                     None, // no PTY relay — this is what we're testing
+                    None, // no pipe relay
                     None, // no URL listener
                     &mut false,
                 );
@@ -5941,6 +6110,7 @@ mod tests {
                     child, &mut sock, &sup_cfg, None, // no startup timeout
                     None, // no trust interceptor
                     None, // no PTY relay
+                    None, // no pipe relay
                     None, // no URL listener
                     &mut false,
                 );
@@ -6064,6 +6234,7 @@ mod tests {
                     &[],  // no initial caps
                     None, // no trust interceptor
                     None, // no PTY relay
+                    None, // no pipe relay
                     None, // no URL listener
                     &mut false,
                 );

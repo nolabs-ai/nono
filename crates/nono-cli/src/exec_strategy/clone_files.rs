@@ -9,6 +9,7 @@
 //! CLI; library preparation only applies the capabilities supplied here.
 
 use super::ExecConfig;
+use super::pipe_relay::PipeChildFds;
 use crate::profile::LinuxSandboxPolicy;
 use nix::fcntl::{OFlag, open};
 use nix::libc;
@@ -69,6 +70,7 @@ pub(super) struct Command<'a> {
     pub cwd: &'a CStr,
     pub supervisor_fd: Option<RawFd>,
     pub pty_slave: Option<RawFd>,
+    pub stdio_pipes: Option<PipeChildFds>,
     pub resource_procs: Option<RawFd>,
     #[cfg(test)]
     pub fault: Fault,
@@ -784,6 +786,11 @@ fn child_exec(
     {
         die(126);
     }
+    if let Some(pipes) = command.stdio_pipes
+        && !setup_stdio_pipes(pipes)
+    {
+        die(126);
+    }
     if gate.is_some() {
         // SAFETY: cwd is a prebuilt NUL-terminated string, live through exec.
         if unsafe { libc::syscall(libc::SYS_chdir, command.cwd.as_ptr()) } < 0 {
@@ -876,6 +883,26 @@ fn setup_pty(slave: RawFd) -> bool {
         }
     }
     true
+}
+
+fn dup_to_stdio(src: RawFd, target: RawFd) -> bool {
+    // SAFETY: called only with a private table and valid inherited pipe fds (>= 3).
+    unsafe {
+        if src == target {
+            libc::syscall(libc::SYS_fcntl, src, libc::F_SETFD, 0) >= 0
+        } else {
+            libc::syscall(libc::SYS_dup3, src, target, 0) >= 0
+                && (src <= 2 || libc::syscall(libc::SYS_close, src) >= 0)
+        }
+    }
+}
+
+fn setup_stdio_pipes(pipes: PipeChildFds) -> bool {
+    dup_to_stdio(pipes.stdout_write, libc::STDOUT_FILENO)
+        && dup_to_stdio(pipes.stderr_write, libc::STDERR_FILENO)
+        && pipes
+            .stdin_read
+            .is_none_or(|fd| dup_to_stdio(fd, libc::STDIN_FILENO))
 }
 
 /// Enumerate the child's live table, not the parent's startup snapshot. The

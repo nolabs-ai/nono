@@ -7,7 +7,7 @@
 //! points: after a pause in output, at a resize, around lifecycle events,
 //! and at the end. Control characters never reach the output.
 
-use super::recording::{CastEvent, Recording, parse_marker};
+use super::recording::{CastEvent, Recording, normalize_lf_for_vt100, parse_marker};
 use serde::Serialize;
 use std::num::NonZeroU16;
 
@@ -223,6 +223,8 @@ fn marker_text(label: &str) -> Option<String> {
 /// Render a recording into transcript entries.
 pub(crate) fn render(recording: &Recording) -> Vec<Entry> {
     let mut renderer = Renderer::new(recording.cols, recording.rows);
+    let normalize_lf = !recording.is_pty();
+    let mut prev_cr = false;
     let mut last_output: Option<f64> = None;
     let mut end = 0.0f64;
     for event in &recording.events {
@@ -238,7 +240,12 @@ pub(crate) fn render(recording: &Recording) -> Vec<Entry> {
                 // Sample just before each switch between the main and
                 // alternate screens, which would otherwise hide the screen
                 // as it stood.
-                let mut rest = data.as_str();
+                let normalized = if normalize_lf {
+                    normalize_lf_for_vt100(data, &mut prev_cr)
+                } else {
+                    std::borrow::Cow::Borrowed(data.as_str())
+                };
+                let mut rest = normalized.as_ref();
                 while let Some(at) = screen_switch(rest) {
                     let (before, after) = rest.split_at(at);
                     renderer.parser.process(before.as_bytes());
@@ -440,5 +447,19 @@ mod tests {
         assert!(text.contains("[nono 00:01] session ended (exited:0)"));
         assert!(text.contains("Password:"));
         assert!(text.contains("ok"));
+    }
+
+    #[test]
+    fn non_pty_bare_lf_lines_do_not_staircase() {
+        let rec = Recording {
+            header: serde_json::json!({ "nono": { "pty": false } }),
+            cols: 40,
+            rows: 5,
+            events: vec![out(0.0, "first\nsecond\n"), out(0.1, "third\n")],
+            report: Default::default(),
+        };
+        let text = to_text(&render(&rec));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines, vec!["first", "second", "third"]);
     }
 }

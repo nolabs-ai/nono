@@ -3688,6 +3688,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            base_url_env_var: None,
             phantom_format: None,
             endpoint_rules: Vec::new(),
             endpoint_policy: None,

@@ -330,6 +330,13 @@ pub struct CustomCredentialDef {
     /// `credential_format`, which shapes the outbound real credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phantom_format: Option<String>,
+    /// Explicit environment variable name for the proxy base URL (e.g., "LANGFUSE_ENDPOINT").
+    ///
+    /// When set, the loopback base URL is exported under this name instead of
+    /// the derived `<PREFIX>_BASE_URL`. Use it for tools that expect the base
+    /// URL under a name not ending in `_BASE_URL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url_env_var: Option<String>,
 
     /// Optional L7 endpoint rules for method+path filtering.
     /// When non-empty, only matching method+path combinations are allowed.
@@ -785,6 +792,22 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
     }
 
     validate_phantom_format(name, cred)?;
+    // Validate base_url_env_var format if specified
+    if let Some(ref ev) = cred.base_url_env_var {
+        if ev.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "base_url_env_var for custom credential '{}' cannot be empty",
+                name
+            )));
+        }
+        if !ev.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(NonoError::ProfileParse(format!(
+                "base_url_env_var '{}' for custom credential '{}' must contain only \
+                 alphanumeric characters and underscores",
+                ev, name
+            )));
+        }
+    }
 
     // Validate upstream URL (HTTPS required, HTTP only for loopback)
     validate_upstream_url(&cred.upstream, name)?;
@@ -1278,6 +1301,29 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
     for (name, cred) in &profile.network.custom_credentials {
         validate_custom_credential(name, cred)?;
     }
+    // Same exported-name check the proxy runs, so `nono profile validate`
+    // reports a clash without starting a session. Only naming fields matter.
+    let routes: Vec<nono_proxy::config::RouteConfig> = profile
+        .network
+        .custom_credentials
+        .iter()
+        .map(|(name, cred)| nono_proxy::config::RouteConfig {
+            prefix: name.clone(),
+            upstream: cred.upstream.clone(),
+            credential_key: cred.credential_key.clone(),
+            env_var: cred.env_var.clone(),
+            base_url_env_var: cred.base_url_env_var.clone(),
+            phantom_format: cred.phantom_format.clone(),
+            oauth2: cred.auth.clone(),
+            spiffe: cred.spiffe.clone(),
+            ..Default::default()
+        })
+        .collect();
+    nono_proxy::server::validate_base_url_env_names(
+        &routes,
+        &nono_proxy::config::default_intercept_ca_env_vars(),
+    )
+    .map_err(|e| NonoError::ProfileParse(e.to_string()))?;
     Ok(())
 }
 
@@ -1386,6 +1432,8 @@ fn custom_credential_from_manifest_entry(cred: &nono::manifest::Credential) -> C
             .as_ref()
             .map(|value| value.as_str().to_string()),
         phantom_format: None,
+        // The capability-manifest schema has no base URL override field.
+        base_url_env_var: None,
         endpoint_rules,
         endpoint_policy: None,
         tls_ca: None,
@@ -6234,6 +6282,35 @@ mod tests {
     // - upstream URL (HTTPS required, HTTP only for loopback)
     // ============================================================================
 
+    #[test]
+    fn test_validate_profile_rejects_custom_credentials_sharing_base_url_env_var() {
+        let mut profile = Profile::default();
+        let mut a = header_cred_builder();
+        a.env_var = Some("A_KEY".to_string());
+        a.base_url_env_var = Some("SHARED_ENDPOINT".to_string());
+        let mut b = header_cred_builder();
+        b.env_var = Some("B_KEY".to_string());
+        b.base_url_env_var = Some("SHARED_ENDPOINT".to_string());
+        profile
+            .network
+            .custom_credentials
+            .insert("a".to_string(), a);
+        profile
+            .network
+            .custom_credentials
+            .insert("b".to_string(), b.clone());
+        let err = validate_profile_custom_credentials(&profile)
+            .expect_err("two credentials exporting one base URL var must be rejected");
+        assert!(err.to_string().contains("SHARED_ENDPOINT"), "{err}");
+
+        b.base_url_env_var = Some("B_ENDPOINT".to_string());
+        profile
+            .network
+            .custom_credentials
+            .insert("b".to_string(), b);
+        assert!(validate_profile_custom_credentials(&profile).is_ok());
+    }
+
     fn header_cred_builder() -> CustomCredentialDef {
         CustomCredentialDef {
             redeem_phantoms: Vec::new(),
@@ -6249,6 +6326,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6608,6 +6686,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6775,6 +6854,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6803,6 +6883,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6833,6 +6914,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6863,6 +6945,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6891,6 +6974,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6921,6 +7005,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6949,6 +7034,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -6979,6 +7065,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -7009,6 +7096,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -7193,6 +7281,35 @@ mod tests {
     }
 
     // ============================================================================
+    // base_url_env_var validation tests
+    // ============================================================================
+
+    #[test]
+    fn test_validate_base_url_env_var_empty_rejected() {
+        let mut cred = header_cred_builder();
+        cred.base_url_env_var = Some("".to_string());
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("empty base_url_env_var should be rejected");
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_base_url_env_var_invalid_chars_rejected() {
+        let mut cred = header_cred_builder();
+        cred.base_url_env_var = Some("LANGFUSE=ENDPOINT".to_string());
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("base_url_env_var with '=' should be rejected");
+        assert!(err.to_string().contains("alphanumeric"));
+    }
+
+    #[test]
+    fn test_validate_base_url_env_var_valid_name_ok() {
+        let mut cred = header_cred_builder();
+        cred.base_url_env_var = Some("LANGFUSE_ENDPOINT".to_string());
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    // ============================================================================
     // OAuth2 auth validation tests
     // ============================================================================
 
@@ -7218,6 +7335,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -7508,6 +7626,57 @@ mod tests {
         assert_eq!(rl.requests_per_minute, 60);
         assert_eq!(rl.burst, 5, "burst should default to 5");
         assert_eq!(rl.max_delay_secs, 5, "max_delay_secs should default to 5");
+    }
+
+    #[test]
+    fn test_parse_profile_with_base_url_env_var() {
+        let json = r#"{
+            "meta": { "name": "base-url-env-var-test" },
+            "network": {
+                "custom_credentials": {
+                    "langfuse": {
+                        "upstream": "https://cloud.langfuse.com",
+                        "credential_key": "env://LANGFUSE_SECRET",
+                        "env_var": "LANGFUSE_API_KEY",
+                        "base_url_env_var": "LANGFUSE_ENDPOINT"
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("base-url-env-var-test.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        let cred = &profile.network.custom_credentials["langfuse"];
+        assert_eq!(cred.env_var.as_deref(), Some("LANGFUSE_API_KEY"));
+        assert_eq!(cred.base_url_env_var.as_deref(), Some("LANGFUSE_ENDPOINT"));
+
+        // Round-trip: serializing and re-parsing must preserve the field.
+        let serialized = serde_json::to_string(cred).expect("serialize credential");
+        let reparsed: CustomCredentialDef =
+            serde_json::from_str(&serialized).expect("re-parse credential");
+        assert_eq!(reparsed, *cred);
+    }
+
+    #[test]
+    fn test_parse_profile_base_url_env_var_defaults_to_none() {
+        let json = r#"{
+            "meta": { "name": "base-url-env-var-absent" },
+            "network": {
+                "custom_credentials": {
+                    "my_api": {
+                        "upstream": "https://api.example.com",
+                        "credential_key": "env://MY_API_KEY"
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("base-url-env-var-absent.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        let cred = &profile.network.custom_credentials["my_api"];
+        assert!(cred.base_url_env_var.is_none());
     }
 
     #[test]
@@ -8230,6 +8399,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -8258,6 +8428,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -8423,6 +8594,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -8451,6 +8623,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 phantom_format: None,
+                base_url_env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -10986,6 +11159,7 @@ mod tests {
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -11017,6 +11191,7 @@ mod tests {
             endpoint_rules: vec![],
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -11051,6 +11226,7 @@ mod tests {
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -11085,6 +11261,7 @@ mod tests {
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -11151,6 +11328,7 @@ mod tests {
             endpoint_rules: vec![],
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -11646,6 +11824,7 @@ mod tests {
             endpoint_rules: vec![],
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
@@ -12458,6 +12637,7 @@ mod tests {
             proxy: None,
             env_var: None,
             phantom_format: None,
+            base_url_env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
